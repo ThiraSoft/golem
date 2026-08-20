@@ -68,7 +68,7 @@ func main() {
 		name, len(m.Cfg.Blocks), *context,
 		time.Since(start).Round(time.Millisecond), runtime.NumCPU())
 	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 — one request at a time\n", *addr)
-	if err := http.ListenAndServe(*addr, server.Handler()); err != nil {
+	if err := http.ListenAndServe(*addr, logging(os.Stderr, server.Handler())); err != nil {
 		fail(err)
 	}
 }

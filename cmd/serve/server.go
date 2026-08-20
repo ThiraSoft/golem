@@ -160,6 +160,11 @@ func writeJSON(w http.ResponseWriter, code int, body any) {
 }
 
 func refuse(w http.ResponseWriter, code int, kind, message string) {
+	// The log line for this request carries the reason too, so a refusal is
+	// visible on the server and not only to the client.
+	if rec, ok := w.(*recorder); ok {
+		rec.reason = message
+	}
 	var body apiError
 	body.Error.Message = message
 	body.Error.Type = kind
