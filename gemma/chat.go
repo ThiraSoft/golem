@@ -9,9 +9,8 @@ package gemma
 // itself makes of that template, so this file is checked against the original
 // rather than against a reading of it.
 //
-// What is not covered — tools, tool calls, tool responses, images, audio,
-// video, and the reasoning channel of a past answer — is refused rather than
-// approximated.
+// What is not covered — images, audio, video, and the reasoning channel of a
+// past answer — is refused rather than approximated.
 
 import (
 	"fmt"
@@ -19,11 +18,17 @@ import (
 )
 
 // Message is one turn of the conversation. Role is "system", "developer",
-// "user", "assistant" or "model"; the template renames "assistant" to "model"
-// and treats "developer" as "system".
+// "user", "assistant", "model" or "tool"; the template renames "assistant" to
+// "model" and treats "developer" as "system".
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// Name is the function a tool result came from.
+	Name string `json:"name,omitempty"`
+	// ToolCalls are the calls a model turn made.
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	// ToolCallID ties a tool result to the call it answers.
+	ToolCallID string `json:"tool_call_id,omitempty"`
 }
 
 type ChatOptions struct {
@@ -36,6 +41,10 @@ type ChatOptions struct {
 	// template has no such line, and Config.EmptyThought says which of the two
 	// the file being run is.
 	EmptyThought bool
+	// Tools are the functions declared to the model. They are written into the
+	// system turn, which the template opens for them even when the
+	// conversation has no system message.
+	Tools []Tool
 	// AddGenerationPrompt appends the empty model turn the model is meant to
 	// continue. A caller rendering a conversation for training rather than for
 	// generation leaves it false.
@@ -61,6 +70,14 @@ const (
 	roleUser          = "user"
 	roleAssistant     = "assistant"
 	roleModel         = "model"
+	roleTool          = "tool"
+	toolOpen          = "<|tool>"
+	toolClose         = "<tool|>"
+	toolCallOpen      = "<|tool_call>"
+	toolCallClose     = "<tool_call|>"
+	toolResponseOpen  = "<|tool_response>"
+	toolResponseClose = "<tool_response|>"
+	quote             = `<|"|>`
 )
 
 // RenderChat writes the conversation the way Gemma's template does, leading
@@ -73,6 +90,14 @@ func RenderChat(messages []Message, opt ChatOptions) (string, error) {
 	for i, m := range messages {
 		switch m.Role {
 		case roleUser, roleAssistant, roleModel:
+		case roleTool:
+			// A result answers a call, so a call has to come before it.
+			if i == 0 {
+				return "", fmt.Errorf("gemma: message 0 is a tool result, and a result answers a call that came before it")
+			}
+			if previous := messages[i-1]; previous.Role != roleTool && len(previous.ToolCalls) == 0 {
+				return "", fmt.Errorf("gemma: message %d is a tool result, but message %d made no call", i, i-1)
+			}
 		case roleSystem, roleDeveloper:
 			if i != 0 {
 				return "", fmt.Errorf("gemma: message %d is a %s message, and the template opens its system turn from the first message only", i, m.Role)
@@ -87,7 +112,7 @@ func RenderChat(messages []Message, opt ChatOptions) (string, error) {
 
 	rest := messages
 	leadingSystem := messages[0].Role == roleSystem || messages[0].Role == roleDeveloper
-	if opt.EnableThinking || leadingSystem {
+	if opt.EnableThinking || leadingSystem || len(opt.Tools) > 0 {
 		b.WriteString(turnOpen + roleSystem + "\n")
 		if opt.EnableThinking {
 			b.WriteString(thinkPiece)
@@ -96,11 +121,22 @@ func RenderChat(messages []Message, opt ChatOptions) (string, error) {
 			b.WriteString(strings.TrimSpace(messages[0].Content))
 			rest = messages[1:]
 		}
+		for _, tool := range opt.Tools {
+			if err := writeDeclaration(&b, tool); err != nil {
+				return "", err
+			}
+		}
 		b.WriteString(turnClose)
 	}
 
 	previous := ""
-	for _, m := range rest {
+	// lastWritten records what the loop wrote last, because the way a turn is
+	// closed — and whether a generation prompt opens a new one — depends on it.
+	lastWritten := ""
+	for i, m := range rest {
+		if m.Role == roleTool {
+			continue // written by the call it answers
+		}
 		role := m.Role
 		if role == roleAssistant {
 			role = roleModel
@@ -109,16 +145,48 @@ func RenderChat(messages []Message, opt ChatOptions) (string, error) {
 		if !(role == roleModel && previous == roleAssistant) {
 			b.WriteString(turnOpen + role + "\n")
 		}
-		if role == roleModel {
-			b.WriteString(StripThinking(m.Content))
-		} else {
-			b.WriteString(strings.TrimSpace(m.Content))
+		for _, call := range m.ToolCalls {
+			writeCall(&b, call)
+			lastWritten = "tool_call"
 		}
-		b.WriteString(turnClose)
+		// The results follow the message that called for them, inside its turn.
+		answered := false
+		for _, follow := range rest[i+1:] {
+			if follow.Role != roleTool {
+				break
+			}
+			name := follow.Name
+			if name == "" {
+				name = nameOfCall(m.ToolCalls, follow.ToolCallID)
+			}
+			writeResponse(&b, name, follow.Content)
+			answered = true
+			lastWritten = "tool_response"
+		}
+		content := m.Content
+		if role == roleModel {
+			content = StripThinking(content)
+		} else {
+			content = strings.TrimSpace(content)
+		}
+		b.WriteString(content)
+		if content != "" {
+			lastWritten = "content"
+		}
+		switch {
+		case lastWritten == "tool_call" && !answered:
+			// A call with no result yet: the template leaves the response open.
+			b.WriteString(toolResponseOpen)
+		case answered && content == "":
+			// The turn stays open: the model speaks on after its results.
+		default:
+			b.WriteString(turnClose)
+			lastWritten = "turn"
+		}
 		previous = m.Role
 	}
 
-	if opt.AddGenerationPrompt {
+	if opt.AddGenerationPrompt && lastWritten != "tool_call" && lastWritten != "tool_response" {
 		b.WriteString(turnOpen + roleModel + "\n")
 		if opt.EmptyThought && !opt.EnableThinking {
 			b.WriteString(emptyThought)
