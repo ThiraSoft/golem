@@ -1,6 +1,9 @@
 package pockettts
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 // TestLanguageTable pins the four values that actually differ between the
 // models Kyutai ships. They were read from the upstream YAML configs; if a
@@ -56,5 +59,34 @@ func TestTokenizerPathIrregularity(t *testing.T) {
 	normal, _ := LookupLanguage("french_24l")
 	if got := normal.TokenizerPath(); got != "languages/french_24l/tokenizer.model" {
 		t.Errorf("french_24l tokenizer at %q", got)
+	}
+}
+
+func TestEmbeddingPath(t *testing.T) {
+	lang, err := LookupLanguage("french_24l")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := lang.EmbeddingPath("alba")
+	want := "languages/french_24l/embeddings/alba.safetensors"
+	if got != want {
+		t.Errorf("EmbeddingPath = %q, want %q", got, want)
+	}
+}
+
+// Locate answers with a path or with nothing; either is a valid answer on a
+// machine that may or may not have downloaded the model.
+func TestLocate(t *testing.T) {
+	lang, err := LookupLanguage("french_24l")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := Locate(lang.WeightsPath()); p != "" {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("Locate returned %q, which does not exist: %v", p, err)
+		}
+	}
+	if p := Locate("languages/french_24l/embeddings/no-such-voice.safetensors"); p != "" {
+		t.Errorf("Locate found %q for a voice that does not exist", p)
 	}
 }

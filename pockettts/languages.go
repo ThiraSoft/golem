@@ -101,3 +101,10 @@ func (l Language) TokenizerPath() string {
 	}
 	return "languages/" + l.Name + "/tokenizer.model"
 }
+
+// EmbeddingPath is where a predefined voice sits inside a Pocket TTS snapshot.
+// The file is the voice state the model starts from, already computed by
+// Kyutai; nothing here encodes a voice from sound.
+func (l Language) EmbeddingPath(voice string) string {
+	return "languages/" + l.Name + "/embeddings/" + voice + ".safetensors"
+}
