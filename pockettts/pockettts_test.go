@@ -70,16 +70,16 @@ func testFullSynthesis(t *testing.T, set string) {
 		t.Fatalf("prepared text %q, want %q", got, f.Text)
 	}
 
-	sound, err := engine.Synthesize(f.Text, voice, &Settings{
-		// The threshold is disabled: the reference produced a fixed number of
-		// frames without stopping at the detected end.
-		EndThreshold: 1e9,
-		noise: func(frame int, into []float32) {
-			if frame < f.Frames {
-				copy(into, noises[frame*L:(frame+1)*L])
-			}
-		},
-	})
+	settings := DefaultSettings(engine.lang)
+	// The threshold is disabled: the reference produced a fixed number of frames
+	// without stopping at the detected end.
+	settings.EndThreshold = 1e9
+	settings.noise = func(frame int, into []float32) {
+		if frame < f.Frames {
+			copy(into, noises[frame*L:(frame+1)*L])
+		}
+	}
+	sound, err := engine.Synthesize(f.Text, voice, &settings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,5 +96,40 @@ func testFullSynthesis(t *testing.T, set string) {
 	for i := 0; i < f.Frames; i++ {
 		start, end := i*mimi.SamplesPerFrame, (i+1)*mimi.SamplesPerFrame
 		reference.Compare(t, "audio", sound[start:end], wantAudio[start:end], 5e-3)
+	}
+}
+
+func TestDefaultSettings(t *testing.T) {
+	lang, err := LookupLanguage("french_24l")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := DefaultSettings(lang)
+	if s.Temperature != 0.7 {
+		t.Errorf("Temperature = %v, want 0.7", s.Temperature)
+	}
+	if s.EndThreshold != -4 {
+		t.Errorf("EndThreshold = %v, want -4", s.EndThreshold)
+	}
+	if s.FramesAfterEnd != lang.FramesAfterEnd {
+		t.Errorf("FramesAfterEnd = %v, want %v", s.FramesAfterEnd, lang.FramesAfterEnd)
+	}
+	if s.MaxTokens != 50 {
+		t.Errorf("MaxTokens = %v, want 50", s.MaxTokens)
+	}
+}
+
+// A caller that means zero gets zero. That is the whole point: gladyss sets an
+// end threshold of 0.0 on purpose, and the old zero-means-default rule turned
+// it into -4 without saying so.
+func TestSettingsKeepsAnExplicitZero(t *testing.T) {
+	lang, err := LookupLanguage("french_24l")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := DefaultSettings(lang)
+	s.EndThreshold = 0
+	if s.EndThreshold != 0 {
+		t.Errorf("EndThreshold = %v, want 0", s.EndThreshold)
 	}
 }

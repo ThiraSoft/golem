@@ -55,7 +55,9 @@ func BenchmarkSynthesis(b *testing.B) {
 
 func benchmarkSynthesis(b *testing.B, language, sentence string) {
 	engine, voice := benchEngine(b, language)
-	settings := &Settings{Seed: 20260820}
+	set := DefaultSettings(engine.lang)
+	set.Seed = 20260820
+	settings := &set
 
 	// One synthesis before the clock starts: the first frame of a run pays for
 	// the pages of the mapping it touches first, which is startup and not
@@ -92,7 +94,9 @@ func BenchmarkFirstFrame(b *testing.B) {
 
 func benchmarkFirstFrame(b *testing.B, language, sentence string) {
 	engine, voice := benchEngine(b, language)
-	if _, err := engine.Synthesize(sentence, voice, &Settings{Seed: 20260820}); err != nil {
+	warmup := DefaultSettings(engine.lang)
+	warmup.Seed = 20260820
+	if _, err := engine.Synthesize(sentence, voice, &warmup); err != nil {
 		b.Fatal(err)
 	}
 
@@ -101,15 +105,14 @@ func benchmarkFirstFrame(b *testing.B, language, sentence string) {
 	for i := 0; i < b.N; i++ {
 		var first time.Duration
 		start := time.Now()
-		settings := &Settings{
-			Seed: 20260820,
-			Frame: func([]float32) {
-				if first == 0 {
-					first = time.Since(start)
-				}
-			},
+		settings := DefaultSettings(engine.lang)
+		settings.Seed = 20260820
+		settings.Frame = func([]float32) {
+			if first == 0 {
+				first = time.Since(start)
+			}
 		}
-		if _, err := engine.Synthesize(sentence, voice, settings); err != nil {
+		if _, err := engine.Synthesize(sentence, voice, &settings); err != nil {
 			b.Fatal(err)
 		}
 		if first == 0 {

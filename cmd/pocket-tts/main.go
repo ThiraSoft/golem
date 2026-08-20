@@ -77,7 +77,9 @@ func main() {
 	}
 
 	start = time.Now()
-	sound, err := engine.Synthesize(text, v, &pockettts.Settings{Seed: *seed})
+	settings := pockettts.DefaultSettings(lang)
+	settings.Seed = *seed
+	sound, err := engine.Synthesize(text, v, &settings)
 	if err != nil {
 		fail(err)
 	}

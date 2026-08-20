@@ -124,14 +124,14 @@ func (m *Engine) rules() text.Rules {
 	}
 }
 
-// Settings tunes the generation. The zero value gives the model's own values,
-// which are those of the reference daemon.
+// Settings tunes the generation. Start from DefaultSettings and change what you
+// mean to change: no field is interpreted, and a zero is a zero.
 type Settings struct {
-	Temperature    float64 // 0 -> 0.7: the variance of the starting noise
-	EndThreshold   float64 // 0 -> -4: beyond it, the model declares itself done
-	FramesAfterEnd int     // 0 -> 8: enough to let the sentence settle
-	MaxTokens      int     // 0 -> 50: size of a segment
-	Seed           uint64  // 0 -> random draw
+	Temperature    float64 // the variance of the starting noise
+	EndThreshold   float64 // beyond it, the model declares itself done
+	FramesAfterEnd int     // enough to let the sentence settle
+	MaxTokens      int     // size of a segment
+	Seed           uint64  // 0 for a random draw, which is a value and not a default
 	// Frame, if provided, receives each frame of samples as soon as it is
 	// ready. That is what allows the sound to be played during generation.
 	Frame func([]float32)
@@ -142,18 +142,19 @@ type Settings struct {
 	noise func(frame int, into []float32)
 }
 
-func (r *Settings) defaults(lang Language) {
-	if r.Temperature == 0 {
-		r.Temperature = 0.7
-	}
-	if r.EndThreshold == 0 {
-		r.EndThreshold = -4
-	}
-	if r.FramesAfterEnd == 0 {
-		r.FramesAfterEnd = lang.FramesAfterEnd
-	}
-	if r.MaxTokens == 0 {
-		r.MaxTokens = 50
+// DefaultSettings returns the model's own values, which are those of the
+// reference daemon. Callers start from it and change what they mean to change.
+//
+// The settings carry no zero-means-default rule: a caller that sets a field to
+// zero gets zero. An end threshold of 0 is a legitimate setting — it makes the
+// model far more reluctant to declare itself done — and the earlier rule turned
+// it into -4 silently.
+func DefaultSettings(lang Language) Settings {
+	return Settings{
+		Temperature:    0.7,
+		EndThreshold:   -4,
+		FramesAfterEnd: lang.FramesAfterEnd,
+		MaxTokens:      50,
 	}
 }
 
@@ -162,11 +163,10 @@ func (m *Engine) Synthesize(t string, voice *Voice, r *Settings) ([]float32, err
 	if voice == nil {
 		return nil, fmt.Errorf("no voice provided")
 	}
-	set := Settings{}
+	set := DefaultSettings(m.lang)
 	if r != nil {
 		set = *r
 	}
-	set.defaults(m.lang)
 
 	seed := set.Seed
 	if seed == 0 {
