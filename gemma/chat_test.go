@@ -10,6 +10,7 @@ import (
 type chatCase struct {
 	Name                string    `json:"name"`
 	Messages            []Message `json:"messages"`
+	Tools               []Tool    `json:"tools"`
 	EnableThinking      bool      `json:"enable_thinking"`
 	AddGenerationPrompt bool      `json:"add_generation_prompt"`
 	Rendered            string    `json:"rendered"`
@@ -47,6 +48,7 @@ func TestRenderChatMatchesTheTemplate(t *testing.T) {
 		for _, c := range cases {
 			t.Run(dir+"/"+c.Name, func(t *testing.T) {
 				got, err := RenderChat(c.Messages, ChatOptions{
+					Tools:               c.Tools,
 					EnableThinking:      c.EnableThinking,
 					EmptyThought:        emptyThought,
 					AddGenerationPrompt: c.AddGenerationPrompt,
@@ -66,8 +68,14 @@ func TestRenderChatRejectsWhatItCannotRender(t *testing.T) {
 	if _, err := RenderChat(nil, ChatOptions{}); err == nil {
 		t.Fatal("an empty conversation has no first message and should be refused")
 	}
-	if _, err := RenderChat([]Message{{Role: "tool", Content: "x"}}, ChatOptions{}); err == nil {
-		t.Fatal("the tool role is not implemented and should be refused rather than mis-rendered")
+	if _, err := RenderChat([]Message{{Role: "tool", Name: "weather", Content: "x"}}, ChatOptions{}); err == nil {
+		t.Fatal("a tool result with no call before it should be refused")
+	}
+	if _, err := RenderChat([]Message{
+		{Role: "user", Content: "one"},
+		{Role: "tool", Name: "weather", Content: "x"},
+	}, ChatOptions{}); err == nil {
+		t.Fatal("a tool result answering a message that made no call should be refused")
 	}
 	if _, err := RenderChat([]Message{
 		{Role: "user", Content: "one"},

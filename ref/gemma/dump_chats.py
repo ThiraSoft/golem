@@ -84,56 +84,160 @@ def metadata(path):
 
 # The corpus. Each case names the messages and the two flags the template reads.
 CASES = [
-    ("user_only", [{"role": "user", "content": "hi"}], False, True),
+    ("user_only", [{"role": "user", "content": "hi"}], False, True, None),
     ("system_user", [
         {"role": "system", "content": "You are terse."},
         {"role": "user", "content": "hi"},
-    ], False, True),
+    ], False, True, None),
     ("developer_user", [
         {"role": "developer", "content": "You are terse."},
         {"role": "user", "content": "hi"},
-    ], False, True),
+    ], False, True, None),
     ("multi_turn", [
         {"role": "user", "content": "one"},
         {"role": "assistant", "content": "two"},
         {"role": "user", "content": "three"},
-    ], False, True),
+    ], False, True, None),
     ("assistant_continuation", [
         {"role": "user", "content": "one"},
         {"role": "assistant", "content": "two"},
         {"role": "assistant", "content": "still two"},
-    ], False, True),
-    ("thinking", [{"role": "user", "content": "hi"}], True, True),
+    ], False, True, None),
+    ("thinking", [{"role": "user", "content": "hi"}], True, True, None),
     ("thinking_with_system", [
         {"role": "system", "content": "You are terse."},
         {"role": "user", "content": "hi"},
-    ], True, True),
+    ], True, True, None),
     ("no_generation_prompt", [
         {"role": "user", "content": "one"},
         {"role": "assistant", "content": "two"},
-    ], False, False),
+    ], False, False, None),
     ("whitespace_trimmed", [
         {"role": "system", "content": "  padded  \n"},
         {"role": "user", "content": "\n  spaced  \n"},
-    ], False, True),
+    ], False, True, None),
     ("assistant_with_channel", [
         {"role": "user", "content": "one"},
         {"role": "assistant",
          "content": "before<|channel>thought\nhidden<channel|>after"},
         {"role": "user", "content": "three"},
-    ], False, True),
+    ], False, True, None),
     ("assistant_channel_unclosed", [
         {"role": "user", "content": "one"},
         {"role": "assistant", "content": "kept<|channel>dropped"},
-    ], False, False),
-    ("system_only", [{"role": "system", "content": "alone"}], False, True),
+    ], False, False, None),
+    ("system_only", [{"role": "system", "content": "alone"}], False, True, None),
     ("empty_content", [
         {"role": "user", "content": ""},
-    ], False, True),
+    ], False, True, None),
     ("unicode", [
         {"role": "user", "content": "héllo — 世界 🙂"},
-    ], False, True),
+    ], False, True, None),
 ]
+
+# The tool path of the template: declarations in the system turn, the calls
+# the model makes, and the results fed back to it.
+WEATHER = {
+    "type": "function",
+    "function": {
+        "name": "weather",
+        "description": "Today's weather in a city.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "Which city."},
+                "unit": {"type": "string", "description": "Scale.",
+                         "enum": ["celsius", "fahrenheit"]},
+            },
+            "required": ["city"],
+        },
+    },
+}
+NOW = {"type": "function",
+       "function": {"name": "now", "description": "The current time."}}
+TAGS = {
+    "type": "function",
+    "function": {
+        "name": "tags",
+        "description": "Tag a note.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "labels": {"type": "array", "description": "The labels.",
+                           "items": {"type": "string"}},
+                "pinned": {"type": "boolean", "description": "Keep it on top."},
+            },
+        },
+    },
+}
+
+TOOL_CASES = [
+    ("tools_declared", [{"role": "user", "content": "weather in Lyon?"}],
+     False, True, [WEATHER]),
+    ("tools_no_parameters", [{"role": "user", "content": "what time is it?"}],
+     False, True, [NOW]),
+    ("tools_array_and_boolean", [{"role": "user", "content": "tag it"}],
+     False, True, [TAGS]),
+    ("tools_two_declarations", [{"role": "user", "content": "hi"}],
+     False, True, [WEATHER, NOW]),
+    ("tools_with_system", [
+        {"role": "system", "content": "You are terse."},
+        {"role": "user", "content": "hi"},
+    ], False, True, [WEATHER]),
+    ("tools_thinking", [{"role": "user", "content": "hi"}], True, True, [WEATHER]),
+    ("tool_call_unanswered", [
+        {"role": "user", "content": "weather in Lyon?"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "weather",
+                          "arguments": {"city": "Lyon", "unit": "celsius"}}},
+        ]},
+    ], False, False, [WEATHER]),
+    ("tool_call_answered", [
+        {"role": "user", "content": "weather in Lyon?"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "weather", "arguments": {"city": "Lyon"}}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "name": "weather",
+         "content": "18 degrees, clear"},
+    ], False, True, [WEATHER]),
+    ("tool_call_two_calls_answered", [
+        {"role": "user", "content": "both please"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "weather", "arguments": {"city": "Lyon"}}},
+            {"id": "call_2", "type": "function",
+             "function": {"name": "now", "arguments": {}}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "name": "weather",
+         "content": "18 degrees"},
+        {"role": "tool", "tool_call_id": "call_2", "name": "now",
+         "content": "14:03"},
+    ], False, True, [WEATHER, NOW]),
+    ("tool_call_then_answer", [
+        {"role": "user", "content": "weather in Lyon?"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "weather", "arguments": {"city": "Lyon"}}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "name": "weather",
+         "content": "18 degrees"},
+        {"role": "assistant", "content": "It is 18 degrees."},
+        {"role": "user", "content": "and tomorrow?"},
+    ], False, True, [WEATHER]),
+    ("tool_call_argument_types", [
+        {"role": "user", "content": "tag it"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "tags",
+                          "arguments": {"labels": ["a", "b"], "pinned": True,
+                                        "count": 2}}},
+        ]},
+    ], False, False, [TAGS]),
+]
+
+CASES = CASES + TOOL_CASES
 
 
 def main():
@@ -149,19 +253,21 @@ def main():
     template = env.from_string(template_text)
 
     cases = []
-    for name, messages, thinking, add_generation_prompt in CASES:
+    for name, messages, thinking, add_generation_prompt, tools in CASES:
         try:
             text = template.render(
                 messages=messages,
                 bos_token="<bos>",
                 enable_thinking=thinking,
                 add_generation_prompt=add_generation_prompt,
+                tools=tools,
             )
         except TemplateError as e:
             raise SystemExit(f"{name}: {e}")
         cases.append({
             "name": name,
             "messages": messages,
+            "tools": tools,
             "enable_thinking": thinking,
             "add_generation_prompt": add_generation_prompt,
             "rendered": text,

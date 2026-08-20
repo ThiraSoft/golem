@@ -39,6 +39,7 @@ use it.
 | | what it does |
 |---|---|
 | [`cmd/chat`](cmd/chat/) | a conversation with Gemma, streamed to the terminal |
+| [`cmd/serve`](cmd/serve/) | an OpenAI-compatible API over the same weights, tool calls included |
 | `cmd/pocket-tts` | text in, a WAV file out |
 
 ```bash

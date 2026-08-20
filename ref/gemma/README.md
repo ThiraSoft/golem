@@ -121,15 +121,22 @@ believes it renders. So this script reads the template out of the file with a
 small metadata reader of its own and hands it to Jinja2, which is the engine
 the template was written for.
 
-Fourteen cases: a bare user turn, a system or developer preamble, several turns,
-two consecutive assistant messages (which the template folds into one model
-turn), the thinking flag, the generation prompt withheld, content that needs
-trimming, a thinking channel that has to be stripped out of a past answer,
-an empty message and a non-ASCII one.
+Twenty-five cases. Fourteen for a text conversation: a bare user turn, a system
+or developer preamble, several turns, two consecutive assistant messages (which
+the template folds into one model turn), the thinking flag, the generation
+prompt withheld, content that needs trimming, a thinking channel that has to be
+stripped out of a past answer, an empty message and a non-ASCII one.
 
-Tools, tool calls and content-part arrays are deliberately absent: golem's
-renderer covers a text conversation, and a fixture for a path that is not
-implemented would only say that it is not implemented.
+Eleven more for tools: a declaration with parameters, one with none, one holding
+an array and a boolean, two declarations at once, declarations beside a system
+message and beside the thinking flag, a call left unanswered (which the template
+ends on a bare `<|tool_response>`), a call answered, two calls answered, a call
+answered and then spoken to, and a call whose arguments run through every type
+the format has.
+
+Content-part arrays — images, audio, video — are still deliberately absent:
+golem's renderer covers text, and a fixture for a path that is not implemented
+would only say that it is not implemented.
 
 ```bash
 python3 dump_chats.py "$MODEL"     ../../testdata/gemma/chat/cases.json
