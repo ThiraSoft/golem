@@ -46,7 +46,16 @@ type Transformer struct {
 	EmbMean     []float32 // denormalization statistics of the latents
 	EmbStd      []float32
 	Conditioner [][]float32 // table of text embeddings, indexed by token
-	scratch     []float32
+
+	// SpeakerProj and BOSBeforeVoice serve the cloning path only: the first
+	// brings an encoded latent up to d_model, the second is the position the
+	// model listens from. They are a separate projection from InputLinear —
+	// listening to a voice and generating from one are not the same operation,
+	// and the model was not trained as though they were.
+	SpeakerProj    nn.Linear
+	BOSBeforeVoice []float32
+
+	scratch []float32
 }
 
 // State is the generation state: one KV cache per layer.
@@ -120,6 +129,46 @@ func (t *Transformer) AdvanceLatent(latent []float32, state *State) []float32 {
 	return x
 }
 
+// CanClone says whether the weights carry what listening to a voice needs.
+func (t *Transformer) CanClone() bool {
+	return t.SpeakerProj.Weights != nil && len(t.BOSBeforeVoice) == t.Config.DModel
+}
+
+// AdvanceVoice listens to an encoded recording and leaves the state holding the
+// voice, ready to be saved or generated from.
+//
+// latents are what the Mimi encoder produced, laid out channel by channel:
+// latents[c*frames+f]. They go in together rather than one at a time, for the
+// reason AdvancePrompt gives — the weights are read once instead of once per
+// frame, and a recording is hundreds of frames long.
+func (t *Transformer) AdvanceVoice(latents []float32, frames int, state *State) error {
+	if !t.CanClone() {
+		return fmt.Errorf("these weights carry no speaker projection: they are the build without voice cloning")
+	}
+	if frames <= 0 || len(latents) != frames*t.Config.LatentDim {
+		return fmt.Errorf("%d values for %d frames of %d latent dimensions",
+			len(latents), frames, t.Config.LatentDim)
+	}
+
+	D, L := t.Config.DModel, t.Config.LatentDim
+	// One position for the start of listening, then one per frame.
+	block := make([]float32, (frames+1)*D)
+	copy(block, t.BOSBeforeVoice)
+
+	latent := make([]float32, L)
+	for f := 0; f < frames; f++ {
+		for c := 0; c < L; c++ {
+			latent[c] = latents[c*frames+f]
+		}
+		t.SpeakerProj.Apply(latent, block[(f+1)*D:(f+2)*D])
+	}
+
+	for i, c := range t.Layers {
+		c.Block(block, frames+1, state.Caches[i])
+	}
+	return nil
+}
+
 // EOSLogit says how finished the model judges the utterance to be.
 func (t *Transformer) EOSLogit(cond []float32) float32 {
 	var y [1]float32
@@ -182,6 +231,15 @@ func Load(m *tensors.Model, cfg Config) (*Transformer, error) {
 
 	if t.BOSEmb, err = f32("flow_lm.bos_emb"); err != nil {
 		return nil, err
+	}
+	// Absent from the models published without voice cloning, and only the
+	// cloning path reads them: a missing one is not an error here, it is a
+	// model that cannot clone.
+	if p, err := lin("flow_lm.speaker_proj_weight", cfg.LatentDim, cfg.DModel); err == nil {
+		t.SpeakerProj = p
+	}
+	if b, err := f32("flow_lm.bos_before_voice"); err == nil {
+		t.BOSBeforeVoice = b
 	}
 	if t.EmbMean, err = f32("flow_lm.emb_mean"); err != nil {
 		return nil, err

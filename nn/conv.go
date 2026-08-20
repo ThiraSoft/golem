@@ -106,9 +106,12 @@ func (c Conv1d) Apply(x []float32, steps int, state *ConvState) ([]float32, int)
 	state.output = grow(state.output, c.Outputs*outputs)
 	y := state.output
 
-	if c.gathered(outputs) {
+	switch {
+	case c.gathered(outputs):
 		c.applyGathered(input, y, total, outputs, state)
-	} else {
+	case c.Stride > 1:
+		c.applyStrided(input, y, total, outputs, state)
+	default:
 		c.applyAxpy(input, y, total, outputs)
 	}
 	c.keepTail(input, total, state)
@@ -226,6 +229,80 @@ func (c Conv1d) applyGathered(input, y []float32, total, outputs int, state *Con
 			}
 		}
 	})
+}
+
+// tileBytes is how much of a core's L2 the gathered window is allowed to fill.
+//
+// The whole window of a wide layer does not fit anywhere useful: the encoder's
+// first reduction has a hundred and sixty thousand output positions of five
+// hundred and twelve values each, which is three hundred megabytes to build
+// before reading any of it. Gathering a tile at a time keeps it inside the
+// cache, where every output channel then reads it, and costs nothing — each
+// tile is gathered once and read by all of them.
+//
+// The count of positions therefore follows the width rather than being fixed: a
+// tile of five hundred and twelve positions is 400 kB at one width and 800 kB at
+// the next, and the second spills.
+const tileBytes = 128 << 10
+
+// tileFor is how many output positions to gather at a time: enough that the
+// window fills half of a core's L2 and no more. Below sixty-four positions the
+// gathering stops paying for itself, so that is the floor whatever the width.
+func tileFor(width int) int {
+	n := tileBytes / (4 * width)
+	if n < 64 {
+		n = 64
+	}
+	return n
+}
+
+// applyStrided computes a strided convolution through gathered windows, tile by
+// tile.
+//
+// The axpy form cannot serve here. Its inner loop walks the input with the
+// stride, `channel[i*Stride+offset]`, which is a scalar loop no vector unit can
+// help with — the decoder never noticed because every convolution it runs has a
+// stride of one. Gathering turns the same arithmetic back into contiguous dot
+// products, and those have a kernel.
+func (c Conv1d) applyStrided(input, y []float32, total, outputs int, state *ConvState) {
+	width := c.Inputs * c.Kernel
+	tile := tileFor(width)
+	state.window = grow(state.window, min(outputs, tile)*width)
+	col := state.window
+
+	for base := 0; base < outputs; base += tile {
+		n := min(tile, outputs-base)
+
+		for e := 0; e < c.Inputs; e++ {
+			channel := input[e*total : (e+1)*total]
+			if c.Dilation == 1 {
+				for i := 0; i < n; i++ {
+					copy(col[i*width+e*c.Kernel:i*width+(e+1)*c.Kernel], channel[(base+i)*c.Stride:])
+				}
+				continue
+			}
+			for i := 0; i < n; i++ {
+				tap := col[i*width+e*c.Kernel:]
+				for k := 0; k < c.Kernel; k++ {
+					tap[k] = channel[(base+i)*c.Stride+k*c.Dilation]
+				}
+			}
+		}
+
+		InParallel(c.Outputs, c.Outputs*width*n, func(start, end int) {
+			for s := start; s < end; s++ {
+				var bias float32
+				if c.Bias != nil {
+					bias = c.Bias[s]
+				}
+				row := y[s*outputs+base : s*outputs+base+n]
+				block := c.Weights[s*width : (s+1)*width]
+				for i := range row {
+					row[i] = bias + DotF32(block, col[i*width:(i+1)*width])
+				}
+			}
+		})
+	}
 }
 
 // ConvTranspose1d widens the signal: it is the one that climbs from the frame

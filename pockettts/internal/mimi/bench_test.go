@@ -1,11 +1,12 @@
 package mimi
 
 import (
-	"testing"
-
+	"math"
 	"os"
 	"path/filepath"
+	"testing"
 
+	"github.com/ThiraSoft/golem/pockettts/internal/reference"
 	"github.com/ThiraSoft/golem/tensors"
 )
 
@@ -41,4 +42,38 @@ func weightsPath(b *testing.B) string {
 		b.Skip("weights not found")
 	}
 	return t[0]
+}
+
+// BenchmarkEncode is the cloning path: a recording in, latents out.
+//
+// It is reported against the length of the recording, like the synthesis
+// benchmark, because that is what a caller waits for — encoding twenty-eight
+// seconds of speech is the whole of what preparing a voice costs.
+func BenchmarkEncode(b *testing.B) {
+	m, err := tensors.Open(reference.ModelPath(b, "french_24l"))
+	if err != nil {
+		b.Skip("no weights")
+	}
+	defer m.Close()
+	e, err := LoadEncoder(m, DefaultConfig)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	// Ten seconds of a deterministic signal: long enough for every layer to be
+	// dominated by its steady state rather than by its padding.
+	const seconds = 10
+	samples := make([]float32, seconds*24000)
+	for i := range samples {
+		samples[i] = float32(math.Sin(float64(i)*0.01)) * 0.5
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := e.Encode(samples); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(seconds*b.N)/b.Elapsed().Seconds(), "x-real-time")
 }
