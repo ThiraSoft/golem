@@ -16,6 +16,7 @@
 package pockettts
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -136,6 +137,13 @@ type Settings struct {
 	// ready. That is what allows the sound to be played during generation.
 	Frame func([]float32)
 
+	// Ctx, when set, stops the generation as soon as it is cancelled: at the
+	// next frame within a segment, and between two segments. Synthesize then
+	// returns the context's error, and the sound it had produced is dropped —
+	// a caller that cancels has already had those frames, through Frame, and
+	// has its own reason to stop.
+	Ctx context.Context
+
 	// noise, if provided, replaces the random draw. Reserved for the
 	// end-to-end test: it is the only way to compare against the reference a
 	// generation that is non-reproducible by nature.
@@ -182,6 +190,9 @@ func (m *Engine) Synthesize(t string, voice *Voice, r *Settings) ([]float32, err
 
 	var sound []float32
 	for _, segment := range segments {
+		if set.Ctx != nil && set.Ctx.Err() != nil {
+			return nil, set.Ctx.Err()
+		}
 		samples, err := m.synthesizeSegment(segment, voice, &set, rng)
 		if err != nil {
 			return nil, err
@@ -245,7 +256,14 @@ func (m *Engine) synthesizeSegment(segment string, voice *Voice, r *Settings, rn
 	noise := make([]float32, m.trans.Config.LatentDim)
 
 	endFrame := -1
+	cancelled := false
 	for frame := 0; frame < maxFrames; frame++ {
+		// The loop is left rather than returned from: the decoding goroutines
+		// are waiting on latents, and only closing it below lets them finish.
+		if r.Ctx != nil && r.Ctx.Err() != nil {
+			cancelled = true
+			break
+		}
 		cond := m.trans.AdvanceLatent(latent, state)
 
 		if float64(m.trans.EOSLogit(cond)) > r.EndThreshold && endFrame < 0 {
@@ -269,5 +287,9 @@ func (m *Engine) synthesizeSegment(segment string, voice *Voice, r *Settings, rn
 		latent = next
 	}
 	close(latents)
-	return <-done, nil
+	sound := <-done
+	if cancelled {
+		return nil, r.Ctx.Err()
+	}
+	return sound, nil
 }
