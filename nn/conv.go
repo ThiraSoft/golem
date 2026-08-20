@@ -21,6 +21,17 @@ type Conv1d struct {
 	Kernel   int
 	Stride   int
 	Dilation int
+
+	// Replicate pads the very start of the signal with its own first value
+	// rather than with zeros. It changes nothing after that first call: from
+	// the second window onward the padding is real signal.
+	//
+	// Which of the two a layer wants is not a detail. The Mimi encoder's
+	// downsampling reads sixteen padded positions out of the thirty-two that
+	// make its first latent, and padding them with zeros instead of the first
+	// sample moves that latent by more than the value itself is worth — the
+	// first frame of a cloned voice, in other words.
+	Replicate bool
 }
 
 // ConvState holds a convolution's context between two calls, and the buffers
@@ -36,6 +47,9 @@ type Conv1d struct {
 type ConvState struct {
 	previous []float32 // Inputs x (effective kernel - stride)
 	keep     int
+	// started says whether previous holds real signal. Until it does, a
+	// replicating convolution has to fill it from the first window it sees.
+	started bool
 
 	input  []float32 // Inputs x (keep + steps)
 	output []float32 // Outputs x outputs
@@ -66,6 +80,17 @@ func (c Conv1d) NewState() *ConvState {
 
 // Apply processes `steps` positions and returns the output, channel by channel.
 func (c Conv1d) Apply(x []float32, steps int, state *ConvState) ([]float32, int) {
+	if c.Replicate && !state.started && state.keep > 0 && steps > 0 {
+		for e := 0; e < c.Inputs; e++ {
+			first := x[e*steps]
+			edge := state.previous[e*state.keep : (e+1)*state.keep]
+			for i := range edge {
+				edge[i] = first
+			}
+		}
+	}
+	state.started = true
+
 	total := state.keep + steps
 	state.input = grow(state.input, c.Inputs*total)
 	input := state.input
