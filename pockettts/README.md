@@ -23,8 +23,23 @@ voice, _ := engine.LoadVoice("testdata/voices/french_24l/<voice>.safetensors")
 sound, _ := engine.Synthesize("Bonjour le monde.", voice, nil)
 ```
 
-`sound` is a `[]float32` at 24 kHz. An optional `Settings.Frame` receives each
-frame as soon as it is ready, so the sound can be played during generation.
+`sound` is a `[]float32` at 24 kHz.
+
+`Synthesize` takes a `*Settings`, or nil for the model's own values. Build one
+from `DefaultSettings(lang)` and change what you mean to change: the fields are
+not interpreted, so a zero is a zero — an `EndThreshold` of 0 is a real setting,
+one that makes the model far more reluctant to declare itself done.
+
+`Settings.Frame` receives each frame as soon as it is ready, so the sound can be
+played during generation. `Settings.Ctx`, when set, stops the generation as soon
+as it is cancelled — at the next frame — and `Synthesize` then returns the
+context's error.
+
+The weights, the tokenizer and the predefined voices can be found where the
+upstream daemon downloads them: `Locate(lang.WeightsPath())`,
+`Locate(lang.TokenizerPath())` and `Locate(lang.EmbeddingPath(name))` each
+return a path in the Hugging Face cache, or the empty string. `LocateVoices(lang)`
+lists the voices that are actually there.
 
 ## Status
 
