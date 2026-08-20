@@ -35,6 +35,19 @@ played during generation. `Settings.Ctx`, when set, stops the generation as soon
 as it is cancelled — at the next frame — and `Synthesize` then returns the
 context's error.
 
+A voice can also be cloned from a recording, without training and without
+leaving Go:
+
+```go
+voice, _ := engine.VoiceFromWAV("someone.wav") // mono, 24 kHz, 20 to 30 seconds
+_ = engine.SaveVoice("someone.safetensors", voice)
+```
+
+Encoding is what costs — some four seconds for a recording of twenty-eight, plus
+two and a half for the transformer to listen to it. Saving the result turns the
+next start into a file read. Past seventy seconds of recording the model stops
+mid-sentence without reporting anything, so VoiceFromWAV refuses beyond that.
+
 The weights, the tokenizer and the predefined voices can be found where the
 upstream daemon downloads them: `Locate(lang.WeightsPath())`,
 `Locate(lang.TokenizerPath())` and `Locate(lang.EmbeddingPath(name))` each
@@ -50,6 +63,7 @@ voice `alba`, and the same end-of-speech threshold on both sides:
 |---|---:|---:|
 | `french_24l` — 24 transformer layers | **×2.37** real time | ×1.27 |
 | `english_2026-01` — 6 layers | **×5.87** | ×4.03 |
+| cloning: encoding a recording | **×7.72** real time | — |
 | first sound, `french_24l` | **210 ms** | 320 ms |
 | first sound, `english_2026-01` | **94 ms** | 90 ms |
 | ready to speak, warm | **30 ms** | 3.5 s |

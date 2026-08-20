@@ -11,7 +11,7 @@ of weights.
 | | what it runs | measured |
 |---|---|---|
 | [`gemma/`](gemma/) | Gemma 4 E2B, from a GGUF | 21.3 tokens/s generated, 102 read — llama.cpp on the same CPU: 22.3 and 172 |
-| [`pockettts/`](pockettts/) | [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts), twelve languages | ×2.37 real time on the 24-layer French model, ×5.87 on the 6-layer English one — PyTorch: ×1.27 and ×4.03 |
+| [`pockettts/`](pockettts/) | [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts), twelve languages, voice cloning included | ×2.37 real time on the 24-layer French model, ×5.87 on the 6-layer English one — PyTorch: ×1.27 and ×4.03 |
 
 Both figures are from an i7-9700K with eight threads, on Q4_0 weights. Each
 engine's README says what it is measured against, where it still differs from
@@ -27,7 +27,7 @@ the shared layer knows they exist.
 | `tensors/` | safetensors and GGUF: metadata, and views on the bytes |
 | `nn/` | quantized matrix products with AVX2 kernels, norms, activations, RoPE, convolutions, and the worker pool they are spread over |
 | `token/` | tokenizers, one package per family |
-| `audio/` | sound formats |
+| `audio/` | sound formats: reading and writing WAV |
 | `sample/` | top-k, top-p, temperature, and a seeded draw over a row of logits |
 
 Nothing is promoted into this layer on the strength of a guess. Code moves here
@@ -77,7 +77,8 @@ them, and they are between three hundred megabytes and three gigabytes each.
   to it.
 - **Pocket TTS** weights, tokenizer and voice states: Kyutai publishes them on
   Hugging Face, and `pockettts/README.md` says which repositories and where the
-  engine looks.
+  engine looks. A voice can also be cloned from any recording, which needs
+  nothing but the weights.
 
 Neither are the recordings of the models themselves. `testdata/gemma/layers`,
 `quants` and `window` hold activations, logits and slabs of quantized weights as
