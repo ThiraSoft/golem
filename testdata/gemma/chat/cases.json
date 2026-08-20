@@ -1,0 +1,221 @@
+{
+ "bos_token_id": 2,
+ "cases": [
+  {
+   "name": "user_only",
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<bos><|turn>user\nhi<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "system_user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<bos><|turn>system\nYou are terse.<turn|>\n<|turn>user\nhi<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "developer_user",
+   "messages": [
+    {
+     "role": "developer",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<bos><|turn>system\nYou are terse.<turn|>\n<|turn>user\nhi<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "multi_turn",
+   "messages": [
+    {
+     "role": "user",
+     "content": "one"
+    },
+    {
+     "role": "assistant",
+     "content": "two"
+    },
+    {
+     "role": "user",
+     "content": "three"
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<bos><|turn>user\none<turn|>\n<|turn>model\ntwo<turn|>\n<|turn>user\nthree<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "assistant_continuation",
+   "messages": [
+    {
+     "role": "user",
+     "content": "one"
+    },
+    {
+     "role": "assistant",
+     "content": "two"
+    },
+    {
+     "role": "assistant",
+     "content": "still two"
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<bos><|turn>user\none<turn|>\n<|turn>model\ntwo<turn|>\nstill two<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "thinking",
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "enable_thinking": true,
+   "add_generation_prompt": true,
+   "rendered": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nhi<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "thinking_with_system",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "enable_thinking": true,
+   "add_generation_prompt": true,
+   "rendered": "<bos><|turn>system\n<|think|>\nYou are terse.<turn|>\n<|turn>user\nhi<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "no_generation_prompt",
+   "messages": [
+    {
+     "role": "user",
+     "content": "one"
+    },
+    {
+     "role": "assistant",
+     "content": "two"
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": false,
+   "rendered": "<bos><|turn>user\none<turn|>\n<|turn>model\ntwo<turn|>\n"
+  },
+  {
+   "name": "whitespace_trimmed",
+   "messages": [
+    {
+     "role": "system",
+     "content": "  padded  \n"
+    },
+    {
+     "role": "user",
+     "content": "\n  spaced  \n"
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<bos><|turn>system\npadded<turn|>\n<|turn>user\nspaced<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "assistant_with_channel",
+   "messages": [
+    {
+     "role": "user",
+     "content": "one"
+    },
+    {
+     "role": "assistant",
+     "content": "before<|channel>thought\nhidden<channel|>after"
+    },
+    {
+     "role": "user",
+     "content": "three"
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<bos><|turn>user\none<turn|>\n<|turn>model\nbeforeafter<turn|>\n<|turn>user\nthree<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "assistant_channel_unclosed",
+   "messages": [
+    {
+     "role": "user",
+     "content": "one"
+    },
+    {
+     "role": "assistant",
+     "content": "kept<|channel>dropped"
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": false,
+   "rendered": "<bos><|turn>user\none<turn|>\n<|turn>model\nkept<turn|>\n"
+  },
+  {
+   "name": "system_only",
+   "messages": [
+    {
+     "role": "system",
+     "content": "alone"
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<bos><|turn>system\nalone<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "empty_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": ""
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<bos><|turn>user\n<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "unicode",
+   "messages": [
+    {
+     "role": "user",
+     "content": "héllo — 世界 🙂"
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<bos><|turn>user\nhéllo — 世界 🙂<turn|>\n<|turn>model\n"
+  }
+ ]
+}

@@ -1,0 +1,30 @@
+{
+  "cases": [
+    {"name": "empty", "text": "", "add_special": true, "parse_special": false, "ids": [2], "detokenized": "<bos>"},
+    {"name": "ascii", "text": "The capital of France is", "add_special": true, "parse_special": false, "ids": [2, 818, 5279, 529, 7001, 563], "detokenized": "<bos>The capital of France is"},
+    {"name": "french", "text": "L'élève a mangé une crêpe à Nîmes.", "add_special": true, "parse_special": false, "ids": [2, 236798, 236789, 161654, 496, 14695, 236859, 3037, 1976, 237041, 635, 1608, 646, 237411, 4404, 236761], "detokenized": "<bos>L'élève a mangé une crêpe à Nîmes."},
+    {"name": "leading_space", "text": " leading", "add_special": true, "parse_special": false, "ids": [2, 5830], "detokenized": "<bos> leading"},
+    {"name": "trailing_space", "text": "trailing ", "add_special": true, "parse_special": false, "ids": [2, 136697, 236743], "detokenized": "<bos>trailing "},
+    {"name": "double_space", "text": "two  spaces", "add_special": true, "parse_special": false, "ids": [2, 13498, 138, 35220], "detokenized": "<bos>two  spaces"},
+    {"name": "only_spaces", "text": "   ", "add_special": true, "parse_special": false, "ids": [2, 139], "detokenized": "<bos>   "},
+    {"name": "newline", "text": "one\ntwo", "add_special": true, "parse_special": false, "ids": [2, 811, 107, 13498], "detokenized": "<bos>one\ntwo"},
+    {"name": "newline_run", "text": "a\n\n\n\nb", "add_special": true, "parse_special": false, "ids": [2, 236746, 110, 236763], "detokenized": "<bos>a\n\n\n\nb"},
+    {"name": "newline_only", "text": "\n\n", "add_special": true, "parse_special": false, "ids": [2, 108], "detokenized": "<bos>\n\n"},
+    {"name": "tab", "text": "a\tb\t\tc", "add_special": true, "parse_special": false, "ids": [2, 236746, 255968, 236763, 255969, 236755], "detokenized": "<bos>a\tb\t\tc"},
+    {"name": "crlf", "text": "line\r\nline", "add_special": true, "parse_special": false, "ids": [2, 1257, 251, 107, 1257], "detokenized": "<bos>line\r\nline"},
+    {"name": "digits", "text": "1234567890 and 42 and 3.14159", "add_special": true, "parse_special": false, "ids": [2, 236770, 236778, 236800, 236812, 236810, 236825, 236832, 236828, 236819, 236771, 532, 236743, 236812, 236778, 532, 236743, 236800, 236761, 236770, 236812, 236770, 236810, 236819], "detokenized": "<bos>1234567890 and 42 and 3.14159"},
+    {"name": "punctuation", "text": "Wait... really?! (yes) [no] {maybe} <a>", "add_special": true, "parse_special": false, "ids": [2, 20470, 1390, 2126, 26052, 568, 4443, 236768, 870, 1904, 236842, 642, 60766, 236783, 655, 236746, 236813], "detokenized": "<bos>Wait... really?! (yes) [no] {maybe} <a>"},
+    {"name": "emoji", "text": "bravo 🎉🇫🇷 et voilà", "add_special": true, "parse_special": false, "ids": [2, 5256, 3369, 204906, 246598, 242644, 1008, 70862], "detokenized": "<bos>bravo 🎉🇫🇷 et voilà"},
+    {"name": "cjk", "text": "日本語のテキストです。", "add_special": true, "parse_special": false, "ids": [2, 94951, 236945, 95830, 3652, 236924], "detokenized": "<bos>日本語のテキストです。"},
+    {"name": "mixed_script", "text": "Привет, мир — hello 世界", "add_special": true, "parse_special": false, "ids": [2, 116130, 236764, 58562, 2192, 29104, 84679], "detokenized": "<bos>Привет, мир — hello 世界"},
+    {"name": "code", "text": "func main() {\n\tfmt.Println(\"hi\")\n}", "add_special": true, "parse_special": false, "ids": [2, 6823, 1689, 825, 642, 107, 255968, 15197, 236761, 29006, 885, 2202, 1373, 107, 236783], "detokenized": "<bos>func main() {\n\tfmt.Println(\"hi\")\n}"},
+    {"name": "long_word", "text": "Donaudampfschiffahrtselektrizitaetenhauptbetriebswerkbauunterbeamtengesellschaft", "add_special": true, "parse_special": false, "ids": [2, 236796, 4267, 689, 1414, 236760, 6652, 2642, 58372, 61888, 2467, 9070, 2665, 19687, 76671, 83173, 2944, 236767, 30725, 14863, 1553, 25837, 206646], "detokenized": "<bos>Donaudampfschiffahrtselektrizitaetenhauptbetriebswerkbauunterbeamtengesellschaft"},
+    {"name": "no_bos", "text": "The capital of France is", "add_special": false, "parse_special": false, "ids": [818, 5279, 529, 7001, 563], "detokenized": "The capital of France is"},
+    {"name": "special_literal", "text": "before <turn|> after", "add_special": true, "parse_special": false, "ids": [2, 15849, 655, 887, 111038, 1308], "detokenized": "<bos>before <turn|> after"},
+    {"name": "special_parsed", "text": "before <turn|> after", "add_special": true, "parse_special": true, "ids": [2, 15849, 236743, 106, 1308], "detokenized": "<bos>before <turn|> after"},
+    {"name": "special_adjacent", "text": "<bos><turn|>user\nhello<turn|>", "add_special": true, "parse_special": true, "ids": [2, 2, 106, 2364, 107, 23391, 106], "detokenized": "<bos><bos><turn|>user\nhello<turn|>"},
+    {"name": "special_only", "text": "<eos>", "add_special": true, "parse_special": true, "ids": [2, 1], "detokenized": "<bos><eos>"},
+    {"name": "byte_fallback", "text": "� unlikely ​ zero width", "add_special": true, "parse_special": false, "ids": [2, 238479, 21137, 36504, 5743, 2962], "detokenized": "<bos>� unlikely ​ zero width"},
+    {"name": "literal_byte_tok", "text": "<0x41> is not an A", "add_special": true, "parse_special": false, "ids": [2, 236820, 236771, 236781, 236812, 236770, 236813, 563, 711, 614, 562], "detokenized": "<bos><0x41> is not an A"}
+  ]
+}

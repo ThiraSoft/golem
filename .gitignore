@@ -1,0 +1,24 @@
+# Built binaries
+/pocket-tts
+/golem
+/chat
+*.test
+
+# Voice states. None ship with the repository: they belong to whoever published
+# them, and the tests that want one skip when it is absent. pockettts/README.md
+# says where to get one.
+/testdata/voices/
+
+# The reference recorder builds against a local llama.cpp checkout.
+/ref/gemma/build/
+
+# What the references record of the models themselves: activations, logits, and
+# slabs of quantized weights. Those belong to whoever published the weights, not
+# to this repository, and the scripts in ref/ write them back in one command
+# each. Every test that reads them skips until they are there.
+/testdata/gemma/layers/
+/testdata/gemma/quants/
+/testdata/gemma/window/
+/testdata/layer0/
+/testdata/pipeline/
+/testdata/pipeline_en/
