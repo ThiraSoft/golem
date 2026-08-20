@@ -56,6 +56,10 @@ type Engine struct {
 	flow      *flowlm.FlowNet
 	decoder   *mimi.Decoder
 	tokenizer *sentencepiece.Tokenizer
+
+	// encoder is loaded on first use: only cloning a voice needs it, and most
+	// runs never do.
+	encoder *mimi.Encoder
 }
 
 // Voice is a starting state: what the transformer had in mind after listening

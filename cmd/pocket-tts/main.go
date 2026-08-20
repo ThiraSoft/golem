@@ -21,6 +21,8 @@ func main() {
 	weights := flag.String("weights", "", "model.safetensors; found in the Hugging Face cache when empty")
 	tokenizer := flag.String("tokenizer", "", "tokenizer.model; found in the Hugging Face cache when empty")
 	voice := flag.String("voice", os.Getenv("POCKET_TTS_VOICE"), "precomputed voice state (.safetensors)")
+	clone := flag.String("clone", "", "clone the voice of this recording (.wav, mono, 24 kHz, twenty to thirty seconds)")
+	saveVoice := flag.String("save-voice", "", "write the cloned voice here, to be reused with -voice")
 	out := flag.String("o", "out.wav", "WAV file to write, or - for standard output")
 	seed := flag.Uint64("seed", 0, "seed of the random draw; 0 for a different voice every time")
 	flag.Usage = func() {
@@ -45,20 +47,24 @@ func main() {
 		}
 	}
 
+	// Cloning a voice and saving it is a job of its own: there is nothing to
+	// say and nothing to listen to, so no text is asked for.
+	onlyCloning := *clone != "" && *saveVoice != "" && len(flag.Args()) == 0
+
 	text := strings.Join(flag.Args(), " ")
-	if text == "" {
+	if text == "" && !onlyCloning {
 		raw, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			fail(err)
 		}
 		text = strings.TrimSpace(string(raw))
 	}
-	if text == "" {
+	if text == "" && !onlyCloning {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if *voice == "" {
-		fail(fmt.Errorf("no voice: pass -voice, or set POCKET_TTS_VOICE"))
+	if *voice == "" && *clone == "" {
+		fail(fmt.Errorf("no voice: pass -voice or -clone, or set POCKET_TTS_VOICE"))
 	}
 
 	start := time.Now()
@@ -71,9 +77,26 @@ func main() {
 	defer engine.Close()
 	loading := time.Since(start)
 
-	v, err := engine.LoadVoice(*voice)
-	if err != nil {
+	var v *pockettts.Voice
+	if *clone != "" {
+		start := time.Now()
+		if v, err = engine.VoiceFromWAV(*clone); err != nil {
+			fail(err)
+		}
+		fmt.Fprintf(os.Stderr, "voice cloned from %s in %v\n",
+			filepath.Base(*clone), time.Since(start).Round(time.Millisecond))
+		if *saveVoice != "" {
+			if err := engine.SaveVoice(*saveVoice, v); err != nil {
+				fail(err)
+			}
+			fmt.Fprintf(os.Stderr, "voice written to %s — reuse it with -voice\n", *saveVoice)
+		}
+	} else if v, err = engine.LoadVoice(*voice); err != nil {
 		fail(err)
+	}
+
+	if onlyCloning {
+		return
 	}
 
 	start = time.Now()

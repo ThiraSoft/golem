@@ -22,3 +22,6 @@
 /testdata/layer0/
 /testdata/pipeline/
 /testdata/pipeline_en/
+
+# The Mimi encoder fixtures, same rule as the others.
+/testdata/encoder/
