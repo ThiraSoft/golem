@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -67,8 +68,14 @@ func main() {
 	fmt.Fprintf(os.Stderr, "%s: %d blocks, %d positions, loaded in %s on %d cores\n",
 		name, len(m.Cfg.Blocks), *context,
 		time.Since(start).Round(time.Millisecond), runtime.NumCPU())
-	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 — one request at a time\n", *addr)
-	if err := http.ListenAndServe(*addr, logging(os.Stderr, server.Handler())); err != nil {
+	// The port is taken before it is announced: an address already in use must
+	// not be reported as a server that is listening.
+	listener, err := net.Listen("tcp", *addr)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 — one request at a time\n", listener.Addr())
+	if err := http.Serve(listener, logging(os.Stderr, server.Handler())); err != nil {
 		fail(err)
 	}
 }

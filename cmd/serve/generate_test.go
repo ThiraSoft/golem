@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -82,7 +84,7 @@ func greedy() sample.Params { return sample.Params{Temperature: 0} }
 func TestGenerateStreamsProse(t *testing.T) {
 	g, v := newGenerator([]string{"hello", "there", "<turn|>"}, 32)
 	var seen []string
-	answer, err := g.Generate(v.Encode("a b", false, true), greedy(), nil,
+	answer, err := g.Generate(context.Background(), v.Encode("a b", false, true), greedy(), nil,
 		func(text string) error { seen = append(seen, text); return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +101,7 @@ func TestGenerateWithholdsAPartialCall(t *testing.T) {
 	script := []string{"Looking.", `<|tool_call>call:weather{city:<|"|>Lyon<|"|>}`, "<tool_call|>", "<turn|>"}
 	g, v := newGenerator(script, 32)
 	var seen []string
-	answer, err := g.Generate(v.Encode("a", false, true), greedy(), nil,
+	answer, err := g.Generate(context.Background(), v.Encode("a", false, true), greedy(), nil,
 		func(text string) error { seen = append(seen, text); return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -129,11 +131,11 @@ func TestGenerateWithholdsAPartialCall(t *testing.T) {
 func TestCallIdentifiersDoNotRepeat(t *testing.T) {
 	call := `<|tool_call>call:now{}<tool_call|>`
 	g, v := newGenerator([]string{call, "<turn|>", call, "<turn|>"}, 32)
-	first, err := g.Generate(v.Encode("a", false, true), greedy(), nil, nil)
+	first, err := g.Generate(context.Background(), v.Encode("a", false, true), greedy(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := g.WithMaxTokens(8).Generate(v.Encode("b", false, true), greedy(), nil, nil)
+	second, err := g.WithMaxTokens(8).Generate(context.Background(), v.Encode("b", false, true), greedy(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +146,7 @@ func TestCallIdentifiersDoNotRepeat(t *testing.T) {
 
 func TestGenerateStopsOnTheTokenLimit(t *testing.T) {
 	g, v := newGenerator([]string{"and", "and", "and", "and"}, 2)
-	answer, err := g.Generate(v.Encode("a", false, true), greedy(), nil, nil)
+	answer, err := g.Generate(context.Background(), v.Encode("a", false, true), greedy(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,11 +157,37 @@ func TestGenerateStopsOnTheTokenLimit(t *testing.T) {
 
 func TestGenerateStopsOnAStopString(t *testing.T) {
 	g, v := newGenerator([]string{"one", "two", "STOP", "three"}, 32)
-	answer, err := g.Generate(v.Encode("a", false, true), greedy(), []string{"STOP"}, nil)
+	answer, err := g.Generate(context.Background(), v.Encode("a", false, true), greedy(), []string{"STOP"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if answer.Text != "onetwo" || answer.Reason != "stop" {
 		t.Fatalf("%+v", answer)
+	}
+}
+
+// A client that hangs up stops the work. Without this the server would draw an
+// answer nobody is waiting for, holding the one lock the next request needs.
+func TestGenerateStopsWhenTheClientHangsUp(t *testing.T) {
+	script := make([]string, 200)
+	for i := range script {
+		script[i] = "on"
+	}
+	g, v := newGenerator(script, 200)
+	ctx, cancel := context.WithCancel(context.Background())
+	drawn := 0
+	_, err := g.Generate(ctx, v.Encode("a", false, true), greedy(), nil,
+		func(string) error {
+			drawn++
+			if drawn == 3 {
+				cancel()
+			}
+			return nil
+		})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err %v, want the cancellation", err)
+	}
+	if drawn > 5 {
+		t.Fatalf("%d pieces drawn after the client left", drawn)
 	}
 }

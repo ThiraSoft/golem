@@ -86,14 +86,20 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 		gen = gen.WithMaxTokens(*req.MaxTokens)
 	}
 	if req.Stream {
-		s.stream(w, gen, id, ids, params, req.Stop)
+		s.stream(r.Context(), w, gen, id, ids, params, req.Stop)
 		return
 	}
-	answer, err := gen.Generate(ids, params, req.Stop, nil)
+	answer, err := gen.Generate(r.Context(), ids, params, req.Stop, nil)
 	if err != nil {
+		// A client that hung up gets no answer, and no error either: there is
+		// nobody left to read one.
+		if r.Context().Err() != nil {
+			return
+		}
 		refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	note(w, answer)
 	reason := answer.Reason
 	writeJSON(w, http.StatusOK, completionResponse{
 		ID: id, Object: "chat.completion", Created: time.Now().Unix(), Model: s.name,
@@ -151,6 +157,26 @@ func (s *Server) sampling(req *completionRequest) sample.Params {
 		p.Seed = *req.Seed
 	}
 	return p
+}
+
+// note tells the log line what the answer cost. Reading a prompt and drawing
+// an answer are the two halves of the wait, and they have nothing in common:
+// only their separate rates say which one to go after.
+func note(w http.ResponseWriter, a Answer) {
+	rec, ok := w.(*recorder)
+	if !ok {
+		return
+	}
+	rate := func(n int, d time.Duration) float64 {
+		if d <= 0 {
+			return 0
+		}
+		return float64(n) / d.Seconds()
+	}
+	rec.note = fmt.Sprintf("%d prompt in %s (%.1f/s), %d drawn in %s (%.2f/s), %s",
+		a.Prompt, a.Prefill.Round(time.Millisecond), rate(a.Prompt, a.Prefill),
+		a.Generated, a.Decode.Round(time.Millisecond), rate(a.Generated, a.Decode),
+		a.Reason)
 }
 
 func writeJSON(w http.ResponseWriter, code int, body any) {

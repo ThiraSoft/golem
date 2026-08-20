@@ -8,9 +8,11 @@ package main
 // a function's arguments with no way to know it.
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ThiraSoft/golem/gemma"
 	"github.com/ThiraSoft/golem/sample"
@@ -33,7 +35,9 @@ type Answer struct {
 	ToolCalls []gemma.ToolCall
 	Prompt    int // positions actually fed, which the cache's prefix makes small
 	Generated int
-	Reason    string // "stop", "length" or "tool_calls"
+	Prefill   time.Duration // reading the prompt
+	Decode    time.Duration // drawing the answer
+	Reason    string        // "stop", "length" or "tool_calls"
 }
 
 func NewGenerator(ctx *Context, v Vocabulary, vocabSize, maxTokens int) *Generator {
@@ -54,12 +58,18 @@ func (g *Generator) WithMaxTokens(n int) *Generator {
 
 // Generate draws an answer for a prompt already rendered and encoded. emit,
 // when it is not nil, receives each piece of prose as it is drawn.
-func (g *Generator) Generate(ids []int32, p sample.Params, stop []string, emit func(string) error) (Answer, error) {
+//
+// The context is the client's: when it hangs up, the drawing stops. A server
+// with one model and one lock cannot afford to finish an answer nobody is
+// waiting for — the next request is queued behind it.
+func (g *Generator) Generate(ctx context.Context, ids []int32, p sample.Params, stop []string, emit func(string) error) (Answer, error) {
+	start := time.Now()
 	hidden, fed, err := g.ctx.Prefill(ids)
 	if err != nil {
 		return Answer{}, err
 	}
-	answer := Answer{Prompt: fed, Reason: "stop"}
+	answer := Answer{Prompt: fed, Prefill: time.Since(start), Reason: "stop"}
+	start = time.Now()
 	sampler := sample.New(p)
 
 	var drawn strings.Builder // everything drawn, calls included
@@ -67,6 +77,9 @@ func (g *Generator) Generate(ids []int32, p sample.Params, stop []string, emit f
 	inCall := false
 
 	for answer.Generated < g.maxTokens && !g.ctx.Full() {
+		if err := ctx.Err(); err != nil {
+			return answer, err
+		}
 		g.ctx.Logits(hidden, g.logits)
 		id := sampler.Pick(g.logits)
 		answer.Generated++
@@ -76,6 +89,7 @@ func (g *Generator) Generate(ids []int32, p sample.Params, stop []string, emit f
 		piece := g.vocab.Piece(id, false)
 
 		if cut, hit := cutAtStop(drawn.String()+piece, stop); hit {
+			answer.Decode = time.Since(start)
 			return g.finish(answer, cut)
 		}
 		drawn.WriteString(piece)
@@ -99,6 +113,7 @@ func (g *Generator) Generate(ids []int32, p sample.Params, stop []string, emit f
 	if answer.Generated >= g.maxTokens {
 		answer.Reason = "length"
 	}
+	answer.Decode = time.Since(start)
 	return g.finish(answer, drawn.String())
 }
 

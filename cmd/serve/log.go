@@ -21,6 +21,8 @@ type recorder struct {
 	written int
 	// reason is the message a refusal carried, kept for the log line.
 	reason string
+	// note is what the answer cost, which only the handler knows.
+	note string
 }
 
 func (r *recorder) WriteHeader(code int) {
@@ -53,6 +55,9 @@ func logging(out io.Writer, next http.Handler) http.Handler {
 		next.ServeHTTP(rec, r)
 		line := fmt.Sprintf("%s %s %d %d bytes in %s", r.Method, r.URL.Path,
 			rec.status, rec.written, time.Since(start).Round(time.Millisecond))
+		if rec.note != "" {
+			line += " — " + rec.note
+		}
 		if rec.reason != "" {
 			line += ": " + rec.reason
 		}

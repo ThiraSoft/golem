@@ -72,6 +72,35 @@ of it. What it does is stop the server from holding one client's conversation
 indefinitely, and give the next request a clean state. `0`, the default, never
 forgets.
 
+## A client that hangs up
+
+Cancelling a request stops the drawing. With one model behind one lock, an
+answer nobody is waiting for is not merely wasted: it is the next request's
+wait. The generation loop watches the request's context and returns as soon as
+the connection is gone.
+
+## Where the time goes
+
+Every request leaves a line on standard error, split between the two halves of
+the wait — they have nothing in common and nothing to gain from being added up:
+
+```
+POST /v1/chat/completions 200 268 bytes in 51.31s — 3919 prompt in 51.226s (76.5/s), 2 drawn in 70ms (28.70/s), stop
+```
+
+A first call carrying a large system prompt and a page of tool declarations is
+almost entirely prefill, and prefill is the slower half of this engine. The
+cache is what pays it back: the next turn of that conversation shares the whole
+prefix and reads only what was added. A client that rewrites the head of its
+conversation between turns — an hour stamped into the system message, tools
+reordered — diverges at position zero and repays the whole prompt every time.
+The `prompt` figure in the log says which of the two is happening.
+
+Sixteen, sixty-four, and up to five hundred and twelve positions per batch were
+measured against thirty-two on this engine, and thirty-two won every time: at
+3919 positions, 76.2/s against 71.7 at sixty-four and 46.4 at five hundred and
+twelve. Past that the activations stop fitting in the caches.
+
 ## What it refuses
 
 With a 400 and OpenAI's error envelope, rather than answering something else:

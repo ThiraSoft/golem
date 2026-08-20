@@ -57,3 +57,21 @@ func TestLoggingKeepsTheStreamFlushable(t *testing.T) {
 		t.Fatalf("the stream never closed: %q", w.Body)
 	}
 }
+
+// The line says what the answer cost, split between reading and drawing: they
+// are the two halves of the wait and they have different remedies.
+func TestLoggingReportsWhatTheAnswerCost(t *testing.T) {
+	var out strings.Builder
+	s := newTestServer([]string{"one", "two", "<turn|>"})
+	h := logging(&out, s.Handler())
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`)))
+	line := out.String()
+	for _, want := range []string{"prompt in", "drawn in", "stop"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("logged %q, which does not say %q", line, want)
+		}
+	}
+}

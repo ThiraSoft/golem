@@ -8,6 +8,7 @@ package main
 // and there is nothing to gain by sending one.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -16,7 +17,7 @@ import (
 	"github.com/ThiraSoft/golem/sample"
 )
 
-func (s *Server) stream(w http.ResponseWriter, gen *Generator, id string, ids []int32, p sample.Params, stop []string) {
+func (s *Server) stream(ctx context.Context, w http.ResponseWriter, gen *Generator, id string, ids []int32, p sample.Params, stop []string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		refuse(w, http.StatusInternalServerError, "server_error", "this connection cannot be streamed to")
@@ -50,16 +51,20 @@ func (s *Server) stream(w http.ResponseWriter, gen *Generator, id string, ids []
 	if err := send(choice{Delta: &responseMessage{Role: "assistant"}}); err != nil {
 		return
 	}
-	answer, err := gen.Generate(ids, p, stop, func(text string) error {
+	answer, err := gen.Generate(ctx, ids, p, stop, func(text string) error {
 		return send(choice{Delta: &responseMessage{Content: text}})
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return // the client left; there is no stream to write to
+		}
 		// The status line is already out, so the error goes down the stream,
 		// which is the only place left for it.
 		send(choice{Delta: &responseMessage{Content: "\n[golem: " + err.Error() + "]"}})
 		done()
 		return
 	}
+	note(w, answer)
 	if len(answer.ToolCalls) > 0 {
 		for i := range answer.ToolCalls {
 			answer.ToolCalls[i].Index, answer.ToolCalls[i].HasIndex = i, true
