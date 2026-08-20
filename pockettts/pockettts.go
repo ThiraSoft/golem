@@ -16,6 +16,7 @@
 package pockettts
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -124,17 +125,24 @@ func (m *Engine) rules() text.Rules {
 	}
 }
 
-// Settings tunes the generation. The zero value gives the model's own values,
-// which are those of the reference daemon.
+// Settings tunes the generation. Start from DefaultSettings and change what you
+// mean to change: no field is interpreted, and a zero is a zero.
 type Settings struct {
-	Temperature    float64 // 0 -> 0.7: the variance of the starting noise
-	EndThreshold   float64 // 0 -> -4: beyond it, the model declares itself done
-	FramesAfterEnd int     // 0 -> 8: enough to let the sentence settle
-	MaxTokens      int     // 0 -> 50: size of a segment
-	Seed           uint64  // 0 -> random draw
+	Temperature    float64 // the variance of the starting noise
+	EndThreshold   float64 // beyond it, the model declares itself done
+	FramesAfterEnd int     // enough to let the sentence settle
+	MaxTokens      int     // size of a segment
+	Seed           uint64  // 0 for a random draw, which is a value and not a default
 	// Frame, if provided, receives each frame of samples as soon as it is
 	// ready. That is what allows the sound to be played during generation.
 	Frame func([]float32)
+
+	// Ctx, when set, stops the generation as soon as it is cancelled: at the
+	// next frame within a segment, and between two segments. Synthesize then
+	// returns the context's error, and the sound it had produced is dropped —
+	// a caller that cancels has already had those frames, through Frame, and
+	// has its own reason to stop.
+	Ctx context.Context
 
 	// noise, if provided, replaces the random draw. Reserved for the
 	// end-to-end test: it is the only way to compare against the reference a
@@ -142,18 +150,19 @@ type Settings struct {
 	noise func(frame int, into []float32)
 }
 
-func (r *Settings) defaults(lang Language) {
-	if r.Temperature == 0 {
-		r.Temperature = 0.7
-	}
-	if r.EndThreshold == 0 {
-		r.EndThreshold = -4
-	}
-	if r.FramesAfterEnd == 0 {
-		r.FramesAfterEnd = lang.FramesAfterEnd
-	}
-	if r.MaxTokens == 0 {
-		r.MaxTokens = 50
+// DefaultSettings returns the model's own values, which are those of the
+// reference daemon. Callers start from it and change what they mean to change.
+//
+// The settings carry no zero-means-default rule: a caller that sets a field to
+// zero gets zero. An end threshold of 0 is a legitimate setting — it makes the
+// model far more reluctant to declare itself done — and the earlier rule turned
+// it into -4 silently.
+func DefaultSettings(lang Language) Settings {
+	return Settings{
+		Temperature:    0.7,
+		EndThreshold:   -4,
+		FramesAfterEnd: lang.FramesAfterEnd,
+		MaxTokens:      50,
 	}
 }
 
@@ -162,11 +171,10 @@ func (m *Engine) Synthesize(t string, voice *Voice, r *Settings) ([]float32, err
 	if voice == nil {
 		return nil, fmt.Errorf("no voice provided")
 	}
-	set := Settings{}
+	set := DefaultSettings(m.lang)
 	if r != nil {
 		set = *r
 	}
-	set.defaults(m.lang)
 
 	seed := set.Seed
 	if seed == 0 {
@@ -182,6 +190,9 @@ func (m *Engine) Synthesize(t string, voice *Voice, r *Settings) ([]float32, err
 
 	var sound []float32
 	for _, segment := range segments {
+		if set.Ctx != nil && set.Ctx.Err() != nil {
+			return nil, set.Ctx.Err()
+		}
 		samples, err := m.synthesizeSegment(segment, voice, &set, rng)
 		if err != nil {
 			return nil, err
@@ -245,7 +256,14 @@ func (m *Engine) synthesizeSegment(segment string, voice *Voice, r *Settings, rn
 	noise := make([]float32, m.trans.Config.LatentDim)
 
 	endFrame := -1
+	cancelled := false
 	for frame := 0; frame < maxFrames; frame++ {
+		// The loop is left rather than returned from: the decoding goroutines
+		// are waiting on latents, and only closing it below lets them finish.
+		if r.Ctx != nil && r.Ctx.Err() != nil {
+			cancelled = true
+			break
+		}
 		cond := m.trans.AdvanceLatent(latent, state)
 
 		if float64(m.trans.EOSLogit(cond)) > r.EndThreshold && endFrame < 0 {
@@ -269,5 +287,9 @@ func (m *Engine) synthesizeSegment(segment string, voice *Voice, r *Settings, rn
 		latent = next
 	}
 	close(latents)
-	return <-done, nil
+	sound := <-done
+	if cancelled {
+		return nil, r.Ctx.Err()
+	}
+	return sound, nil
 }

@@ -189,13 +189,3 @@ func InParallel(n, totalWork int, work func(start, end int)) {
 	pool.run(n, chunks, work)
 	parallelMutex.Unlock()
 }
-
-// spinPause is one turn of a waiting loop, short enough not to hold the memory
-// system and long enough not to saturate the counter it watches.
-func spinPause() {
-	for i := 0; i < 8; i++ {
-		dummy++
-	}
-}
-
-var dummy int

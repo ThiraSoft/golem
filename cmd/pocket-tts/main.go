@@ -35,12 +35,12 @@ func main() {
 		fail(err)
 	}
 	if *weights == "" {
-		if *weights = orDefault("POCKET_TTS_WEIGHTS", cloningRepo, lang.WeightsPath()); *weights == "" {
+		if *weights = orEnv("POCKET_TTS_WEIGHTS", pockettts.Locate(lang.WeightsPath())); *weights == "" {
 			fail(missing(lang, "weights", "-weights", "POCKET_TTS_WEIGHTS"))
 		}
 	}
 	if *tokenizer == "" {
-		if *tokenizer = orDefault("POCKET_TTS_TOKENIZER", plainRepo, lang.TokenizerPath()); *tokenizer == "" {
+		if *tokenizer = orEnv("POCKET_TTS_TOKENIZER", pockettts.Locate(lang.TokenizerPath())); *tokenizer == "" {
 			fail(missing(lang, "tokenizer", "-tokenizer", "POCKET_TTS_TOKENIZER"))
 		}
 	}
@@ -77,7 +77,9 @@ func main() {
 	}
 
 	start = time.Now()
-	sound, err := engine.Synthesize(text, v, &pockettts.Settings{Seed: *seed})
+	settings := pockettts.DefaultSettings(lang)
+	settings.Seed = *seed
+	sound, err := engine.Synthesize(text, v, &settings)
 	if err != nil {
 		fail(err)
 	}
@@ -104,26 +106,6 @@ func main() {
 	fmt.Fprintf(os.Stderr, "loading %v — %.1f s of sound in %v, that is x%.2f real time\n",
 		loading.Round(time.Millisecond), seconds, elapsed.Round(time.Millisecond),
 		seconds/elapsed.Seconds())
-}
-
-// The two Hugging Face repositories the Python daemon downloads into. The
-// weights come from the voice-cloning one, the tokenizer from the other; that
-// is the split the upstream configs use.
-const cloningRepo = ".cache/huggingface/hub/models--kyutai--pocket-tts/snapshots/*/"
-const plainRepo = ".cache/huggingface/hub/models--kyutai--pocket-tts-without-voice-cloning/snapshots/*/"
-
-// orDefault looks for the file where the Python daemon already downloaded it.
-// A snapshot that does not hold the language simply yields nothing, and the
-// engine then reports the missing file rather than guessing.
-func orDefault(env, repo, relative string) string {
-	if p := os.Getenv(env); p != "" {
-		return p
-	}
-	found, _ := filepath.Glob(filepath.Join(os.Getenv("HOME"), repo, relative))
-	if len(found) > 0 {
-		return found[0]
-	}
-	return ""
 }
 
 // orEnv is the same for a plain string setting.

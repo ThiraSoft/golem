@@ -10,6 +10,8 @@ package pockettts
 // The noise comes from the fixtures: that is what makes the comparison possible.
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -70,16 +72,16 @@ func testFullSynthesis(t *testing.T, set string) {
 		t.Fatalf("prepared text %q, want %q", got, f.Text)
 	}
 
-	sound, err := engine.Synthesize(f.Text, voice, &Settings{
-		// The threshold is disabled: the reference produced a fixed number of
-		// frames without stopping at the detected end.
-		EndThreshold: 1e9,
-		noise: func(frame int, into []float32) {
-			if frame < f.Frames {
-				copy(into, noises[frame*L:(frame+1)*L])
-			}
-		},
-	})
+	settings := DefaultSettings(engine.lang)
+	// The threshold is disabled: the reference produced a fixed number of frames
+	// without stopping at the detected end.
+	settings.EndThreshold = 1e9
+	settings.noise = func(frame int, into []float32) {
+		if frame < f.Frames {
+			copy(into, noises[frame*L:(frame+1)*L])
+		}
+	}
+	sound, err := engine.Synthesize(f.Text, voice, &settings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,5 +98,105 @@ func testFullSynthesis(t *testing.T, set string) {
 	for i := 0; i < f.Frames; i++ {
 		start, end := i*mimi.SamplesPerFrame, (i+1)*mimi.SamplesPerFrame
 		reference.Compare(t, "audio", sound[start:end], wantAudio[start:end], 5e-3)
+	}
+}
+
+func TestDefaultSettings(t *testing.T) {
+	lang, err := LookupLanguage("french_24l")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := DefaultSettings(lang)
+	if s.Temperature != 0.7 {
+		t.Errorf("Temperature = %v, want 0.7", s.Temperature)
+	}
+	if s.EndThreshold != -4 {
+		t.Errorf("EndThreshold = %v, want -4", s.EndThreshold)
+	}
+	if s.FramesAfterEnd != lang.FramesAfterEnd {
+		t.Errorf("FramesAfterEnd = %v, want %v", s.FramesAfterEnd, lang.FramesAfterEnd)
+	}
+	if s.MaxTokens != 50 {
+		t.Errorf("MaxTokens = %v, want 50", s.MaxTokens)
+	}
+}
+
+// A caller that means zero gets zero. That is the whole point: gladyss sets an
+// end threshold of 0.0 on purpose, and the old zero-means-default rule turned
+// it into -4 without saying so.
+func TestSettingsKeepsAnExplicitZero(t *testing.T) {
+	lang, err := LookupLanguage("french_24l")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := DefaultSettings(lang)
+	s.EndThreshold = 0
+	if s.EndThreshold != 0 {
+		t.Errorf("EndThreshold = %v, want 0", s.EndThreshold)
+	}
+}
+
+// testEngine opens the French engine on the weights in the Hugging Face cache,
+// and loads the first voice it finds. It skips when the model is not there:
+// a fresh clone has no weights, and these tests are about the engine's control
+// flow, not about anything a fixture could stand in for.
+func testEngine(t *testing.T) (*Engine, *Voice) {
+	t.Helper()
+	lang, err := LookupLanguage(DefaultLanguage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	weights, tokenizer := Locate(lang.WeightsPath()), Locate(lang.TokenizerPath())
+	if weights == "" || tokenizer == "" {
+		t.Skip("Pocket TTS weights not in the Hugging Face cache")
+	}
+	engine, err := Open(Options{Weights: weights, Tokenizer: tokenizer, Language: lang.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { engine.Close() })
+
+	var voice *Voice
+	for _, name := range LocateVoices(lang) {
+		if voice, err = engine.LoadVoice(Locate(lang.EmbeddingPath(name))); err == nil {
+			break
+		}
+		t.Fatal(err)
+	}
+	if voice == nil {
+		t.Skip("no voice in the Hugging Face cache")
+	}
+	return engine, voice
+}
+
+// A cancelled context stops the generation rather than running the text to its
+// end.
+func TestSynthesizeStopsOnCancel(t *testing.T) {
+	engine, voice := testEngine(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	settings := DefaultSettings(engine.lang)
+	settings.Seed = 1
+	settings.Frame = func([]float32) { cancel() } // stop at the very first frame
+	settings.Ctx = ctx
+
+	_, err := engine.Synthesize("Une phrase assez longue pour occuper le modèle un moment.", voice, &settings)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// Without a context, nothing changes.
+func TestSynthesizeWithoutContext(t *testing.T) {
+	engine, voice := testEngine(t)
+
+	settings := DefaultSettings(engine.lang)
+	settings.Seed = 1
+	sound, err := engine.Synthesize("Bonjour.", voice, &settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sound) == 0 {
+		t.Fatal("no sound produced")
 	}
 }
