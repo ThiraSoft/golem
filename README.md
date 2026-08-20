@@ -25,7 +25,7 @@ the shared layer knows they exist.
 | package | holds |
 |---|---|
 | `tensors/` | safetensors and GGUF: metadata, and views on the bytes |
-| `nn/` | quantized matrix products with AVX2 kernels, norms, activations, RoPE, convolutions |
+| `nn/` | quantized matrix products with AVX2 kernels, norms, activations, RoPE, convolutions, and the worker pool they are spread over |
 | `token/` | tokenizers, one package per family |
 | `audio/` | sound formats |
 | `sample/` | top-k, top-p, temperature, and a seeded draw over a row of logits |
