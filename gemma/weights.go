@@ -123,8 +123,10 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 			if b.K, err = matrix(g, p+"attn_k.weight"); err != nil {
 				return nil, err
 			}
-			if b.V, err = matrix(g, p+"attn_v.weight"); err != nil {
-				return nil, err
+			if !bc.ValueIsKey {
+				if b.V, err = matrix(g, p+"attn_v.weight"); err != nil {
+					return nil, err
+				}
 			}
 			if b.KNorm, err = floats(g, p+"attn_k_norm.weight"); err != nil {
 				return nil, err

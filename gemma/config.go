@@ -13,6 +13,7 @@ package gemma
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/ThiraSoft/golem/sample"
 	"github.com/ThiraSoft/golem/tensors"
@@ -29,7 +30,8 @@ type BlockConfig struct {
 	RoPEDims   int // how many elements of the head are rotated
 	FFN        int
 	OwnsKV     bool
-	KVSource   int // the block whose cache this one reads; Index when OwnsKV
+	KVSource   int  // the block whose cache this one reads; Index when OwnsKV
+	ValueIsKey bool // no value projection: the key projection serves as both
 }
 
 type Config struct {
@@ -44,6 +46,16 @@ type Config struct {
 	// Sampling is what the file asks to be sampled with. A checkpoint that
 	// declares none of the three keys gets sample.Defaults().
 	Sampling sample.Params
+	// Suppress are tokens the file forbids. The 12B checkpoint can emit the
+	// markers that stand for an image or a piece of audio, which no text
+	// decoder can turn into anything; llama.cpp answers by adding minus
+	// infinity to those logits, and so does Logits below.
+	Suppress []int32
+	// EmptyThought is what ChatOptions.EmptyThought means: this file's template
+	// opens and closes a thought channel at the end of a generation prompt when
+	// thinking is off. It is read from the Jinja rather than from the model's
+	// name, because that is where the difference actually is.
+	EmptyThought bool
 }
 
 // perBlock reads a value that the format may have stored once for the whole
@@ -143,6 +155,15 @@ func LoadConfig(g *tensors.GGUF, maxContext int) (*Config, error) {
 	if v, err := g.Float32(key("final_logit_softcapping")); err == nil {
 		cfg.LogitSoftcap = v
 	}
+	if t, err := g.String("tokenizer.chat_template"); err == nil {
+		cfg.EmptyThought = strings.Contains(t, emptyThoughtJinja)
+	}
+	if ids, err := g.Uint32Slice("tokenizer.ggml.suppress_tokens"); err == nil {
+		cfg.Suppress = make([]int32, len(ids))
+		for i, id := range ids {
+			cfg.Suppress[i] = int32(id)
+		}
+	}
 
 	embd, ok := g.Tensors["token_embd.weight"]
 	if !ok || len(embd.Shape) != 2 {
@@ -196,6 +217,14 @@ func LoadConfig(g *tensors.GGUF, maxContext int) (*Config, error) {
 		}
 		if b.HeadDim%2 != 0 || b.RoPEDims > b.HeadDim {
 			return nil, fmt.Errorf("block %d: head %d, rotated %d", i, b.HeadDim, b.RoPEDims)
+		}
+		if b.OwnsKV {
+			// A block may publish no value projection at all, and the 12B's
+			// global blocks do not. Its keys are then its values as well,
+			// taken before the key norm and before the rotation. llama.cpp
+			// reads the same absence the same way.
+			_, hasV := g.Tensors[fmt.Sprintf("blk.%d.attn_v.weight", i)]
+			b.ValueIsKey = !hasV
 		}
 		if b.Heads%b.KVHeads != 0 {
 			return nil, fmt.Errorf("block %d: %d query heads do not divide among %d key-value heads", i, b.Heads, b.KVHeads)

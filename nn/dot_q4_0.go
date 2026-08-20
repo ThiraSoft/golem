@@ -118,6 +118,10 @@ func MatVecQ4_0(w []byte, b *Batch, outputs, inputs int, ys [][]float32) {
 // out of the first-level cache is fetched again for every step of the other, so
 // both are cut down until they fit.
 //
+// The last stretch of a row is whatever is left, which need not be a whole
+// tile: the 12B computes over 3840 and 15360 inputs, neither a multiple of the
+// tile. A kernel told to read a whole tile there would read past the row.
+//
 // kTile cuts the input: four columns of a feed-forward output are forty-eight
 // kilobytes of activation, which is past the cache, and the down projection of
 // this model is exactly that shape. Two thousand inputs at a time makes it
@@ -175,16 +179,16 @@ func matVecQ4_0Rows(w []byte, b *Batch, inputs int, ys [][]float32, start, end i
 		c := 0
 		for ; c+4 <= b.Size; c += 4 {
 			for k := 0; k < inputs; k += steps {
-				block := k / QuantBlock
+				block, n := k/QuantBlock, min(steps, inputs-k)
 				mode := Mode(0)
 				if k == 0 {
 					mode |= Begin
 				}
-				if k+steps >= inputs {
+				if k+n >= inputs {
 					mode |= Finish
 				}
 				for r := from; r < to; r++ {
-					dotQ4_0x4(w[r*rowBytes+block*q4_0BlockBytes:], b, block, c, steps, four[r-from][:], mode)
+					dotQ4_0x4(w[r*rowBytes+block*q4_0BlockBytes:], b, block, c, n, four[r-from][:], mode)
 				}
 			}
 			for r := from; r < to; r++ {
@@ -195,16 +199,16 @@ func matVecQ4_0Rows(w []byte, b *Batch, inputs int, ys [][]float32, start, end i
 		}
 		for ; c < b.Size; c++ {
 			for k := 0; k < inputs; k += steps {
-				block := k / QuantBlock
+				block, n := k/QuantBlock, min(steps, inputs-k)
 				mode := Mode(0)
 				if k == 0 {
 					mode |= Begin
 				}
-				if k+steps >= inputs {
+				if k+n >= inputs {
 					mode |= Finish
 				}
 				for r := from; r < to; r++ {
-					dotQ4_0(w[r*rowBytes+block*q4_0BlockBytes:], b, block, c, steps, one[r-from][:], mode)
+					dotQ4_0(w[r*rowBytes+block*q4_0BlockBytes:], b, block, c, n, one[r-from][:], mode)
 				}
 			}
 			for r := from; r < to; r++ {

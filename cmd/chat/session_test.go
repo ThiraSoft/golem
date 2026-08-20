@@ -77,7 +77,7 @@ func (e *scriptedEngine) Logits(hidden, out []float32) {
 func newSession(t *testing.T, v *wordVocab, e *scriptedEngine, maxTokens int, system string) *Session {
 	t.Helper()
 	// Greedy, so the script is the answer.
-	return NewSession(e, v, sample.Params{Temperature: 0}, 4096, 4096, maxTokens, system, false)
+	return NewSession(e, v, sample.Params{Temperature: 0}, 4096, 4096, maxTokens, system, false, false)
 }
 
 // The context a token at a time: what the model was fed, in order.
@@ -201,7 +201,7 @@ func TestTheAnswerIsStreamed(t *testing.T) {
 func TestAConversationThatNoLongerFitsIsRefused(t *testing.T) {
 	v := newWordVocab()
 	e := &scriptedEngine{vocab: v, script: []string{"<turn|>"}}
-	s := NewSession(e, v, sample.Params{Temperature: 0}, 4096, 4, 8, "", false)
+	s := NewSession(e, v, sample.Params{Temperature: 0}, 4096, 4, 8, "", false, false)
 
 	if _, err := s.Ask("this prompt is longer than four positions", nil); err == nil {
 		t.Fatal("a prompt past the context should be refused rather than wrap the cache")

@@ -30,6 +30,12 @@ type ChatOptions struct {
 	// EnableThinking opens a system turn carrying <|think|>, even when the
 	// conversation has no system message.
 	EnableThinking bool
+	// EmptyThought closes the generation prompt with a thought channel that is
+	// opened and closed at once. It is the one rule the two checkpoints spell
+	// differently: the 12B's template writes it whenever thinking is off, E2B's
+	// template has no such line, and Config.EmptyThought says which of the two
+	// the file being run is.
+	EmptyThought bool
 	// AddGenerationPrompt appends the empty model turn the model is meant to
 	// continue. A caller rendering a conversation for training rather than for
 	// generation leaves it false.
@@ -38,17 +44,23 @@ type ChatOptions struct {
 
 // The markers, spelled once.
 const (
-	bosPiece      = "<bos>"
-	turnOpen      = "<|turn>"
-	turnClose     = "<turn|>\n"
-	thinkPiece    = "<|think|>\n"
-	channelOpen   = "<|channel>"
-	channelClose  = "<channel|>"
-	roleSystem    = "system"
-	roleDeveloper = "developer"
-	roleUser      = "user"
-	roleAssistant = "assistant"
-	roleModel     = "model"
+	bosPiece     = "<bos>"
+	turnOpen     = "<|turn>"
+	turnClose    = "<turn|>\n"
+	thinkPiece   = "<|think|>\n"
+	channelOpen  = "<|channel>"
+	channelClose = "<channel|>"
+	// emptyThought is what the 12B's template appends to a generation prompt
+	// when thinking is off.
+	emptyThought = channelOpen + "thought\n" + channelClose
+	// emptyThoughtJinja is the same thing as the template spells it, where the
+	// newline is still two characters. It is what LoadConfig looks for.
+	emptyThoughtJinja = channelOpen + `thought\n` + channelClose
+	roleSystem        = "system"
+	roleDeveloper     = "developer"
+	roleUser          = "user"
+	roleAssistant     = "assistant"
+	roleModel         = "model"
 )
 
 // RenderChat writes the conversation the way Gemma's template does, leading
@@ -108,6 +120,9 @@ func RenderChat(messages []Message, opt ChatOptions) (string, error) {
 
 	if opt.AddGenerationPrompt {
 		b.WriteString(turnOpen + roleModel + "\n")
+		if opt.EmptyThought && !opt.EnableThinking {
+			b.WriteString(emptyThought)
+		}
 	}
 	return b.String(), nil
 }

@@ -80,7 +80,7 @@ func main() {
 	}
 
 	newSession := func() *Session {
-		return NewSession(m, vocab, params, m.Cfg.Vocab, *context, *maxTokens, *system, *think)
+		return NewSession(m, vocab, params, m.Cfg.Vocab, *context, *maxTokens, *system, *think, m.Cfg.EmptyThought)
 	}
 	session := newSession()
 	out := bufio.NewWriter(os.Stdout)

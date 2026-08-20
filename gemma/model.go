@@ -9,6 +9,7 @@ package gemma
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/tensors"
@@ -170,6 +171,26 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 	v.QuantizeK()
 	m.W.TokenEmbd.MatVec(v, out)
 	nn.Softcap(out, m.Cfg.LogitSoftcap)
+	m.suppress(out, nil)
+}
+
+// suppress forbids the tokens the file forbids, after the softcap, which is
+// where llama.cpp adds its bias. ids says which token each entry of out scores;
+// nil means out is the whole vocabulary in order.
+func (m *Model) suppress(out []float32, ids []int32) {
+	for _, id := range m.Cfg.Suppress {
+		if ids == nil {
+			if int(id) < len(out) {
+				out[id] = float32(math.Inf(-1))
+			}
+			continue
+		}
+		for i, want := range ids {
+			if want == id {
+				out[i] = float32(math.Inf(-1))
+			}
+		}
+	}
 }
 
 // LogitsAt scores the given tokens and nothing else, which is what a parity
@@ -185,6 +206,7 @@ func (m *Model) LogitsAt(hidden []float32, ids []int32, out []float32) {
 		out[i] = sum
 	}
 	nn.Softcap(out, m.Cfg.LogitSoftcap)
+	m.suppress(out, ids)
 }
 
 // Argmax is the greedy choice. Ties go to the lower identifier, as llama.cpp

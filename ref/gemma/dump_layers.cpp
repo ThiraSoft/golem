@@ -85,35 +85,32 @@ static bool on_node(struct ggml_tensor * t, bool ask, void * user_data) {
     return true;
 }
 
-// The waypoints kept for the short run. Six blocks cover every kind and every
-// pairing: 0 and 13 own window caches, 4 and 14 own global ones, 15 reads
-// block 13's, 19 reads block 14's. Blocks 13 and 14 are kept because the
-// sharing tests need the source's input in order to fill the cache the sharer
-// then reads, without running the whole stack first.
-static std::set<std::string> short_run_names() {
-    std::set<std::string> names = {
-        "inp_scaled", "per_layer_proj", "inp_per_layer", "result_norm",
-    };
-    for (int il : {0, 4, 13, 14, 15, 19}) {
+// The waypoints kept for the short run. Seven blocks cover every kind and
+// every pairing: in E2B, 0 and 13 own window caches, 4 and 14 own global ones,
+// 15 reads block 13's, 19 reads block 14's; blocks 13 and 14 are kept because
+// the sharing tests need the source's input in order to fill the cache the
+// sharer then reads, without running the whole stack first. Block 5 is there
+// for the 12B, where it is the first global block — the kind that publishes no
+// value projection and uses its keys as values.
+//
+// The two checkpoints do not agree on which of those blocks compute keys at
+// all, and only E2B has per-layer embeddings, so the waypoints that depend on
+// either are asked for and allowed to be absent rather than being predicted
+// from the block number.
+static std::set<std::string> short_run_names(int n_layer) {
+    std::set<std::string> names = { "inp_scaled", "result_norm" };
+    for (int il : {0, 4, 5, 13, 14, 15, 19}) {
+        if (il >= n_layer) continue;
         const std::string s = "-" + std::to_string(il);
         names.insert("attn_norm"          + s);
         names.insert("Qcur_normed"        + s);
         names.insert("Qcur_pos"           + s);
-        // Blocks 15 and 19 compute no keys or values at all: they read the
-        // cache blocks 13 and 14 filled, so those waypoints do not exist.
-        if (il < 15) {
-            names.insert("Kcur_normed"    + s);
-            names.insert("Kcur_pos"       + s);
-            names.insert("Vcur_normed"    + s);
-        }
         names.insert("kqv_out"            + s);
         names.insert("attn_post_norm"     + s);
         names.insert("attn_out"           + s);
         names.insert("ffn_norm"           + s);
         names.insert("ffn_out"            + s);
         names.insert("ffn_post_norm"      + s);
-        names.insert("pe_in"              + s);
-        names.insert("per_layer_embd_out" + s);
         names.insert("l_out"              + s);
     }
     // Every block's output, for all thirty-five: it is what the next block
@@ -122,6 +119,23 @@ static std::set<std::string> short_run_names() {
     // stack says which block it began in.
     for (int il = 0; il < 64; ++il) {
         names.insert("l_out-" + std::to_string(il));
+    }
+    return names;
+}
+
+// The waypoints a checkpoint may or may not have: the keys and values of a
+// block that shares another's cache do not exist, and neither does anything
+// per-layer in a model that declares no per-layer width.
+static std::set<std::string> optional_names(int n_layer) {
+    std::set<std::string> names = { "per_layer_proj", "inp_per_layer" };
+    for (int il : {0, 4, 5, 13, 14, 15, 19}) {
+        if (il >= n_layer) continue;
+        const std::string s = "-" + std::to_string(il);
+        names.insert("Kcur_normed"        + s);
+        names.insert("Kcur_pos"           + s);
+        names.insert("Vcur_normed"        + s);
+        names.insert("pe_in"              + s);
+        names.insert("per_layer_embd_out" + s);
     }
     return names;
 }
@@ -136,6 +150,7 @@ static void prune_absent_l_out(std::set<std::string> & names, int n_layer) {
 
 static void write_index(const dump_state & st,
                         const std::string & prompt,
+                        const std::string & model_name,
                         const std::vector<llama_token> & tokens,
                         const std::vector<std::pair<int, float>> & top,
                         const std::vector<llama_token> & greedy,
@@ -145,7 +160,7 @@ static void write_index(const dump_state & st,
     if (!f) die(("cannot write " + path).c_str());
 
     fprintf(f, "{\n");
-    fprintf(f, "  \"model\": \"gemma-4-E2B-it-QAT-Q4_0.gguf\",\n");
+    fprintf(f, "  \"model\": \"%s\",\n", model_name.c_str());
     fprintf(f, "  \"prompt\": \"%s\",\n", prompt.c_str());
     fprintf(f, "  \"n_embd\": %d,\n  \"n_layer\": %d,\n  \"n_embd_per_layer\": %d,\n",
             n_embd, n_layer, n_embd_per_layer);
@@ -221,9 +236,12 @@ int main(int argc, char ** argv) {
 
     dump_state st;
     st.dir = out_dir;
+    std::set<std::string> optional;
     if (mode == "short") {
-        st.wanted = short_run_names();
+        st.wanted = short_run_names(llama_model_n_layer(model));
         prune_absent_l_out(st.wanted, llama_model_n_layer(model));
+        optional = optional_names(llama_model_n_layer(model));
+        st.wanted.insert(optional.begin(), optional.end());
     } else {
         st.wanted = {"l_out-0", "l_out-4", "l_out-15", "result_norm"};
         st.last_column_only = true;
@@ -248,10 +266,10 @@ int main(int argc, char ** argv) {
     st.active = false;   // the greedy continuation below must not overwrite
 
     for (const auto & name : st.wanted) {
-        if (st.written.find(name) == st.written.end()) {
-            fprintf(stderr, "dump_layers: %s never appeared in the graph\n", name.c_str());
-            return 1;
-        }
+        if (st.written.find(name) != st.written.end()) continue;
+        if (optional.find(name) != optional.end()) continue;
+        fprintf(stderr, "dump_layers: %s never appeared in the graph\n", name.c_str());
+        return 1;
     }
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
@@ -276,9 +294,13 @@ int main(int argc, char ** argv) {
         next = best;
     }
 
+    const size_t slash = model_path.find_last_of('/');
     write_index(st, mode == "window" ? "(repeated sentence)" : prompt,
+                slash == std::string::npos ? model_path : model_path.substr(slash + 1),
                 tokens, top, greedy,
-                llama_model_n_embd(model), llama_model_n_layer(model), 256);
+                llama_model_n_embd(model), llama_model_n_layer(model),
+                st.written.count("inp_per_layer")
+                    ? (int) st.written["inp_per_layer"].ne[0] : 0);
 
     llama_free(ctx);
     llama_model_free(model);

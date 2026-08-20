@@ -1,6 +1,6 @@
 {
  "bos_token_id": 2,
- "empty_thought": false,
+ "empty_thought": true,
  "cases": [
   {
    "name": "user_only",
@@ -12,7 +12,7 @@
    ],
    "enable_thinking": false,
    "add_generation_prompt": true,
-   "rendered": "<bos><|turn>user\nhi<turn|>\n<|turn>model\n"
+   "rendered": "<bos><|turn>user\nhi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
   },
   {
    "name": "system_user",
@@ -28,7 +28,7 @@
    ],
    "enable_thinking": false,
    "add_generation_prompt": true,
-   "rendered": "<bos><|turn>system\nYou are terse.<turn|>\n<|turn>user\nhi<turn|>\n<|turn>model\n"
+   "rendered": "<bos><|turn>system\nYou are terse.<turn|>\n<|turn>user\nhi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
   },
   {
    "name": "developer_user",
@@ -44,7 +44,7 @@
    ],
    "enable_thinking": false,
    "add_generation_prompt": true,
-   "rendered": "<bos><|turn>system\nYou are terse.<turn|>\n<|turn>user\nhi<turn|>\n<|turn>model\n"
+   "rendered": "<bos><|turn>system\nYou are terse.<turn|>\n<|turn>user\nhi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
   },
   {
    "name": "multi_turn",
@@ -64,7 +64,7 @@
    ],
    "enable_thinking": false,
    "add_generation_prompt": true,
-   "rendered": "<bos><|turn>user\none<turn|>\n<|turn>model\ntwo<turn|>\n<|turn>user\nthree<turn|>\n<|turn>model\n"
+   "rendered": "<bos><|turn>user\none<turn|>\n<|turn>model\ntwo<turn|>\n<|turn>user\nthree<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
   },
   {
    "name": "assistant_continuation",
@@ -84,7 +84,7 @@
    ],
    "enable_thinking": false,
    "add_generation_prompt": true,
-   "rendered": "<bos><|turn>user\none<turn|>\n<|turn>model\ntwo<turn|>\nstill two<turn|>\n<|turn>model\n"
+   "rendered": "<bos><|turn>user\none<turn|>\n<|turn>model\ntwo<turn|>\nstill two<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
   },
   {
    "name": "thinking",
@@ -144,7 +144,7 @@
    ],
    "enable_thinking": false,
    "add_generation_prompt": true,
-   "rendered": "<bos><|turn>system\npadded<turn|>\n<|turn>user\nspaced<turn|>\n<|turn>model\n"
+   "rendered": "<bos><|turn>system\npadded<turn|>\n<|turn>user\nspaced<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
   },
   {
    "name": "assistant_with_channel",
@@ -164,7 +164,7 @@
    ],
    "enable_thinking": false,
    "add_generation_prompt": true,
-   "rendered": "<bos><|turn>user\none<turn|>\n<|turn>model\nbeforeafter<turn|>\n<|turn>user\nthree<turn|>\n<|turn>model\n"
+   "rendered": "<bos><|turn>user\none<turn|>\n<|turn>model\nbeforeafter<turn|>\n<|turn>user\nthree<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
   },
   {
    "name": "assistant_channel_unclosed",
@@ -192,7 +192,7 @@
    ],
    "enable_thinking": false,
    "add_generation_prompt": true,
-   "rendered": "<bos><|turn>system\nalone<turn|>\n<|turn>model\n"
+   "rendered": "<bos><|turn>system\nalone<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
   },
   {
    "name": "empty_content",
@@ -204,7 +204,7 @@
    ],
    "enable_thinking": false,
    "add_generation_prompt": true,
-   "rendered": "<bos><|turn>user\n<turn|>\n<|turn>model\n"
+   "rendered": "<bos><|turn>user\n<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
   },
   {
    "name": "unicode",
@@ -216,7 +216,7 @@
    ],
    "enable_thinking": false,
    "add_generation_prompt": true,
-   "rendered": "<bos><|turn>user\nhéllo — 世界 🙂<turn|>\n<|turn>model\n"
+   "rendered": "<bos><|turn>user\nhéllo — 世界 🙂<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
   }
  ]
 }

@@ -10,7 +10,7 @@ of weights.
 
 | | what it runs | measured |
 |---|---|---|
-| [`gemma/`](gemma/) | Gemma 4 E2B, from a GGUF | 21.3 tokens/s generated, 102 read — llama.cpp on the same CPU: 22.3 and 172 |
+| [`gemma/`](gemma/) | Gemma 4 E2B and 12B, from a GGUF | E2B: 21.3 tokens/s generated, 102 read — llama.cpp on the same CPU: 22.3 and 172. 12B: 4.75 and 20.7, against 4.81 and 29.8 |
 | [`pockettts/`](pockettts/) | [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts), twelve languages, voice cloning included | ×2.37 real time on the 24-layer French model, ×5.87 on the 6-layer English one — PyTorch: ×1.27 and ×4.03 |
 
 Both figures are from an i7-9700K with eight threads, on Q4_0 weights. Each
@@ -73,25 +73,27 @@ them, and they are between three hundred megabytes and three gigabytes each.
 
 - **Gemma 4** weights: a GGUF from Hugging Face, whatever quantization you like
   — the engine reads Q4_0, Q6_K, bf16 and float32, and the tests want the
-  QAT Q4_0 build. Point `GOLEM_MODEL` at the file. Google's Gemma terms apply
-  to it.
+  QAT Q4_0 build. Point `GOLEM_MODEL` at the file, and `GOLEM_MODEL_12B` at a
+  12B one if you have both: the two checkpoints are tested separately, because
+  they agree on the architecture's name and on very little else. Google's Gemma
+  terms apply to them.
 - **Pocket TTS** weights, tokenizer and voice states: Kyutai publishes them on
   Hugging Face, and `pockettts/README.md` says which repositories and where the
   engine looks. A voice can also be cloned from any recording, which needs
   nothing but the weights.
 
 Neither are the recordings of the models themselves. `testdata/gemma/layers`,
-`quants` and `window` hold activations, logits and slabs of quantized weights as
-ggml computed them; `testdata/layer0`, `pipeline` and `pipeline_en` hold what
+`layers12`, `quants` and `window` hold activations, logits and slabs of
+quantized weights as ggml computed them; `testdata/layer0`, `pipeline` and `pipeline_en` hold what
 PyTorch computes inside Pocket TTS. Those are the models' output, not this
 repository's, and each is one command away — `ref/gemma/README.md` and
 `pockettts/README.md` have them.
 
 What *is* versioned is what the models did not write: tokenizations and chat
 templates, which are text and integers. Tests that need a file which is not
-there skip rather than fail, so a fresh clone with no model at all still runs 72
-of them green — and a machine with the weights and one run of the two recorders
-runs 175.
+there skip rather than fail, so a fresh clone with no model at all still runs 73
+of them green — and a machine with both Gemma checkpoints, the voices and one
+run of the recorders runs 123.
 
 ## Building
 

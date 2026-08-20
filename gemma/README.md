@@ -4,6 +4,11 @@ Runs Google's Gemma 4 from a GGUF file: no cgo, no Python, nothing outside the
 standard library. The weights stay mapped and quantized; nothing is converted
 at load time.
 
+Two checkpoints are known to run, and both are checked against llama.cpp here:
+**E2B**, 35 blocks of 1536, and the **12B**, 48 blocks of 3840. They declare the
+same architecture and share almost none of its numbers; the section below says
+what differs, and none of it is a branch on the model's name.
+
 ## What it does
 
 `Open` maps the file and reads its geometry. `Forward` advances one token and
@@ -42,8 +47,40 @@ softcapped at 30, and a 256-wide vector per token *per block* folded into the
 residual stream on the way out of each.
 
 None of it is written into the code. Every number is read from the file, which
-is why the 12B — no per-layer embeddings, no shared keys, a different window —
-runs from the same lines.
+is why the 12B runs from the same lines.
+
+## The 12B, and what it does not have
+
+The 12B declares `general.architecture = "gemma4"` like E2B and then disagrees
+with it about nearly everything the code could have assumed:
+
+- **No per-layer embeddings.** `embedding_length_per_layer_input` is zero, the
+  file carries no `per_layer_*` tensor, and the whole branch is skipped — a
+  zero read from the file, not a case on the checkpoint.
+- **No sharing.** Every one of the 48 blocks computes its own keys and values;
+  `attention.shared_kv_layers` is zero.
+- **A different alternation.** Five window blocks of 1024 positions, then one
+  global; sixteen query heads throughout, over eight key-value heads of 256 in a
+  window block and *one* of 512 in a global one.
+- **No value projection in a global block.** `blk.N.attn_v.weight` is simply
+  absent there, and the key projection serves as both: the value is that
+  projection normed without a gain of its own and never rotated, which is what
+  llama.cpp does when it finds no `wv`. `Config.ValueIsKey` is read from the
+  tensor's absence.
+- **Two tokens it must not emit.** `tokenizer.ggml.suppress_tokens` names the
+  image and audio markers, which no text decoder can turn into anything.
+  llama.cpp adds minus infinity to those logits after the softcap; so does
+  `Logits`. Without it the 12B answers a chat turn with one marker repeated to
+  the token limit, which is the whole visible symptom of a missing line.
+- **A template with one more rule.** See "The chat template" below.
+
+Its widths are also what found a real bug in the shared kernel: 3840 and 15360
+inputs, neither a multiple of the 2048-input tile the Q4_0 product cuts a wide
+row into. The last stretch of such a row is shorter than a tile, and the kernel
+used to be told a whole one — reading past both the row and the activation, and
+returning sums with no bound at all. E2B never showed it, because 1536, 6144 and
+12288 all divide. `nn.TestMatVecQ4_0PartialTiles` is that case, with both
+operands padded so an overrun meets numbers rather than zeros.
 
 ## How it is known to be right
 
@@ -75,6 +112,21 @@ below are what that command produced on this machine.
 | the top 64 logits | 0.29, on logits near 15 |
 | the reference's argmax | identical |
 | sixteen greedy tokens | fifteen identical, one tie decided the other way |
+
+The same table for the 12B, from `testdata/gemma/layers12` and
+`GOLEM_MODEL_12B`:
+
+| what is compared | worst gap |
+|---|---|
+| a window block, driven by the reference's own input | 2e-3 relative |
+| a global block — the kind whose keys are its values | 2e-3 relative |
+| the hidden state after 48 blocks | 5.6e-2 relative |
+| the top 64 logits | 0.86, on logits near 15 |
+| the reference's argmax | identical |
+| sixteen greedy tokens | identical |
+
+Thirteen more blocks is what stands between the two hidden-state figures: the
+per-block gaps are the same size in both checkpoints, and they compound.
 
 Three things had to be reproduced rather than reimplemented, each of which
 costs a day if guessed:
@@ -111,7 +163,7 @@ tokens.
 
 ## Speed
 
-On an i7-9700K, eight threads, Q4_0 weights:
+On an i7-9700K, eight threads, Q4_0 weights. E2B first:
 
 | | per token |
 |---|---|
@@ -143,6 +195,19 @@ build 9603 held to the CPU (`-dev none -ngl 0`):
 llama-bench -m "$MODEL" -dev none -ngl 0 -t 8 -p 64 -n 32 -r 3
 chat -model "$MODEL" -p "<fifty-nine tokens>" -temp 0 -n 32 -stats
 ```
+
+The 12B on the same machine, the same way, `gemma-4-12B-it-QAT-Q4_0.gguf`:
+
+| | llama.cpp | golem | |
+|---|---:|---:|---|
+| prompt, 64 tokens | 29.8 t/s | 20.7 t/s | ×1.4 |
+| generation, 32 tokens | 4.81 t/s | 4.75 t/s | ×1.01 |
+
+Per token of generation that is 191 ms in the blocks and 24 ms in the logit
+head. Both engines are reading 6.5 GB of weights for every token here, and at
+that size there is nothing between them but the memory bus — which is why the
+ratio that is ×1.05 on E2B is ×1.01 on the 12B, and why the prompt, where the
+bus stops being the limit, keeps the gap the kernels account for.
 
 **Generation** is where the two meet, and four things closed a gap that used to
 be a factor of four and a half.
@@ -221,9 +286,17 @@ Two details are not guessable from the shape of the output and are worth naming:
   `<channel|>` and keeps, from each piece holding a `<|channel>` marker, only
   what preceded it. An unclosed channel therefore swallows everything after it.
 
-`testdata/gemma/chat/cases.json` holds what Jinja itself renders, from the
-template read out of the model file, over fourteen conversations. The test
-compares character for character. The recorder is `ref/gemma/dump_chats.py`.
+The two checkpoints do not carry the same template. The 12B's, asked for a
+generation prompt with thinking off, closes it with a thought channel opened and
+shut at once — `<|channel>thought\n<channel|>` — and E2B's has no such line.
+`Config.EmptyThought` is read from the Jinja in the file, `ChatOptions` carries
+it, and a 12B answered without it drifts off distribution within a token or two.
+
+`testdata/gemma/chat/cases.json` and `chat12/cases.json` hold what Jinja itself
+renders, from each template read out of its own model file, over fourteen
+conversations each. The test compares character for character, and the fixture
+says which of the two spellings it came from. The recorder is
+`ref/gemma/dump_chats.py`.
 
 Tools, tool calls, tool responses, content-part arrays and media markers are the
 rest of that template, and `RenderChat` refuses a conversation that would need
@@ -232,6 +305,6 @@ them rather than rendering something close.
 ## Sampling
 
 `Config.Sampling` is read from the file's own `general.sampling.*` keys — for
-E2B, temperature 1, top-k 64, top-p 0.95 — and falls back to `sample.Defaults()`
-when a checkpoint declares none. Feeding it to `sample.New` gives the draw;
+both checkpoints, temperature 1, top-k 64, top-p 0.95 — and falls back to
+`sample.Defaults()` when a checkpoint declares none. Feeding it to `sample.New` gives the draw;
 `gemma.Argmax` remains the greedy choice the parity tests use.

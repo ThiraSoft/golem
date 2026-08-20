@@ -17,6 +17,7 @@
 # to this repository, and the scripts in ref/ write them back in one command
 # each. Every test that reads them skips until they are there.
 /testdata/gemma/layers/
+/testdata/gemma/layers12/
 /testdata/gemma/quants/
 /testdata/gemma/window/
 /testdata/layer0/

@@ -43,7 +43,7 @@ commit of its own.
 ## dump_layers — recording a forward pass
 
 `dump_quants` pins the kernels; `dump_layers` pins the engine. It runs Gemma 4
-E2B on a fixed prompt with a scheduler callback attached, and writes out every
+on a fixed prompt with a scheduler callback attached, and writes out every
 intermediate llama.cpp names, as float32 in ggml's own layout — dimension 0
 fastest. Both the weights and the graph are kept on the CPU, and flash
 attention is disabled: the reference is ggml's own arithmetic, and a fused
@@ -52,14 +52,14 @@ attention kernel has no waypoints to record.
 Two runs:
 
 - `short` into `testdata/gemma/layers/`: the prompt "The capital of France is",
-  every waypoint of blocks 0, 4, 13, 14, 15 and 19, the final norm, the top 64
-  logits and sixteen greedy tokens. Those six blocks cover the four kinds a
-  block can be — owning a window cache, owning a global one, reading block
-  13's, reading block 14's — and include the two sources, so that a sharing
-  block can be tested without running the thirteen blocks before it. Every
-  block's output is kept as well, which is what lets a test start any block
-  from the reference's own input. Blocks 15 and 19 have no key or value
-  waypoints, because they compute neither.
+  every waypoint of blocks 0, 4, 5, 13, 14, 15 and 19, the final norm, the top
+  64 logits and sixteen greedy tokens. Those blocks cover every kind a block
+  can be in either checkpoint — owning a window cache, owning a global one,
+  reading block 13's, reading block 14's, and the 12B's global block, which is
+  block 5 and computes no value projection — and include the two sources, so
+  that a sharing block can be tested without running the thirteen blocks before
+  it. Every block's output is kept as well, which is what lets a test start any
+  block from the reference's own input.
 - `window` into `testdata/gemma/window/`: a sentence repeated past 512 tokens,
   keeping only the last position of blocks 0, 4 and 15 and the final norm. Its
   only job is to make the sliding window matter — on a short prompt a window
@@ -75,9 +75,23 @@ mkdir -p ../../testdata/gemma/layers ../../testdata/gemma/window
 ./build/dump_layers "$MODEL" ../../testdata/gemma/window  window
 ```
 
+The 12B is recorded the same way, into a directory of its own, and the tests
+that read it want `GOLEM_MODEL_12B` set to the same file:
+
+```bash
+MODEL_12B=/path/to/gemma-4-12B-it-QAT-Q4_0.gguf
+mkdir -p ../../testdata/gemma/layers12
+./build/dump_layers "$MODEL_12B" ../../testdata/gemma/layers12 short
+```
+
 The tool fails if a name it was asked for never appeared in the graph. That is
 deliberate: llama.cpp renames waypoints from time to time, and a silently
-missing fixture is a test that passes without testing anything.
+missing fixture is a test that passes without testing anything. The waypoints
+the two checkpoints disagree about are the exception — the keys and values of a
+block that shares another's cache, and everything per-layer, which the 12B does
+not have — and those are asked for and allowed to be absent. `index.json` names
+the model each recording came from and the per-layer width it found, so a
+fixture cannot be mistaken for the other checkpoint's.
 
 ## dump_tokens — recording a segmentation
 
@@ -118,8 +132,15 @@ renderer covers a text conversation, and a fixture for a path that is not
 implemented would only say that it is not implemented.
 
 ```bash
-python3 dump_chats.py "$MODEL" ../../testdata/gemma/chat/cases.json
+python3 dump_chats.py "$MODEL"     ../../testdata/gemma/chat/cases.json
+python3 dump_chats.py "$MODEL_12B" ../../testdata/gemma/chat12/cases.json
 ```
+
+Two files, because the two checkpoints do not carry the same template: the 12B's
+closes a generation prompt with a thought channel opened and shut at once when
+thinking is off, and E2B's has no such line. The fixture records which of the
+two it came from under `empty_thought`, and the Go renderer is told by the
+fixture rather than by the model's name.
 
 Needs Jinja2 (`pip install jinja2`). Run by hand; the fixture is committed —
 a rendered template is text, not weights.

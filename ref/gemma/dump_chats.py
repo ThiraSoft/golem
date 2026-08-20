@@ -167,8 +167,16 @@ def main():
             "rendered": text,
         })
 
+    # Which of the two spellings of the generation prompt this template uses.
+    # The 12B closes it with an empty thought channel when thinking is off; E2B
+    # does not, and the Go renderer is told which by the fixture rather than by
+    # guessing from the model's name.
+    # The literal as the Jinja spells it: a backslash and an n, not a newline.
+    empty_thought = r"<|channel>thought\n<channel|>" in template_text
+
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump({"bos_token_id": bos_id, "cases": cases}, f,
+        json.dump({"bos_token_id": bos_id, "empty_thought": empty_thought,
+                   "cases": cases}, f,
                   ensure_ascii=False, indent=1)
         f.write("\n")
     print(f"{len(cases)} cases written to {out_path}")

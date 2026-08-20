@@ -64,9 +64,16 @@ func Attention(
 			h := u - bc.Heads
 			from, to := h*bc.HeadDim, (h+1)*bc.HeadDim
 			bw.K.MatVecRows(normed, k, from, to)
-			bw.V.MatVecRows(normed, v, from, to)
+			if !bc.ValueIsKey {
+				bw.V.MatVecRows(normed, v, from, to)
+			}
 			for t := 0; t < batch; t++ {
 				kh, vh := k[t][from:to], v[t][from:to]
+				if bc.ValueIsKey {
+					// One projection for both, copied before the key is
+					// normed and rotated: the value is neither.
+					copy(vh, kh)
+				}
 				nn.RMSNormPlain(kh, bw.KNorm, cfg.Eps)
 				// The value is normalized with no gain of its own, and is not
 				// rotated: position enters through the key alone.

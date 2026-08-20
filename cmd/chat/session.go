@@ -51,6 +51,9 @@ type Session struct {
 	maxTokens  int
 	system     string
 	thinking   bool
+	// emptyThought is the file's own template rule, carried here because the
+	// second turn and the ones after it are appended rather than rendered.
+	emptyThought bool
 
 	pos     int
 	started bool
@@ -72,17 +75,18 @@ type Turn struct {
 	Truncated bool // stopped on a limit rather than on an end-of-turn token
 }
 
-func NewSession(m engine, v vocabulary, p sample.Params, vocabSize, maxContext, maxTokens int, system string, thinking bool) *Session {
+func NewSession(m engine, v vocabulary, p sample.Params, vocabSize, maxContext, maxTokens int, system string, thinking, emptyThought bool) *Session {
 	return &Session{
-		model:      m,
-		vocab:      v,
-		sampler:    sample.New(p),
-		vocabSize:  vocabSize,
-		maxContext: maxContext,
-		maxTokens:  maxTokens,
-		system:     system,
-		thinking:   thinking,
-		logits:     make([]float32, vocabSize),
+		model:        m,
+		vocab:        v,
+		sampler:      sample.New(p),
+		vocabSize:    vocabSize,
+		maxContext:   maxContext,
+		maxTokens:    maxTokens,
+		system:       system,
+		thinking:     thinking,
+		emptyThought: emptyThought,
+		logits:       make([]float32, vocabSize),
 	}
 }
 
@@ -98,10 +102,15 @@ func (s *Session) prompt(text string) (string, error) {
 		messages = append(messages, gemma.Message{Role: "user", Content: text})
 		return gemma.RenderChat(messages, gemma.ChatOptions{
 			EnableThinking:      s.thinking,
+			EmptyThought:        s.emptyThought,
 			AddGenerationPrompt: true,
 		})
 	}
-	return s.pending + "<|turn>user\n" + text + "<turn|>\n<|turn>model\n", nil
+	opener := "<|turn>model\n"
+	if s.emptyThought && !s.thinking {
+		opener += "<|channel>thought\n<channel|>"
+	}
+	return s.pending + "<|turn>user\n" + text + "<turn|>\n" + opener, nil
 }
 
 // Ask feeds one user message and writes the answer to w as it comes.

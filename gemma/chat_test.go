@@ -15,15 +15,18 @@ type chatCase struct {
 	Rendered            string    `json:"rendered"`
 }
 
-func loadChatCases(t *testing.T) []chatCase {
+// The fixture also carries the one rule the two checkpoints spell differently,
+// read from the template it was rendered from.
+func loadChatCases(t *testing.T, dir string) ([]chatCase, bool) {
 	t.Helper()
-	path := filepath.Join(repoRoot(t), "testdata", "gemma", "chat", "cases.json")
+	path := filepath.Join(repoRoot(t), "testdata", "gemma", dir, "cases.json")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("the chat fixture is committed and should be readable: %v", err)
 	}
 	var file struct {
-		Cases []chatCase `json:"cases"`
+		EmptyThought bool       `json:"empty_thought"`
+		Cases        []chatCase `json:"cases"`
 	}
 	if err := json.Unmarshal(raw, &file); err != nil {
 		t.Fatal(err)
@@ -31,25 +34,31 @@ func loadChatCases(t *testing.T) []chatCase {
 	if len(file.Cases) == 0 {
 		t.Fatal("the fixture holds no cases")
 	}
-	return file.Cases
+	return file.Cases, file.EmptyThought
 }
 
 // The whole point: what Jinja made of Gemma's own template, character for
 // character, without a Jinja interpreter.
 func TestRenderChatMatchesTheTemplate(t *testing.T) {
-	for _, c := range loadChatCases(t) {
-		t.Run(c.Name, func(t *testing.T) {
-			got, err := RenderChat(c.Messages, ChatOptions{
-				EnableThinking:      c.EnableThinking,
-				AddGenerationPrompt: c.AddGenerationPrompt,
+	// One fixture per checkpoint, because the two templates are not the same
+	// text: chat came from E2B, chat12 from the 12B.
+	for _, dir := range []string{"chat", "chat12"} {
+		cases, emptyThought := loadChatCases(t, dir)
+		for _, c := range cases {
+			t.Run(dir+"/"+c.Name, func(t *testing.T) {
+				got, err := RenderChat(c.Messages, ChatOptions{
+					EnableThinking:      c.EnableThinking,
+					EmptyThought:        emptyThought,
+					AddGenerationPrompt: c.AddGenerationPrompt,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != c.Rendered {
+					t.Fatalf("rendered\n%q\nwant\n%q", got, c.Rendered)
+				}
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != c.Rendered {
-				t.Fatalf("rendered\n%q\nwant\n%q", got, c.Rendered)
-			}
-		})
+		}
 	}
 }
 
