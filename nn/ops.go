@@ -90,23 +90,15 @@ func ApplyRoPE(vec []float32, position int, maxPeriod float64) {
 }
 
 // SiLU, or "swish": x*sigma(x). This is the activation of the flow net and of
-// the adaptive modulations, where pockettts's transformer uses GELU; it is also
-// the gate of a Qwen feed forward.
-func SiLU(x []float32) { SiLURange(x, 0, len(x)) }
-
-// SiLURange is the same over one stretch, on the caller's thread: the section
-// that computed those values applies it before its barrier.
+// the adaptive modulations, where pockettts's transformer uses GELU.
 //
-// The exponential is float64 and exact where ggml's AVX2 path uses a
-// polynomial good to about one and a half units in the last place. That is a
-// part in ten million on the result, which is two orders below the float32
-// summation order already between this engine and its reference — so the exact
-// one is kept, and the difference is measured rather than assumed: see
-// TestFeedForwardMatchesReference in qwen.
-func SiLURange(x []float32, start, end int) {
-	for i := start; i < end; i++ {
-		v := float64(x[i])
-		x[i] = float32(v / (1 + math.Exp(-v)))
+// The exponential is float64 and exact. A language engine reading a GGUF wants
+// the other one — ggml's polynomial, in SwiGLURange — because there the
+// reference is ggml and the two differ by a couple of units in the last place.
+// Here the reference is PyTorch, and this is left alone.
+func SiLU(x []float32) {
+	for i, v := range x {
+		x[i] = float32(float64(v) / (1 + math.Exp(-float64(v))))
 	}
 }
 
