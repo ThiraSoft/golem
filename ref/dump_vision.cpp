@@ -184,6 +184,12 @@ int main(int argc, char ** argv) {
     cparams.n_threads       = 8;
     cparams.n_threads_batch = 8;
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    // The text model's own waypoints are recorded too, so that a divergence
+    // can be blamed on the tower or on what the tower was spliced into. The
+    // chunks are decoded one after another and each write wins in turn, so
+    // what survives is the last chunk's — the one the answer is drawn from.
+    cparams.cb_eval           = on_node;
+    cparams.cb_eval_user_data = &st;
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (!lctx) die("cannot create the context");
 

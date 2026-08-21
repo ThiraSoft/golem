@@ -239,3 +239,73 @@ func TestVisionEncodeMatchesTheReference(t *testing.T) {
 	}
 	closeRelative(t, "the whole tower", flat, want, 1e-2)
 }
+
+// The whole path: the picture through the tower, the rows into the prompt, the
+// span attended to in both directions, and the same tokens out as llama.cpp
+// drew from the same prompt.
+//
+// This is what says the eight thousandths the tower ends up from the reference
+// are nothing that matters: an argmax either agrees or it does not. The tie
+// rule is TestGreedyGenerationMatchesTheReference's, for the same reason and
+// with the same number — the logits of this engine and of llama.cpp are known
+// to sit a fraction of a logit apart, and a choice decided inside that is not
+// a fault.
+func TestVisionGenerationMatchesTheReference(t *testing.T) {
+	f := loadVisionFixture(t)
+	if os.Getenv("GOLEM_MMPROJ") == "" {
+		t.Skip("set GOLEM_MMPROJ to run this test")
+	}
+	m := openTextModel(t)
+	if err := m.OpenVision(os.Getenv("GOLEM_MMPROJ")); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := m.EncodeImage(testImageBytes(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != f.NImageTokens {
+		t.Fatalf("this engine made %d image tokens, llama.cpp %d", len(rows), f.NImageTokens)
+	}
+
+	// The prompt is the fixture's own text tokens, which keeps this test about
+	// the picture rather than about the template. The recorder wrote the
+	// padding token where the soft tokens went, so what is left after taking
+	// them out is the text, markers included, and BuildPrompt fills the
+	// markers back in.
+	var text []int32
+	text = append(text, f.Tokens[:f.ImageStart]...)
+	text = append(text, f.Tokens[f.ImageStart+f.NImageTokens:]...)
+	p, err := m.BuildPrompt(text, [][][]float32{rows})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Tokens) != len(f.Tokens) {
+		t.Fatalf("the prompt came to %d tokens, llama.cpp's to %d", len(p.Tokens), len(f.Tokens))
+	}
+	for i := range p.Tokens {
+		if p.Embeds[i] == nil && p.Tokens[i] != f.Tokens[i] {
+			t.Fatalf("token %d is %d, llama.cpp's is %d", i, p.Tokens[i], f.Tokens[i])
+		}
+	}
+
+	const tie = 0.5
+	hidden := m.ForwardPrompt(p, 0)
+	last := hidden[len(hidden)-1]
+	logits := make([]float32, m.Cfg.Vocab)
+	pos := len(p.Tokens)
+	for step, want := range f.Greedy {
+		m.Logits(last, logits)
+		got := Argmax(logits)
+		if got != want {
+			if margin := logits[got] - logits[want]; margin > tie {
+				t.Fatalf("step %d: chose %d over the reference's %d by %v, which is past a tie",
+					step, got, want, margin)
+			} else {
+				t.Logf("step %d: chose %d over %d by %v, a tie inside the measured gap",
+					step, got, want, margin)
+			}
+		}
+		last = m.Forward(want, pos)
+		pos++
+	}
+}
