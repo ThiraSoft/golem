@@ -1,0 +1,29 @@
+# The corpus exists to make the branches of the tokenizer differ from one
+# another: escaping, runs of newlines, byte fallback, and the special tokens
+# with and without parse_special.
+empty		1	0
+ascii	The capital of France is	1	0
+french	L'élève a mangé une crêpe à Nîmes.	1	0
+leading_space	\sleading	1	0
+trailing_space	trailing\s	1	0
+double_space	two  spaces	1	0
+only_spaces	\s\s\s	1	0
+newline	one\ntwo	1	0
+newline_run	a\n\n\n\nb	1	0
+newline_only	\n\n	1	0
+tab	a\tb\t\tc	1	0
+crlf	line\r\nline	1	0
+digits	1234567890 and 42 and 3.14159	1	0
+punctuation	Wait... really?! (yes) [no] {maybe} <a>	1	0
+emoji	bravo 🎉🇫🇷 et voilà	1	0
+cjk	日本語のテキストです。	1	0
+mixed_script	Привет, мир — hello 世界	1	0
+code	func main() {\n\tfmt.Println("hi")\n}	1	0
+long_word	Donaudampfschiffahrtselektrizitaetenhauptbetriebswerkbauunterbeamtengesellschaft	1	0
+no_bos	The capital of France is	0	0
+special_literal	before <turn|> after	1	0
+special_parsed	before <turn|> after	1	1
+special_adjacent	<bos><turn|>user\nhello<turn|>	1	1
+special_only	<eos>	1	1
+byte_fallback	\xef\xbf\xbd unlikely \xe2\x80\x8b zero width	1	0
+literal_byte_tok	<0x41> is not an A	1	0

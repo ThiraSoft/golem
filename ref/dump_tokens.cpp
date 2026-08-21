@@ -1,9 +1,21 @@
-// Records what llama.cpp makes of a corpus of sentences, so the Go tokenizer
-// can be checked against it without llama.cpp being present at test time.
+// Records what llama.cpp makes of a corpus of sentences, so a Go tokenizer can
+// be checked against it without llama.cpp being present at test time.
 //
-// Only the vocabulary is loaded — vocab_only skips the 3.2 GB of weights — and
-// each case is written with the flags it was tokenized under, because
+// Only the vocabulary is loaded — vocab_only skips the gigabytes of weights —
+// and each case is written with the flags it was tokenized under, because
 // add_special and parse_special change the answer.
+//
+// The corpus is a file rather than an array in this source, because the cases
+// that matter are the ones a given tokenizer gets wrong, and those differ by
+// model: Gemma's special tokens are not Qwen's, and Gemma has no byte alphabet
+// to get wrong. Four tab-separated columns:
+//
+//   name <TAB> text <TAB> add_special <TAB> parse_special
+//
+// The text column uses \n, \t, \r, \s, \\ and \xNN, because a tab-separated
+// file cannot carry a literal tab, a line cannot carry a literal newline, and
+// a trailing space would not survive being read. A line starting with # is a
+// comment; a blank line is ignored.
 
 #include "llama.h"
 
@@ -13,42 +25,10 @@
 #include <vector>
 
 struct testcase {
-    const char * name;
-    const char * text;
+    std::string name;
+    std::string text;
     bool add_special;
     bool parse_special;
-};
-
-// The corpus exists to make the branches of the tokenizer differ from one
-// another: escaping, runs of newlines, byte fallback, and the special tokens
-// with and without parse_special.
-static const testcase cases[] = {
-    {"empty",             "",                                              true,  false},
-    {"ascii",             "The capital of France is",                      true,  false},
-    {"french",            "L'élève a mangé une crêpe à Nîmes.",            true,  false},
-    {"leading_space",     " leading",                                      true,  false},
-    {"trailing_space",    "trailing ",                                     true,  false},
-    {"double_space",      "two  spaces",                                   true,  false},
-    {"only_spaces",       "   ",                                           true,  false},
-    {"newline",           "one\ntwo",                                      true,  false},
-    {"newline_run",       "a\n\n\n\nb",                                    true,  false},
-    {"newline_only",      "\n\n",                                          true,  false},
-    {"tab",               "a\tb\t\tc",                                     true,  false},
-    {"crlf",              "line\r\nline",                                  true,  false},
-    {"digits",            "1234567890 and 42 and 3.14159",                 true,  false},
-    {"punctuation",       "Wait... really?! (yes) [no] {maybe} <a>",       true,  false},
-    {"emoji",             "bravo 🎉🇫🇷 et voilà",                          true,  false},
-    {"cjk",               "日本語のテキストです。",                          true,  false},
-    {"mixed_script",      "Привет, мир — hello 世界",                       true,  false},
-    {"code",              "func main() {\n\tfmt.Println(\"hi\")\n}",       true,  false},
-    {"long_word",         "Donaudampfschiffahrtselektrizitaetenhauptbetriebswerkbauunterbeamtengesellschaft", true, false},
-    {"no_bos",            "The capital of France is",                      false, false},
-    {"special_literal",   "before <turn|> after",                          true,  false},
-    {"special_parsed",    "before <turn|> after",                          true,  true},
-    {"special_adjacent",  "<bos><turn|>user\nhello<turn|>",                true,  true},
-    {"special_only",      "<eos>",                                         true,  true},
-    {"byte_fallback",     "\xef\xbf\xbd unlikely \xe2\x80\x8b zero width",  true,  false},
-    {"literal_byte_tok",  "<0x41> is not an A",                            true,  false},
 };
 
 static void die(const char * what) {
@@ -79,13 +59,70 @@ static std::string escape(const std::string & s) {
     return out + "\"";
 }
 
+// The corpus file's escapes. Distinct from JSON's: this one has to survive a
+// tab-separated line, so a tab and a newline cannot be written literally, and
+// a significant trailing space has to be written \s.
+static std::string unescape(const std::string & s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] != '\\' || i + 1 == s.size()) { out += s[i]; continue; }
+        switch (s[++i]) {
+            case 'n':    out += '\n'; break;
+            case 't':    out += '\t'; break;
+            case 'r':    out += '\r'; break;
+            case 's':    out += ' ';  break;
+            case '\\': out += '\\'; break;
+            case 'x': {
+                if (i + 2 >= s.size()) die("truncated \\x escape in the corpus");
+                out += (char) strtol(s.substr(i + 1, 2).c_str(), nullptr, 16);
+                i += 2;
+                break;
+            }
+            default: die("unknown escape in the corpus");
+        }
+    }
+    return out;
+}
+
+static std::vector<testcase> read_corpus(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "r");
+    if (!f) die(("cannot read " + path).c_str());
+
+    std::vector<testcase> cases;
+    char line[8192];
+    while (fgets(line, sizeof(line), f)) {
+        std::string s(line);
+        // Only the line ending goes: a trailing tab separates an empty column
+        // from a present one, and a trailing space is written \s anyway.
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        if (s.empty() || s[0] == '#') continue;
+
+        std::vector<std::string> col;
+        size_t start = 0;
+        for (size_t i = 0; i <= s.size(); ++i) {
+            if (i == s.size() || s[i] == '\t') {
+                col.push_back(s.substr(start, i - start));
+                start = i + 1;
+            }
+        }
+        if (col.size() != 4) {
+            die(("a corpus line has " + std::to_string(col.size()) + " columns, not 4").c_str());
+        }
+        cases.push_back({col[0], unescape(col[1]), col[2] == "1", col[3] == "1"});
+    }
+    fclose(f);
+    if (cases.empty()) die("the corpus is empty");
+    return cases;
+}
+
 int main(int argc, char ** argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: dump_tokens <model.gguf> <out-dir>\n");
+    if (argc != 4) {
+        fprintf(stderr, "usage: dump_tokens <model.gguf> <out-dir> <corpus.tsv>\n");
         return 1;
     }
     const std::string model_path = argv[1];
     const std::string out_dir    = argv[2];
+    const std::vector<testcase> cases = read_corpus(argv[3]);
 
     llama_backend_init();
 
@@ -101,7 +138,7 @@ int main(int argc, char ** argv) {
     if (!f) die("cannot write cases.json");
 
     fprintf(f, "{\n  \"cases\": [\n");
-    const int n_cases = (int) (sizeof(cases) / sizeof(cases[0]));
+    const int n_cases = (int) cases.size();
     for (int i = 0; i < n_cases; i++) {
         const testcase & c = cases[i];
         const std::string text = c.text;
