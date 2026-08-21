@@ -18,19 +18,15 @@ package main
 import (
 	"fmt"
 	"time"
-
-	"github.com/ThiraSoft/golem/gemma"
 )
 
-// Engine is the part of gemma.Model the server uses.
+// Engine is the part of a model the server drives. engine.Open supplies
+// whatever satisfies it, whichever architecture the file declared.
 type Engine interface {
 	ForwardBatch(tokens []int32, startPos int) [][]float32
 	Logits(hidden, out []float32)
 	Reset()
 }
-
-// The model is the engine this server was written for.
-var _ Engine = (*gemma.Model)(nil)
 
 // Vocabulary is the part of bpe.Vocab the server uses.
 type Vocabulary interface {

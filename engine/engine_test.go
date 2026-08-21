@@ -56,8 +56,19 @@ func TestOpenReadsARealModel(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if ids := m.Vocab.Encode(text, false, true); len(ids) == 0 {
+			ids := m.Vocab.Encode(text, false, true)
+			if len(ids) == 0 {
 				t.Fatal("the rendered prompt encoded to nothing")
+			}
+			// Each engine's vocabulary is its own — SentencePiece for one,
+			// byte-level BPE for the other — and loading the wrong one still
+			// encodes something. What it does not do is give the text back.
+			var back strings.Builder
+			for _, id := range ids {
+				back.WriteString(m.Vocab.Piece(id, true))
+			}
+			if back.String() != text {
+				t.Fatalf("the prompt came back as\n%q\nfrom\n%q", back.String(), text)
 			}
 		})
 	}

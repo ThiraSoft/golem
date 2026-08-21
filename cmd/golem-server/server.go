@@ -15,22 +15,22 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ThiraSoft/golem/gemma"
+	"github.com/ThiraSoft/golem/chat"
 	"github.com/ThiraSoft/golem/sample"
 )
 
 type Server struct {
-	mu           sync.Mutex
-	gen          *Generator
-	vocab        Vocabulary
-	name         string
-	emptyThought bool
-	defaults     sample.Params
-	served       int
+	mu       sync.Mutex
+	gen      *Generator
+	vocab    Vocabulary
+	name     string
+	tpl      chat.Template
+	defaults sample.Params
+	served   int
 }
 
-func NewServer(g *Generator, v Vocabulary, name string, emptyThought bool, defaults sample.Params) *Server {
-	return &Server{gen: g, vocab: v, name: name, emptyThought: emptyThought, defaults: defaults}
+func NewServer(g *Generator, v Vocabulary, name string, tpl chat.Template, defaults sample.Params) *Server {
+	return &Server{gen: g, vocab: v, name: name, tpl: tpl, defaults: defaults}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -64,9 +64,8 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prompt, err := gemma.RenderChat(req.Messages, gemma.ChatOptions{
+	prompt, err := s.tpl.Render(req.Messages, chat.Options{
 		Tools:               req.Tools,
-		EmptyThought:        s.emptyThought,
 		AddGenerationPrompt: true,
 	})
 	if err != nil {

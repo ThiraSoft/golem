@@ -16,7 +16,18 @@ import (
 	"github.com/ThiraSoft/golem/sample"
 	"github.com/ThiraSoft/golem/tensors"
 	"github.com/ThiraSoft/golem/token/bpe"
+	"github.com/ThiraSoft/golem/token/bytebpe"
 )
+
+// Vocabulary is the part of a tokenizer a conversation drives. The two
+// implementations are not interchangeable and are not chosen by hand: Gemma's
+// vocabulary is SentencePiece, Qwen's is byte-level BPE with the qwen2
+// pre-tokenizer, and each engine loads its own.
+type Vocabulary interface {
+	Encode(text string, addBOS, parseSpecial bool) []int32
+	Piece(id int32, special bool) string
+	IsEOG(id int32) bool
+}
 
 // Forward is the part of an engine a conversation drives.
 type Forward interface {
@@ -28,7 +39,7 @@ type Forward interface {
 // Model is one opened checkpoint, as a command sees it.
 type Model struct {
 	Forward  Forward
-	Vocab    *bpe.Vocab
+	Vocab    Vocabulary
 	Template chat.Template
 	// Name is the architecture the file declares.
 	Name string
@@ -75,18 +86,15 @@ func Open(path string, maxContext int) (*Model, error) {
 		return nil, err
 	}
 	m.Name = arch
-	// The vocabulary is read from the same file, and the model owns it now, so
-	// a failure here closes through the model rather than through the file.
-	m.Vocab, err = bpe.Load(g)
-	if err != nil {
-		m.Close()
-		return nil, err
-	}
 	return m, nil
 }
 
 func openGemma(g *tensors.GGUF, maxContext int) (*Model, error) {
 	inner, err := gemma.New(g, maxContext)
+	if err != nil {
+		return nil, err
+	}
+	vocab, err := bpe.Load(g)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +106,7 @@ func openGemma(g *tensors.GGUF, maxContext int) (*Model, error) {
 		}
 	}
 	return &Model{
-		Forward: inner, Template: gemma.NewTemplate(inner.Cfg),
+		Forward: inner, Vocab: vocab, Template: gemma.NewTemplate(inner.Cfg),
 		Window: window, Vocabulary: inner.Cfg.Vocab,
 		Blocks: len(inner.Cfg.Blocks), Sampling: inner.Cfg.Sampling,
 		closer: inner,
@@ -110,10 +118,14 @@ func openQwen(g *tensors.GGUF, maxContext int) (*Model, error) {
 	if err != nil {
 		return nil, err
 	}
+	vocab, err := bytebpe.Load(g)
+	if err != nil {
+		return nil, err
+	}
 	// Every Qwen3 block attends to the whole context: there is no window to
 	// respect, and a rewind costs nothing.
 	return &Model{
-		Forward: inner, Template: qwen.NewTemplate(inner.Cfg),
+		Forward: inner, Vocab: vocab, Template: qwen.NewTemplate(inner.Cfg),
 		Window: 0, Vocabulary: inner.Cfg.Vocab,
 		Blocks: len(inner.Cfg.Blocks), Sampling: inner.Cfg.Sampling,
 		closer: inner,

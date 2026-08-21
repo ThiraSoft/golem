@@ -64,7 +64,7 @@ func TestStreamSendsProseThenAFinishReasonThenDone(t *testing.T) {
 }
 
 func TestStreamSendsACallInOnePiece(t *testing.T) {
-	s := newTestServer([]string{"Looking.", `<|tool_call>call:weather{city:<|"|>Lyon<|"|>}`, "<tool_call|>", "<turn|>"})
+	s := newTestServer([]string{"Looking.", "CALL", "weather{city=Lyon}", "<turn|>"})
 	w := post(t, s, `{"messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	f := frames(t, w.Body.String())
 
@@ -109,7 +109,7 @@ func TestStreamSendsACallInOnePiece(t *testing.T) {
 	if callFrames != 1 {
 		t.Fatalf("%d frames carried the call, want exactly one", callFrames)
 	}
-	if strings.Contains(prose.String(), "tool_call") {
+	if strings.Contains(prose.String(), "CALL") {
 		t.Fatalf("the call leaked into the prose: %q", prose.String())
 	}
 	if prose.String() != "Looking." {

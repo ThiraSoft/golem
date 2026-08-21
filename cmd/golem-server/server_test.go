@@ -10,7 +10,7 @@ import (
 
 func newTestServer(script []string) *Server {
 	g, v := newGenerator(script, 64)
-	return NewServer(g, v, "test-model", false, greedy())
+	return NewServer(g, v, "test-model", wordTemplate{}, greedy())
 }
 
 func post(t *testing.T, s *Server, body string) *httptest.ResponseRecorder {
@@ -119,7 +119,7 @@ func promptTokens(t *testing.T, w *httptest.ResponseRecorder) int {
 }
 
 func TestCompletionReportsAToolCall(t *testing.T) {
-	s := newTestServer([]string{`<|tool_call>call:weather{city:<|"|>Lyon<|"|>}<tool_call|>`, "<turn|>"})
+	s := newTestServer([]string{"CALLweather{city=Lyon}", "<turn|>"})
 	w := post(t, s, `{"model":"test-model","messages":[{"role":"user","content":"weather?"}],
 		"tools":[{"type":"function","function":{"name":"weather","description":"w",
 		"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}`)

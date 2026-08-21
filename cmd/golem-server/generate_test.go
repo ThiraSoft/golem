@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ThiraSoft/golem/chat"
 	"github.com/ThiraSoft/golem/sample"
 )
 
@@ -76,7 +77,7 @@ func newGenerator(script []string, maxTokens int) (*Generator, *wordVocab) {
 	}
 	v.id("<turn|>")
 	ctx := NewContext(e, 0, 4096, time.Now, 0)
-	return NewGenerator(ctx, v, 4096, maxTokens), v
+	return NewGenerator(ctx, v, wordTemplate{}, 4096, maxTokens), v
 }
 
 func greedy() sample.Params { return sample.Params{Temperature: 0} }
@@ -98,7 +99,7 @@ func TestGenerateStreamsProse(t *testing.T) {
 }
 
 func TestGenerateWithholdsAPartialCall(t *testing.T) {
-	script := []string{"Looking.", `<|tool_call>call:weather{city:<|"|>Lyon<|"|>}`, "<tool_call|>", "<turn|>"}
+	script := []string{"Looking.", "CALL", "weather{city=Lyon}", "<turn|>"}
 	g, v := newGenerator(script, 32)
 	var seen []string
 	answer, err := g.Generate(context.Background(), v.Encode("a", false, true), greedy(), nil,
@@ -129,7 +130,7 @@ func TestGenerateWithholdsAPartialCall(t *testing.T) {
 // Identifiers are not reused between answers: a client holding two calls has
 // two names for them.
 func TestCallIdentifiersDoNotRepeat(t *testing.T) {
-	call := `<|tool_call>call:now{}<tool_call|>`
+	call := "CALLnow{}"
 	g, v := newGenerator([]string{call, "<turn|>", call, "<turn|>"}, 32)
 	first, err := g.Generate(context.Background(), v.Encode("a", false, true), greedy(), nil, nil)
 	if err != nil {
@@ -190,4 +191,70 @@ func TestGenerateStopsWhenTheClientHangsUp(t *testing.T) {
 	if drawn > 5 {
 		t.Fatalf("%d pieces drawn after the client left", drawn)
 	}
+}
+
+// A template of whole words, so that the server's tests say nothing about
+// which engine answered. Prose stops at CALL; what follows is a function's
+// name and, between braces, its arguments: CALLweather{city=Lyon}.
+type wordTemplate struct{}
+
+func (wordTemplate) Render(msgs []chat.Message, opt chat.Options) (string, error) {
+	// Both real templates refuse these, so the fake has to as well: otherwise
+	// the tests that check the server refuses them pass for the wrong reason.
+	if len(msgs) == 0 {
+		return "", errors.New("an empty conversation")
+	}
+	for i, m := range msgs {
+		if m.Role != "tool" {
+			continue
+		}
+		if i == 0 || (msgs[i-1].Role != "tool" && len(msgs[i-1].ToolCalls) == 0) {
+			return "", errors.New("a tool result answering no call")
+		}
+	}
+	var b strings.Builder
+	for _, m := range msgs {
+		b.WriteString(m.Role + " " + m.Content + " ")
+	}
+	for _, tool := range opt.Tools {
+		b.WriteString("tool " + tool.Name + " ")
+	}
+	return b.String(), nil
+}
+
+func (wordTemplate) CallOpen() string { return "CALL" }
+
+func (wordTemplate) ParseCalls(text string) (string, []chat.ToolCall, error) {
+	at := strings.Index(text, "CALL")
+	if at < 0 {
+		return text, nil, nil
+	}
+	before, rest := text[:at], text[at:]
+	var calls []chat.ToolCall
+	for _, piece := range strings.Split(rest, "CALL")[1:] {
+		name, args, found := strings.Cut(piece, "{")
+		if name == "" {
+			return before, nil, errors.New("a call with no function name")
+		}
+		call := chat.ToolCall{Name: name}
+		if found {
+			body, closed := strings.CutSuffix(args, "}")
+			if !closed {
+				return before, nil, errors.New("a call that never closes")
+			}
+			call.Arguments = map[string]any{}
+			for _, pair := range strings.Split(body, ",") {
+				if pair == "" {
+					continue
+				}
+				key, value, ok := strings.Cut(pair, "=")
+				if !ok {
+					return before, nil, errors.New("an argument that is not a pair")
+				}
+				call.Arguments[key] = value
+			}
+		}
+		calls = append(calls, call)
+	}
+	return before, calls, nil
 }

@@ -5,23 +5,23 @@ package main
 import (
 	"encoding/json"
 
-	"github.com/ThiraSoft/golem/gemma"
+	"github.com/ThiraSoft/golem/chat"
 )
 
 type completionRequest struct {
-	Model       string          `json:"model"`
-	Messages    []gemma.Message `json:"messages"`
-	Tools       []gemma.Tool    `json:"tools"`
-	ToolChoice  any             `json:"tool_choice"`
-	Stream      bool            `json:"stream"`
-	Temperature *float64        `json:"temperature"`
-	TopP        *float64        `json:"top_p"`
-	TopK        *int            `json:"top_k"`
-	MaxTokens   *int            `json:"max_tokens"`
-	Seed        *uint64         `json:"seed"`
-	Stop        stopStrings     `json:"stop"`
-	N           *int            `json:"n"`
-	LogProbs    *bool           `json:"logprobs"`
+	Model       string         `json:"model"`
+	Messages    []chat.Message `json:"messages"`
+	Tools       []chat.Tool    `json:"tools"`
+	ToolChoice  any            `json:"tool_choice"`
+	Stream      bool           `json:"stream"`
+	Temperature *float64       `json:"temperature"`
+	TopP        *float64       `json:"top_p"`
+	TopK        *int           `json:"top_k"`
+	MaxTokens   *int           `json:"max_tokens"`
+	Seed        *uint64        `json:"seed"`
+	Stop        stopStrings    `json:"stop"`
+	N           *int           `json:"n"`
+	LogProbs    *bool          `json:"logprobs"`
 }
 
 // stopStrings reads the two spellings the API allows: one string, or a list.
@@ -45,9 +45,9 @@ func (s *stopStrings) UnmarshalJSON(raw []byte) error {
 }
 
 type responseMessage struct {
-	Role      string           `json:"role,omitempty"`
-	Content   string           `json:"content"`
-	ToolCalls []gemma.ToolCall `json:"tool_calls,omitempty"`
+	Role      string          `json:"role,omitempty"`
+	Content   string          `json:"content"`
+	ToolCalls []chat.ToolCall `json:"tool_calls,omitempty"`
 }
 
 type choice struct {

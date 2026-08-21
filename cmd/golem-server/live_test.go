@@ -8,37 +8,38 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ThiraSoft/golem/gemma"
-	"github.com/ThiraSoft/golem/token/bpe"
+	"github.com/ThiraSoft/golem/chat"
+	"github.com/ThiraSoft/golem/engine"
 )
 
-// The one test with weights: a conversation declaring a tool, whose answer is a
-// call this server can read. Skipped when the file is not on the machine.
+// The tests with weights: a conversation declaring a tool, whose answer is a
+// call this server can read. One per architecture, because a template that
+// renders is not yet a template a model answers, and each skips when its file
+// is not on the machine.
 func TestLiveToolCall(t *testing.T) {
-	path := os.Getenv("GOLEM_MODEL")
-	if path == "" {
-		t.Skip("GOLEM_MODEL is not set")
+	for _, key := range []string{"GOLEM_MODEL", "GOLEM_MODEL_QWEN"} {
+		t.Run(key, func(t *testing.T) {
+			path := os.Getenv(key)
+			if path == "" {
+				t.Skipf("%s is not set", key)
+			}
+			liveToolCall(t, path)
+		})
 	}
-	m, err := gemma.Open(path, 2048)
+}
+
+func liveToolCall(t *testing.T, path string) {
+	t.Helper()
+	m, err := engine.Open(path, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	vocab, err := bpe.Load(m.File())
-	if err != nil {
-		t.Fatal(err)
-	}
-	window := 0
-	for _, b := range m.Cfg.Blocks {
-		if b.Window && b.WindowSize > window {
-			window = b.WindowSize
-		}
-	}
-	params := m.Cfg.Sampling
+	params := m.Sampling
 	params.Temperature = 0
-	ctx := NewContext(m, window, 2048, time.Now, 0)
-	server := NewServer(NewGenerator(ctx, vocab, m.Cfg.Vocab, 128), vocab,
-		"live", m.Cfg.EmptyThought, params)
+	ctx := NewContext(m.Forward, m.Window, 2048, time.Now, 0)
+	server := NewServer(NewGenerator(ctx, m.Vocab, m.Template, m.Vocabulary, 128),
+		m.Vocab, "live", m.Template, params)
 
 	body := `{"messages":[{"role":"user","content":"What is the weather in Lyon right now?"}],
 		"tools":[{"type":"function","function":{"name":"get_weather",
@@ -55,8 +56,8 @@ func TestLiveToolCall(t *testing.T) {
 	var out struct {
 		Choices []struct {
 			Message struct {
-				Content   string           `json:"content"`
-				ToolCalls []gemma.ToolCall `json:"tool_calls"`
+				Content   string          `json:"content"`
+				ToolCalls []chat.ToolCall `json:"tool_calls"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`

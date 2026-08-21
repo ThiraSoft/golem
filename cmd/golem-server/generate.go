@@ -3,7 +3,7 @@ package main
 // Drawing one answer.
 //
 // Prose reaches the client as it is drawn. A tool call does not: as soon as
-// <|tool_call> appears the output is held back, and the call leaves in one
+// a call opens the output is held back, and the call leaves in one
 // piece once it has closed. A client that received half a call would hold half
 // a function's arguments with no way to know it.
 
@@ -14,16 +14,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ThiraSoft/golem/gemma"
+	"github.com/ThiraSoft/golem/chat"
 	"github.com/ThiraSoft/golem/sample"
 )
-
-// callOpen is where prose stops and a call begins.
-const callOpen = "<|tool_call>"
 
 type Generator struct {
 	ctx       *Context
 	vocab     Vocabulary
+	tpl       chat.Template
 	logits    []float32
 	maxTokens int
 	calls     *int // how many calls this server has handed out, for identifiers
@@ -32,7 +30,7 @@ type Generator struct {
 // Answer is one answer and what it cost.
 type Answer struct {
 	Text      string
-	ToolCalls []gemma.ToolCall
+	ToolCalls []chat.ToolCall
 	Prompt    int // positions actually fed, which the cache's prefix makes small
 	Generated int
 	Prefill   time.Duration // reading the prompt
@@ -40,9 +38,9 @@ type Answer struct {
 	Reason    string        // "stop", "length" or "tool_calls"
 }
 
-func NewGenerator(ctx *Context, v Vocabulary, vocabSize, maxTokens int) *Generator {
+func NewGenerator(ctx *Context, v Vocabulary, tpl chat.Template, vocabSize, maxTokens int) *Generator {
 	calls := 0
-	return &Generator{ctx: ctx, vocab: v, logits: make([]float32, vocabSize),
+	return &Generator{ctx: ctx, vocab: v, tpl: tpl, logits: make([]float32, vocabSize),
 		maxTokens: maxTokens, calls: &calls}
 }
 
@@ -98,7 +96,7 @@ func (g *Generator) Generate(ctx context.Context, ids []int32, p sample.Params, 
 		// held, and what it holds leaves as a call rather than as text.
 		if !inCall {
 			text := drawn.String()[sent:]
-			if at := strings.Index(text, callOpen); at >= 0 {
+			if at := strings.Index(text, g.tpl.CallOpen()); at >= 0 {
 				text, inCall = text[:at], true
 			}
 			if text != "" && emit != nil {
@@ -119,7 +117,7 @@ func (g *Generator) Generate(ctx context.Context, ids []int32, p sample.Params, 
 
 // finish splits what was drawn into prose and calls, and names the calls.
 func (g *Generator) finish(answer Answer, drawn string) (Answer, error) {
-	before, calls, err := gemma.ParseToolCalls(drawn)
+	before, calls, err := g.tpl.ParseCalls(drawn)
 	if err != nil {
 		return answer, fmt.Errorf("the model wrote a call this server cannot read: %w", err)
 	}
