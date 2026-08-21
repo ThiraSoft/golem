@@ -1,10 +1,10 @@
-# serve
+# golem-server
 
 An OpenAI-compatible API over a Gemma 4 GGUF, on the CPU.
 
 ```bash
-go build -o serve ./cmd/serve
-./serve -model gemma-4-E2B-it-QAT-Q4_0.gguf -addr 127.0.0.1:8080
+go build ./cmd/golem-server
+./golem-server -model gemma-4-E2B-it-QAT-Q4_0.gguf -addr 127.0.0.1:8080
 ```
 
 Two endpoints:

@@ -9,7 +9,7 @@ import (
 )
 
 // modelPath is where the tests look for the weights: GOLEM_MODEL, the same
-// variable cmd/chat reads. A machine without the file skips, exactly as the
+// variable cmd/golem-cli reads. A machine without the file skips, exactly as the
 // pocket-tts tests do — the weights are three gigabytes and belong to whoever
 // published them, not to this repository.
 func modelPath(tb testing.TB) string {

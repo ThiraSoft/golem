@@ -17,20 +17,6 @@ import (
 	"strings"
 )
 
-// Message is one turn of the conversation. Role is "system", "developer",
-// "user", "assistant", "model" or "tool"; the template renames "assistant" to
-// "model" and treats "developer" as "system".
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-	// Name is the function a tool result came from.
-	Name string `json:"name,omitempty"`
-	// ToolCalls are the calls a model turn made.
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
-	// ToolCallID ties a tool result to the call it answers.
-	ToolCallID string `json:"tool_call_id,omitempty"`
-}
-
 type ChatOptions struct {
 	// EnableThinking opens a system turn carrying <|think|>, even when the
 	// conversation has no system message.

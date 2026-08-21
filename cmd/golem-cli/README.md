@@ -1,11 +1,11 @@
-# chat
+# golem-cli
 
 A conversation with Gemma 4, from a GGUF, on the CPU.
 
 ```bash
-go build -o chat ./cmd/chat
-./chat -model gemma-4-E2B-it-QAT-Q4_0.gguf
-./chat -model … -p "Explain what a mutex is, in one sentence." -temp 0 -stats
+go build ./cmd/golem-cli
+./golem-cli -model gemma-4-E2B-it-QAT-Q4_0.gguf
+./golem-cli -model … -p "Explain what a mutex is, in one sentence." -temp 0 -stats
 ```
 
 `-p` answers once and exits. Without it, turns are read from the terminal until

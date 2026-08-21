@@ -1,7 +1,7 @@
 # Built binaries
 /pocket-tts
-/golem
-/chat
+/golem-cli
+/golem-server
 *.test
 
 # Voice states. None ship with the repository: they belong to whoever published

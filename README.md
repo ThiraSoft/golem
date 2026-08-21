@@ -39,8 +39,8 @@ use it.
 
 | | what it does |
 |---|---|
-| [`cmd/chat`](cmd/chat/) | a conversation with Gemma, streamed to the terminal |
-| [`cmd/serve`](cmd/serve/) | an OpenAI-compatible API over the same weights, tool calls included |
+| [`cmd/golem-cli`](cmd/golem-cli/) | a conversation with the model, streamed to the terminal |
+| [`cmd/golem-server`](cmd/golem-server/) | an OpenAI-compatible API over the same weights, tool calls included |
 | `cmd/pocket-tts` | text in, a WAV file out |
 
 Both language commands are wired to `gemma/` alone for now. `qwen/` runs from
@@ -48,8 +48,8 @@ its own tests and its own API; giving the commands an architecture switch, and
 Qwen a chat template, is the work that comes next.
 
 ```bash
-go build ./cmd/chat
-GOLEM_MODEL=gemma-4-E2B-it-QAT-Q4_0.gguf ./chat
+go build ./cmd/golem-cli
+GOLEM_MODEL=gemma-4-E2B-it-QAT-Q4_0.gguf ./golem-cli
 ```
 
 ## The method

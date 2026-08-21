@@ -1,4 +1,4 @@
-package gemma
+package chat
 
 // The tool vocabulary of the chat template, and the JSON the OpenAI API
 // spells it with.
@@ -49,10 +49,10 @@ func (t *Tool) UnmarshalJSON(raw []byte) error {
 		return err
 	}
 	if w.Type != "" && w.Type != "function" {
-		return fmt.Errorf("gemma: tool type %q is not implemented; only functions are", w.Type)
+		return fmt.Errorf("chat: tool type %q is not implemented; only functions are", w.Type)
 	}
 	if w.Function.Name == "" {
-		return fmt.Errorf("gemma: a tool with no function name")
+		return fmt.Errorf("chat: a tool with no function name")
 	}
 	*t = Tool{
 		Name:        w.Function.Name,
@@ -100,7 +100,7 @@ func (c *ToolCall) UnmarshalJSON(raw []byte) error {
 		return err
 	}
 	if w.Type != "" && w.Type != "function" {
-		return fmt.Errorf("gemma: tool call type %q is not implemented", w.Type)
+		return fmt.Errorf("chat: tool call type %q is not implemented", w.Type)
 	}
 	args, err := decodeArguments(w.Function.Arguments)
 	if err != nil {
@@ -131,7 +131,7 @@ func decodeArguments(raw json.RawMessage) (map[string]any, error) {
 	}
 	var args map[string]any
 	if err := json.Unmarshal(raw, &args); err != nil {
-		return nil, fmt.Errorf("gemma: tool call arguments are not a JSON object: %w", err)
+		return nil, fmt.Errorf("chat: tool call arguments are not a JSON object: %w", err)
 	}
 	return args, nil
 }

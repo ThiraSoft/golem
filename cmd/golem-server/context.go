@@ -40,7 +40,7 @@ type Vocabulary interface {
 }
 
 // promptBatch is how many positions go through the model together. Thirty-two
-// is what cmd/chat measured: the gain is flat by sixteen, and past sixty-four
+// is what cmd/golem-cli measured: the gain is flat by sixteen, and past sixty-four
 // the activations stop fitting in the caches.
 const promptBatch = 32
 
