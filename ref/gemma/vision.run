@@ -18,6 +18,9 @@ global projected
 # tensors, which E2B's does not.
 global_opt std_scaled
 
+require layer_inp_normed
+require Qcur
+require Qcur_norm_per_head
 require Qcur_pos
 require Kcur_pos
 require Vcur_normed

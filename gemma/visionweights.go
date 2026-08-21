@@ -22,12 +22,48 @@ import (
 // Clamp is one Gemma4ClippableLinear's two ranges.
 type Clamp struct{ InMin, InMax, OutMin, OutMax float32 }
 
+// VisionLinear is a projection that was quantization-aware trained: the input
+// is held inside the range the weight was fitted for, and so is the output.
+//
+// Every product in this tower is one of these. clip.cpp says so by overriding
+// build_mm for gemma4v, which is the function build_vit calls for the query,
+// the key, the value, the output projection and all three of the feed
+// forward's — not only for the final projection, which is what the four
+// scalars next to each weight in the file already suggested.
+type VisionLinear struct {
+	nn.Linear
+	Clamp Clamp
+}
+
+// Apply computes y = clamp(W * clamp(x)). tmp holds the clamped input and must
+// be as wide as one; the caller owns it so that a per-patch loop allocates
+// nothing.
+func (l VisionLinear) Apply(x, tmp, y []float32) {
+	for i, v := range x {
+		tmp[i] = clampF32(v, l.Clamp.InMin, l.Clamp.InMax)
+	}
+	l.ApplyRows(tmp, y, 1, 0, l.Outputs)
+	for i, v := range y {
+		y[i] = clampF32(v, l.Clamp.OutMin, l.Clamp.OutMax)
+	}
+}
+
+func clampF32(v, lo, hi float32) float32 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
 type VisionBlockWeights struct {
 	LN1, LN2                  []float32
 	QNorm, KNorm              []float32
-	Q, K, V, O                nn.Linear
+	Q, K, V, O                VisionLinear
 	PostAttnNorm, PostFFNNorm []float32
-	Gate, Up, Down            nn.Linear
+	Gate, Up, Down            VisionLinear
 }
 
 type VisionWeights struct {
@@ -35,8 +71,7 @@ type VisionWeights struct {
 	PosX, PosY []float32
 	Positions  int
 	Blocks     []VisionBlockWeights
-	Proj       nn.Linear
-	ProjClamp  Clamp
+	Proj       VisionLinear
 	StdBias    []float32
 	StdScale   []float32
 }
@@ -44,18 +79,21 @@ type VisionWeights struct {
 // linear binds a BF16 matrix as a projection with no bias. GGUF writes the row
 // length first, so Shape[0] counts inputs and Shape[1] outputs — the same
 // convention gemma/weights.go reads.
-func linear(g *tensors.GGUF, name string) (nn.Linear, error) {
+func linear(g *tensors.GGUF, name string) (VisionLinear, error) {
 	t, ok := g.Tensors[name]
 	if !ok {
-		return nn.Linear{}, fmt.Errorf("tensor %q is absent", name)
+		return VisionLinear{}, fmt.Errorf("tensor %q is absent", name)
 	}
 	if t.DType != "BF16" {
-		return nn.Linear{}, fmt.Errorf("tensor %q is %s; the projector is expected to be BF16", name, t.DType)
+		return VisionLinear{}, fmt.Errorf("tensor %q is %s; the projector is expected to be BF16", name, t.DType)
 	}
 	if len(t.Shape) != 2 {
-		return nn.Linear{}, fmt.Errorf("tensor %q has %d dimensions", name, len(t.Shape))
+		return VisionLinear{}, fmt.Errorf("tensor %q has %d dimensions", name, len(t.Shape))
 	}
-	return nn.Linear{Weights: t.Raw, Inputs: t.Shape[0], Outputs: t.Shape[1]}, nil
+	return VisionLinear{
+		Linear: nn.Linear{Weights: t.Raw, Inputs: t.Shape[0], Outputs: t.Shape[1]},
+		Clamp:  clampOf(g, name),
+	}, nil
 }
 
 // scalar reads one of the QAT range tensors, which are one-element F32. A
@@ -124,7 +162,7 @@ func LoadVisionWeights(g *tensors.GGUF, cfg *VisionConfig) (*VisionWeights, erro
 		}
 		for _, f := range []struct {
 			name string
-			dst  *nn.Linear
+			dst  *VisionLinear
 		}{
 			{p + "attn_q.weight", &b.Q},
 			{p + "attn_k.weight", &b.K},
@@ -158,7 +196,6 @@ func LoadVisionWeights(g *tensors.GGUF, cfg *VisionConfig) (*VisionWeights, erro
 		return nil, fmt.Errorf("the projection is %dx%d, expected %dx%d",
 			w.Proj.Outputs, w.Proj.Inputs, cfg.ProjDim, cfg.Dim)
 	}
-	w.ProjClamp = clampOf(g, "mm.input_projection.weight")
 
 	// Optional, and llama.cpp treats them as a pair: both or neither. E2B's
 	// projector carries neither, and the standardisation is then not a step.

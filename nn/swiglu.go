@@ -80,3 +80,17 @@ func SwiGLURange(gate, up []float32, start, end int) {
 		gate[i] = g / (1 + expf(-g)) * up[i]
 	}
 }
+
+// GEGLUQuickRange writes gelu_quick(gate) * up into gate, over one stretch, on
+// the caller's thread.
+//
+// The quick GELU is the sigmoid approximation, x/(1+exp(-1.702x)), and ggml
+// computes it exactly that way rather than through a table — so this does too.
+// A vision tower that declares neither use_gelu nor use_silu gets this one,
+// which is how Gemma 4's ends up with it.
+func GEGLUQuickRange(gate, up []float32, start, end int) {
+	for i := start; i < end; i++ {
+		g := gate[i]
+		gate[i] = g / (1 + expf(-1.702*g)) * up[i]
+	}
+}

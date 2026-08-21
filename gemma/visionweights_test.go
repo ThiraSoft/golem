@@ -27,8 +27,8 @@ func TestLoadVisionWeights(t *testing.T) {
 			w.Proj.Outputs, w.Proj.Inputs, cfg.ProjDim, cfg.Dim)
 	}
 	// The QAT ranges are what make this a clipped linear rather than a linear.
-	if w.ProjClamp.InMax <= w.ProjClamp.InMin || w.ProjClamp.OutMax <= w.ProjClamp.OutMin {
-		t.Errorf("the projection's clamp is empty: %+v", w.ProjClamp)
+	if w.Proj.Clamp.InMax <= w.Proj.Clamp.InMin || w.Proj.Clamp.OutMax <= w.Proj.Clamp.OutMin {
+		t.Errorf("the projection's clamp is empty: %+v", w.Proj.Clamp)
 	}
 	b := w.Blocks[0]
 	if b.Q.Inputs != cfg.Dim || b.Q.Outputs != cfg.Dim {
@@ -40,5 +40,9 @@ func TestLoadVisionWeights(t *testing.T) {
 	}
 	if b.Gate.Outputs != cfg.FFN {
 		t.Errorf("block 0 feed forward is %d wide, expected %d", b.Gate.Outputs, cfg.FFN)
+	}
+	// Every product in the tower is clipped, not only the last one.
+	if b.Q.Clamp.OutMax <= b.Q.Clamp.OutMin {
+		t.Errorf("block 0 query carries no clamp: %+v", b.Q.Clamp)
 	}
 }

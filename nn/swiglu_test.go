@@ -154,3 +154,18 @@ func BenchmarkBenchSourceCopy(b *testing.B) {
 		copy(gate, src)
 	}
 }
+
+func TestGEGLUQuickRange(t *testing.T) {
+	gate := []float32{0, 1, -1, 2.5}
+	up := []float32{1, 2, 3, 4}
+	want := make([]float32, len(gate))
+	for i, g := range gate {
+		want[i] = float32(float64(g)/(1+math.Exp(-1.702*float64(g))) * float64(up[i]))
+	}
+	GEGLUQuickRange(gate, up, 0, len(gate))
+	for i := range want {
+		if diff := gate[i] - want[i]; diff > 1e-5 || diff < -1e-5 {
+			t.Errorf("element %d is %g, expected %g", i, gate[i], want[i])
+		}
+	}
+}
