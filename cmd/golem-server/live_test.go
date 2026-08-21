@@ -38,7 +38,7 @@ func liveToolCall(t *testing.T, path string) {
 	params := m.Sampling
 	params.Temperature = 0
 	ctx := NewContext(m.Forward, m.Window, 2048, time.Now, 0)
-	server := NewServer(NewGenerator(ctx, m.Vocab, m.Template, m.Vocabulary, 128),
+	server := NewServer(poolOf(NewGenerator(ctx, m.Vocab, m.Template, m.Vocabulary, 128)),
 		m.Vocab, "live", m.Template, params)
 
 	body := `{"messages":[{"role":"user","content":"What is the weather in Lyon right now?"}],

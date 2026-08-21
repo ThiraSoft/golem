@@ -30,10 +30,19 @@ type Vocabulary interface {
 }
 
 // Forward is the part of an engine a conversation drives.
+//
+// Slots are how several conversations share one set of weights: a slot is a
+// cache, UseSlot says which one the next pass writes to, and Reset forgets the
+// one in use. A model that was never asked for more than one answers 1 and
+// takes UseSlot(0), so a caller that does not care never has to know.
 type Forward interface {
 	ForwardBatch(tokens []int32, startPos int) [][]float32
 	Logits(hidden, out []float32)
 	Reset()
+	SetSlots(n int) error
+	Slots() int
+	SlotContext() int
+	UseSlot(i int)
 }
 
 // Model is one opened checkpoint, as a command sees it.
@@ -56,13 +65,25 @@ type Model struct {
 	closer interface{ Close() error }
 }
 
+// Slots is how many conversations the model holds at once, and SlotContext
+// how many positions each of them has. They are read off the engine rather
+// than copied here, so that nothing can disagree with it.
+func (m *Model) Slots() int { return m.Forward.Slots() }
+
+// SlotContext is how many positions one conversation has.
+func (m *Model) SlotContext() int { return m.Forward.SlotContext() }
+
 // Close releases the model and the file behind it.
 func (m *Model) Close() error { return m.closer.Close() }
 
 // Open reads the architecture and hands the file to the engine that implements
 // it. maxContext caps the cache; the files declare far more than a machine here
 // would survive.
-func Open(path string, maxContext int) (*Model, error) {
+//
+// slots, when given, cuts that context into that many independent
+// conversations, the way llama.cpp's -parallel does: the memory is what the
+// caller allowed, and each conversation gets its share of the positions.
+func Open(path string, maxContext int, slots ...int) (*Model, error) {
 	g, err := tensors.OpenGGUF(path)
 	if err != nil {
 		return nil, err
@@ -86,6 +107,12 @@ func Open(path string, maxContext int) (*Model, error) {
 		return nil, err
 	}
 	m.Name = arch
+	if len(slots) > 0 {
+		if err := m.Forward.SetSlots(slots[0]); err != nil {
+			m.Close()
+			return nil, err
+		}
+	}
 	return m, nil
 }
 

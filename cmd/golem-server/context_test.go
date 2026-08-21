@@ -8,6 +8,8 @@ import (
 // An engine that records what it was fed and at which position, and whose
 // hidden state is the token itself, so a test can see which state came back.
 type recordingEngine struct {
+	slot int
+
 	fed    []int32
 	posOf  []int
 	resets int
@@ -30,6 +32,10 @@ func (e *recordingEngine) Logits(hidden, out []float32) {
 }
 
 func (e *recordingEngine) Reset() { e.resets++ }
+
+// slot is the last one the context asked for, so a test can check that every
+// pass names its own.
+func (e *recordingEngine) UseSlot(i int) { e.slot = i }
 
 func TestPrefillFeedsTheWholePromptTheFirstTime(t *testing.T) {
 	e := &recordingEngine{}

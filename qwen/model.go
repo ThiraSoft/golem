@@ -22,14 +22,17 @@ type Model struct {
 	Cfg *Config
 	W   *Weights
 
-	file     *tensors.GGUF
-	cache    *Cache
-	scratch  *Scratch
-	embedded map[int]*nn.Batch
-	xs       [][]float32
-	hidden   [][]float32
-	outputs  [][]float32 // one per block, for the tests that locate a divergence
-	batch    int
+	file        *tensors.GGUF
+	cache       *Cache   // the active slot
+	caches      []*Cache // every slot, when the caller asked for more than one
+	slot        int
+	slotContext int
+	scratch     *Scratch
+	embedded    map[int]*nn.Batch
+	xs          [][]float32
+	hidden      [][]float32
+	outputs     [][]float32 // one per block, for the tests that locate a divergence
+	batch       int
 }
 
 // Open maps a GGUF file and binds it. maxContext caps the cache; the file

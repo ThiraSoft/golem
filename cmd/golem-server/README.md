@@ -11,7 +11,7 @@ go build ./cmd/golem-server
 ```
 
 One model per server, and the request's `model` field routes nothing: there is
-one set of weights and one cache, so there is nothing to route to. `-model`
+one set of weights, so there is nothing to route to. `-model`
 names the file; `/v1/models` reports it.
 
 Two endpoints:
@@ -54,11 +54,40 @@ leaves in a single `tool_calls` delta once it has closed. OpenAI's API allows
 fragments and clients do reassemble them, but half a function's arguments is a
 thing nothing can check.
 
-## One request at a time
+## One request at a time, several conversations
 
-There is one model and one KV cache, so a mutex serializes requests: a second
-one waits for the first to finish. No queue, no batching between requests. For
-a machine running a 12B on eight cores that is the honest shape of it.
+There is one model, so one request is answered at a time: a slot is held for
+the whole of an answer and a second request waits for one. There is no batching
+between requests. For a machine running a 12B on eight cores that is the honest
+shape of it — the cores are already busy with the answer being drawn.
+
+What `-parallel` changes is not the throughput but the cache. Each slot is a KV
+cache holding its own conversation, so two clients stop overwriting each
+other's prefix. The context is cut rather than multiplied, as llama.cpp's
+`--parallel` cuts it: `-context 4096 -parallel 2` is two conversations of 2048
+positions, and the memory is what it was.
+
+Which slot answers is decided as llama.cpp's server decides it. The free slot
+whose tokens share the longest prefix with this prompt wins, provided the
+shared part is a tenth of the prompt or more; failing that, a slot holding no
+conversation; failing that, the one nobody has come back to in longest. Three
+requests measured on a Qwen3 0.6B — Alice's conversation, Bob's, then Alice's
+next turn:
+
+| | Alice's second turn costs |
+|---|---|
+| `-parallel 1` | 59 positions: Bob's conversation had taken the cache |
+| `-parallel 2` | 21 positions: the added turn, and nothing else |
+
+A request that waits says so in its log line, next to the slot that answered
+it:
+
+```
+POST /v1/chat/completions 200 284 bytes in 139ms — slot 0 — 21 prompt in 37ms (566.4/s), 8 drawn in 102ms (78.65/s), length
+```
+
+A client that hangs up while queued takes its request with it, and never
+reaches a slot.
 
 ## The cache across stateless requests
 
@@ -123,7 +152,8 @@ Not implemented at all: `/v1/completions`, embeddings, images, audio.
 |---|---|
 | `-model` | the GGUF, or `GOLEM_MODEL` |
 | `-addr` | what to listen on; `127.0.0.1:8080` by default |
-| `-context` | positions to keep; 4096 by default |
+| `-context` | positions to keep; 4096 by default, cut between the slots |
+| `-parallel` | conversations cached at once; 1 by default |
 | `-n` | most tokens for one answer, when the request names no `max_tokens` |
 | `-cache-ttl` | forget a conversation's tokens after this long idle; `0` never |
 

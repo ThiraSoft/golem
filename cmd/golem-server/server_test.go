@@ -6,11 +6,17 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestServer(script []string) *Server {
 	g, v := newGenerator(script, 64)
-	return NewServer(g, v, "test-model", wordTemplate{}, greedy())
+	return NewServer(poolOf(g), v, "test-model", wordTemplate{}, greedy())
+}
+
+// poolOf is the one-slot pool a test that does not care about slots wants.
+func poolOf(g *Generator) *Pool {
+	return NewPool([]*slot{{index: 0, ctx: g.ctx, gen: g}}, time.Now)
 }
 
 func post(t *testing.T, s *Server, body string) *httptest.ResponseRecorder {

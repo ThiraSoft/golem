@@ -23,6 +23,9 @@ type recorder struct {
 	reason string
 	// note is what the answer cost, which only the handler knows.
 	note string
+	// slot is which conversation slot answered, and wait how long the request
+	// spent queued for it. A queue that is invisible is a queue nobody tunes.
+	slot string
 }
 
 func (r *recorder) WriteHeader(code int) {
@@ -55,6 +58,9 @@ func logging(out io.Writer, next http.Handler) http.Handler {
 		next.ServeHTTP(rec, r)
 		line := fmt.Sprintf("%s %s %d %d bytes in %s", r.Method, r.URL.Path,
 			rec.status, rec.written, time.Since(start).Round(time.Millisecond))
+		if rec.slot != "" {
+			line += " — " + rec.slot
+		}
 		if rec.note != "" {
 			line += " — " + rec.note
 		}

@@ -67,7 +67,8 @@ func (e *scriptedEngine) Logits(hidden, out []float32) {
 	out[e.vocab.id(word)] = 100
 }
 
-func (e *scriptedEngine) Reset() {}
+func (e *scriptedEngine) Reset()      {}
+func (e *scriptedEngine) UseSlot(int) {}
 
 func newGenerator(script []string, maxTokens int) (*Generator, *wordVocab) {
 	v := newWordVocab()

@@ -26,6 +26,7 @@ type Engine interface {
 	ForwardBatch(tokens []int32, startPos int) [][]float32
 	Logits(hidden, out []float32)
 	Reset()
+	UseSlot(i int)
 }
 
 // Vocabulary is the part of bpe.Vocab the server uses.
@@ -42,6 +43,7 @@ const promptBatch = 32
 
 type Context struct {
 	engine     Engine
+	slot       int // which of the engine's caches this context is
 	window     int // the largest sliding window; 0 when every block is global
 	maxContext int
 	now        func() time.Time
@@ -55,10 +57,22 @@ func NewContext(e Engine, window, maxContext int, now func() time.Time, ttl time
 	return &Context{engine: e, window: window, maxContext: maxContext, now: now, ttl: ttl}
 }
 
+// NewSlotContext is the same, for one of several caches the engine holds.
+func NewSlotContext(e Engine, slot, window, maxContext int, now func() time.Time, ttl time.Duration) *Context {
+	c := NewContext(e, window, maxContext, now, ttl)
+	c.slot = slot
+	return c
+}
+
+// use points the engine at this context's cache. Every pass goes through it,
+// because between two of them another conversation may have run.
+func (c *Context) use() { c.engine.UseSlot(c.slot) }
+
 // Pos is the position the next token would be fed at.
 func (c *Context) Pos() int { return len(c.held) }
 
-// Logits reads the distribution one hidden state produced.
+// Logits reads the distribution one hidden state produced. It needs no slot:
+// the head is the same weights whichever conversation drew the state.
 func (c *Context) Logits(hidden, out []float32) { c.engine.Logits(hidden, out) }
 
 // Prefill brings the cache up to ids and returns the hidden state of the last
@@ -70,6 +84,7 @@ func (c *Context) Prefill(ids []int32) ([]float32, int, error) {
 	if len(ids) > c.maxContext {
 		return nil, 0, fmt.Errorf("serve: the conversation is %d positions and the context is %d: start the server with a larger -context, or send less", len(ids), c.maxContext)
 	}
+	c.use()
 	c.expire()
 
 	shared := 0
@@ -104,6 +119,7 @@ func (c *Context) Prefill(ids []int32) ([]float32, int, error) {
 
 // Advance feeds one drawn token and returns the state it produced.
 func (c *Context) Advance(id int32) []float32 {
+	c.use()
 	states := c.engine.ForwardBatch([]int32{id}, len(c.held))
 	c.held = append(c.held, id)
 	c.last = c.now()

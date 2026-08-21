@@ -3,9 +3,10 @@ package main
 // The HTTP layer. It knows the shapes of OpenAI's API and nothing about
 // attention.
 //
-// One model and one cache mean one request at a time: a mutex serializes them
-// and a second request waits. There is no queue and no batching between
-// requests, which the README says plainly rather than implying otherwise.
+// One model means one request at a time: a slot is held for the whole of an
+// answer and a second request waits for one. What several slots buy is the
+// cache, not the throughput — slots.go says how one is chosen, and there is
+// still no batching between requests.
 
 import (
 	"encoding/json"
@@ -20,8 +21,8 @@ import (
 )
 
 type Server struct {
-	mu       sync.Mutex
-	gen      *Generator
+	mu       sync.Mutex // the identifiers, not the model: the pool serializes that
+	pool     *Pool
 	vocab    Vocabulary
 	name     string
 	tpl      chat.Template
@@ -29,8 +30,8 @@ type Server struct {
 	served   int
 }
 
-func NewServer(g *Generator, v Vocabulary, name string, tpl chat.Template, defaults sample.Params) *Server {
-	return &Server{gen: g, vocab: v, name: name, tpl: tpl, defaults: defaults}
+func NewServer(pool *Pool, v Vocabulary, name string, tpl chat.Template, defaults sample.Params) *Server {
+	return &Server{pool: pool, vocab: v, name: name, tpl: tpl, defaults: defaults}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -73,14 +74,23 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ids := s.vocab.Encode(prompt, false, true)
+	slot, waited, err := s.pool.Acquire(r.Context(), ids)
+	if err != nil {
+		// The client hung up while waiting for a slot. Nobody is left to read
+		// an answer, or an error either.
+		return
+	}
+	defer s.pool.Release(slot)
+	waitedFor(w, waited, slot.index)
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.served++
 	id := "chatcmpl-" + strconv.Itoa(s.served)
+	s.mu.Unlock()
 
-	ids := s.vocab.Encode(prompt, false, true)
 	params := s.sampling(&req)
-	gen := s.gen
+	gen := slot.gen
 	if req.MaxTokens != nil && *req.MaxTokens > 0 {
 		gen = gen.WithMaxTokens(*req.MaxTokens)
 	}
@@ -156,6 +166,20 @@ func (s *Server) sampling(req *completionRequest) sample.Params {
 		p.Seed = *req.Seed
 	}
 	return p
+}
+
+// waitedFor tells the log line which slot answered, and how long the request
+// waited for it. A wait too short to round to a millisecond is not a queue and
+// is left unsaid.
+func waitedFor(w http.ResponseWriter, waited time.Duration, index int) {
+	rec, ok := w.(*recorder)
+	if !ok {
+		return
+	}
+	rec.slot = fmt.Sprintf("slot %d", index)
+	if waited.Round(time.Millisecond) > 0 {
+		rec.slot += fmt.Sprintf(", queued %s", waited.Round(time.Millisecond))
+	}
 }
 
 // note tells the log line what the answer cost. Reading a prompt and drawing
