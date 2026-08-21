@@ -145,3 +145,40 @@ func TestBuildPromptRefusesAMiscount(t *testing.T) {
 		t.Fatal("two pictures went into a prompt that opens one")
 	}
 }
+
+func TestPromptSliceAndBoundary(t *testing.T) {
+	p := &Prompt{
+		Tokens: make([]int32, 20),
+		Embeds: make([][]float32, 20),
+		PLE:    make([]int32, 20),
+		Spans:  [][2]int{{3, 6}, {12, 17}},
+	}
+	// A cut inside a picture moves out past it; one outside stays put.
+	for _, c := range []struct{ from, want, expect int }{
+		{0, 5, 7},
+		{0, 3, 3},
+		{0, 7, 7},
+		{7, 14, 18},
+		{7, 12, 12},
+		{18, 20, 20},
+	} {
+		if got := p.Boundary(c.from, c.want); got != c.expect {
+			t.Errorf("a batch from %d wanting %d may end at %d, expected %d", c.from, c.want, got, c.expect)
+		}
+	}
+	// A picture larger than the batch still makes progress.
+	if got := p.Boundary(3, 4); got != 7 {
+		t.Errorf("a cut inside the first picture came out %d", got)
+	}
+
+	s := p.Slice(7, 18)
+	if len(s.Tokens) != 11 {
+		t.Fatalf("the slice is %d tokens", len(s.Tokens))
+	}
+	if len(s.Spans) != 1 || s.Spans[0] != [2]int{5, 10} {
+		t.Fatalf("the slice's spans came out %v", s.Spans)
+	}
+	if len(p.Slice(0, 7).Spans) != 1 {
+		t.Fatalf("a slice holding the whole first picture lost it")
+	}
+}

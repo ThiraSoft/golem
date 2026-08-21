@@ -135,3 +135,44 @@ func (p *Prompt) Places(cache *Cache, startPos int) []Place {
 func (m *Model) ForwardPrompt(p *Prompt, startPos int) [][]float32 {
 	return m.ForwardEmbedded(p.Tokens, p.Embeds, p.PLE, p.Places(m.cache, startPos))
 }
+
+// Slice is the run of positions [from, to) as a prompt of its own, with the
+// spans that fall inside it moved to match.
+//
+// It exists because a long prompt is fed in batches, and a picture must not be
+// cut across two of them: every key of a span has to be in the cache before
+// any of its queries is scored, which is true within one batch and false
+// across two. Whoever cuts asks Boundary where it may.
+func (p *Prompt) Slice(from, to int) *Prompt {
+	out := &Prompt{
+		Tokens: p.Tokens[from:to],
+		Embeds: p.Embeds[from:to],
+		PLE:    p.PLE[from:to],
+	}
+	for _, span := range p.Spans {
+		if span[0] >= from && span[1] < to {
+			out.Spans = append(out.Spans, [2]int{span[0] - from, span[1] - from})
+		}
+	}
+	return out
+}
+
+// Boundary is the largest cut no further than want that falls outside every
+// picture: a batch may end there. It never returns from itself, so a caller
+// looping on it makes progress even when one picture is larger than a batch.
+func (p *Prompt) Boundary(from, want int) int {
+	if want > len(p.Tokens) {
+		want = len(p.Tokens)
+	}
+	for _, span := range p.Spans {
+		// A cut inside a span, or one that would leave its start behind,
+		// moves out to the end of it.
+		if want > span[0] && want <= span[1] {
+			want = span[1] + 1
+		}
+	}
+	if want <= from {
+		want = from + 1
+	}
+	return want
+}
