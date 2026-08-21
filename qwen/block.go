@@ -19,9 +19,15 @@ package qwen
 
 import "github.com/ThiraSoft/golem/nn"
 
-// perPosition weighs a pass that touches one position at a time against a
-// matrix product, for deciding whether spreading it over the cores pays.
-const perPosition = 4
+// perPosition is what a pass over one position costs, in the units InParallel
+// counts: a norm, a residual add and a quantization come to a few dozen
+// operations for every element of the stream.
+//
+// Guessing low is not a small mistake. At four, a batch of sixty-four
+// positions of this model came to 262144, just under the threshold below which
+// InParallel declines to split — so three passes a block, eighty-four in a
+// prompt, ran on one core while seven spun. That was 29% of the reading.
+const perPosition = 24
 
 func Block(
 	cfg *Config, bc BlockConfig, bw *BlockWeights,
