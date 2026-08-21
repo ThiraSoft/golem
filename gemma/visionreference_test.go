@@ -138,12 +138,7 @@ func TestVisionPatchesMatchTheReference(t *testing.T) {
 	want := f.tensor(t, "pos_embd")
 
 	pixels, cols, rows := tower.Cfg.Prepare(testImage(t))
-	got := tower.Patches(pixels, cols, rows)
-	flat := make([]float32, 0, len(got)*tower.Cfg.Dim)
-	for _, row := range got {
-		flat = append(flat, row...)
-	}
-	close(t, "patches", flat, want, 5e-3)
+	close(t, "patches", tower.Patches(pixels, cols, rows), want, 5e-3)
 }
 
 // Each block is started from the reference's own input, so a divergence is
@@ -154,25 +149,16 @@ func TestVisionBlocksMatchTheReference(t *testing.T) {
 	cfg := tower.Cfg
 
 	_, cols, rows := cfg.Prepare(testImage(t))
-	n := cols * rows
+	s := tower.newScratch(cols * rows)
 
 	for i := 0; i < cfg.Blocks; i++ {
 		name := "pos_embd"
 		if i > 0 {
 			name = fmt.Sprintf("layer_out-%d", i-1)
 		}
-		input := f.tensor(t, name)
-		xs := make([][]float32, n)
-		for p := range xs {
-			xs[p] = append([]float32(nil), input[p*cfg.Dim:(p+1)*cfg.Dim]...)
-		}
-		tower.Block(i, xs, cols)
-
-		flat := make([]float32, 0, n*cfg.Dim)
-		for _, row := range xs {
-			flat = append(flat, row...)
-		}
-		closeRelative(t, fmt.Sprintf("block %d", i), flat, f.tensor(t, fmt.Sprintf("layer_out-%d", i)), 5e-4)
+		xs := append([]float32(nil), f.tensor(t, name)...)
+		tower.Block(i, xs, cols, s)
+		closeRelative(t, fmt.Sprintf("block %d", i), xs, f.tensor(t, fmt.Sprintf("layer_out-%d", i)), 5e-4)
 	}
 }
 
@@ -185,25 +171,11 @@ func TestVisionPoolAndProjectMatchTheReference(t *testing.T) {
 	cfg := tower.Cfg
 	_, cols, rows := cfg.Prepare(testImage(t))
 
-	last := f.tensor(t, fmt.Sprintf("layer_out-%d", cfg.Blocks-1))
-	xs := make([][]float32, cols*rows)
-	for p := range xs {
-		xs[p] = append([]float32(nil), last[p*cfg.Dim:(p+1)*cfg.Dim]...)
-	}
-	pooled := tower.Pool(xs, cols, rows)
-	flat := make([]float32, 0, len(pooled)*cfg.Dim)
-	for _, r := range pooled {
-		flat = append(flat, r...)
-	}
-	closeRelative(t, "pooled", flat, f.tensor(t, "pooled"), 1e-4)
+	last := append([]float32(nil), f.tensor(t, fmt.Sprintf("layer_out-%d", cfg.Blocks-1))...)
+	closeRelative(t, "pooled", tower.Pool(last, cols, rows), f.tensor(t, "pooled"), 1e-4)
 
-	refPooled := f.tensor(t, "pooled")
-	tokens := make([][]float32, len(pooled))
-	for i := range tokens {
-		tokens[i] = append([]float32(nil), refPooled[i*cfg.Dim:(i+1)*cfg.Dim]...)
-	}
-	projected := tower.Project(tokens)
-	flat = flat[:0]
+	projected := tower.Project(append([]float32(nil), f.tensor(t, "pooled")...))
+	flat := make([]float32, 0, len(projected)*cfg.ProjDim)
 	for _, r := range projected {
 		flat = append(flat, r...)
 	}

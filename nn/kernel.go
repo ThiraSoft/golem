@@ -77,6 +77,27 @@ func MatMatBF16(w []byte, x []float32, outputs, inputs, batch int, y []float32) 
 	})
 }
 
+// panelBytes is how much of the second-level cache a panel of activations may
+// take. A core here has 256 KB of it and the rows of weights streaming past
+// want their share, so a panel is given half.
+const panelBytes = 128 << 10
+
+// panelOf is how many vectors of the batch are taken together: enough that the
+// weights are read from memory a handful of times for a whole batch, few
+// enough that the panel answers from cache.
+func panelOf(inputs int) int {
+	n := panelBytes / (inputs * 4)
+	// A whole number of fours: what does not fill a group of four columns
+	// falls to the one-column kernel, which is four times the work per
+	// weight read, and two stray columns in every panel are not two columns
+	// in a hundred of the time.
+	n &^= 3
+	if n < 4 {
+		return 4
+	}
+	return n
+}
+
 // MatMatBF16Rows is the same for rows [start, end) on the caller's thread.
 func MatMatBF16Rows(w []byte, x []float32, outputs, inputs, batch int, y []float32, start, end int) {
 	weights := unsafe.Slice((*uint16)(unsafe.Pointer(&w[0])), len(w)/2)
@@ -87,11 +108,59 @@ func MatMatBF16Rows(w []byte, x []float32, outputs, inputs, batch int, y []float
 	// With AVX2 the question no longer arises: the raw row fits in the
 	// first-level cache, re-reading it for each vector of the batch
 	// costs nothing, and the conversion is folded into the computation.
+	//
+	// Four columns at a time where there are four: widening a row of weights
+	// costs the same whether one column or four are waiting for it, and the
+	// one-column kernel spends two instructions in three feeding the
+	// multiply-accumulate rather than doing it.
+	//
+	// And the batch is walked in panels rather than whole. A large batch is
+	// wider than any cache: taking all of it for one row of weights, and then
+	// all of it again for the next, streams the activations past every row —
+	// megabytes per row, from memory, for a row of weights that is kilobytes.
+	// A panel narrow enough to sit in the second-level cache is read once from
+	// memory and then answers every row out of it.
 	if avx2 {
-		for o := start; o < end; o++ {
-			raw := weights[o*inputs : (o+1)*inputs]
-			for l := 0; l < batch; l++ {
-				y[l*outputs+o] = dotBF16AVX2(&raw[0], &x[l*inputs], inputs)
+		var four [4]float32
+		var eight [8]float32
+		panel := panelOf(inputs)
+		// Two rows at a time when the row is a whole number of eights, which
+		// is what makes an activation load feed two multiply-accumulates
+		// instead of one.
+		pairs := inputs%8 == 0
+		for at := 0; at < batch; at += panel {
+			to := min(at+panel, batch)
+			o := start
+			if pairs {
+				for ; o+1 < end; o += 2 {
+					raw := weights[o*inputs:]
+					l := at
+					for ; l+3 < to; l += 4 {
+						dotBF16x2x4AVX2(&raw[0], inputs, &x[l*inputs], inputs, inputs, &eight[0])
+						for c := 0; c < 4; c++ {
+							y[(l+c)*outputs+o] = eight[c]
+							y[(l+c)*outputs+o+1] = eight[4+c]
+						}
+					}
+					for ; l < to; l++ {
+						y[l*outputs+o] = dotBF16AVX2(&raw[0], &x[l*inputs], inputs)
+						y[l*outputs+o+1] = dotBF16AVX2(&weights[(o+1)*inputs], &x[l*inputs], inputs)
+					}
+				}
+			}
+			for ; o < end; o++ {
+				raw := weights[o*inputs : (o+1)*inputs]
+				l := at
+				for ; l+3 < to; l += 4 {
+					dotBF16x4AVX2(&raw[0], &x[l*inputs], inputs, inputs, &four[0])
+					y[l*outputs+o] = four[0]
+					y[(l+1)*outputs+o] = four[1]
+					y[(l+2)*outputs+o] = four[2]
+					y[(l+3)*outputs+o] = four[3]
+				}
+				for ; l < to; l++ {
+					y[l*outputs+o] = dotBF16AVX2(&raw[0], &x[l*inputs], inputs)
+				}
 			}
 		}
 		return

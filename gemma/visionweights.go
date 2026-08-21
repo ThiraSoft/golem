@@ -35,23 +35,41 @@ type VisionLinear struct {
 	Clamp Clamp
 }
 
-// Apply computes y = clamp(W * clamp(x)). tmp holds the clamped input and must
-// be as wide as one; the caller owns it so that a per-patch loop allocates
-// nothing.
+// Apply computes Y = clamp(W * clamp(X)) for a whole batch of vectors laid end
+// to end: x holds batch*Inputs floats and y batch*Outputs, both with the batch
+// as the slower index. tmp is the caller's scratch for the clamped input and
+// must be as large as x.
+//
+// The batch is the point. A projection read one vector at a time reads its
+// weight from memory for every vector, and this tower has a thousand of them
+// per block: the same matrix would be pulled across the bus a thousand times.
+// Read once for the batch, it is pulled once. The split is over the output
+// rows, so each core holds a panel of the weight small enough to stay in its
+// own cache while the whole batch streams past it.
 //
 // The input is rounded to bfloat16 on the way in. ggml's kernel for a bf16
 // weight takes both operands in bf16 — vec_dot_type is BF16 — so an activation
 // that kept its float32 mantissa here would not be more accurate than the
 // reference, it would be a thousandth away from it, and a thousandth
 // compounded over sixteen blocks is visible at the end.
-func (l VisionLinear) Apply(x, tmp, y []float32) {
-	for i, v := range x {
-		tmp[i] = nn.RoundBF16(clampF32(v, l.Clamp.InMin, l.Clamp.InMax))
-	}
-	l.ApplyRows(tmp, y, 1, 0, l.Outputs)
-	for i, v := range y {
-		y[i] = clampF32(v, l.Clamp.OutMin, l.Clamp.OutMax)
-	}
+func (l VisionLinear) Apply(x, tmp, y []float32, batch int) {
+	in, out := batch*l.Inputs, batch*l.Outputs
+	nn.InParallel(batch, in, func(first, last int) {
+		for i := first * l.Inputs; i < last*l.Inputs; i++ {
+			tmp[i] = nn.RoundBF16(clampF32(x[i], l.Clamp.InMin, l.Clamp.InMax))
+		}
+	})
+	nn.InParallel(l.Outputs, in*l.Outputs, func(start, end int) {
+		l.ApplyRows(tmp[:in], y[:out], batch, start, end)
+		// The rows this core produced, clamped before the barrier: a pass over
+		// the outputs afterwards would be a pass on one core.
+		for c := 0; c < batch; c++ {
+			block := y[c*l.Outputs : (c+1)*l.Outputs]
+			for i := start; i < end; i++ {
+				block[i] = clampF32(block[i], l.Clamp.OutMin, l.Clamp.OutMax)
+			}
+		}
+	})
 }
 
 func clampF32(v, lo, hi float32) float32 {
