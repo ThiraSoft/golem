@@ -5,7 +5,8 @@
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **CPU inference engines in pure Go.** No Python, no cgo, no GPU, no runtime to
-install: `go build`, one static binary, a GGUF file, an answer. On an eight-core
+install: `go build`, one static binary, a GGUF file, an answer. One dependency
+outside the standard library, `golang.org/x/image`, and only to read a WebP. On an eight-core
 desktop CPU that binary keeps pace with llama.cpp — ahead on the models large
 enough for memory bandwidth to be the limit, behind on the smallest, and every
 number below is a benchmark in this repository rather than an estimate.
@@ -29,6 +30,19 @@ go build ./cmd/golem-server
 ./golem-server -model Qwen3-4B-Q4_0.gguf -addr 127.0.0.1:8080
 ```
 
+Gemma also looks at pictures. The encoder is a second GGUF, and both commands
+take it the same way:
+
+```bash
+./golem-cli -model gemma-4-E2B-it-QAT-Q4_0.gguf \
+    -mmproj mmproj-gemma-4-E2B-it-QAT-BF16.gguf \
+    -image photo.png -p "What is in this picture?"
+```
+
+The server reads the OpenAI content parts a client sends, as a `data:` URI or a
+path on the machine it runs on. It does not fetch pictures over the network: a
+server that fetches what a prompt names is a server that can be aimed.
+
 Weights are not in this repository; [what is here, and what is not](#what-is-here-and-what-is-not)
 says where each one comes from.
 
@@ -36,7 +50,7 @@ says where each one comes from.
 
 | | what it runs | against its reference, on the same CPU |
 |---|---|---|
-| [`gemma/`](gemma/) | Gemma 4 E2B and 12B, from a GGUF | E2B ×1.01 generating, ×1.24 reading a prompt. 12B ×1.04 and ×1.33 — vs llama.cpp |
+| [`gemma/`](gemma/) | Gemma 4 E2B and 12B, from a GGUF, pictures included | E2B ×1.01 generating, ×1.24 reading a prompt. 12B ×1.04 and ×1.33 — vs llama.cpp |
 | [`qwen/`](qwen/) | Qwen3 dense, from a GGUF | 4B ×1.00 and ×1.13. 0.6B ×0.85 and ×0.99 — vs llama.cpp |
 | [`pockettts/`](pockettts/) | [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts), twelve languages, voice cloning included | ×2.22 and ×1.63 the speed of PyTorch, on the 24- and 6-layer models |
 

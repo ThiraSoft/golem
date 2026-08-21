@@ -28,6 +28,48 @@ m.Logits(hidden, logits)
 next := gemma.Argmax(logits)
 ```
 
+## Sight
+
+Gemma 4 can look at a picture, and the encoder that lets it is a second GGUF —
+`mmproj-gemma-4-E2B-it-QAT-BF16.gguf`, whose `general.architecture` is `clip`.
+`OpenVision` binds one to a model that is already loaded; a projector whose
+output is not the model's width is refused rather than run.
+
+```go
+m, _ := gemma.Open("gemma-4-E2B-it-QAT-Q4_0.gguf", 4096)
+_ = m.OpenVision("mmproj-gemma-4-E2B-it-QAT-BF16.gguf")
+
+rows, _ := m.EncodeImage(png)              // one row per soft token
+prompt, _ := m.BuildPrompt(ids, [][][]float32{rows})
+hidden := m.ForwardPrompt(prompt, 0)
+```
+
+The tower is sixteen blocks of 768, and four things separate it from the
+language model beside it. **The image keeps its shape**: there is no fixed
+input size — `clip.vision.image_size` says 224 and means nothing — so the
+picture is scaled until the patch grid holds between 40 and 280 pooled tokens,
+rounded to a whole number of them, and what the rounding leaves over becomes a
+black border rather than a stretch. **The rotation is two-dimensional**: the
+low half of each head turns with the patch's column and the high half with its
+row, at base 100. **Every product is clipped** to the range it was quantized
+under — the four scalars beside each weight in the file — because `gemma4v`
+overrides `build_mm`, not only the final projection. And the feed forward is a
+quick-GELU gate, which is the default `clip.cpp` falls to for a projector
+declaring neither `use_gelu` nor `use_silu`.
+
+Three numbers the file does not carry are written down in `visionconfig.go`
+with a comment saying where they come from: the pooling kernel of 3, the RoPE
+base of 100, and the token range of 40 … 280. They are what llama.cpp
+hardcodes for this projector, and a file that disagreed with them would run
+under llama.cpp with those values anyway.
+
+Reaching the language model costs two changes to it and no more. A position may
+be handed the row itself instead of a token identifier — the per-layer input of
+such a position is the padding token's, which is what llama.cpp uses for an
+embedding batch — and **a picture is attended to in both directions**: every
+token of one carries the last position of the span, and the window is measured
+from there. It is a wider window, not a new mask.
+
 ## The model, in the two places it is unusual
 
 **Two attention geometries alternate.** Four blocks that see the last 512
@@ -170,6 +212,19 @@ On an i7-9700K, eight threads, Q4_0 weights. E2B first:
 | `Forward` — 35 blocks, a prompt already in the cache | 35 ms |
 | `Logits` — the whole vocabulary | 10 ms |
 | `ForwardBatch` — 64 positions of a prompt at once | 5.0 ms |
+
+And the vision tower, per picture rather than per token:
+
+| | per image |
+|---|---|
+| `VisionTower.Encode` — a 640×426 picture, 117 soft tokens | 3.2 s |
+
+**That one is behind its reference, and by a lot**: llama.cpp encodes the same
+picture in 0.67 s. The reason is not the arithmetic but its shape — this tower
+projects one patch at a time, a thousand mat-vecs where llama.cpp does one
+matrix product over the whole grid, and a mat-vec reads the weight for a single
+column. It is the one place in this repository where the obvious next
+measurement has not been taken yet.
 
 The first two are within a quarter of what the memory bus on this machine can
 deliver: a token being generated reads 999 MB of block weights and 315 MB of
