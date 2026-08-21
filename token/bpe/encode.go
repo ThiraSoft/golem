@@ -8,9 +8,10 @@ package bpe
 // newlines cut the text, because a merge is never allowed to straddle one.
 
 import (
-	"container/heap"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/ThiraSoft/golem/token/merge"
 )
 
 // escapeSpaces replaces the ASCII space, and nothing else. The non-breaking
@@ -36,44 +37,6 @@ func splitNewlines(text string) []string {
 	return runs
 }
 
-// symbol is one span of the run being merged, in a doubly-linked list held in
-// a slice. A merged-away symbol keeps its place with an empty text rather than
-// being removed, so that the indices already queued stay valid.
-type symbol struct {
-	text       string
-	prev, next int
-}
-
-// bigram is a candidate merge waiting in the queue. text is what the pair
-// spelled when it was queued: a merge on either side may have changed that,
-// and the pop checks it before applying.
-type bigram struct {
-	left, right int
-	text        string
-	rank        int
-}
-
-// queue orders by ascending rank, ties by ascending left index — llama.cpp's
-// comparator, which decides the outcome whenever two merges are equally good.
-type queue []bigram
-
-func (q queue) Len() int { return len(q) }
-func (q queue) Less(i, j int) bool {
-	if q[i].rank != q[j].rank {
-		return q[i].rank < q[j].rank
-	}
-	return q[i].left < q[j].left
-}
-func (q queue) Swap(i, j int) { q[i], q[j] = q[j], q[i] }
-func (q *queue) Push(x any)   { *q = append(*q, x.(bigram)) }
-func (q *queue) Pop() any {
-	old := *q
-	n := len(old)
-	item := old[n-1]
-	*q = old[:n-1]
-	return item
-}
-
 // Encode turns text into identifiers. addBOS prepends the beginning-of-text
 // piece; parseSpecial lets the control tokens in the text be recognized rather
 // than spelled out.
@@ -94,91 +57,56 @@ func (v *Vocab) Encode(text string, addBOS, parseSpecial bool) []int32 {
 
 // encodeRaw handles one stretch of ordinary text: escape, cut on newlines,
 // merge each run, emit.
+//
+// The merger and the symbol slice are made here rather than per run: a chat
+// turn is a few dozen short runs, and on those the allocation costs more than
+// the merging. They belong to this call and are never shared, so Encode stays
+// safe to call from several goroutines at once.
 func (v *Vocab) encodeRaw(text string, out []int32) []int32 {
-	for _, run := range splitNewlines(escapeSpaces(text)) {
-		out = v.encodeRun(run, out)
+	var m merge.Merger
+	escaped := escapeSpaces(text)
+	// One symbol per rune, so the byte length is an upper bound and a generous
+	// one. Sized once here, reused by every run below.
+	symbols := make([]string, 0, len(escaped))
+	for _, run := range splitNewlines(escaped) {
+		out, symbols = v.encodeRun(&m, symbols, run, out)
 	}
 	return out
 }
 
-// encodeRun applies the merges to a single run and emits what survives.
-func (v *Vocab) encodeRun(run string, out []int32) []int32 {
+// encodeRun applies the merges to a single run and emits what survives. It
+// gives the symbol slice back so the next run can reuse its capacity.
+func (v *Vocab) encodeRun(m *merge.Merger, symbols []string, run string, out []int32) ([]int32, []string) {
 	if run == "" {
-		return out
+		return out, symbols
 	}
-
-	var symbols []symbol
+	symbols = symbols[:0]
 
 	// A run made only of newlines that the vocabulary already knows is taken
 	// whole. Splitting it would leave the merges to rebuild it, and they do
 	// not always reach the same answer.
+	whole := false
 	if strings.Trim(run, "\n") == "" {
 		if _, ok := v.ID(run); ok {
-			symbols = []symbol{{text: run, prev: -1, next: -1}}
+			symbols = append(symbols, run)
+			whole = true
 		}
 	}
 
-	if symbols == nil {
+	// Otherwise one symbol per rune: this tokenizer merges over raw UTF-8, so
+	// a character is where a symbol starts, not a byte.
+	if !whole {
 		for i := 0; i < len(run); {
 			_, size := utf8.DecodeRuneInString(run[i:])
-			index := len(symbols)
-			next := index + 1
-			if i+size == len(run) {
-				next = -1
-			}
-			symbols = append(symbols, symbol{text: run[i : i+size], prev: index - 1, next: next})
+			symbols = append(symbols, run[i:i+size])
 			i += size
 		}
 	}
 
-	q := &queue{}
-	push := func(left, right int) {
-		if left < 0 || right < 0 {
-			return
-		}
-		rank, ok := v.rank(symbols[left].text, symbols[right].text)
-		if !ok {
-			return
-		}
-		heap.Push(q, bigram{
-			left:  left,
-			right: right,
-			text:  symbols[left].text + symbols[right].text,
-			rank:  rank,
-		})
+	for _, text := range m.Apply(symbols, v.ranks) {
+		out = v.emit(text, out)
 	}
-	for i := 1; i < len(symbols); i++ {
-		push(i-1, i)
-	}
-
-	for q.Len() > 0 {
-		b := heap.Pop(q).(bigram)
-		left, right := &symbols[b.left], &symbols[b.right]
-		if left.text == "" || right.text == "" {
-			continue
-		}
-		if left.text+right.text != b.text {
-			continue // the pair has moved on since it was queued
-		}
-
-		left.text += right.text
-		right.text = ""
-		left.next = right.next
-		if right.next >= 0 {
-			symbols[right.next].prev = b.left
-		}
-
-		push(left.prev, b.left)
-		push(b.left, left.next)
-	}
-
-	for i := range symbols {
-		if symbols[i].text == "" {
-			continue
-		}
-		out = v.emit(symbols[i].text, out)
-	}
-	return out
+	return out, symbols
 }
 
 // emit writes one finished symbol. A symbol the vocabulary does not know is

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/ThiraSoft/golem/tensors"
+	"github.com/ThiraSoft/golem/token/merge"
 )
 
 // Space is the character standing in for the space, so that the pieces keep
@@ -30,15 +31,13 @@ const (
 	Byte        Kind = 6
 )
 
-type pair struct{ left, right string }
-
 // Vocab is a loaded tokenizer: the pieces, what each one is, and the ranked
 // merges that build them.
 type Vocab struct {
 	texts    []string
 	kinds    []Kind
 	index    map[string]int32
-	ranks    map[pair]int
+	ranks    map[merge.Pair]int
 	specials []int32 // control, unknown and user-defined, longest text first
 	byteIDs  [256]int32
 
@@ -68,7 +67,7 @@ func Load(g *tensors.GGUF) (*Vocab, error) {
 		texts: texts,
 		kinds: make([]Kind, len(rawKinds)),
 		index: make(map[string]int32, len(texts)),
-		ranks: make(map[pair]int, len(merges)),
+		ranks: make(map[merge.Pair]int, len(merges)),
 	}
 	for i := range v.byteIDs {
 		v.byteIDs[i] = -1
@@ -101,7 +100,7 @@ func Load(g *tensors.GGUF) (*Vocab, error) {
 			return nil, fmt.Errorf("merge %d has no separator: %q", rank, m)
 		}
 		cut++
-		v.ranks[pair{m[:cut], m[cut+1:]}] = rank
+		v.ranks[merge.Pair{Left: m[:cut], Right: m[cut+1:]}] = rank
 	}
 
 	// Longest first: a short special token may be a substring of a longer one,
@@ -181,10 +180,5 @@ func (v *Vocab) ID(text string) (int32, bool) {
 func (v *Vocab) BOS() int32   { return v.bos }
 func (v *Vocab) EOS() int32   { return v.eos }
 func (v *Vocab) AddBOS() bool { return v.addBOS }
-
-func (v *Vocab) rank(left, right string) (int, bool) {
-	r, ok := v.ranks[pair{left, right}]
-	return r, ok
-}
 
 func (v *Vocab) specialsByLength() []int32 { return v.specials }
