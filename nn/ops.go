@@ -90,7 +90,12 @@ func ApplyRoPE(vec []float32, position int, maxPeriod float64) {
 }
 
 // SiLU, or "swish": x*sigma(x). This is the activation of the flow net and of
-// the adaptive modulations, where the transformer uses GELU.
+// the adaptive modulations, where pockettts's transformer uses GELU.
+//
+// The exponential is float64 and exact. A language engine reading a GGUF wants
+// the other one — ggml's polynomial, in SwiGLURange — because there the
+// reference is ggml and the two differ by a couple of units in the last place.
+// Here the reference is PyTorch, and this is left alone.
 func SiLU(x []float32) {
 	for i, v := range x {
 		x[i] = float32(float64(v) / (1 + math.Exp(-float64(v))))

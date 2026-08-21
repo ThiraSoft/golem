@@ -1,14 +1,16 @@
-package gemma
+package qwen
 
 // Where the keys and values live between tokens.
 //
-// Two decisions are worth stating. A sliding-window block is given a ring of
-// exactly its window, because a position that has fallen out of the ring is a
-// position the mask would have hidden anyway — the storage and the rule agree,
-// so neither has to be checked against the other. And a block that shares its
-// keys and values is given the *same* LayerCache pointer as the block it reads
-// from, not a copy: there is one cache and twenty-one blocks reading it, which
-// is what makes E2B small.
+// Simpler than Gemma's, in the two ways that matter. Every block owns its own
+// cache: there is no sharing here, so there are twenty-eight of them and no
+// aliasing to be careful about. And every block sees the whole context, so a
+// cache is the context long and the ring never wraps.
+//
+// Visible stays a method rather than becoming 0, pos at the call site. Qwen3
+// dense attends to everything, but qwen35 declares a full_attention_interval,
+// which makes this a real question again — and when it does, this is where the
+// answer goes.
 //
 // The entries are held as float32 rounded through fp16, which is what
 // llama.cpp's default cache type stores: keeping more precision than the
@@ -23,11 +25,11 @@ type LayerCache struct {
 	K        []float32 // Capacity * KVHeads * HeadDim
 	V        []float32
 
-	// used is one past the highest position written since the last Reset,
-	// clamped to the capacity by Reset itself. It exists so that forgetting a
-	// conversation costs what the conversation was, not what the context was
-	// sized for: a global block holds four thousand positions and a chat turn
-	// touches a few dozen.
+	// used is one past the highest position written since the last Reset, so
+	// that Reset clears what a conversation touched rather than what the
+	// context was sized for. A cache built for four thousand positions and
+	// used for sixty-four is the ordinary case, and zeroing the whole of it
+	// costs more than reading the prompt did.
 	used int
 }
 
@@ -42,8 +44,7 @@ func newLayerCache(kvHeads, headDim, capacity int) *LayerCache {
 	}
 }
 
-// offset locates one head at one position. The ring wraps for window blocks;
-// for global ones Capacity is the whole context and it never does.
+// offset locates one head at one position.
 func (c *LayerCache) offset(pos, head int) int {
 	return ((pos%c.Capacity)*c.KVHeads + head) * c.HeadDim
 }
@@ -69,7 +70,7 @@ func (c *LayerCache) Value(pos, head int) []float32 {
 	return c.V[o : o+c.HeadDim]
 }
 
-// Cache holds one entry per block. Blocks that share point at the same one.
+// Cache holds one entry per block.
 type Cache struct {
 	Layers []*LayerCache
 }
@@ -77,45 +78,30 @@ type Cache struct {
 func NewCache(cfg *Config) *Cache {
 	c := &Cache{Layers: make([]*LayerCache, len(cfg.Blocks))}
 	for i, b := range cfg.Blocks {
-		if !b.OwnsKV {
-			c.Layers[i] = c.Layers[b.KVSource]
-			continue
-		}
-		capacity := cfg.MaxContext
-		if b.Window && b.WindowSize < capacity {
-			capacity = b.WindowSize
-		}
-		c.Layers[i] = newLayerCache(b.KVHeads, b.HeadDim, capacity)
+		c.Layers[i] = newLayerCache(b.KVHeads, b.HeadDim, cfg.MaxContext)
 	}
 	return c
 }
 
 // Visible gives the inclusive range of positions a block may attend to from
-// pos. llama.cpp masks a key position p0 when p1 - p0 >= the window, so a
-// window of 512 leaves 512 positions counting the query's own.
+// pos. Every block here sees everything before it, so the range is the whole
+// prefix; the signature takes a BlockConfig because the next architecture's
+// answer will depend on it.
 func (c *Cache) Visible(b BlockConfig, pos int) (first, last int) {
-	first = 0
-	if b.Window && pos-b.WindowSize+1 > 0 {
-		first = pos - b.WindowSize + 1
-	}
-	return first, pos
+	return 0, pos
 }
 
-// Reset forgets everything without releasing the memory. Distinct pointers
-// only: a shared cache would otherwise be cleared as many times as it is read.
+// Reset forgets the conversation without releasing the memory.
 //
 // Only the positions that were written are cleared. Nothing beyond them can be
 // read — Visible stops at the query's own position, and a position is always
 // stored before it is attended to — but clearing them is what makes that an
-// invariant of the cache rather than a property of the caller. A window block
-// wraps, so its count is clamped to what it holds.
+// invariant of the cache rather than a property of the caller.
 func (c *Cache) Reset() {
-	done := map[*LayerCache]bool{}
 	for _, lc := range c.Layers {
-		if lc == nil || done[lc] {
+		if lc == nil {
 			continue
 		}
-		done[lc] = true
 		n := lc.used * lc.KVHeads * lc.HeadDim
 		if n > len(lc.K) {
 			n = len(lc.K)

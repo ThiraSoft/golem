@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/ThiraSoft/golem/tensors"
+	"github.com/ThiraSoft/golem/token/merge"
 )
 
 // modelPath is the GGUF the tests read, named by GOLEM_MODEL. A machine without
@@ -82,10 +83,10 @@ func TestLoadVocab(t *testing.T) {
 func TestMergeRanks(t *testing.T) {
 	v := openVocab(t)
 
-	if r, ok := v.rank("▁", "▁"); !ok || r < 0 {
+	if r, ok := v.ranks[merge.Pair{Left: "▁", Right: "▁"}]; !ok || r < 0 {
 		t.Fatalf("the two-space merge is missing: %d, %v", r, ok)
 	}
-	if _, ok := v.rank("▁the", "zzzzzz"); ok {
+	if _, ok := v.ranks[merge.Pair{Left: "▁the", Right: "zzzzzz"}]; ok {
 		t.Fatal("an invented pair has a rank")
 	}
 }
@@ -100,9 +101,9 @@ func TestSpecialsAreSortedByDescendingLength(t *testing.T) {
 		t.Fatalf("%d specials", len(specials))
 	}
 	for i := 1; i < len(specials); i++ {
-		if len(v.Text(specials[i-1])) < len(v.Text(specials[i])) {
+		if len(specials[i-1].Text) < len(specials[i].Text) {
 			t.Fatalf("specials are not sorted: %q before %q",
-				v.Text(specials[i-1]), v.Text(specials[i]))
+				specials[i-1].Text, specials[i].Text)
 		}
 	}
 }

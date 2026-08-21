@@ -30,6 +30,18 @@ type Batch struct {
 	QK      []int8    // [column][width]
 	KScales []float32 // [column][superblock]
 	BSums   []int16   // [column][group of sixteen]
+
+	// BF16 says the floats are to be rounded to bfloat16 as they are
+	// quantized. ggml converts an activation to whatever the weight's dot
+	// wants: Q8_0 for a Q4_0 weight, which is what Q and Scales above hold,
+	// and bfloat16 for a bfloat16 one. Keeping float32 there would be more
+	// precision than the reference has, which is a divergence and not an
+	// improvement — it moves the queries of a Qwen block by a part in a
+	// thousand, four thousand times the gap that remains once it is done.
+	//
+	// It is set on the batches an engine feeds to bfloat16 weights. Rounding
+	// is idempotent, so a caller that has already rounded loses nothing.
+	BF16 bool
 }
 
 // NewBatch allocates for `size` activations of `width` elements each.
@@ -72,7 +84,17 @@ func (b *Batch) QuantizeRange(first, last int) {
 
 // QuantizeColumnRange is the same for one column alone, for the sections that
 // are split by column rather than by row.
+//
+// When BF16 is set it also rounds the floats of that range, because a bfloat16
+// weight is multiplied against a bfloat16 activation and not a float32 one.
+// See the field's comment.
 func (b *Batch) QuantizeColumnRange(column, first, last int) {
+	if b.BF16 {
+		f := b.F[column]
+		for i := first; i < last && i < len(f); i++ {
+			f[i] = RoundBF16(f[i])
+		}
+	}
 	for block := first / QuantBlock; block < last/QuantBlock; block++ {
 		b.quantizeBlock(block, column)
 	}
