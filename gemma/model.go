@@ -126,6 +126,21 @@ func (m *Model) ForwardBatch(tokens []int32, startPos int) [][]float32 {
 // and where. One read of the weights then serves several conversations, which
 // is what lets a server answer more than one at a time.
 func (m *Model) ForwardMixed(tokens []int32, at []Place) [][]float32 {
+	return m.ForwardEmbedded(tokens, nil, tokens, at)
+}
+
+// ForwardEmbedded is the same pass with the embedding of some positions given
+// rather than looked up: embeds[t], when it is not nil, is the row that goes
+// in at position t instead of the token's own. That is how a picture reaches
+// the model — the vision tower's output rows go in at the placeholder
+// positions.
+//
+// ple says which identifier each position contributes to the per-layer inputs,
+// which is a lookup and needs one even where the embedding did not come from
+// the table. llama.cpp answers that with the padding token for every position
+// of an embedding batch, and passing zeros there is what agrees with it.
+// Callers with no picture pass tokens for both.
+func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32, at []Place) [][]float32 {
 	cfg, w := m.Cfg, m.W
 	batch := len(tokens)
 	m.reserve(batch)
@@ -140,12 +155,16 @@ func (m *Model) ForwardMixed(tokens []int32, at []Place) [][]float32 {
 	}
 	nn.InParallel(batch, batch*cfg.Dim*perPosition, func(first, last int) {
 		for t := first; t < last; t++ {
-			Embed(cfg, w, tokens[t], embedded.F[t])
+			if embeds != nil && embeds[t] != nil {
+				copy(embedded.F[t], embeds[t])
+			} else {
+				Embed(cfg, w, tokens[t], embedded.F[t])
+			}
 			embedded.QuantizeColumnRange(t, 0, cfg.Dim)
 		}
 	})
-	ple := m.ple[:batch]
-	PerLayerInputs(cfg, w, m.scratch, embedded, tokens, ple)
+	perLayer := m.ple[:batch]
+	PerLayerInputs(cfg, w, m.scratch, embedded, ple, perLayer)
 
 	xs := m.xs[:batch]
 	for t := range tokens {
@@ -160,7 +179,7 @@ func (m *Model) ForwardMixed(tokens []int32, at []Place) [][]float32 {
 		}
 		if cfg.PLEDim > 0 {
 			for t := range tokens {
-				blockPLE[t] = ple[t][i*cfg.PLEDim : (i+1)*cfg.PLEDim]
+				blockPLE[t] = perLayer[t][i*cfg.PLEDim : (i+1)*cfg.PLEDim]
 			}
 		}
 		ropes := m.scratch.RoPE(bc, at, freqs)

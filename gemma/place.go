@@ -13,10 +13,19 @@ package gemma
 // what it would have been given alone — TestMixedBatchAgreesWithOneAtATime
 // holds it to that, bit for bit.
 
-// Place is one token's cache and its position in it.
+// Place is one token's cache, its position in it, and the furthest position it
+// is allowed to see.
+//
+// Until is that last one. Text is causal and a text token's Until is its own
+// position, which is what Run writes. An image is not: Gemma attends to the
+// tokens of one picture in both directions, so every token of a span carries
+// the span's last position and the widening stops there. It is a wider window,
+// not a new mask — a position still reads a contiguous run of the cache, and
+// every key of the batch is stored before any score is computed.
 type Place struct {
 	Cache *Cache
 	Pos   int
+	Until int
 }
 
 // Run is the places of a run of consecutive positions in one cache, which is
@@ -24,7 +33,7 @@ type Place struct {
 func Run(cache *Cache, startPos, n int) []Place {
 	at := make([]Place, n)
 	for i := range at {
-		at[i] = Place{Cache: cache, Pos: startPos + i}
+		at[i] = Place{Cache: cache, Pos: startPos + i, Until: startPos + i}
 	}
 	return at
 }
@@ -35,7 +44,7 @@ func Run(cache *Cache, startPos, n int) []Place {
 func (m *Model) ForwardSlots(tokens []int32, slots, positions []int) [][]float32 {
 	at := make([]Place, len(tokens))
 	for i := range tokens {
-		at[i] = Place{Cache: m.Slot(slots[i]), Pos: positions[i]}
+		at[i] = Place{Cache: m.Slot(slots[i]), Pos: positions[i], Until: positions[i]}
 	}
 	return m.ForwardMixed(tokens, at)
 }
