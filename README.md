@@ -50,13 +50,15 @@ says where each one comes from.
 
 | | what it runs | against its reference, on the same CPU |
 |---|---|---|
-| [`gemma/`](gemma/) | Gemma 4 E2B and 12B, from a GGUF, pictures included | E2B ×1.01 generating, ×1.24 reading a prompt. 12B ×1.04 and ×1.33 — vs llama.cpp |
+| [`gemma/`](gemma/) | Gemma 4 E2B and 12B, from a GGUF, pictures included | E2B ×1.01 generating, ×1.24 reading a prompt. 12B ×1.04 and ×1.33. A picture through the vision tower, ×1.38 — vs llama.cpp |
 | [`qwen/`](qwen/) | Qwen3 dense, from a GGUF | 4B ×1.00 and ×1.13. 0.6B ×0.85 and ×0.99 — vs llama.cpp |
 | [`pockettts/`](pockettts/) | [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts), twelve languages, voice cloning included | ×2.22 and ×1.63 the speed of PyTorch, on the 24- and 6-layer models |
 
 In absolute terms, on an i7-9700K with eight threads and Q4_0 weights: Gemma
 E2B draws 22.6 tokens a second and reads 204; the 12B, 5.0 and 42. Qwen3 4B,
 14.6 and 110. Pocket TTS speaks at ×2.82 real time in French, ×6.55 in English.
+A 640×426 picture goes through Gemma's vision tower in 0.78 seconds, against
+llama.cpp's 1.08.
 
 **The 0.6B is the one this engine loses**, and `qwen/README.md` says why: at
 320 MB the weights fit close enough that the memory bus stops being the limit,

@@ -218,16 +218,25 @@ And the vision tower, per picture rather than per token:
 | | per image |
 |---|---|
 | `VisionTower.Encode` — a 640×426 picture, 1053 patches, 117 soft tokens | 0.78 s |
+| llama.cpp's `mtmd_encode_chunk`, the same picture | 1.08 s |
 
-llama.cpp encodes the same picture in 0.68 s on this machine, so the tower is
-within a seventh of its reference — where it began, before any of the work
-below, it was 3.2 s and four and a half times slower.
+**×1.38, and the comparison is if anything against this engine**: the figure
+above includes resizing the picture, and llama.cpp's does not — its
+preprocessing happens in `mtmd_tokenize`, before that timer starts. Both are
+the best of four runs on eight cores with no accelerator.
 
-The tower is 318 GFLOP of matrix products and 54 of attention. Four fifths of
-that time is now the one kernel that multiplies bfloat16 weights by float32
-activations, at 785 GFLOP/s on the shapes the blocks are made of, against a
-machine peak near 1100. What got it there, in the order the measurements asked
-for it:
+A warning for anyone repeating this. `llama-mtmd-cli` prints two durations for
+one picture, and only the first is the tower: `image slice encoded in …` is
+`mtmd_encode_chunk`, and `image decoded (batch 1/1) in …` is the *language*
+model reading the embeddings the tower produced. They are different
+computations, and the second is the smaller one.
+
+Where this began, before any of the work below, `Encode` took 3.2 s — three
+times llama.cpp's tower rather than a third under it. The tower is 318 GFLOP
+of matrix products and 54 of attention, and four fifths of what it costs now
+is the one kernel that multiplies bfloat16 weights by float32 activations, at
+785 GFLOP/s on the shapes the blocks are made of, against a machine peak near
+1100. What got it there, in the order the measurements asked for it:
 
 - **Whole matrices, not one patch at a time.** A thousand patches arrive
   together, so the weight is read once for all of them rather than a thousand
