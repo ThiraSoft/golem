@@ -1,0 +1,26 @@
+# The waypoints kept for one image through the vision tower. The names are the
+# ones models/gemma4v.cpp gives its nodes, so this file changes when that graph
+# does and nothing else has to.
+image       testdata/gemma/shapes.png
+prompt      Describe this image.
+n_predict   16
+
+# Every block: the tower is short enough that keeping all of them costs little,
+# and a divergence then says which block it began in.
+blocks all
+
+global inp_raw_scaled
+global pos_embd
+global pooled
+global projected
+
+# std_scaled exists only if the projector carries the two standardisation
+# tensors, which E2B's does not.
+global_opt std_scaled
+
+require Qcur_pos
+require Kcur_pos
+require Vcur_normed
+require attn_out
+require ffn_out
+require layer_out

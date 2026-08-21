@@ -12,11 +12,21 @@ in a file under `ref/<model>/`, named on the command line.
 
 **A new architecture adds a directory here, not a recorder.**
 
+`dump_vision.cpp` is the one exception, and it is a different graph engine
+rather than a different architecture: a vision tower is built by `clip.cpp`,
+whose nodes `llama_decode` never sees. The way in is `mtmd` — a prompt carrying
+a media marker, tokenized into chunks, the picture encoded and handed to the
+text model as embeddings — so that recorder links `libmtmd` and includes its
+headers, where the other three link `llama` alone. It records the tower's
+waypoints, the token layout the prompt became, and the greedy continuation,
+which is what an end-to-end test replays.
+
 | | pins | takes |
 |---|---|---|
 | `dump_layers.cpp` | the engine | a model, an output directory, a `.run` file |
 | `dump_tokens.cpp` | the tokenizer | a model, an output directory, a `.tsv` corpus |
 | `dump_quants.cpp` | the kernels | a model, an output directory |
+| `dump_vision.cpp` | the vision tower | a model, a projector, an output directory, a `.run` file |
 
 The per-model files are in [`gemma/`](gemma/) and [`qwen/`](qwen/), alongside
 the one recorder that is not shared — each architecture's own `dump_chats.py`,

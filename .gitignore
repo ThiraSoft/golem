@@ -20,6 +20,7 @@
 /testdata/gemma/layers12/
 /testdata/gemma/quants/
 /testdata/gemma/window/
+/testdata/gemma/vision/
 /testdata/qwen/layers/
 /testdata/qwen/long/
 /testdata/qwen/layers_q4/
