@@ -118,6 +118,14 @@ func (m *Model) Forward(token int32, pos int) []float32 {
 // results of a batch are what the same tokens would have given one at a time,
 // to the last bit — and only the memory traffic changes.
 func (m *Model) ForwardBatch(tokens []int32, startPos int) [][]float32 {
+	return m.ForwardMixed(tokens, Run(m.cache, startPos, len(tokens)))
+}
+
+// ForwardMixed is the same pass over a batch whose tokens need not belong to
+// the same conversation: at says, for each of them, which cache it writes to
+// and where. One read of the weights then serves several conversations, which
+// is what lets a server answer more than one at a time.
+func (m *Model) ForwardMixed(tokens []int32, at []Place) [][]float32 {
 	cfg, w := m.Cfg, m.W
 	batch := len(tokens)
 	m.reserve(batch)
@@ -155,8 +163,8 @@ func (m *Model) ForwardBatch(tokens []int32, startPos int) [][]float32 {
 				blockPLE[t] = ple[t][i*cfg.PLEDim : (i+1)*cfg.PLEDim]
 			}
 		}
-		ropes := m.scratch.RoPE(bc, startPos, batch, freqs)
-		Block(cfg, bc, &w.Blocks[i], ropes, m.cache, m.scratch, xs, blockPLE, startPos)
+		ropes := m.scratch.RoPE(bc, at, freqs)
+		Block(cfg, bc, &w.Blocks[i], ropes, at, m.scratch, xs, blockPLE)
 		copy(m.outputs[i], xs[batch-1])
 	}
 

@@ -52,6 +52,15 @@ func (m *Model) SlotContext() int {
 	return m.slotContext
 }
 
+// Slot is one of the caches, for a caller building a batch out of several
+// conversations at once.
+func (m *Model) Slot(i int) *Cache {
+	if len(m.caches) == 0 {
+		return m.cache
+	}
+	return m.caches[i]
+}
+
 // UseSlot points the next forward pass at one of them. Out of range is a
 // caller's mistake rather than a request's, so it panics.
 func (m *Model) UseSlot(i int) {

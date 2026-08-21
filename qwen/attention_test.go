@@ -31,10 +31,10 @@ func TestAttentionWaypoints(t *testing.T) {
 		// own inputs, so that a divergence at pos is this position's.
 		for p := 0; p < pos; p++ {
 			normed.Set(0, f.column(t, "attn_norm-"+itoa(il), p))
-			Attention(cfg, bc, bw, s.RoPE(bc, p, 1), cache, s, normed, p, out)
+			Attention(cfg, bc, bw, s.RoPE(bc, Run(cache, p, 1)), Run(cache, p, 1), s, normed, out)
 		}
 		normed.Set(0, f.column(t, "attn_norm-"+itoa(il), pos))
-		Attention(cfg, bc, bw, s.RoPE(bc, pos, 1), cache, s, normed, pos, out)
+		Attention(cfg, bc, bw, s.RoPE(bc, Run(cache, pos, 1)), Run(cache, pos, 1), s, normed, out)
 
 		// After the rotation, which is what the engine leaves in the scratch.
 		compare(t, "Qcur-"+itoa(il), s.Q(bc), f.heads(t, "Qcur-"+itoa(il), pos), 2e-4)

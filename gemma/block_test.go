@@ -36,7 +36,7 @@ func replayFullBlock(t *testing.T, f *fixture, cfg *Config, w *Weights,
 		PerLayerInputs(cfg, w, s, embedded, []int32{token}, ple)
 
 		blockPLE := [][]float32{ple[0][il*cfg.PLEDim : (il+1)*cfg.PLEDim]}
-		Block(cfg, bc, bw, s.RoPE(bc, pos, 1, freqs), cache, s, xs, blockPLE, pos)
+		Block(cfg, bc, bw, s.RoPE(bc, Run(cache, pos, 1), freqs), Run(cache, pos, 1), s, xs, blockPLE)
 
 		if check {
 			compareRelative(t, "l_out-"+itoa(il)+" at position "+itoa(pos),
@@ -99,7 +99,7 @@ func TestBlockWaypoints(t *testing.T) {
 		embedded.Set(0, f.column(t, "inp_scaled", p))
 		PerLayerInputs(cfg, w, s, embedded, []int32{f.Tokens[p]}, ple)
 		blockPLE := [][]float32{ple[0][il*cfg.PLEDim : (il+1)*cfg.PLEDim]}
-		Block(cfg, bc, bw, s.RoPE(bc, p, 1, nil), cache, s, xs, blockPLE, p)
+		Block(cfg, bc, bw, s.RoPE(bc, Run(cache, p, 1), nil), Run(cache, p, 1), s, xs, blockPLE)
 	}
 
 	compareRelative(t, "attn_out-"+itoa(il), s.AttnOut(), f.column(t, "attn_out-"+itoa(il), pos), 1e-3)

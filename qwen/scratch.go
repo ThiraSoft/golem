@@ -120,14 +120,14 @@ func (s *Scratch) Batch(width, batch int) *nn.Batch {
 // of the batch and each made current for its own position. Every block shares
 // one base here, so the sines and cosines are computed once per batch rather
 // than once per head of every block.
-func (s *Scratch) RoPE(bc BlockConfig, startPos, batch int) []*nn.RoPETable {
+func (s *Scratch) RoPE(bc BlockConfig, at []Place) []*nn.RoPETable {
 	t, ok := s.ropes[bc.RoPEBase]
 	if !ok {
 		t = tables(s.batch)
 		s.ropes[bc.RoPEBase] = t
 	}
-	for i := 0; i < batch; i++ {
-		t[i].Prepare(bc.RoPEDims, startPos+i, bc.RoPEBase, nil)
+	for i, p := range at {
+		t[i].Prepare(bc.RoPEDims, p.Pos, bc.RoPEBase, nil)
 	}
 	return t
 }

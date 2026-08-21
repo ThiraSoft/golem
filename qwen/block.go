@@ -31,8 +31,8 @@ const perPosition = 24
 
 func Block(
 	cfg *Config, bc BlockConfig, bw *BlockWeights,
-	ropes []*nn.RoPETable, cache *Cache, s *Scratch,
-	xs [][]float32, startPos int,
+	ropes []*nn.RoPETable, at []Place, s *Scratch,
+	xs [][]float32,
 ) {
 	batch := len(xs)
 
@@ -52,7 +52,7 @@ func Block(
 	})
 
 	attn := s.attn[:batch]
-	Attention(cfg, bc, bw, ropes, cache, s, normed, startPos, attn)
+	Attention(cfg, bc, bw, ropes, at, s, normed, attn)
 
 	// The residual, with no norm between it and the projection — this is
 	// llama.cpp's ffn_inp, and it is written back over the input.

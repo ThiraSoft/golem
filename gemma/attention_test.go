@@ -25,7 +25,7 @@ func replayBlock(t *testing.T, f *fixture, cfg *Config, w *Weights,
 
 	for pos := range f.Tokens {
 		normed.Set(0, f.column(t, "attn_norm-"+itoa(il), pos))
-		Attention(cfg, bc, bw, s.RoPE(bc, pos, 1, freqs), cache, s, normed, pos, out)
+		Attention(cfg, bc, bw, s.RoPE(bc, Run(cache, pos, 1), freqs), Run(cache, pos, 1), s, normed, out)
 
 		if !check {
 			continue
@@ -97,10 +97,10 @@ func TestAttentionWaypoints(t *testing.T) {
 		// Fill the cache up to the position under test.
 		for p := 0; p < pos; p++ {
 			normed.Set(0, f.column(t, "attn_norm-"+itoa(il), p))
-			Attention(cfg, bc, bw, s.RoPE(bc, p, 1, freqs), cache, s, normed, p, out)
+			Attention(cfg, bc, bw, s.RoPE(bc, Run(cache, p, 1), freqs), Run(cache, p, 1), s, normed, out)
 		}
 		normed.Set(0, f.column(t, "attn_norm-"+itoa(il), pos))
-		Attention(cfg, bc, bw, s.RoPE(bc, pos, 1, freqs), cache, s, normed, pos, out)
+		Attention(cfg, bc, bw, s.RoPE(bc, Run(cache, pos, 1), freqs), Run(cache, pos, 1), s, normed, out)
 
 		compare(t, "Qcur_pos-"+itoa(il), s.Q(bc), f.heads(t, "Qcur_pos-"+itoa(il), pos), 2e-4)
 		compare(t, "Kcur_pos-"+itoa(il), s.K(bc), f.heads(t, "Kcur_pos-"+itoa(il), pos), 2e-4)

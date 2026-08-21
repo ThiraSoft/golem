@@ -128,14 +128,14 @@ func (s *Scratch) BF16(batch int) *nn.Batch {
 // of the batch and each made current for its own position. The model has two
 // geometries, so the sines and cosines are computed twice per batch rather than
 // once per head of every block.
-func (s *Scratch) RoPE(bc BlockConfig, startPos, batch int, freqs []float32) []*nn.RoPETable {
+func (s *Scratch) RoPE(bc BlockConfig, at []Place, freqs []float32) []*nn.RoPETable {
 	t, ok := s.ropes[bc.RoPEBase]
 	if !ok {
 		t = tables(s.batch)
 		s.ropes[bc.RoPEBase] = t
 	}
-	for i := 0; i < batch; i++ {
-		t[i].Prepare(bc.RoPEDims, startPos+i, bc.RoPEBase, freqs)
+	for i, p := range at {
+		t[i].Prepare(bc.RoPEDims, p.Pos, bc.RoPEBase, freqs)
 	}
 	return t
 }

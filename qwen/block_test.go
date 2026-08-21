@@ -70,7 +70,7 @@ func TestBlockMatchesReference(t *testing.T) {
 			xs[p] = append([]float32(nil), f.column(t, source, p)...)
 		}
 		s.Reserve(len(xs))
-		Block(cfg, bc, bw, s.RoPE(bc, 0, len(xs)), cache, s, xs, 0)
+		Block(cfg, bc, bw, s.RoPE(bc, Run(cache, 0, len(xs))), Run(cache, 0, len(xs)), s, xs)
 
 		compareRelative(t, "l_out-"+itoa(il), xs[last], f.lastColumn(t, "l_out-"+itoa(il)), 2e-3)
 	}
@@ -109,7 +109,7 @@ func TestAttentionOutputMatchesReference(t *testing.T) {
 			attn[p] = make([]float32, cfg.Dim)
 		}
 		s.Reserve(len(xs))
-		Attention(cfg, bc, bw, s.RoPE(bc, 0, len(xs)), cache, s, normed, 0, attn)
+		Attention(cfg, bc, bw, s.RoPE(bc, Run(cache, 0, len(xs))), Run(cache, 0, len(xs)), s, normed, attn)
 		for i := range xs[last] {
 			xs[last][i] += attn[last][i]
 		}

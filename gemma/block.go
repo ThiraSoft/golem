@@ -17,8 +17,8 @@ import "github.com/ThiraSoft/golem/nn"
 
 func Block(
 	cfg *Config, bc BlockConfig, bw *BlockWeights,
-	ropes []*nn.RoPETable, cache *Cache, s *Scratch,
-	xs [][]float32, ple [][]float32, startPos int,
+	ropes []*nn.RoPETable, at []Place, s *Scratch,
+	xs [][]float32, ple [][]float32,
 ) {
 	batch := len(xs)
 
@@ -38,7 +38,7 @@ func Block(
 	})
 
 	attn := s.attn[:batch]
-	Attention(cfg, bc, bw, ropes, cache, s, normed, startPos, attn)
+	Attention(cfg, bc, bw, ropes, at, s, normed, attn)
 	nn.InParallel(batch, batch*cfg.Dim*perPosition, func(first, last int) {
 		for t := first; t < last; t++ {
 			nn.RMSNormPlain(attn[t], bw.PostAttnNorm, cfg.Eps)

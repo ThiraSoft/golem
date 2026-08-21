@@ -26,13 +26,17 @@ import (
 
 // Attention writes cfg.Dim floats per position into out: the attention output
 // after the output projection, before the residual add.
+//
+// at says where each token of the batch goes: which conversation's cache it
+// writes to, and at which position in it. A batch of one conversation is the
+// ordinary case and every entry names the same cache; a batch drawn from
+// several names several, and no two of them see each other.
 func Attention(
 	cfg *Config, bc BlockConfig, bw *BlockWeights,
-	ropes []*nn.RoPETable, cache *Cache, s *Scratch,
-	normed *nn.Batch, startPos int, out [][]float32,
+	ropes []*nn.RoPETable, at []Place, s *Scratch,
+	normed *nn.Batch, out [][]float32,
 ) {
 	batch := normed.Size
-	lc := cache.Layers[bc.Index]
 	// The scratch rows are as wide as the widest block; a narrower one writes
 	// the head range it owns and reads it back by the same indices.
 	q, qh := s.q[:batch], s.qh[:batch]
@@ -70,10 +74,11 @@ func Attention(
 			bw.K.MatVecRows(normed, k, from, to)
 			bw.V.MatVecRows(normed, v, from, to)
 			for t := 0; t < batch; t++ {
+				lc := at[t].Cache.Layers[bc.Index]
 				kh, vh := k[t][from:to], v[t][from:to]
 				nn.RMSNormPlain(kh, bw.KNorm, cfg.Eps)
 				ropes[t].Apply(kh[:bc.RoPEDims])
-				lc.Store(startPos+t, h, kh, vh)
+				lc.Store(at[t].Pos, h, kh, vh)
 			}
 		}
 	})
@@ -88,11 +93,12 @@ func Attention(
 	// While an answer is being generated this is short; it is what grows with
 	// the conversation, and what a prompt has most of.
 	set := s.Batch(bc.Heads*bc.HeadDim, batch)
-	nn.InParallel(batch*bc.Heads, 2*batch*bc.Heads*(startPos+batch)*bc.HeadDim, func(start, end int) {
+	nn.InParallel(batch*bc.Heads, 2*batch*bc.Heads*(deepest(at)+1)*bc.HeadDim, func(start, end int) {
 		for u := start; u < end; u++ {
 			t, h := u/bc.Heads, u%bc.Heads
-			pos := startPos + t
-			first, last := cache.Visible(bc, pos)
+			lc := at[t].Cache.Layers[bc.Index]
+			pos := at[t].Pos
+			first, last := at[t].Cache.Visible(bc, pos)
 			n := last - first + 1
 			scores := s.scores[t*s.maxHeads+h][:n]
 			query := qh[t][h*bc.HeadDim : (h+1)*bc.HeadDim]
@@ -118,4 +124,16 @@ func Attention(
 	})
 
 	bw.O.MatVecBatch(set, out)
+}
+
+// deepest is the furthest into a conversation this batch reaches, which is
+// what the attention of it costs.
+func deepest(at []Place) int {
+	n := 0
+	for _, p := range at {
+		if p.Pos > n {
+			n = p.Pos
+		}
+	}
+	return n
 }
