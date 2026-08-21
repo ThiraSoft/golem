@@ -167,13 +167,13 @@ On an i7-9700K, eight threads, Q4_0 weights. E2B first:
 
 | | per token |
 |---|---|
-| `Forward` — 35 blocks, a prompt already in the cache | 37 ms |
+| `Forward` — 35 blocks, a prompt already in the cache | 35 ms |
 | `Logits` — the whole vocabulary | 10 ms |
-| `ForwardBatch` — 64 positions of a prompt at once | 7.4 ms |
+| `ForwardBatch` — 64 positions of a prompt at once | 5.0 ms |
 
 The first two are within a quarter of what the memory bus on this machine can
 deliver: a token being generated reads 999 MB of block weights and 315 MB of
-logit head, and 1.3 GB in 47 ms is 28 GB/s against the 38 GB/s eight cores can
+logit head, and 1.3 GB in 45 ms is 29 GB/s against the 38 GB/s eight cores can
 sustain on a plain read. There is no arithmetic left worth removing there; what
 remains is the waiting.
 
@@ -186,10 +186,10 @@ becomes it — which is why the figure is per token of a batch and not per pass.
 Same i7-9700K, eight threads, the same `gemma-4-E2B-it-QAT-Q4_0.gguf`, llama.cpp
 build 9603 held to the CPU (`-dev none -ngl 0`):
 
-| | llama.cpp | golem | |
+| | llama.cpp | golem | golem ÷ llama.cpp |
 |---|---:|---:|---|
-| prompt, 64 tokens | 172 t/s | 134 t/s | ×1.28 |
-| generation, 32 tokens | 22.3 t/s | 21.5 t/s | ×1.04 |
+| prompt, 64 tokens | 165 t/s | 204 t/s | ×1.24 |
+| generation, 32 tokens | 22.4 t/s | 22.6 t/s | ×1.01 |
 
 ```bash
 llama-bench -m "$MODEL" -dev none -ngl 0 -t 8 -p 64 -n 32 -r 3
@@ -198,16 +198,17 @@ chat -model "$MODEL" -p "<fifty-nine tokens>" -temp 0 -n 32 -stats
 
 The 12B on the same machine, the same way, `gemma-4-12B-it-QAT-Q4_0.gguf`:
 
-| | llama.cpp | golem | |
+| | llama.cpp | golem | golem ÷ llama.cpp |
 |---|---:|---:|---|
-| prompt, 64 tokens | 29.8 t/s | 27.0 t/s | ×1.10 |
-| generation, 32 tokens | 4.81 t/s | 4.74 t/s | ×1.01 |
+| prompt, 64 tokens | 31.7 t/s | 42.0 t/s | ×1.33 |
+| generation, 32 tokens | 4.83 t/s | 5.0 t/s | ×1.04 |
 
-Per token of generation that is 191 ms in the blocks and 24 ms in the logit
+Per token of generation that is 176 ms in the blocks and 24 ms in the logit
 head. Both engines are reading 6.5 GB of weights for every token here, and at
-that size there is nothing between them but the memory bus — which is why the
-ratio that is ×1.05 on E2B is ×1.01 on the 12B, and why the prompt, where the
-bus stops being the limit, keeps the gap the kernels account for.
+that size there is nothing between them but the memory bus, which is why
+generation is a tie on both models. The prompt is not: there the bus stops
+being the limit and the integer kernel becomes it, and that is arithmetic
+rather than waiting.
 
 **Generation** is where the two meet, and four things closed a gap that used to
 be a factor of four and a half.
@@ -238,7 +239,8 @@ over the same twelve thousand values, four of which used to run on one core
 while seven waited. Attention is a head to a core, which matters little at a
 hundred positions and is what matters at four thousand.
 
-**The prompt** was a factor of eleven and is a factor of one and a quarter. It
+**The prompt** was a factor of eleven behind llama.cpp and is now a quarter
+ahead of it. It
 was eleven because every kernel here took a vector: sixty-four tokens meant
 sixty-four passes over a gigabyte of weights for arithmetic that needed one.
 `nn.Batch` is the answer — a set of activations quantized together and
@@ -248,7 +250,7 @@ every column of the batch while it is still in the first-level cache. What
 together; the batch is causal within itself, which is why a block stores all of
 its keys and values before any of its scores are computed.
 
-Three things about that path are worth naming, because all three were measured
+Four things about that path are worth naming, because all four were measured
 rather than assumed:
 
 - **The tiles matter as much as the kernel.** A group of columns of a
@@ -263,7 +265,6 @@ rather than assumed:
   already stopped being the limit; past sixty-four the activations no longer fit
   in the caches and every position attends to every position before it, and the
   rate falls.
-
 - **The width of a pass is what the row costs.** Unpacking the nibbles,
   converting the fp16 scale and folding the correction happen once per block
   whatever the width of the group, so at four columns they were a third of the
@@ -273,15 +274,28 @@ rather than assumed:
   order, so the bit-for-bit agreement holds. That, and folding the multiply and
   the add of each block into one `VFMADD231PS`, took the prompt from 102 t/s to
   134 on E2B and from 20.7 to 27.0 on the 12B.
+- **What the width could not amortize was the row's scale**, and that took a
+  second layout of the weights. One conversion of a block's integer sum to a
+  float, one multiply by the two scales and one add: three instructions per row,
+  per column, per block, which no grouping of columns removes because the scale
+  belongs to the row. Unless the rows are in the lanes of one register.
+  `nn/pack_q4_0.go` interleaves eight rows so that they are — one horizontal add
+  a block, and eight rows' sums come out in ascending lanes — and
+  `dotPackedQ4_0x4AVX2` reads a group once for four positions. It also sums a
+  block's four chunks in int16 before widening them, which is exact here (a lane
+  holds at most fifteen thousand) and saves three instructions more. The prompt
+  went from 134 t/s to 204 on E2B and from 27.0 to 42.0 on the 12B, which is
+  where it passed llama.cpp; generation gained a little too, because fewer
+  instructions still help when the bus is the limit.
 
-What is left between golem and llama.cpp on a prompt is the shape of the weights
-themselves. ggml repacks Q4_0 into an interleaved layout at load time, so that
-one pass of its kernel serves eight rows with contiguous nibbles: the scale of
-each row lands in its own lane, and the conversion to floats is paid once for
-eight rows rather than once for each. golem reads the file's own layout, which
-leaves that conversion per row and per column — a quarter of its inner loop, and
-about the factor that remains. Repacking is the next thing to write, and it
-costs a second copy of the weights in memory.
+The price is the one thing the engine did not do before: `Weights.Repack` builds
+that layout at load time, in a third of a second on E2B and under two on the
+12B, and holds
+it in memory — 960 MB beside the mapping for E2B, 6.5 GB for the 12B. The
+mapping's own pages are clean and the kernel can drop them under pressure, so
+what the machine has to find is one copy plus what it is using. It is the same
+trade ggml makes with its repacked buffer types, and it is what the prompt is
+worth here.
 
 ## The chat template
 

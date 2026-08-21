@@ -47,6 +47,7 @@ func Open(path string, maxContext int) (*Model, error) {
 		g.Close()
 		return nil, err
 	}
+	w.Repack()
 	m := &Model{
 		Cfg:      cfg,
 		W:        w,

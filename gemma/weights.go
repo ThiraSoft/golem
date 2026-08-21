@@ -2,10 +2,11 @@ package gemma
 
 // Binding the file's tensors to the shapes the engine computes with.
 //
-// Nothing is copied except the norm gains, which are small and read on every
-// token. The weight matrices are views over the mapping: three gigabytes stay
-// where they are, and the first token is produced before a reader would have
-// finished loading them.
+// The weight matrices are views over the mapping, and the norm gains — small,
+// and read on every token — are the only thing copied out of it. Then Repack
+// builds a second layout of the matrices a product reads, which is the one
+// exception and is paid for in nn/pack_q4_0.go: a third of a second at load and
+// a gigabyte of memory on E2B, against a prompt read half again as fast.
 
 import (
 	"encoding/binary"
@@ -37,6 +38,28 @@ type Weights struct {
 	OutputNorm  []float32
 	RoPEFreqs   []float32
 	Blocks      []BlockWeights
+}
+
+// Repack builds the interleaved form of every matrix a product reads, which
+// nn/pack_q4_0.go describes. The embedding tables are left alone: they are read
+// a row at a time and never multiplied.
+//
+// It is a second copy of the weights in memory and a few seconds of work at
+// load time, and it is what makes a prompt a third faster. The matrices are
+// independent, so the cores share them out.
+func (w *Weights) Repack() {
+	var all []*nn.Matrix
+	for i := range w.Blocks {
+		b := &w.Blocks[i]
+		all = append(all, &b.Q, &b.K, &b.V, &b.O, &b.Gate, &b.Up, &b.Down, &b.InpGate, &b.Proj)
+	}
+	all = append(all, &w.PLEProj)
+
+	nn.InParallel(len(all), 1<<30, func(first, last int) {
+		for i := first; i < last; i++ {
+			all[i].Repack()
+		}
+	})
 }
 
 // matrix binds a two-dimensional tensor. GGUF writes the row length first, so

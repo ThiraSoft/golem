@@ -5,8 +5,13 @@ package nn
 // The switch on the format happens once per matrix rather than once per
 // element, so it costs nothing measurable and each format keeps a kernel
 // written for it alone. The bytes are the ones in the mapped file: nothing is
-// converted at load time, because re-reading the whole matrix on every token is
-// what caps generation speed, and a wider format would mean more bandwidth.
+// dequantized at load time, because re-reading the whole matrix on every token
+// is what caps generation speed, and a wider format would mean more bandwidth.
+//
+// Repack is the one thing built at load time, and it is not a wider format: it
+// is the same Q4_0 weights, byte for byte as many, laid out eight rows at a
+// time so that the product can put a row in a lane. nn/pack_q4_0.go says what
+// it buys and what it costs.
 
 import (
 	"encoding/binary"
@@ -20,6 +25,24 @@ type Matrix struct {
 	Quant      Quant
 	Rows, Cols int       // Rows outputs, each reading Cols inputs
 	Bias       []float32 // nil when the projection has none
+
+	// Packed is the same weights, eight rows interleaved, built by Repack.
+	// It is what the products read when it is there; the rows past the last
+	// whole group of eight are not in it and keep reading Data.
+	Packed []byte
+}
+
+// Repack builds the interleaved form of a Q4_0 matrix, which nn/pack_q4_0.go
+// describes. It costs a second copy of the weights in memory and gives back
+// about a third of the time a prompt spends in the product. A matrix in any
+// other format, or too narrow to hold one group of eight rows, is left as it
+// is.
+func (m *Matrix) Repack() {
+	if m.Quant != Q4_0 || m.Packed != nil || m.Rows < PackedRows || m.Cols%QuantBlock != 0 {
+		return
+	}
+	m.Packed = make([]byte, PackedQ4_0Bytes(m.Rows, m.Cols))
+	PackQ4_0(m.Data, m.Rows, m.Cols, m.Packed)
 }
 
 // RowBytes is what one row occupies on disk.
@@ -104,7 +127,14 @@ func (m Matrix) MatVecRows(b *Batch, ys [][]float32, start, end int) {
 func (m Matrix) rows(b *Batch, ys [][]float32, start, end int) {
 	switch m.Quant {
 	case Q4_0:
-		matVecQ4_0Rows(m.Data, b, m.Cols, ys, start, end)
+		if packed := m.Rows / PackedRows * PackedRows; m.Packed != nil && start < packed {
+			matVecPackedQ4_0Rows(m.Packed, b, m.Cols, ys, start, min(end, packed))
+			if end > packed {
+				matVecQ4_0Rows(m.Data, b, m.Cols, ys, packed, end)
+			}
+		} else {
+			matVecQ4_0Rows(m.Data, b, m.Cols, ys, start, end)
+		}
 	case BF16:
 		weights := unsafe.Slice((*uint16)(unsafe.Pointer(&m.Data[0])), len(m.Data)/2)
 		for r := start; r < end; r++ {
