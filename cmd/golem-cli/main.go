@@ -1,7 +1,10 @@
-// Command chat holds a conversation with Gemma 4, from a GGUF file, on the CPU.
+// Command golem-cli holds a conversation with a GGUF model, on the CPU.
 //
-//	chat -model gemma-4-E2B-it-QAT-Q4_0.gguf
-//	chat -model … -p "Explain a mutex in one sentence." -stats
+//	golem-cli -model gemma-4-E2B-it-QAT-Q4_0.gguf
+//	golem-cli -model Qwen3-4B-Q4_0.gguf -p "Explain a mutex in one sentence." -stats
+//
+// Which engine reads the file is read from the file: it declares its own
+// architecture, and gemma4 and qwen3 are the two that are implemented.
 //
 // With -p it answers once and exits; without, it reads turns from the terminal
 // until end of file.
@@ -18,13 +21,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ThiraSoft/golem/gemma"
-	"github.com/ThiraSoft/golem/token/bpe"
+	"github.com/ThiraSoft/golem/engine"
 )
 
 func main() {
-	model := flag.String("model", os.Getenv("GOLEM_MODEL"), "Gemma 4 GGUF file (or GOLEM_MODEL)")
-	context := flag.Int("context", 4096, "positions to keep; the file declares 131072, which no machine here would survive")
+	model := flag.String("model", os.Getenv("GOLEM_MODEL"), "GGUF file, gemma4 or qwen3 (or GOLEM_MODEL)")
+	context := flag.Int("context", 4096, "positions to keep; the files declare far more than any machine here would survive")
 	system := flag.String("system", "", "system message opening the conversation")
 	think := flag.Bool("think", false, "open the system turn with the thinking marker")
 	maxTokens := flag.Int("n", 512, "most tokens to draw for one answer")
@@ -45,18 +47,14 @@ func main() {
 	}
 
 	start := time.Now()
-	m, err := gemma.Open(*model, *context)
+	m, err := engine.Open(*model, *context)
 	if err != nil {
 		fail(err)
 	}
 	defer m.Close()
-	vocab, err := bpe.Load(m.File())
-	if err != nil {
-		fail(err)
-	}
 	loading := time.Since(start)
 
-	params := m.Cfg.Sampling
+	params := m.Sampling
 	if *temp >= 0 {
 		params.Temperature = float32(*temp)
 	}
@@ -72,15 +70,16 @@ func main() {
 	}
 
 	if *stats {
-		fmt.Fprintf(os.Stderr, "%s: %d blocks, %d positions, vocabulary %d, loaded in %s on %d cores\n",
-			filepath.Base(*model), len(m.Cfg.Blocks), *context, m.Cfg.Vocab,
+		fmt.Fprintf(os.Stderr, "%s: %s, %d blocks, %d positions, vocabulary %d, loaded in %s on %d cores\n",
+			filepath.Base(*model), m.Name, m.Blocks, *context, m.Vocabulary,
 			loading.Round(time.Millisecond), runtime.NumCPU())
 		fmt.Fprintf(os.Stderr, "sampling: temperature %g, top-k %d, top-p %g, seed %d\n",
 			params.Temperature, params.TopK, params.TopP, params.Seed)
 	}
 
 	newSession := func() *Session {
-		return NewSession(m, vocab, params, m.Cfg.Vocab, *context, *maxTokens, *system, *think, m.Cfg.EmptyThought)
+		return NewSession(m.Forward, m.Vocab, m.Template, params,
+			m.Vocabulary, *context, *maxTokens, *system, *think)
 	}
 	session := newSession()
 	out := bufio.NewWriter(os.Stdout)
@@ -115,7 +114,7 @@ func main() {
 		case line == "":
 			continue
 		case line == "/reset":
-			m.Reset()
+			m.Forward.Reset()
 			session = newSession()
 			fmt.Fprintln(os.Stderr, "(forgotten)")
 			continue
@@ -156,6 +155,6 @@ func report(t Turn) {
 }
 
 func fail(err error) {
-	fmt.Fprintln(os.Stderr, "chat:", err)
+	fmt.Fprintln(os.Stderr, "golem-cli:", err)
 	os.Exit(1)
 }

@@ -1,11 +1,38 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/ThiraSoft/golem/chat"
 	"github.com/ThiraSoft/golem/sample"
 )
+
+// A template of whole words, so that these tests say nothing about which
+// engine answered. Every message is its role, its content, and a space; a
+// generation prompt is the bare word "assistant".
+type wordTemplate struct{}
+
+func (wordTemplate) Render(msgs []chat.Message, opt chat.Options) (string, error) {
+	if len(msgs) == 0 {
+		return "", errors.New("an empty conversation")
+	}
+	var b strings.Builder
+	for _, m := range msgs {
+		b.WriteString(m.Role + " " + m.Content + " ")
+	}
+	if opt.AddGenerationPrompt {
+		b.WriteString("assistant ")
+	}
+	return b.String(), nil
+}
+
+func (wordTemplate) CallOpen() string { return "CALL" }
+
+func (wordTemplate) ParseCalls(text string) (string, []chat.ToolCall, error) {
+	return text, nil, nil
+}
 
 // A vocabulary of whole words: every space-separated piece of the fed text is
 // one identifier. Enough to say what the session put in the context, which is
@@ -77,7 +104,7 @@ func (e *scriptedEngine) Logits(hidden, out []float32) {
 func newSession(t *testing.T, v *wordVocab, e *scriptedEngine, maxTokens int, system string) *Session {
 	t.Helper()
 	// Greedy, so the script is the answer.
-	return NewSession(e, v, sample.Params{Temperature: 0}, 4096, 4096, maxTokens, system, false, false)
+	return NewSession(e, v, wordTemplate{}, sample.Params{Temperature: 0}, 4096, 4096, maxTokens, system, false)
 }
 
 // The context a token at a time: what the model was fed, in order.
@@ -104,7 +131,7 @@ func TestFirstTurnFeedsTheWholeTemplate(t *testing.T) {
 	if turn.Generated != 3 || turn.Truncated {
 		t.Fatalf("%+v", turn)
 	}
-	want := "<bos><|turn>system Be terse.<turn|> <|turn>user hi<turn|> <|turn>model hello there"
+	want := "system Be terse. user hi assistant hello there"
 	if got := e.context(v); got != want {
 		t.Fatalf("context\n%q\nwant\n%q", got, want)
 	}
@@ -114,9 +141,10 @@ func TestFirstTurnFeedsTheWholeTemplate(t *testing.T) {
 	}
 }
 
-// The second turn encodes only what is new, and closes the turn the model
-// stopped on — the end-of-turn token was drawn but never fed.
-func TestSecondTurnOnlyEncodesTheContinuation(t *testing.T) {
+// The second turn re-renders the whole conversation — the template is the only
+// thing that knows how to write one — and feeds only the tokens the cache does
+// not already hold.
+func TestSecondTurnFeedsOnlyWhatIsNew(t *testing.T) {
 	v := newWordVocab()
 	e := &scriptedEngine{vocab: v, script: []string{"one", "<turn|>", "two", "<turn|>"}}
 	s := newSession(t, v, e, 32, "")
@@ -131,17 +159,37 @@ func TestSecondTurnOnlyEncodesTheContinuation(t *testing.T) {
 	if len(v.fed) != 2 {
 		t.Fatalf("%d encodings", len(v.fed))
 	}
-	want := "<turn|>\n<|turn>user\nsecond<turn|>\n<|turn>model\n"
+	// What was rendered is the whole conversation, the first answer included.
+	want := "user first assistant one user second assistant "
 	if v.fed[1] != want {
-		t.Fatalf("the continuation was %q, want %q", v.fed[1], want)
+		t.Fatalf("the second render was %q, want %q", v.fed[1], want)
 	}
-	if strings.Contains(v.fed[1], "<bos>") || strings.Contains(v.fed[1], "first") {
-		t.Fatalf("the second turn re-sent the conversation: %q", v.fed[1])
-	}
-
-	full := "<bos><|turn>user first<turn|> <|turn>model one <turn|> <|turn>user second<turn|> <|turn>model two"
+	// What was fed is only its tail: the cache already held the rest.
+	full := "user first assistant one user second assistant two"
 	if got := e.context(v); got != full {
 		t.Fatalf("context\n%q\nwant\n%q", got, full)
+	}
+}
+
+// The point of re-rendering is that it stays cheap. A conversation twice as
+// long must not cost twice the prompt.
+func TestReRenderingDoesNotRefeedTheConversation(t *testing.T) {
+	v := newWordVocab()
+	e := &scriptedEngine{vocab: v, script: []string{"one", "<turn|>", "two", "<turn|>"}}
+	s := newSession(t, v, e, 32, "")
+
+	first, err := s.Ask("first", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.Ask("second", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// "user second assistant": three tokens, whatever came before.
+	if second.Prompt != 3 {
+		t.Fatalf("the second turn fed %d tokens, want 3 (the first fed %d)",
+			second.Prompt, first.Prompt)
 	}
 }
 
@@ -201,7 +249,7 @@ func TestTheAnswerIsStreamed(t *testing.T) {
 func TestAConversationThatNoLongerFitsIsRefused(t *testing.T) {
 	v := newWordVocab()
 	e := &scriptedEngine{vocab: v, script: []string{"<turn|>"}}
-	s := NewSession(e, v, sample.Params{Temperature: 0}, 4096, 4, 8, "", false, false)
+	s := NewSession(e, v, wordTemplate{}, sample.Params{Temperature: 0}, 4096, 4, 8, "", false)
 
 	if _, err := s.Ask("this prompt is longer than four positions", nil); err == nil {
 		t.Fatal("a prompt past the context should be refused rather than wrap the cache")

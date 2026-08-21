@@ -2,11 +2,13 @@ package main
 
 // One conversation with the model.
 //
-// The context is built once and never rebuilt: the template's output grows by
-// appending, so each turn only has to encode what is new — the closing of the
-// model's last turn, the user's message, and the header of the next answer.
-// Re-rendering the whole conversation every turn would re-read three gigabytes
-// of weights for every token already spoken.
+// Every turn re-renders the whole conversation, because the template is the
+// only thing that knows how to write one and no two checkpoints write it the
+// same way. What keeps that cheap is that the cache is not rebuilt with it:
+// the new render is encoded, compared against the tokens the cache already
+// holds, and only the tail that differs is fed. A turn therefore costs a turn,
+// not a conversation — which is the whole point, since re-reading three
+// gigabytes of weights for every token already spoken is what this avoids.
 
 import (
 	"fmt"
@@ -14,13 +16,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ThiraSoft/golem/gemma"
+	"github.com/ThiraSoft/golem/chat"
 	"github.com/ThiraSoft/golem/sample"
 )
 
-// engine is the part of gemma.Model a conversation uses. Named here so that the
+// forward is the part of a model a conversation uses. Reset is not in it: a
+// conversation never resets, cmd/golem-cli builds a new one instead. Named here so that the
 // loop can be tested without three gigabytes of weights.
-type engine interface {
+type forward interface {
 	ForwardBatch(tokens []int32, startPos int) [][]float32
 	Logits(hidden, out []float32)
 }
@@ -43,26 +46,22 @@ type vocabulary interface {
 }
 
 type Session struct {
-	model      engine
+	model      forward
 	vocab      vocabulary
+	tpl        chat.Template
 	sampler    *sample.Sampler
 	vocabSize  int
 	maxContext int
 	maxTokens  int
-	system     string
 	thinking   bool
-	// emptyThought is the file's own template rule, carried here because the
-	// second turn and the ones after it are appended rather than rendered.
-	emptyThought bool
 
-	pos     int
-	started bool
-	// pending closes the turn the model has just spoken. The end-of-turn token
-	// is drawn but never fed — feeding it would cost a forward pass for a
-	// marker the next prompt is about to carry anyway — so the closing belongs
-	// to the front of the next encoding.
-	pending string
-	logits  []float32
+	// history is the conversation as messages, because the template is what
+	// turns it into text and only the template knows how.
+	history []chat.Message
+	// held is what the cache holds, position by position. A turn renders the
+	// whole conversation and feeds only what is not already a prefix of this.
+	held   []int32
+	logits []float32
 }
 
 // Turn is what one exchange cost.
@@ -75,70 +74,68 @@ type Turn struct {
 	Truncated bool // stopped on a limit rather than on an end-of-turn token
 }
 
-func NewSession(m engine, v vocabulary, p sample.Params, vocabSize, maxContext, maxTokens int, system string, thinking, emptyThought bool) *Session {
-	return &Session{
-		model:        m,
-		vocab:        v,
-		sampler:      sample.New(p),
-		vocabSize:    vocabSize,
-		maxContext:   maxContext,
-		maxTokens:    maxTokens,
-		system:       system,
-		thinking:     thinking,
-		emptyThought: emptyThought,
-		logits:       make([]float32, vocabSize),
+func NewSession(m forward, v vocabulary, tpl chat.Template, p sample.Params,
+	vocabSize, maxContext, maxTokens int, system string, thinking bool) *Session {
+	s := &Session{
+		model:      m,
+		vocab:      v,
+		tpl:        tpl,
+		sampler:    sample.New(p),
+		vocabSize:  vocabSize,
+		maxContext: maxContext,
+		maxTokens:  maxTokens,
+		thinking:   thinking,
+		logits:     make([]float32, vocabSize),
 	}
-}
-
-// prompt is the text to encode for a user message: the whole template on the
-// first turn, its continuation afterwards.
-func (s *Session) prompt(text string) (string, error) {
-	text = strings.TrimSpace(text)
-	if !s.started {
-		var messages []gemma.Message
-		if s.system != "" {
-			messages = append(messages, gemma.Message{Role: "system", Content: s.system})
-		}
-		messages = append(messages, gemma.Message{Role: "user", Content: text})
-		return gemma.RenderChat(messages, gemma.ChatOptions{
-			EnableThinking:      s.thinking,
-			EmptyThought:        s.emptyThought,
-			AddGenerationPrompt: true,
-		})
+	if system != "" {
+		s.history = append(s.history, chat.Message{Role: "system", Content: system})
 	}
-	opener := "<|turn>model\n"
-	if s.emptyThought && !s.thinking {
-		opener += "<|channel>thought\n<channel|>"
-	}
-	return s.pending + "<|turn>user\n" + text + "<turn|>\n" + opener, nil
+	return s
 }
 
 // Ask feeds one user message and writes the answer to w as it comes.
 func (s *Session) Ask(text string, w io.Writer) (Turn, error) {
-	prompt, err := s.prompt(text)
+	s.history = append(s.history, chat.Message{Role: "user", Content: strings.TrimSpace(text)})
+	rendered, err := s.tpl.Render(s.history, chat.Options{
+		EnableThinking:      s.thinking,
+		AddGenerationPrompt: true,
+	})
 	if err != nil {
 		return Turn{}, err
 	}
-	ids := s.vocab.Encode(prompt, false, true)
-	if s.pos+len(ids) >= s.maxContext {
+	ids := s.vocab.Encode(rendered, false, true)
+	if len(ids) >= s.maxContext {
 		return Turn{}, fmt.Errorf("the conversation no longer fits in %d positions: pass a larger -context, or start again", s.maxContext)
+	}
+
+	// What the cache holds is a prefix of what this turn needs, unless the
+	// template rewrote something behind us — a past answer losing its thinking
+	// block, for instance. Either way, feeding starts where the two stop
+	// agreeing, and the last position is always fed because its hidden state
+	// was not kept.
+	shared := 0
+	for shared < len(s.held) && shared < len(ids) && s.held[shared] == ids[shared] {
+		shared++
+	}
+	from := shared
+	if from >= len(ids) {
+		from = len(ids) - 1
 	}
 
 	start := time.Now()
 	var hidden []float32
-	for from := 0; from < len(ids); from += promptBatch {
-		to := min(from+promptBatch, len(ids))
-		states := s.model.ForwardBatch(ids[from:to], s.pos)
+	for at := from; at < len(ids); at += promptBatch {
+		to := min(at+promptBatch, len(ids))
+		states := s.model.ForwardBatch(ids[at:to], at)
 		hidden = states[len(states)-1]
-		s.pos += to - from
 	}
-	turn := Turn{Prompt: len(ids), Prefill: time.Since(start)}
-	s.started = true
+	s.held = append(s.held[:0], ids...)
+	turn := Turn{Prompt: len(ids) - from, Prefill: time.Since(start)}
 
 	var answer strings.Builder
 	start = time.Now()
 	last := int32(-1)
-	for turn.Generated < s.maxTokens && s.pos < s.maxContext {
+	for turn.Generated < s.maxTokens && len(s.held) < s.maxContext {
 		s.model.Logits(hidden, s.logits)
 		id := s.sampler.Pick(s.logits)
 		turn.Generated++
@@ -153,16 +150,16 @@ func (s *Session) Ask(text string, w io.Writer) (Turn, error) {
 				return turn, err
 			}
 		}
-		hidden = s.model.ForwardBatch([]int32{id}, s.pos)[0]
-		s.pos++
+		hidden = s.model.ForwardBatch([]int32{id}, len(s.held))[0]
+		s.held = append(s.held, id)
 	}
 	turn.Decode = time.Since(start)
 	turn.Text = answer.String()
 	turn.Truncated = last < 0 || !s.vocab.IsEOG(last)
 
-	// The token that ended the turn was drawn but never fed, so the closing
-	// marker is still missing from the context and the next turn opens with it.
-	// The template writes <turn|> whatever the model stopped on.
-	s.pending = "<turn|>\n"
+	// The token that ended the turn was drawn but never fed: feeding it would
+	// cost a forward pass for a marker the next render is about to carry
+	// anyway, and the prefix comparison will put it in at the right position.
+	s.history = append(s.history, chat.Message{Role: "assistant", Content: turn.Text})
 	return turn, nil
 }
