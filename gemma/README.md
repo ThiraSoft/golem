@@ -325,9 +325,15 @@ conversations each. The test compares character for character, and the fixture
 says which of the two spellings it came from. The recorder is
 `ref/gemma/dump_chats.py`.
 
-Tools, tool calls, tool responses, content-part arrays and media markers are the
-rest of that template, and `RenderChat` refuses a conversation that would need
-them rather than rendering something close.
+Tools, tool calls and tool responses are the rest of that template, and
+`toolrender.go` and `toolcall.go` write and read them. Content-part arrays and
+media markers are not: `RenderChat` refuses a conversation that would need them
+rather than rendering something close.
+
+`gemma.Template` is how a command reaches all of this. It is the `chat.Template`
+this engine implements — render, parse the calls, say where a call opens — and
+it carries `Config.EmptyThought` so that a caller holding one never has to know
+which of the two checkpoints it opened.
 
 ## Sampling
 

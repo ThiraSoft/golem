@@ -1,11 +1,18 @@
 # golem-server
 
-An OpenAI-compatible API over a Gemma 4 GGUF, on the CPU.
+An OpenAI-compatible API over a GGUF, on the CPU. Gemma 4 or Qwen3: the file
+declares its own architecture and `engine/` opens whichever implements it, so
+this command names neither, and tools work on both.
 
 ```bash
 go build ./cmd/golem-server
 ./golem-server -model gemma-4-E2B-it-QAT-Q4_0.gguf -addr 127.0.0.1:8080
+./golem-server -model Qwen3-4B-Q4_0.gguf -addr 127.0.0.1:8080
 ```
+
+One model per server, and the request's `model` field routes nothing: there is
+one set of weights and one cache, so there is nothing to route to. `-model`
+names the file; `/v1/models` reports it.
 
 Two endpoints:
 

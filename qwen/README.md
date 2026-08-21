@@ -45,6 +45,47 @@ The head is the input embedding read the other way round. A checkpoint carrying
 its own `output.weight` is refused rather than having two hundred megabytes of
 it quietly ignored.
 
+## The chat template
+
+The GGUF carries the template as Jinja under `tokenizer.chat_template`. golem
+does not interpret Jinja. [`chat.go`](chat.go) writes out what that template
+renders: no leading marker of any kind, one `<|im_start|>{role}\n…<|im_end|>\n`
+per message, tool declarations folded into the system turn, and an empty
+assistant turn at the end when the caller wants one generated.
+
+Three of its rules are not guessable from the shape of the output:
+
+- **Nothing is trimmed.** A system message of `"  padded  \n"` reaches the model
+  with its spaces and its newline. Gemma's template trims; this one does not.
+- **The empty `<think></think>` block goes to a turn chosen by a backwards
+  scan**, not to the last one. The template walks the conversation in reverse
+  for the last user message that is not itself a tool result, and only assistant
+  turns after that index keep their reasoning. Everything earlier loses it,
+  which is what keeps a long conversation from carrying every thought the model
+  ever had.
+- **Consecutive tool results share one `user` turn.** The first opens it, the
+  last closes it, and each result sits in its own `<tool_response>` block.
+
+Calls are JSON inside `<tool_call>` tags, which makes
+[`toolcall.go`](toolcall.go) a good deal shorter than Gemma's scanner. What it
+keeps from Gemma is the rule that matters: it refuses a call it cannot read
+whole, because a half-read call would be executed.
+
+The declarations are emitted by hand, in [`toolrender.go`](toolrender.go),
+rather than with `encoding/json`. Jinja's `tojson` sorts an object's keys,
+separates with `", "` and `": "`, and escapes the four characters HTML cares
+about — the apostrophe included, which JSON does not require and Go does not
+write.
+
+`testdata/qwen/chat/cases.json` holds what Jinja itself renders, from the
+template read out of the model file, over nineteen conversations. The test
+compares character for character. The recorder is
+[`ref/qwen/dump_chats.py`](../ref/qwen/dump_chats.py), and its docstring names
+the two places this fixture and llama.cpp disagree, and which one golem follows.
+
+Not covered: multimodal content parts, and a past answer's reasoning beyond
+stripping it. Both are refused rather than approximated.
+
 ## What it is checked against
 
 `ref/qwen/*.run` describe what llama.cpp records; `ref/README.md` says how to

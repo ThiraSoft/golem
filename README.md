@@ -30,10 +30,18 @@ the shared layer knows they exist.
 | `token/` | tokenizers, one package per family |
 | `audio/` | sound formats: reading and writing WAV |
 | `sample/` | top-k, top-p, temperature, and a seeded draw over a row of logits |
+| `chat/` | a conversation's shape — messages, tools, calls — and the interface an engine implements to write one out |
 
 Nothing is promoted into this layer on the strength of a guess. Code moves here
 once two engines are shown to want it, in the same commit that makes them both
-use it.
+use it. `chat/` is the newest of them: the conversation types lived in `gemma/`
+until a second engine needed them.
+
+`engine/` is the one package that sits above the engines rather than under
+them. It reads `general.architecture` out of a GGUF, opens whichever engine
+implements it, and hands back one shape — the forward pass, the vocabulary, the
+chat template, and the numbers a startup line prints. It exists so that a
+command names no engine, and nothing but a command imports it.
 
 ## The commands
 
@@ -43,13 +51,14 @@ use it.
 | [`cmd/golem-server`](cmd/golem-server/) | an OpenAI-compatible API over the same weights, tool calls included |
 | `cmd/pocket-tts` | text in, a WAV file out |
 
-Both language commands are wired to `gemma/` alone for now. `qwen/` runs from
-its own tests and its own API; giving the commands an architecture switch, and
-Qwen a chat template, is the work that comes next.
+Both language commands run either engine, with tools on both. Neither names
+one: `-model` takes a GGUF, the file declares its own architecture, and
+`engine/` opens whichever implements it.
 
 ```bash
 go build ./cmd/golem-cli
 GOLEM_MODEL=gemma-4-E2B-it-QAT-Q4_0.gguf ./golem-cli
+./golem-cli -model Qwen3-4B-Q4_0.gguf -p "Explain a mutex in one sentence."
 ```
 
 ## The method
