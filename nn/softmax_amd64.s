@@ -288,3 +288,77 @@ div1:
 divdone:
 	VZEROUPPER
 	RET
+
+DATA gegluc<>+0x00(SB)/4, $0xbfd9db23  // -1.702, the quick GELU's slope
+DATA gegluc<>+0x04(SB)/4, $0xbfd9db23
+DATA gegluc<>+0x08(SB)/4, $0xbfd9db23
+DATA gegluc<>+0x0c(SB)/4, $0xbfd9db23
+DATA gegluc<>+0x10(SB)/4, $0xbfd9db23
+DATA gegluc<>+0x14(SB)/4, $0xbfd9db23
+DATA gegluc<>+0x18(SB)/4, $0xbfd9db23
+DATA gegluc<>+0x1c(SB)/4, $0xbfd9db23
+
+GLOBL gegluc<>(SB), RODATA|NOPTR, $32
+
+// func gegluQuickAVX2(gate, up *float32, n int)
+//
+// gate = gate/(1 + exp(-1.702*gate)) * up, eight at a time, with the same
+// exponential the softmax above uses — ggml's, which is what the feed forward
+// of this tower is compared against.
+//
+// n must be a multiple of eight.
+TEXT ·gegluQuickAVX2(SB), NOSPLIT, $0-24
+	MOVQ gate+0(FP), DI
+	MOVQ up+8(FP), SI
+	MOVQ n+16(FP), CX
+	XORQ AX, AX
+
+g8:
+	VMOVUPS (DI)(AX*4), Y0          // g
+	VMULPS  gegluc<>+0x00(SB), Y0, Y1
+	VMAXPS  expc<>+0x140(SB), Y1, Y1 // held at -87, where the exponential is nothing
+
+	VMOVUPS Y1, Y2
+	VMULPS  expc<>+0x00(SB), Y2, Y2
+	VADDPS  expc<>+0x20(SB), Y2, Y2
+	VSUBPS  expc<>+0x20(SB), Y2, Y3
+
+	VMOVUPS Y3, Y4
+	VMULPS  expc<>+0x40(SB), Y4, Y4
+	VSUBPS  Y4, Y1, Y4
+	VMOVUPS Y3, Y5
+	VMULPS  expc<>+0x60(SB), Y5, Y5
+	VSUBPS  Y5, Y4, Y4
+
+	VPSLLD $23, Y2, Y5
+	VPADDD expc<>+0x120(SB), Y5, Y5
+
+	VMULPS Y4, Y4, Y6
+
+	VMOVUPS expc<>+0x100(SB), Y7
+	VMULPS  Y4, Y7, Y7
+	VADDPS  expc<>+0xe0(SB), Y7, Y7
+	VMOVUPS expc<>+0xc0(SB), Y8
+	VMULPS  Y4, Y8, Y8
+	VADDPS  expc<>+0xa0(SB), Y8, Y8
+	VMULPS  Y6, Y7, Y7
+	VADDPS  Y8, Y7, Y7
+	VMULPS  Y6, Y7, Y7
+	VMOVUPS expc<>+0x80(SB), Y9
+	VMULPS  Y4, Y9, Y9
+	VADDPS  Y9, Y7, Y7
+
+	VMULPS Y5, Y7, Y7
+	VADDPS Y5, Y7, Y7               // exp(-1.702*g)
+
+	VADDPS  expc<>+0x120(SB), Y7, Y7 // 1 + it
+	VDIVPS  Y7, Y0, Y0               // g / it
+	VMULPS  (SI)(AX*4), Y0, Y0       // times up
+	VMOVUPS Y0, (DI)(AX*4)
+
+	ADDQ $8, AX
+	CMPQ AX, CX
+	JLT  g8
+
+	VZEROUPPER
+	RET

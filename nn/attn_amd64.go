@@ -92,3 +92,6 @@ func Mix4(dst []float32, dstStride int, v, w []float32, wStride, hd, n int) bool
 	mix4AVX2(&dst[0], dstStride, &v[0], &w[0], wStride, hd, n)
 	return true
 }
+
+//go:noescape
+func gegluQuickAVX2(gate, up *float32, n int)

@@ -82,11 +82,21 @@ func MatMatBF16(w []byte, x []float32, outputs, inputs, batch int, y []float32) 
 // want their share, so a panel is given half.
 const panelBytes = 128 << 10
 
+// panelFloor is the narrowest panel worth having. A wide input makes for a
+// narrow panel, and a narrow panel is a matrix read again for every handful of
+// columns: the activations of a wider one spill out of the second-level cache,
+// but the third holds them and the bus stops carrying the weights over and
+// over.
+const panelFloor = 8
+
 // panelOf is how many vectors of the batch are taken together: enough that the
 // weights are read from memory a handful of times for a whole batch, few
 // enough that the panel answers from cache.
 func panelOf(inputs int) int {
 	n := panelBytes / (inputs * 4)
+	if n < panelFloor {
+		n = panelFloor
+	}
 	// A whole number of fours: what does not fill a group of four columns
 	// falls to the one-column kernel, which is four times the work per
 	// weight read, and two stray columns in every panel are not two columns
@@ -223,4 +233,68 @@ func AxpyFull(dst, src []float32, a float32) {
 	for i, v := range src {
 		dst[i] += a * v
 	}
+}
+
+// Interleaved says whether the interleaved kernel exists for a row of this
+// width, and therefore whether the caller should lay its activation out for
+// it. Everything narrower, or a machine without AVX2, takes the plain path.
+func Interleaved(inputs int) bool { return avx2 && inputs%16 == 0 }
+
+// InterleaveOrder is the permutation the interleaved kernel reads a group of
+// sixteen in. A caller writing an activation for it writes group[i] where the
+// plain layout would have written group[InterleaveOrder[i]].
+var InterleaveOrder = [16]int{0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15}
+
+// MatMatBF16IlvRows is MatMatBF16Rows for an activation already laid out in
+// that order. It is what the vision tower uses, and it is a fifth faster:
+// widening the weights by an interleave instead of a shift takes two
+// instructions per eight products off the ports the arithmetic runs on.
+func MatMatBF16IlvRows(w []byte, x []float32, outputs, inputs, batch int, y []float32, start, end int) {
+	weights := unsafe.Slice((*uint16)(unsafe.Pointer(&w[0])), len(w)/2)
+	var eight [8]float32
+	panel := panelOf(inputs)
+	// The columns outside and the rows inside, which is the order that keeps
+	// both operands where they are wanted: four columns are twelve kilobytes
+	// and stay in the first-level cache while every row of this core's share
+	// sweeps past them, and that share of the weights is small enough to stay
+	// in the second.
+	for at := 0; at < batch; at += panel {
+		to := min(at+panel, batch)
+		l := at
+		for ; l+3 < to; l += 4 {
+			o := start
+			for ; o+1 < end; o += 2 {
+				dotBF16x2x4IlvAVX2(&weights[o*inputs], inputs, &x[l*inputs], inputs, inputs, &eight[0])
+				for c := 0; c < 4; c++ {
+					y[(l+c)*outputs+o] = eight[c]
+					y[(l+c)*outputs+o+1] = eight[4+c]
+				}
+			}
+			for ; o < end; o++ {
+				dotBF16x2x4IlvAVX2(&weights[o*inputs], 0, &x[l*inputs], inputs, inputs, &eight[0])
+				for c := 0; c < 4; c++ {
+					y[(l+c)*outputs+o] = eight[c]
+				}
+			}
+		}
+		// The tail of a panel that is not a whole number of fours.
+		for ; l < to; l++ {
+			o := start
+			for ; o+1 < end; o += 2 {
+				dotBF16x2x4IlvAVX2(&weights[o*inputs], inputs, &x[l*inputs], 0, inputs, &eight[0])
+				y[l*outputs+o] = eight[0]
+				y[l*outputs+o+1] = eight[4]
+			}
+			for ; o < end; o++ {
+				dotBF16x2x4IlvAVX2(&weights[o*inputs], 0, &x[l*inputs], 0, inputs, &eight[0])
+				y[l*outputs+o] = eight[0]
+			}
+		}
+	}
+}
+
+// unsafeWords views a byte slice as the bfloat16 words it holds, for the tests
+// that have to write weights rather than read them.
+func unsafeWords(b []byte) []uint16 {
+	return unsafe.Slice((*uint16)(unsafe.Pointer(&b[0])), len(b)/2)
 }

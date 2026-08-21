@@ -27,13 +27,29 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 )
 
-// ffnTile is how many patches go through the feed forward together. Bigger is
-// faster — every tile is a fresh sweep over three matrices, and four sections
-// the cores have to meet at — and the whole grid at once is fastest of all.
-// What stops it there is memory: the intermediate is four times as wide as the
-// stream, so a thousand patches of it are already twelve megabytes, and an
-// image is allowed to be twice this one.
-const ffnTile = 1024
+// ffnBudget is how much memory one image's feed forward may hold at once.
+// Bigger tiles are faster — every tile is a fresh sweep over three matrices
+// and four more places the cores have to meet at — and the whole grid in one
+// tile is fastest of all. What stops it there is that the intermediate is four
+// times as wide as the stream, so a thousand patches of it are already twelve
+// megabytes and an image is allowed to be twice this one.
+const ffnBudget = 32 << 20
+
+// ffnTile is how many patches go through together: the whole grid when it
+// fits, and otherwise as few equal tiles as the budget allows. Equal, because
+// a tile of twenty-nine patches reads three matrices for twenty-nine columns
+// and pays what a full one pays.
+func ffnTile(cfg *VisionConfig, n int) int {
+	most := ffnBudget / (cfg.FFN * 4)
+	if most < 1 {
+		most = 1
+	}
+	if n <= most {
+		return n
+	}
+	tiles := (n + most - 1) / most
+	return (n + tiles - 1) / tiles
+}
 
 type VisionTower struct {
 	Cfg *VisionConfig
@@ -60,7 +76,7 @@ type scratch struct {
 
 func (v *VisionTower) newScratch(n int) *scratch {
 	cfg := v.Cfg
-	tile := min(n, ffnTile)
+	tile := ffnTile(cfg, n)
 	return &scratch{
 		normed: make([]float32, n*cfg.Dim),
 		q:      make([]float32, n*cfg.Dim),
@@ -165,9 +181,10 @@ func (v *VisionTower) Block(i int, xs []float32, cols int, s *scratch) {
 			nn.RMSNormPlain(row, w.LN1, cfg.Eps)
 		}
 	})
-	w.Q.Apply(s.normed, s.tmp, s.q, n)
-	w.K.Apply(s.normed, s.tmp, s.k, n)
-	w.V.Apply(s.normed, s.tmp, s.v, n)
+	// The three share an input and its range, so they share the pass that
+	// prepares it and the pass that reads it.
+	ApplyShared([]VisionLinear{w.Q, w.K, w.V}, s.normed, s.tmp,
+		[][]float32{s.q, s.k, s.v}, n)
 
 	// Then the per-head business: the norms, and a rotation that depends on
 	// where the patch is in the grid and on nothing else. What comes out is
@@ -254,8 +271,9 @@ func (v *VisionTower) Block(i int, xs []float32, cols int, s *scratch) {
 		}
 	})
 
-	for at := 0; at < n; at += ffnTile {
-		to := min(at+ffnTile, n)
+	tile := ffnTile(cfg, n)
+	for at := 0; at < n; at += tile {
+		to := min(at+tile, n)
 		batch := to - at
 		grid := xs[at*cfg.Dim : to*cfg.Dim]
 		normed := s.normed[:batch*cfg.Dim]
@@ -266,8 +284,8 @@ func (v *VisionTower) Block(i int, xs []float32, cols int, s *scratch) {
 				nn.RMSNormPlain(row, w.LN2, cfg.Eps)
 			}
 		})
-		w.Gate.Apply(normed, s.tmp, s.gate, batch)
-		w.Up.Apply(normed, s.tmp, s.up, batch)
+		ApplyShared([]VisionLinear{w.Gate, w.Up}, normed, s.tmp,
+			[][]float32{s.gate, s.up}, batch)
 		nn.InParallel(batch, batch*cfg.FFN, func(first, last int) {
 			nn.GEGLUQuickRange(s.gate, s.up, first*cfg.FFN, last*cfg.FFN)
 		})

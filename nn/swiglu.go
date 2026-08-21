@@ -89,6 +89,10 @@ func SwiGLURange(gate, up []float32, start, end int) {
 // A vision tower that declares neither use_gelu nor use_silu gets this one,
 // which is how Gemma 4's ends up with it.
 func GEGLUQuickRange(gate, up []float32, start, end int) {
+	if n := end - start; avx2 && n > 0 && n%8 == 0 {
+		gegluQuickAVX2(&gate[start], &up[start], n)
+		return
+	}
 	for i := start; i < end; i++ {
 		g := gate[i]
 		gate[i] = g / (1 + expf(-1.702*g)) * up[i]

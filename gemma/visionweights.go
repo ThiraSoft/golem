@@ -35,10 +35,58 @@ type VisionLinear struct {
 	Clamp Clamp
 }
 
-// Apply computes Y = clamp(W * clamp(X)) for a whole batch of vectors laid end
-// to end: x holds batch*Inputs floats and y batch*Outputs, both with the batch
-// as the slower index. tmp is the caller's scratch for the clamped input and
-// must be as large as x.
+// PrepareInput writes into tmp the activation the products below read:
+// clamped to the range the weights were fitted for, rounded to bfloat16, and
+// laid out the way the kernel widens its weights.
+//
+// It is a step of its own because several projections share it. The file gives
+// every weight its own input range, and the query, the key and the value turn
+// out to have the same one — they see the same activation, so they were
+// calibrated on the same numbers — as do the two halves of the feed forward's
+// gate. Preparing it once for the three of them is one pass over the grid
+// instead of three.
+//
+// The rounding to bfloat16 is not an economy. ggml's kernel for a bfloat16
+// weight takes both operands in bfloat16 — vec_dot_type is BF16 — so an
+// activation that kept its float32 mantissa here would not be more accurate
+// than the reference, it would be a thousandth away from it, and a thousandth
+// compounded over sixteen blocks is visible at the end.
+func (l VisionLinear) PrepareInput(x, tmp []float32, batch int) {
+	lo, hi := l.Clamp.InMin, l.Clamp.InMax
+	interleaved := nn.Interleaved(l.Inputs)
+	nn.InParallel(batch, batch*l.Inputs, func(first, last int) {
+		from, to := first*l.Inputs, last*l.Inputs
+		if interleaved && nn.PrepareIlv(tmp[from:to], x[from:to], lo, hi) {
+			return
+		}
+		for i := from; i < to; i++ {
+			tmp[i] = nn.RoundBF16(clampF32(x[i], lo, hi))
+		}
+	})
+}
+
+// rows computes rows [start, end) of Y = clamp(W * tmp) on the caller's
+// thread, for an input PrepareInput has already written.
+func (l VisionLinear) rows(tmp, y []float32, batch, start, end int) {
+	in, out := batch*l.Inputs, batch*l.Outputs
+	if nn.Interleaved(l.Inputs) {
+		nn.MatMatBF16IlvRows(l.Weights, tmp[:in], l.Outputs, l.Inputs, batch, y[:out], start, end)
+	} else {
+		l.ApplyRows(tmp[:in], y[:out], batch, start, end)
+	}
+	// The rows this core produced, clamped before the barrier: a pass over the
+	// outputs afterwards would be a pass on one core.
+	lo, hi := l.Clamp.OutMin, l.Clamp.OutMax
+	for c := 0; c < batch; c++ {
+		block := y[c*l.Outputs : (c+1)*l.Outputs]
+		for i := start; i < end; i++ {
+			block[i] = clampF32(block[i], lo, hi)
+		}
+	}
+}
+
+// Apply is one projection over a whole batch: the input prepared, then the
+// product.
 //
 // The batch is the point. A projection read one vector at a time reads its
 // weight from memory for every vector, and this tower has a thousand of them
@@ -46,28 +94,34 @@ type VisionLinear struct {
 // Read once for the batch, it is pulled once. The split is over the output
 // rows, so each core holds a panel of the weight small enough to stay in its
 // own cache while the whole batch streams past it.
-//
-// The input is rounded to bfloat16 on the way in. ggml's kernel for a bf16
-// weight takes both operands in bf16 — vec_dot_type is BF16 — so an activation
-// that kept its float32 mantissa here would not be more accurate than the
-// reference, it would be a thousandth away from it, and a thousandth
-// compounded over sixteen blocks is visible at the end.
 func (l VisionLinear) Apply(x, tmp, y []float32, batch int) {
-	in, out := batch*l.Inputs, batch*l.Outputs
-	nn.InParallel(batch, in, func(first, last int) {
-		for i := first * l.Inputs; i < last*l.Inputs; i++ {
-			tmp[i] = nn.RoundBF16(clampF32(x[i], l.Clamp.InMin, l.Clamp.InMax))
-		}
+	l.PrepareInput(x, tmp, batch)
+	nn.InParallel(l.Outputs, batch*l.Inputs*l.Outputs, func(start, end int) {
+		l.rows(tmp, y, batch, start, end)
 	})
-	nn.InParallel(l.Outputs, in*l.Outputs, func(start, end int) {
-		l.ApplyRows(tmp[:in], y[:out], batch, start, end)
-		// The rows this core produced, clamped before the barrier: a pass over
-		// the outputs afterwards would be a pass on one core.
-		for c := 0; c < batch; c++ {
-			block := y[c*l.Outputs : (c+1)*l.Outputs]
-			for i := start; i < end; i++ {
-				block[i] = clampF32(block[i], l.Clamp.OutMin, l.Clamp.OutMax)
+}
+
+// ApplyShared is several projections of the same prepared input, in one pass.
+//
+// One pass rather than one each because the cores meet at the end of every
+// one of them, and three projections that could have been one are two
+// meetings nobody needed. The rows of all of them are laid end to end and
+// shared out as if they were a single taller matrix.
+func ApplyShared(ls []VisionLinear, x, tmp []float32, ys [][]float32, batch int) {
+	total, work := 0, 0
+	for _, l := range ls {
+		total += l.Outputs
+		work += batch * l.Inputs * l.Outputs
+	}
+	ls[0].PrepareInput(x, tmp, batch)
+	nn.InParallel(total, work, func(start, end int) {
+		base := 0
+		for i, l := range ls {
+			from, to := max(start, base), min(end, base+l.Outputs)
+			if from < to {
+				l.rows(tmp, ys[i], batch, from-base, to-base)
 			}
+			base += l.Outputs
 		}
 	})
 }
