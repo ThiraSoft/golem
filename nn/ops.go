@@ -41,11 +41,17 @@ func GELU(x []float32) {
 	// twenty-four layers per frame. Spreading over the cores is justified here,
 	// where it would not be for an addition.
 	InParallel(len(x), len(x)*128, func(start, end int) {
-		for i := start; i < end; i++ {
-			d := float64(x[i])
-			x[i] = float32(0.5 * d * (1 + math.Erf(d/math.Sqrt2)))
-		}
+		GELURange(x, start, end)
 	})
+}
+
+// GELURange is the same over one stretch, on the caller's thread: the section
+// that computed those values applies it before its barrier.
+func GELURange(x []float32, start, end int) {
+	for i := start; i < end; i++ {
+		d := float64(x[i])
+		x[i] = float32(0.5 * d * (1 + math.Erf(d/math.Sqrt2)))
+	}
 }
 
 // SoftmaxInPlace normalizes x into probabilities, subtracting the maximum so
@@ -102,12 +108,17 @@ func SiLU(x []float32) {
 // pays.
 func ELU(x []float32) {
 	InParallel(len(x), len(x)*elementwiseWork, func(start, end int) {
-		for i, v := range x[start:end] {
-			if v < 0 {
-				x[start+i] = float32(math.Exp(float64(v)) - 1)
-			}
-		}
+		ELURange(x, start, end)
 	})
+}
+
+// ELURange is the same over one stretch, on the caller's thread.
+func ELURange(x []float32, start, end int) {
+	for i, v := range x[start:end] {
+		if v < 0 {
+			x[start+i] = float32(math.Exp(float64(v)) - 1)
+		}
+	}
 }
 
 // elementwiseWork is what one transcendental costs, in units of the

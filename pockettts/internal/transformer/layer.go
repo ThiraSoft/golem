@@ -34,7 +34,6 @@ type Layer struct {
 	scratchProj  []float32
 	scratchAttn  []float32
 	scratchFF    []float32
-	scratchIn    []float32
 	scratchOut   []float32
 	batchAlloc   int
 }
@@ -79,55 +78,74 @@ func (c *Layer) Block(x []float32, batch int, cache *Cache) {
 	D, d, h := c.DModel, c.HeadDim, c.NumHeads
 
 	// --- self-attention block ---
-	copy(c.scratchIn, x[:batch*D]) // the residual connection starts from the raw input
+	// x is the residual itself: nothing writes it until the section that adds
+	// the block's output to it, and that section writes only the rows it read.
+	// The norm works on a copy, which is what scratchOut is for.
 	copy(c.scratchOut, x[:batch*D])
 	for l := 0; l < batch; l++ {
 		c.Norm1.Apply(c.scratchOut[l*D : (l+1)*D])
 	}
-	c.InProj.ApplyBatch(c.scratchOut, c.scratchProj, batch)
-
-	// The projections of the `batch` positions are independent; the attention is
-	// not. So we apply the rotation and fill the cache for all of them, before
-	// walking the positions in order.
-	for l := 0; l < batch; l++ {
-		proj := c.scratchProj[l*3*D : (l+1)*3*D]
-		q, k, v := proj[0:h*d], proj[h*d:2*h*d], proj[2*h*d:]
-		position := cache.Position + l
-		for t := 0; t < h; t++ {
-			nn.ApplyRoPE(q[t*d:(t+1)*d], position, c.MaxPeriod)
-			nn.ApplyRoPE(k[t*d:(t+1)*d], position, c.MaxPeriod)
+	// The query, key and value projections, the rotation and the cache, in one
+	// section. What follows a projection here is not one pass over its outputs
+	// but three — rotate, copy the keys, copy the values — and on one core they
+	// cost as much again as the product did.
+	//
+	// The section is cut into heads rather than into rows, because that is the
+	// unit the rotation needs whole: slot s below is the s-th head of the query,
+	// then of the key, then of the value, and its rows are its own. The
+	// projections of the `batch` positions are independent; the attention that
+	// follows is not, which is why every key and value is in the cache before
+	// any score is computed.
+	slots := 3 * h
+	nn.InParallel(slots, batch*3*D*c.InProj.Inputs, func(first, last int) {
+		c.InProj.ApplyRows(c.scratchOut, c.scratchProj, batch, first*d, last*d)
+		for s := first; s < last; s++ {
+			for l := 0; l < batch; l++ {
+				proj := c.scratchProj[l*3*D : (l+1)*3*D]
+				position := cache.Position + l
+				head := proj[s*d : (s+1)*d]
+				switch {
+				case s < h: // a query head: rotated, and read where it lies
+					nn.ApplyRoPE(head, position, c.MaxPeriod)
+				case s < 2*h: // a key head: rotated, then kept
+					nn.ApplyRoPE(head, position, c.MaxPeriod)
+					base := position*h*d + (s-h)*d
+					copy(cache.K[base:base+d], head)
+				default: // a value head: kept as it is
+					base := position*h*d + (s-2*h)*d
+					copy(cache.V[base:base+d], head)
+				}
+			}
 		}
-		base := position * h * d
-		copy(cache.K[base:base+h*d], k)
-		copy(cache.V[base:base+h*d], v)
-	}
+	})
 
 	c.attention(batch, cache)
 	cache.Position += batch
 
-	c.OutProj.ApplyBatch(c.scratchAttn, c.scratchOut, batch)
-	for l := 0; l < batch; l++ {
-		applyScale(c.Scale1, c.scratchOut[l*D:(l+1)*D])
-	}
-	for i := range x[:batch*D] {
-		x[i] = c.scratchIn[i] + c.scratchOut[i]
-	}
+	// The output projection, its scale and the residual in one section. The
+	// three are one pass over the same rows, and the two that follow the
+	// product used to be a pass on one core with the others waiting at the
+	// barrier — a barrier the section had to reach first.
+	c.finish(c.OutProj, c.scratchAttn, c.Scale1, x, batch, true)
 
 	// --- feed-forward block ---
-	copy(c.scratchIn, x[:batch*D])
-	copy(c.scratchOut, x[:batch*D])
+	// The residual and the norm's input are already copies of x: the section
+	// that wrote x wrote them too, which is two passes over the width that no
+	// longer happen while seven cores wait.
 	for l := 0; l < batch; l++ {
 		c.Norm2.Apply(c.scratchOut[l*D : (l+1)*D])
 	}
-	c.Linear1.ApplyBatch(c.scratchOut, c.scratchFF, batch)
-	nn.GELU(c.scratchFF[:batch*c.Linear1.Outputs])
-	c.Linear2.ApplyBatch(c.scratchFF, c.scratchOut, batch)
-	for l := 0; l < batch; l++ {
-		applyScale(c.Scale2, c.scratchOut[l*D:(l+1)*D])
-	}
-	for i := range x[:batch*D] {
-		x[i] = c.scratchIn[i] + c.scratchOut[i]
-	}
+	// The first projection activates what it computed before it lets go: GELU
+	// over four thousand values is not worth a section of its own, and it was
+	// paying for one.
+	wide := c.Linear1.Outputs
+	nn.InParallel(wide, batch*wide*(c.Linear1.Inputs+gelWork), func(start, end int) {
+		c.Linear1.ApplyRows(c.scratchOut, c.scratchFF, batch, start, end)
+		for l := 0; l < batch; l++ {
+			nn.GELURange(c.scratchFF[l*wide:(l+1)*wide], start, end)
+		}
+	})
+	c.finish(c.Linear2, c.scratchFF, c.Scale2, x, batch, false)
 }
 
 // attention computes the output of the `batch` positions whose keys and values
@@ -193,6 +211,36 @@ func (c *Layer) attention(batch int, cache *Cache) {
 
 // applyScale multiplies termwise, or does nothing if the layer has no scale.
 // The audio decoder has one, the flow_lm does not.
+// gelWork is what one GELU costs beside the multiply-add the section's weight
+// is counted in. It only decides whether a section is worth splitting.
+const gelWork = 128
+
+// finish computes a projection into the scratch, scales it and adds it to the
+// residual, all inside one section. The three walk the same rows, so a worker
+// that has computed rows [start, end) has everything it needs to finish them.
+func (c *Layer) finish(l nn.Linear, in, scale, x []float32, batch int, again bool) {
+	D := c.DModel
+	nn.InParallel(D, batch*D*l.Inputs, func(start, end int) {
+		l.ApplyRows(in, c.scratchProj, batch, start, end)
+		for p := 0; p < batch; p++ {
+			out := c.scratchProj[p*D : (p+1)*D]
+			dst := x[p*D : (p+1)*D]
+			for i := start; i < end; i++ {
+				v := out[i]
+				if scale != nil { // the layer may carry none
+					v *= scale[i]
+				}
+				dst[i] += v
+			}
+			// The copy the next half's norm works on, made where the values
+			// are still in this core's cache.
+			if again {
+				copy(c.scratchOut[p*D+start:p*D+end], dst[start:end])
+			}
+		}
+	})
+}
+
 func applyScale(scale, x []float32) {
 	for i, e := range scale {
 		x[i] *= e
@@ -207,7 +255,6 @@ func (c *Layer) allocate(batch int) {
 	c.scratchProj = make([]float32, batch*3*D)
 	c.scratchAttn = make([]float32, batch*D)
 	c.scratchFF = make([]float32, batch*c.Linear1.Outputs)
-	c.scratchIn = make([]float32, batch*D)
 	c.scratchOut = make([]float32, batch*D)
 	c.batchAlloc = batch
 }

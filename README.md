@@ -11,7 +11,7 @@ of weights.
 | | what it runs | measured |
 |---|---|---|
 | [`gemma/`](gemma/) | Gemma 4 E2B and 12B, from a GGUF | E2B: 22.6 tokens/s generated, 204 read — llama.cpp on the same CPU: 22.4 and 165. 12B: 5.0 and 42, against 4.83 and 31.7 |
-| [`pockettts/`](pockettts/) | [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts), twelve languages, voice cloning included | ×2.37 real time on the 24-layer French model, ×5.87 on the 6-layer English one — PyTorch: ×1.27 and ×4.03 |
+| [`pockettts/`](pockettts/) | [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts), twelve languages, voice cloning included | ×2.82 real time on the 24-layer French model, ×6.55 on the 6-layer English one — PyTorch: ×1.27 and ×4.03 |
 
 Both figures are from an i7-9700K with eight threads, on Q4_0 weights. Each
 engine's README says what it is measured against, where it still differs from

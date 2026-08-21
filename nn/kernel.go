@@ -27,12 +27,14 @@ const parallelThreshold = 1 << 19
 // bfloat16.
 func MatVecBF16(w []byte, x []float32, outputs, inputs int, y []float32) {
 	InParallel(outputs, outputs*inputs, func(start, end int) {
-		matVecBF16Rows(w, x, inputs, y, start, end)
+		MatVecBF16Rows(w, x, inputs, y, start, end)
 	})
 }
 
-// matVecBF16Rows computes rows [start, end) on the caller's thread.
-func matVecBF16Rows(w []byte, x []float32, inputs int, y []float32, start, end int) {
+// MatVecBF16Rows computes rows [start, end) on the caller's thread, for a
+// caller that is already inside a section and has something to do with the rows
+// it just produced before the barrier.
+func MatVecBF16Rows(w []byte, x []float32, inputs int, y []float32, start, end int) {
 	weights := unsafe.Slice((*uint16)(unsafe.Pointer(&w[0])), len(w)/2)
 	for o := start; o < end; o++ {
 		y[o] = dotBF16(weights[o*inputs:(o+1)*inputs], x)
@@ -70,49 +72,52 @@ func dotBF16(row []uint16, x []float32) float32 {
 // processes sixteen positions in a row while reading its matrices sixteen times
 // spends its time waiting on memory for nothing.
 func MatMatBF16(w []byte, x []float32, outputs, inputs, batch int, y []float32) {
+	InParallel(outputs, outputs*inputs*batch, func(start, end int) {
+		MatMatBF16Rows(w, x, outputs, inputs, batch, y, start, end)
+	})
+}
+
+// MatMatBF16Rows is the same for rows [start, end) on the caller's thread.
+func MatMatBF16Rows(w []byte, x []float32, outputs, inputs, batch int, y []float32, start, end int) {
 	weights := unsafe.Slice((*uint16)(unsafe.Pointer(&w[0])), len(w)/2)
 
-	InParallel(outputs, outputs*inputs*batch, func(start, end int) {
-		{
-			// The row is converted once for the whole batch: without that, the
-			// bfloat16 conversion would be paid as many times as there are
-			// vectors, which is precisely what the batch is meant to amortize.
-			// With AVX2 the question no longer arises: the raw row fits in the
-			// first-level cache, re-reading it for each vector of the batch
-			// costs nothing, and the conversion is folded into the computation.
-			if avx2 {
-				for o := start; o < end; o++ {
-					raw := weights[o*inputs : (o+1)*inputs]
-					for l := 0; l < batch; l++ {
-						y[l*outputs+o] = dotBF16AVX2(&raw[0], &x[l*inputs], inputs)
-					}
-				}
-				return
-			}
-			row := make([]float32, inputs)
-			for o := start; o < end; o++ {
-				raw := weights[o*inputs : (o+1)*inputs]
-				for i, p := range raw {
-					row[i] = math.Float32frombits(uint32(p) << 16)
-				}
-				for l := 0; l < batch; l++ {
-					v := x[l*inputs : (l+1)*inputs]
-					var s0, s1, s2, s3 float32
-					i := 0
-					for ; i+3 < inputs; i += 4 {
-						s0 += row[i] * v[i]
-						s1 += row[i+1] * v[i+1]
-						s2 += row[i+2] * v[i+2]
-						s3 += row[i+3] * v[i+3]
-					}
-					for ; i < inputs; i++ {
-						s0 += row[i] * v[i]
-					}
-					y[l*outputs+o] = s0 + s1 + s2 + s3
-				}
+	// The row is converted once for the whole batch: without that, the
+	// bfloat16 conversion would be paid as many times as there are
+	// vectors, which is precisely what the batch is meant to amortize.
+	// With AVX2 the question no longer arises: the raw row fits in the
+	// first-level cache, re-reading it for each vector of the batch
+	// costs nothing, and the conversion is folded into the computation.
+	if avx2 {
+		for o := start; o < end; o++ {
+			raw := weights[o*inputs : (o+1)*inputs]
+			for l := 0; l < batch; l++ {
+				y[l*outputs+o] = dotBF16AVX2(&raw[0], &x[l*inputs], inputs)
 			}
 		}
-	})
+		return
+	}
+	row := make([]float32, inputs)
+	for o := start; o < end; o++ {
+		raw := weights[o*inputs : (o+1)*inputs]
+		for i, p := range raw {
+			row[i] = math.Float32frombits(uint32(p) << 16)
+		}
+		for l := 0; l < batch; l++ {
+			v := x[l*inputs : (l+1)*inputs]
+			var s0, s1, s2, s3 float32
+			i := 0
+			for ; i+3 < inputs; i += 4 {
+				s0 += row[i] * v[i]
+				s1 += row[i+1] * v[i+1]
+				s2 += row[i+2] * v[i+2]
+				s3 += row[i+3] * v[i+3]
+			}
+			for ; i < inputs; i++ {
+				s0 += row[i] * v[i]
+			}
+			y[l*outputs+o] = s0 + s1 + s2 + s3
+		}
+	}
 }
 
 // Axpy computes dst += a*src over the first n elements common to both.

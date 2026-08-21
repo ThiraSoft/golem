@@ -61,11 +61,11 @@ voice `alba`, and the same end-of-speech threshold on both sides:
 
 | | golem | pocket_tts, PyTorch |
 |---|---:|---:|
-| `french_24l` — 24 transformer layers | **×2.37** real time | ×1.27 |
-| `english_2026-01` — 6 layers | **×5.87** | ×4.03 |
+| `french_24l` — 24 transformer layers | **×2.82** real time | ×1.27 |
+| `english_2026-01` — 6 layers | **×6.55** | ×4.03 |
 | cloning: encoding a recording | **×7.72** real time | — |
-| first sound, `french_24l` | **210 ms** | 320 ms |
-| first sound, `english_2026-01` | **94 ms** | 90 ms |
+| first sound, `french_24l` | **175 ms** | 320 ms |
+| first sound, `english_2026-01` | **66 ms** | 90 ms |
 | ready to speak, warm | **30 ms** | 3.5 s |
 
 ```bash
@@ -80,9 +80,11 @@ day.
 Both columns used to read the other way round on the six-layer model, and what
 turned them is under *Throughput* below: the audio decoder was spending its time
 entering kernels rather than computing in them, and one frame of it went from
-17.8 ms to 6.3 ms. Where the transformer dominates — twenty-four layers,
-memory-bound matrix-vector products — golem was already ahead and is now twice
-PyTorch. Where it does not, the decoder was the whole difference.
+17.8 ms to 6.3 ms. Then the barriers went — everything a section produced is now
+finished inside it — which is the last third. Where the transformer dominates —
+twenty-four layers, memory-bound matrix-vector products — golem was already ahead
+and is now more than twice PyTorch.
+Where it does not, the decoder was the whole difference.
 
 What golem brings either way: a binary of a few megabytes instead of a gigabyte
 of environment, thirty milliseconds to first readiness instead of three and a
@@ -183,11 +185,11 @@ Measured breakdown, per frame (the budget is 80 ms):
 |---|---:|---:|
 | flow_lm and flow net, 24 layers, alone | 19 ms | 16 ms — 604 MB of weights, at the 38 GB/s eight cores sustain |
 | Mimi decoder, alone | 6.3 ms | ~1 ms — 162 MMAC over eight AVX2 cores |
-| one frame of `french_24l`, the two pipelined | 34 ms | |
+| one frame of `french_24l`, the two pipelined | 29 ms | |
 
 The two floors are floors for something having the machine to itself, which in
 the pipeline neither has: the isolated times add up to 25 ms and a pipelined
-frame costs 34, and the nine milliseconds between them are the two halves
+frame costs 29, and the four milliseconds between them are the two halves
 sharing eight cores. The transformer is close to its floor and there is little
 left in it. The decoder is six times above its own, and that is now a matter of
 how much of its arithmetic is spent in kernels rather than around them.
@@ -206,6 +208,29 @@ than the whole flow_lm, for a tenth of the computation. The sweet spot is low:
 with bfloat16 weights, a batch of size L gives L multiply-accumulates per two
 bytes read, and the balance between memory and compute falls around L≈4. The text
 prompt benefits from the same treatment.
+
+**Finishing what a section produced, inside it.** A section ends with every core
+waiting on the slowest, and what came after one here was always another pass over
+the same values on a single core: the bias of a projection, the activation over
+its outputs, the layer scale, the residual, the rotation of the queries and keys
+and the copy into the cache. Measured on one French sentence, that was 367 ms of
+the 2.29 s spent outside any section at all, plus a barrier for each of the
+1 738 activations that had a section to itself.
+
+They are now folded into the section that computed the values they read.
+`nn.Linear.ApplyRows`, `nn.GELURange` and `nn.MatMatBF16Rows` exist for exactly
+that: a worker that has computed rows [start, end) applies the bias, the
+activation, the scale and the residual to those rows before it lets go. The
+projection of the queries, keys and values is cut into heads rather than rows,
+because the rotation needs a head whole — so the same worker rotates what it
+projected and writes it into the cache. What is left outside the sections is
+112 ms, and it is almost all the norms, which need every value of a position
+before they can start.
+
+Nothing about the arithmetic changed: the same values in the same order, and the
+fixtures hold it. The sentence went from ×2.43 to ×2.82 real time, the six-layer
+model from ×5.66 to ×6.55, and eight cores now give ×2.9 the speed of one where
+they gave ×2.4.
 
 **Pipelining.** Generating a latent and decoding it are independent from one
 frame to the next. Decoding therefore runs on its own goroutine, and the two

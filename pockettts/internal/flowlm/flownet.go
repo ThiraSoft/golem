@@ -29,6 +29,7 @@ type TimeEncoder struct {
 	MLP2   nn.Linear // 512 -> 512
 	Norm   nn.RMSNorm
 	buffer []float32
+	tmp    []float32
 }
 
 func (e *TimeEncoder) Apply(t float32, out []float32) {
@@ -43,7 +44,10 @@ func (e *TimeEncoder) Apply(t float32, out []float32) {
 	}
 	e.MLP0.Apply(e.buffer, out)
 	nn.SiLU(out)
-	tmp := make([]float32, len(out))
+	if cap(e.tmp) < len(out) {
+		e.tmp = make([]float32, len(out))
+	}
+	tmp := e.tmp[:len(out)]
 	e.MLP2.Apply(out, tmp)
 	copy(out, tmp)
 	e.Norm.Apply(out)
@@ -55,6 +59,7 @@ type ResidualBlock struct {
 	InLN       nn.LayerNorm
 	MLP0, MLP2 nn.Linear
 	mod, h, y  []float32
+	tmp        []float32
 }
 
 func (b *ResidualBlock) Apply(x, cond []float32) {
@@ -63,6 +68,7 @@ func (b *ResidualBlock) Apply(x, cond []float32) {
 		b.mod = make([]float32, 3*n)
 		b.h = make([]float32, n)
 		b.y = make([]float32, n)
+		b.tmp = make([]float32, b.MLP0.Outputs)
 	}
 	copy(b.y, cond)
 	nn.SiLU(b.y)
@@ -74,7 +80,7 @@ func (b *ResidualBlock) Apply(x, cond []float32) {
 	for i := range b.h {
 		b.h[i] = b.h[i]*(1+scale[i]) + shift[i]
 	}
-	tmp := make([]float32, n)
+	tmp := b.tmp[:n]
 	b.MLP0.Apply(b.h, tmp)
 	nn.SiLU(tmp)
 	b.MLP2.Apply(tmp, b.h)
@@ -117,6 +123,7 @@ type FlowNet struct {
 	Blocks              []*ResidualBlock
 	Final               FinalLayer
 	cond, t0, t1, state []float32
+	velocity, current   []float32
 }
 
 // Velocity returns the flow field at point x, between the instants s and t.
@@ -147,11 +154,16 @@ func (r *FlowNet) Velocity(condTransformer []float32, s, t float32, x, out []flo
 // formulation allows it.
 func (r *FlowNet) Latent(cond, noise []float32, steps int, out []float32) {
 	copy(out, noise)
-	velocity := make([]float32, len(out))
+	if cap(r.velocity) < len(out) {
+		r.velocity = make([]float32, len(out))
+		r.current = make([]float32, len(out))
+	}
+	velocity, current := r.velocity[:len(out)], r.current[:len(out)]
 	for i := 0; i < steps; i++ {
 		s := float32(i) / float32(steps)
 		t := float32(i+1) / float32(steps)
-		r.Velocity(cond, s, t, append([]float32(nil), out...), velocity)
+		copy(current, out)
+		r.Velocity(cond, s, t, current, velocity)
 		for j := range out {
 			out[j] += velocity[j] / float32(steps)
 		}
