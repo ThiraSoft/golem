@@ -47,3 +47,38 @@ func TestMixedBatchCost(t *testing.T) {
 			float64(n)/(each+head).Seconds())
 	}
 }
+
+// Reading four prompts at once against reading one. A pass is thirty-two
+// positions wide whichever way they are made up, so the question is whether
+// four conversations of eight cost what one run of thirty-two costs.
+func TestMixedPrefillCost(t *testing.T) {
+	m := openEngine(t, 4096)
+	const width = 32
+	tokens := make([]int32, width)
+
+	m.SetSlots(1)
+	at := Run(m.Slot(0), 0, width)
+	m.ForwardMixed(tokens, at)
+	start := time.Now()
+	for r := 0; r < 3; r++ {
+		m.ForwardMixed(tokens, at)
+	}
+	one := time.Since(start) / 3
+
+	if err := m.SetSlots(4); err != nil {
+		t.Fatal(err)
+	}
+	four := make([]Place, 0, width)
+	for i := 0; i < 4; i++ {
+		four = append(four, Run(m.Slot(i), 0, width/4)...)
+	}
+	m.ForwardMixed(tokens, four)
+	start = time.Now()
+	for r := 0; r < 3; r++ {
+		m.ForwardMixed(tokens, four)
+	}
+	split := time.Since(start) / 3
+
+	t.Logf("32 positions of one conversation: %s (%.0f tokens/s)", one.Round(time.Millisecond), width/one.Seconds())
+	t.Logf("8 positions of each of four:      %s (%.0f tokens/s)", split.Round(time.Millisecond), width/split.Seconds())
+}
