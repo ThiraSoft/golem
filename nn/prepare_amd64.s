@@ -87,3 +87,44 @@ p16:
 
 	VZEROUPPER
 	RET
+
+// func clampAVX2(x *float32, n int, lo, hi float32)
+//
+// Every value held inside [lo, hi], eight at a time. It is what a
+// quantization-aware weight's output range costs, and it was the last scalar
+// loop in the tower's hot path.
+TEXT ·clampAVX2(SB), NOSPLIT, $0-24
+	MOVQ x+0(FP), DI
+	MOVQ n+8(FP), CX
+	VBROADCASTSS lo+16(FP), Y14
+	VBROADCASTSS hi+20(FP), Y15
+	XORQ AX, AX
+
+	MOVQ CX, DX
+	ANDQ $-8, DX
+	JMP  c8cond
+
+c8:
+	VMOVUPS (DI)(AX*4), Y0
+	VMAXPS  Y14, Y0, Y0
+	VMINPS  Y15, Y0, Y0
+	VMOVUPS Y0, (DI)(AX*4)
+	ADDQ    $8, AX
+
+c8cond:
+	CMPQ AX, DX
+	JLT  c8
+
+c1:
+	CMPQ   AX, CX
+	JGE    done
+	VMOVSS (DI)(AX*4), X0
+	VMAXSS X14, X0, X0
+	VMINSS X15, X0, X0
+	VMOVSS X0, (DI)(AX*4)
+	INCQ   AX
+	JMP    c1
+
+done:
+	VZEROUPPER
+	RET

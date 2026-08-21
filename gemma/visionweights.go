@@ -78,10 +78,7 @@ func (l VisionLinear) rows(tmp, y []float32, batch, start, end int) {
 	// outputs afterwards would be a pass on one core.
 	lo, hi := l.Clamp.OutMin, l.Clamp.OutMax
 	for c := 0; c < batch; c++ {
-		block := y[c*l.Outputs : (c+1)*l.Outputs]
-		for i := start; i < end; i++ {
-			block[i] = clampF32(block[i], lo, hi)
-		}
+		nn.Clamp(y[c*l.Outputs+start:c*l.Outputs+end], lo, hi)
 	}
 }
 

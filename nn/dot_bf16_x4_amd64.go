@@ -35,3 +35,24 @@ func PrepareIlv(dst, src []float32, lo, hi float32) bool {
 	prepareIlvAVX2(&dst[0], &src[0], len(src), lo, hi)
 	return true
 }
+
+//go:noescape
+func clampAVX2(x *float32, n int, lo, hi float32)
+
+// Clamp holds every value of x inside [lo, hi].
+func Clamp(x []float32, lo, hi float32) {
+	if len(x) == 0 {
+		return
+	}
+	if avx2 {
+		clampAVX2(&x[0], len(x), lo, hi)
+		return
+	}
+	for i, v := range x {
+		if v < lo {
+			x[i] = lo
+		} else if v > hi {
+			x[i] = hi
+		}
+	}
+}

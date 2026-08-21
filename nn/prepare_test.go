@@ -55,3 +55,26 @@ func TestPrepareIlvRoundsLikeRoundBF16(t *testing.T) {
 		}
 	}
 }
+
+func TestClamp(t *testing.T) {
+	for _, n := range []int{0, 1, 7, 8, 9, 768} {
+		x := make([]float32, n)
+		want := make([]float32, n)
+		for i := range x {
+			x[i] = float32(i%23) - 11
+			want[i] = x[i]
+			if want[i] < -3 {
+				want[i] = -3
+			}
+			if want[i] > 4 {
+				want[i] = 4
+			}
+		}
+		Clamp(x, -3, 4)
+		for i := range want {
+			if x[i] != want[i] {
+				t.Fatalf("n=%d element %d is %v, expected %v", n, i, x[i], want[i])
+			}
+		}
+	}
+}

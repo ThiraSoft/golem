@@ -33,7 +33,16 @@ import (
 // tile is fastest of all. What stops it there is that the intermediate is four
 // times as wide as the stream, so a thousand patches of it are already twelve
 // megabytes and an image is allowed to be twice this one.
-const ffnBudget = 32 << 20
+const ffnBudget = 16 << 20
+
+// queryGroup is how many patches of a head are attended to together, and
+// keyBlock how many keys they read at a time. The first says how often a
+// head's keys and values are swept — once per group rather than once per
+// patch — and the second keeps each sweep inside a core's own cache.
+const (
+	queryGroup = 8
+	keyBlock   = 256
+)
 
 // ffnTile is how many patches go through together: the whole grid when it
 // fits, and otherwise as few equal tiles as the budget allows. Equal, because
@@ -214,45 +223,67 @@ func (v *VisionTower) Block(i int, xs []float32, cols int, s *scratch) {
 		}
 	})
 
-	// The attention itself, four patches of a head to a core. Every patch
-	// attends to every patch: an image has no past.
+	// The attention itself, a block of patches of a head to a core. Every
+	// patch attends to every patch: an image has no past.
 	//
-	// Four at a time because a head's keys are a quarter of a megabyte and
-	// every query reads all of them: taken one at a time they would be read a
-	// thousand times over, and the values with them. The four share what they
-	// read, and the sums they scatter into are four rows of one buffer rather
-	// than four places in the grid — which is why the block below puts them
-	// back afterwards.
-	groups := (n + 3) / 4
+	// Two blockings, and both are about what a cache holds rather than about
+	// arithmetic. A head's keys and its values are a quarter of a megabyte
+	// each here, so a query that swept them alone would pull half a megabyte
+	// past the cores for sixty-four floats of answer — the queries therefore
+	// go in groups, and share the sweep. And the sweep itself is cut into
+	// blocks of keys small enough to sit in a core's own cache while the
+	// group's queries all read them.
+	groups := (n + queryGroup - 1) / queryGroup
 	nn.InParallel(groups*cfg.Heads, 2*n*n*cfg.Heads*hd, func(first, last int) {
-		scores := make([]float32, 4*n)
-		mixed := make([]float32, 4*hd)
+		scores := make([]float32, queryGroup*n)
+		mixed := make([]float32, queryGroup*hd)
 		for u := first; u < last; u++ {
 			h, g := u/groups, u%groups
 			head := h * n * hd
-			p := g * 4
+			from := g * queryGroup
+			to := min(from+queryGroup, n)
 			k := s.kh[head : head+n*hd]
 			v := s.vh[head : head+n*hd]
-			// No 1/sqrt(head_dim): gemma4v scales the scores by one, and the
-			// query norm is what keeps them in range.
-			if p+4 <= n && nn.Scores4(s.qh[head+p*hd:], k, hd, n, scores, n) {
-				for i := 0; i < 4; i++ {
-					nn.SoftmaxGGML(scores[i*n : (i+1)*n])
+
+			// The scores, a block of keys at a time so the block stays where
+			// the queries can reach it. No 1/sqrt(head_dim): gemma4v scales
+			// the scores by one, and the query norm is what keeps them in
+			// range.
+			for at := 0; at < n; at += keyBlock {
+				end := min(at+keyBlock, n)
+				for p := from; p < to; p += 4 {
+					out := scores[(p-from)*n+at:]
+					if p+4 <= to && nn.Scores4(s.qh[head+p*hd:], k[at*hd:], hd, end-at, out, n) {
+						continue
+					}
+					for i := 0; p+i < to && i < 4; i++ {
+						nn.Scores(s.qh[head+(p+i)*hd:head+(p+i+1)*hd], k[at*hd:], hd, end-at,
+							scores[(p+i-from)*n+at:])
+					}
 				}
-				clear(mixed)
-				nn.Mix4(mixed, hd, v, scores, n, hd, n)
-				for i := 0; i < 4; i++ {
-					copy(s.attn[(p+i)*cfg.Dim+h*hd:], mixed[i*hd:(i+1)*hd])
-				}
-				continue
 			}
-			// The tail of a grid that is not a whole number of fours.
-			for i := 0; p+i < n && i < 4; i++ {
-				nn.Scores(s.qh[head+(p+i)*hd:head+(p+i+1)*hd], k, hd, n, scores[:n])
-				nn.SoftmaxGGML(scores[:n])
-				dst := s.attn[(p+i)*cfg.Dim+h*hd : (p+i)*cfg.Dim+(h+1)*hd]
-				clear(dst)
-				nn.Mix(dst, v, scores[:n], hd, n)
+			for p := from; p < to; p++ {
+				nn.SoftmaxGGML(scores[(p-from)*n : (p-from+1)*n])
+			}
+
+			// And the sum of the values, blocked the same way.
+			clear(mixed)
+			for at := 0; at < n; at += keyBlock {
+				end := min(at+keyBlock, n)
+				for p := from; p < to; p += 4 {
+					w := scores[(p-from)*n+at:]
+					dst := mixed[(p-from)*hd:]
+					if p+4 <= to && nn.Mix4(dst, hd, v[at*hd:], w, n, hd, end-at) {
+						continue
+					}
+					for i := 0; p+i < to && i < 4; i++ {
+						nn.Mix(mixed[(p+i-from)*hd:(p+i-from+1)*hd], v[at*hd:],
+							scores[(p+i-from)*n+at:], hd, end-at)
+					}
+				}
+			}
+			for p := from; p < to; p++ {
+				copy(s.attn[p*cfg.Dim+h*hd:], mixed[(p-from)*hd:(p-from+1)*hd])
 			}
 		}
 	})

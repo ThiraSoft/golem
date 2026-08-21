@@ -42,3 +42,14 @@ func SoftmaxGGML(x []float32) {
 func Scores4(q, k []float32, hd, n int, out []float32, outStride int) bool { return false }
 
 func Mix4(dst []float32, dstStride int, v, w []float32, wStride, hd, n int) bool { return false }
+
+// Clamp holds every value of x inside [lo, hi].
+func Clamp(x []float32, lo, hi float32) {
+	for i, v := range x {
+		if v < lo {
+			x[i] = lo
+		} else if v > hi {
+			x[i] = hi
+		}
+	}
+}
