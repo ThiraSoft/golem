@@ -81,39 +81,6 @@ func (m Matrix) MatVecBatch(b *Batch, ys [][]float32) {
 	})
 }
 
-// MatVecGroup computes several products against the same activation in a single
-// parallel section.
-//
-// The barrier at the end of a section is not free: every core waits for the
-// slowest, and a token holds three hundred of them. The query, key and value
-// projections of a block do not depend on one another, and neither do the gate
-// and the up projection of its feed forward — sharing one section spreads the
-// three matrices over the cores as if they were one, and pays for one barrier
-// instead of three.
-func MatVecGroup(b *Batch, matrices []Matrix, outputs [][][]float32) {
-	total, work := 0, 0
-	for _, m := range matrices {
-		total += m.Rows
-		work += m.Rows * m.Cols * b.Size
-	}
-	InParallel(total, work, func(start, end int) {
-		base := 0
-		for i, m := range matrices {
-			from, to := start-base, end-base
-			if from < 0 {
-				from = 0
-			}
-			if to > m.Rows {
-				to = m.Rows
-			}
-			if from < to {
-				m.rows(b, outputs[i], from, to)
-			}
-			base += m.Rows
-		}
-	})
-}
-
 // MatVecRows computes rows [start, end) of the product on the caller's thread,
 // for a caller that is already inside a parallel section and wants to finish
 // what it produced before the section ends.
