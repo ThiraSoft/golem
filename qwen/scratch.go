@@ -32,14 +32,24 @@ type Scratch struct {
 
 	dim, maxContext               int
 	maxQ, maxKV, maxFFN, maxHeads int
+
+	// actBF16 is stamped onto every batch handed out, so that quantizing a
+	// column also rounds it. See Weights.ActBF16.
+	actBF16 bool
 }
 
-func NewScratch(cfg *Config) *Scratch {
+func NewScratch(cfg *Config) *Scratch { return newScratch(cfg, false) }
+
+// NewScratchFor is NewScratch told what the weights want of its activations.
+func NewScratchFor(cfg *Config, w *Weights) *Scratch { return newScratch(cfg, w.ActBF16) }
+
+func newScratch(cfg *Config, actBF16 bool) *Scratch {
 	s := &Scratch{
 		batches:    map[[2]int]*nn.Batch{},
 		ropes:      map[float64][]*nn.RoPETable{},
 		dim:        cfg.Dim,
 		maxContext: cfg.MaxContext,
+		actBF16:    actBF16,
 	}
 	for _, b := range cfg.Blocks {
 		s.maxHeads = max(s.maxHeads, b.Heads)
@@ -100,6 +110,7 @@ func (s *Scratch) Batch(width, batch int) *nn.Batch {
 	b, ok := s.batches[key]
 	if !ok {
 		b = nn.NewBatch(width, batch)
+		b.BF16 = s.actBF16
 		s.batches[key] = b
 	}
 	return b

@@ -35,6 +35,12 @@ type Weights struct {
 	TokenEmbd  nn.Matrix
 	OutputNorm []float32
 	Blocks     []BlockWeights
+
+	// ActBF16 says the activations must be rounded to bfloat16 before they
+	// meet these weights. ggml converts an activation to whatever the weight's
+	// dot product wants, and for a bfloat16 weight that is bfloat16 — so a
+	// float32 activation is more precision than the reference has.
+	ActBF16 bool
 }
 
 // Repack builds the interleaved form of every matrix a product reads, which
@@ -163,5 +169,9 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 			*bind.dst = m
 		}
 	}
+
+	// Every matrix in a checkpoint has the same format, and the first one
+	// answers for all of them.
+	w.ActBF16 = w.Blocks[0].Q.Quant == nn.BF16
 	return w, nil
 }
