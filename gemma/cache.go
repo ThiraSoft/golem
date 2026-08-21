@@ -22,6 +22,13 @@ type LayerCache struct {
 	Capacity int
 	K        []float32 // Capacity * KVHeads * HeadDim
 	V        []float32
+
+	// used is one past the highest position written since the last Reset,
+	// clamped to the capacity by Reset itself. It exists so that forgetting a
+	// conversation costs what the conversation was, not what the context was
+	// sized for: a global block holds four thousand positions and a chat turn
+	// touches a few dozen.
+	used int
 }
 
 func newLayerCache(kvHeads, headDim, capacity int) *LayerCache {
@@ -42,6 +49,9 @@ func (c *LayerCache) offset(pos, head int) int {
 }
 
 func (c *LayerCache) Store(pos, head int, k, v []float32) {
+	if pos >= c.used {
+		c.used = pos + 1
+	}
 	o := c.offset(pos, head)
 	for i := 0; i < c.HeadDim; i++ {
 		c.K[o+i] = nn.RoundHalf(k[i])
@@ -93,6 +103,12 @@ func (c *Cache) Visible(b BlockConfig, pos int) (first, last int) {
 
 // Reset forgets everything without releasing the memory. Distinct pointers
 // only: a shared cache would otherwise be cleared as many times as it is read.
+//
+// Only the positions that were written are cleared. Nothing beyond them can be
+// read — Visible stops at the query's own position, and a position is always
+// stored before it is attended to — but clearing them is what makes that an
+// invariant of the cache rather than a property of the caller. A window block
+// wraps, so its count is clamped to what it holds.
 func (c *Cache) Reset() {
 	done := map[*LayerCache]bool{}
 	for _, lc := range c.Layers {
@@ -100,9 +116,12 @@ func (c *Cache) Reset() {
 			continue
 		}
 		done[lc] = true
-		for i := range lc.K {
-			lc.K[i] = 0
-			lc.V[i] = 0
+		n := lc.used * lc.KVHeads * lc.HeadDim
+		if n > len(lc.K) {
+			n = len(lc.K)
 		}
+		clear(lc.K[:n])
+		clear(lc.V[:n])
+		lc.used = 0
 	}
 }

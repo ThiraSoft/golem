@@ -24,6 +24,13 @@ type LayerCache struct {
 	Capacity int
 	K        []float32 // Capacity * KVHeads * HeadDim
 	V        []float32
+
+	// used is one past the highest position written since the last Reset, so
+	// that Reset clears what a conversation touched rather than what the
+	// context was sized for. A cache built for four thousand positions and
+	// used for sixty-four is the ordinary case, and zeroing the whole of it
+	// costs more than reading the prompt did.
+	used int
 }
 
 func newLayerCache(kvHeads, headDim, capacity int) *LayerCache {
@@ -43,6 +50,9 @@ func (c *LayerCache) offset(pos, head int) int {
 }
 
 func (c *LayerCache) Store(pos, head int, k, v []float32) {
+	if pos >= c.used {
+		c.used = pos + 1
+	}
 	o := c.offset(pos, head)
 	for i := 0; i < c.HeadDim; i++ {
 		c.K[o+i] = nn.RoundHalf(k[i])
@@ -81,15 +91,23 @@ func (c *Cache) Visible(b BlockConfig, pos int) (first, last int) {
 	return 0, pos
 }
 
-// Reset forgets everything without releasing the memory.
+// Reset forgets the conversation without releasing the memory.
+//
+// Only the positions that were written are cleared. Nothing beyond them can be
+// read — Visible stops at the query's own position, and a position is always
+// stored before it is attended to — but clearing them is what makes that an
+// invariant of the cache rather than a property of the caller.
 func (c *Cache) Reset() {
 	for _, lc := range c.Layers {
 		if lc == nil {
 			continue
 		}
-		for i := range lc.K {
-			lc.K[i] = 0
-			lc.V[i] = 0
+		n := lc.used * lc.KVHeads * lc.HeadDim
+		if n > len(lc.K) {
+			n = len(lc.K)
 		}
+		clear(lc.K[:n])
+		clear(lc.V[:n])
+		lc.used = 0
 	}
 }
