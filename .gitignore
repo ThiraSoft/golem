@@ -20,6 +20,9 @@
 /testdata/gemma/layers12/
 /testdata/gemma/quants/
 /testdata/gemma/window/
+/testdata/qwen/layers/
+/testdata/qwen/long/
+/testdata/qwen/layers_q4/
 /testdata/layer0/
 /testdata/pipeline/
 /testdata/pipeline_en/

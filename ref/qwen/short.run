@@ -1,0 +1,32 @@
+# Qwen3 dense: twenty-eight blocks and no two of them different. Four are kept
+# rather than Gemma's seven, because there is no window pattern, no cache
+# sharing and no per-layer branch to cover. 0 is the first, 1 catches what only
+# goes wrong from the second block on, 14 is the middle, and 27 is the last,
+# where anything that accumulates is largest.
+prompt      The capital of France is
+add_special 0
+
+blocks 0 1 14 27
+
+global result_norm
+
+# The names are llama.cpp's, from src/models/qwen3.cpp. Two things a reader
+# coming from ref/gemma/short.run should notice: the queries are normed before
+# they are rotated and recorded on both sides of it, so a mismatch says which
+# of the two is wrong; and there is no waypoint between the attention and its
+# output projection, so ffn_inp -- the projection's result plus the residual --
+# is the first place the attention itself can be checked.
+require attn_norm
+require Qcur_normed
+require Kcur_normed
+require Qcur
+require Kcur
+require Vcur
+require ffn_inp
+require ffn_norm
+require ffn_out
+require l_out
+
+# Every block's output, so a test can start any block from the reference's own
+# input, and a divergence in the full stack says which block it began in.
+all_blocks l_out

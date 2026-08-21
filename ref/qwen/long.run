@@ -1,0 +1,14 @@
+# Qwen has no sliding window, so this run is not about one. It is about a cache
+# that has to stay right several hundred positions in, where an indexing
+# mistake a five-token prompt hides becomes visible.
+prompt      \sThe capital of France is Paris and the capital of Japan is Tokyo.
+repeat      60
+label       (repeated sentence)
+add_special 0
+min_tokens  600
+last_column 1
+
+global l_out-0
+global l_out-14
+global l_out-27
+global result_norm
