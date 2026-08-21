@@ -20,15 +20,6 @@ import (
 	"time"
 )
 
-// Engine is the part of a model the server drives. engine.Open supplies
-// whatever satisfies it, whichever architecture the file declared.
-type Engine interface {
-	ForwardBatch(tokens []int32, startPos int) [][]float32
-	Logits(hidden, out []float32)
-	Reset()
-	UseSlot(i int)
-}
-
 // Vocabulary is the part of bpe.Vocab the server uses.
 type Vocabulary interface {
 	Encode(text string, addBOS, parseSpecial bool) []int32
@@ -42,8 +33,8 @@ type Vocabulary interface {
 const promptBatch = 32
 
 type Context struct {
-	engine     Engine
-	slot       int // which of the engine's caches this context is
+	runner     *Runner
+	slot       int // which of the model's caches this context is
 	window     int // the largest sliding window; 0 when every block is global
 	maxContext int
 	now        func() time.Time
@@ -53,38 +44,29 @@ type Context struct {
 	last time.Time
 }
 
-func NewContext(e Engine, window, maxContext int, now func() time.Time, ttl time.Duration) *Context {
-	return &Context{engine: e, window: window, maxContext: maxContext, now: now, ttl: ttl}
+func NewContext(r *Runner, window, maxContext int, now func() time.Time, ttl time.Duration) *Context {
+	return &Context{runner: r, window: window, maxContext: maxContext, now: now, ttl: ttl}
 }
 
-// NewSlotContext is the same, for one of several caches the engine holds.
-func NewSlotContext(e Engine, slot, window, maxContext int, now func() time.Time, ttl time.Duration) *Context {
-	c := NewContext(e, window, maxContext, now, ttl)
+// NewSlotContext is the same, for one of several caches the model holds.
+func NewSlotContext(r *Runner, slot, window, maxContext int, now func() time.Time, ttl time.Duration) *Context {
+	c := NewContext(r, window, maxContext, now, ttl)
 	c.slot = slot
 	return c
 }
 
-// use points the engine at this context's cache. Every pass goes through it,
-// because between two of them another conversation may have run.
-func (c *Context) use() { c.engine.UseSlot(c.slot) }
-
 // Pos is the position the next token would be fed at.
 func (c *Context) Pos() int { return len(c.held) }
 
-// Logits reads the distribution one hidden state produced. It needs no slot:
-// the head is the same weights whichever conversation drew the state.
-func (c *Context) Logits(hidden, out []float32) { c.engine.Logits(hidden, out) }
-
-// Prefill brings the cache up to ids and returns the hidden state of the last
-// position, with the number of positions it had to feed.
-func (c *Context) Prefill(ids []int32) ([]float32, int, error) {
+// Prefill brings the cache up to ids, scores the last position into logits,
+// and returns how many positions it had to feed.
+func (c *Context) Prefill(ids []int32, logits []float32) (int, error) {
 	if len(ids) == 0 {
-		return nil, 0, fmt.Errorf("serve: an empty prompt")
+		return 0, fmt.Errorf("serve: an empty prompt")
 	}
 	if len(ids) > c.maxContext {
-		return nil, 0, fmt.Errorf("serve: the conversation is %d positions and the context is %d: start the server with a larger -context, or send less", len(ids), c.maxContext)
+		return 0, fmt.Errorf("serve: the conversation is %d positions and the context is %d: start the server with a larger -context, or send less", len(ids), c.maxContext)
 	}
-	c.use()
 	c.expire()
 
 	shared := 0
@@ -106,24 +88,35 @@ func (c *Context) Prefill(ids []int32) ([]float32, int, error) {
 		}
 	}
 
-	var hidden []float32
 	for at := from; at < len(ids); at += promptBatch {
 		to := min(at+promptBatch, len(ids))
-		states := c.engine.ForwardBatch(ids[at:to], at)
-		hidden = states[len(states)-1]
+		// Only the chunk that ends the prompt is scored: the ones before it
+		// are read for their keys and values alone.
+		var out []float32
+		if to == len(ids) {
+			out = logits
+		}
+		c.runner.Forward(c.slot, ids[at:to], span(at, to-at), out)
 	}
 	c.held = append(c.held[:0], ids...)
 	c.last = c.now()
-	return hidden, len(ids) - from, nil
+	return len(ids) - from, nil
 }
 
-// Advance feeds one drawn token and returns the state it produced.
-func (c *Context) Advance(id int32) []float32 {
-	c.use()
-	states := c.engine.ForwardBatch([]int32{id}, len(c.held))
+// Advance feeds one drawn token and scores what it produced.
+func (c *Context) Advance(id int32, logits []float32) {
+	c.runner.Forward(c.slot, []int32{id}, span(len(c.held), 1), logits)
 	c.held = append(c.held, id)
 	c.last = c.now()
-	return states[0]
+}
+
+// span is the positions a run of n tokens starting at from occupies.
+func span(from, n int) []int {
+	out := make([]int, n)
+	for i := range out {
+		out[i] = from + i
+	}
+	return out
 }
 
 // Full reports whether the context has no room left for another token.
@@ -139,6 +132,6 @@ func (c *Context) expire() {
 	if c.now().Sub(c.last) < c.ttl {
 		return
 	}
-	c.engine.Reset()
+	c.runner.Reset(c.slot)
 	c.held = nil
 }

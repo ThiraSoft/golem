@@ -9,9 +9,30 @@ import (
 	"time"
 )
 
-func newTestServer(script []string) *Server {
-	g, v := newGenerator(script, 64)
+func newTestServer(t testing.TB, script []string) *Server {
+	g, v := newGenerator(t, script, 64)
 	return NewServer(poolOf(g), v, "test-model", wordTemplate{}, greedy())
+}
+
+// newTestServerWithSlots is the same over several conversations at once.
+func newTestServerWithSlots(t testing.TB, script []string, slots int) *Server {
+	g, v := newGenerator(t, script, 64)
+	pool := NewPool(slotsOf(g, slots), time.Now)
+	return NewServer(pool, v, "test-model", wordTemplate{}, greedy())
+}
+
+// slotsOf is n slots over the same engine, each with its own conversation.
+func slotsOf(g *Generator, n int) []*slot {
+	out := make([]*slot, n)
+	for i := range out {
+		// A generator of its own, as main.go builds one per slot: the buffer
+		// it scores into is not something two conversations may share.
+		ctx := NewSlotContext(g.ctx.runner, i, 0, 4096, time.Now, 0)
+		gen := NewGenerator(ctx, g.vocab, g.tpl, len(g.logits), g.maxTokens)
+		gen.calls = g.calls
+		out[i] = &slot{index: i, ctx: ctx, gen: gen}
+	}
+	return out
 }
 
 // poolOf is the one-slot pool a test that does not care about slots wants.
@@ -29,7 +50,7 @@ func post(t *testing.T, s *Server, body string) *httptest.ResponseRecorder {
 }
 
 func TestModelsListsTheOneModel(t *testing.T) {
-	s := newTestServer(nil)
+	s := newTestServer(t, nil)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, httptest.NewRequest("GET", "/v1/models", nil))
 	if w.Code != http.StatusOK {
@@ -51,7 +72,7 @@ func TestModelsListsTheOneModel(t *testing.T) {
 }
 
 func TestCompletionAnswers(t *testing.T) {
-	s := newTestServer([]string{"hello", "<turn|>"})
+	s := newTestServer(t, []string{"hello", "<turn|>"})
 	w := post(t, s, `{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("%d: %s", w.Code, w.Body)
@@ -98,11 +119,11 @@ func TestASecondRequestReusesTheCache(t *testing.T) {
 		{"role":"assistant","content":"one"},{"role":"user","content":"b"}]}`
 	script := []string{"one", "<turn|>", "two", "<turn|>"}
 
-	warm := newTestServer(script)
+	warm := newTestServer(t, script)
 	post(t, warm, first)
 	reused := promptTokens(t, post(t, warm, second))
 
-	cold := newTestServer(script)
+	cold := newTestServer(t, script)
 	whole := promptTokens(t, post(t, cold, second))
 
 	if reused >= whole {
@@ -125,7 +146,7 @@ func promptTokens(t *testing.T, w *httptest.ResponseRecorder) int {
 }
 
 func TestCompletionReportsAToolCall(t *testing.T) {
-	s := newTestServer([]string{"CALLweather{city=Lyon}", "<turn|>"})
+	s := newTestServer(t, []string{"CALLweather{city=Lyon}", "<turn|>"})
 	w := post(t, s, `{"model":"test-model","messages":[{"role":"user","content":"weather?"}],
 		"tools":[{"type":"function","function":{"name":"weather","description":"w",
 		"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}`)
@@ -168,7 +189,7 @@ func TestCompletionReportsAToolCall(t *testing.T) {
 }
 
 func TestCompletionRefusesWhatItDoesNotImplement(t *testing.T) {
-	s := newTestServer([]string{"x", "<turn|>"})
+	s := newTestServer(t, []string{"x", "<turn|>"})
 	for _, body := range []string{
 		`{"messages":[{"role":"user","content":"hi"}],"n":2}`,
 		`{"messages":[{"role":"user","content":"hi"}],"logprobs":true}`,
@@ -194,7 +215,7 @@ func TestCompletionRefusesWhatItDoesNotImplement(t *testing.T) {
 }
 
 func TestAnUnknownPathIs404(t *testing.T) {
-	s := newTestServer(nil)
+	s := newTestServer(t, nil)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, httptest.NewRequest("GET", "/v1/embeddings", nil))
 	if w.Code != http.StatusNotFound {

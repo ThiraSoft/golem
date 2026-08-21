@@ -52,12 +52,19 @@ func main() {
 	params := m.Sampling
 	params.Seed = rand.Uint64()
 
+	// One goroutine owns the model; every conversation asks it for its passes,
+	// and what is waiting at the moment a pass is built goes into it together.
+	runner := NewRunner(m.Forward)
+	stop := make(chan struct{})
+	defer close(stop)
+	go runner.Run(stop)
+
 	// One generator per slot: they share the weights, the vocabulary and the
 	// count of calls handed out, and differ only in which cache they write.
 	calls := 0
 	slots := make([]*slot, m.Slots())
 	for i := range slots {
-		ctx := NewSlotContext(m.Forward, i, m.Window, m.SlotContext(), time.Now, *ttl)
+		ctx := NewSlotContext(runner, i, m.Window, m.SlotContext(), time.Now, *ttl)
 		gen := NewGenerator(ctx, m.Vocab, m.Template, m.Vocabulary, *maxTokens)
 		gen.calls = &calls
 		slots[i] = &slot{index: i, ctx: ctx, gen: gen}
@@ -75,7 +82,7 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
-	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 — one request at a time, %d conversations cached\n",
+	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 — %d conversations at once, batched into one pass\n",
 		listener.Addr(), m.Slots())
 	if err := http.Serve(listener, logging(os.Stderr, server.Handler())); err != nil {
 		fail(err)

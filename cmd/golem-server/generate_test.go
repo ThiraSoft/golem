@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,7 +14,10 @@ import (
 
 // A vocabulary of whole words: each space-separated piece is one token, which
 // is enough to script an answer.
+// A real vocabulary is read only and shared freely; this one grows as words
+// are met, so it holds a lock the real one has no use for.
 type wordVocab struct {
+	mu    sync.Mutex
 	texts []string
 	index map[string]int32
 }
@@ -21,6 +25,8 @@ type wordVocab struct {
 func newWordVocab() *wordVocab { return &wordVocab{index: map[string]int32{}} }
 
 func (v *wordVocab) id(text string) int32 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	if id, ok := v.index[text]; ok {
 		return id
 	}
@@ -37,14 +43,22 @@ func (v *wordVocab) Encode(text string, addBOS, parseSpecial bool) []int32 {
 	return out
 }
 
-func (v *wordVocab) Piece(id int32, special bool) string { return v.texts[id] }
-func (v *wordVocab) IsEOG(id int32) bool                 { return v.texts[id] == "<turn|>" }
+func (v *wordVocab) Piece(id int32, special bool) string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.texts[id]
+}
+func (v *wordVocab) IsEOG(id int32) bool { return v.texts[id] == "<turn|>" }
 
 // An engine that speaks a script: each call to Logits names the next word.
 type scriptedEngine struct {
 	vocab  *wordVocab
 	script []string
 	at     int
+}
+
+func (e *scriptedEngine) ForwardSlots(tokens []int32, slots, positions []int) [][]float32 {
+	return e.ForwardBatch(tokens, positions[0])
 }
 
 func (e *scriptedEngine) ForwardBatch(tokens []int32, startPos int) [][]float32 {
@@ -55,36 +69,38 @@ func (e *scriptedEngine) ForwardBatch(tokens []int32, startPos int) [][]float32 
 	return hidden
 }
 
-func (e *scriptedEngine) Logits(hidden, out []float32) {
-	for i := range out {
-		out[i] = 0
+// Each state scored takes the next word of the script, which is what makes a
+// batch of several states legible: they take them in the order of the batch.
+func (e *scriptedEngine) LogitsBatch(hidden [][]float32, out [][]float32) {
+	for _, o := range out {
+		clear(o)
+		word := "<turn|>"
+		if e.at < len(e.script) {
+			word = e.script[e.at]
+		}
+		e.at++
+		o[e.vocab.id(word)] = 100
 	}
-	word := "<turn|>"
-	if e.at < len(e.script) {
-		word = e.script[e.at]
-	}
-	e.at++
-	out[e.vocab.id(word)] = 100
 }
 
 func (e *scriptedEngine) Reset()      {}
 func (e *scriptedEngine) UseSlot(int) {}
 
-func newGenerator(script []string, maxTokens int) (*Generator, *wordVocab) {
+func newGenerator(tb testing.TB, script []string, maxTokens int) (*Generator, *wordVocab) {
 	v := newWordVocab()
 	e := &scriptedEngine{vocab: v, script: script}
 	for _, word := range script {
 		v.id(word)
 	}
 	v.id("<turn|>")
-	ctx := NewContext(e, 0, 4096, time.Now, 0)
+	ctx := NewContext(running(tb, e), 0, 4096, time.Now, 0)
 	return NewGenerator(ctx, v, wordTemplate{}, 4096, maxTokens), v
 }
 
 func greedy() sample.Params { return sample.Params{Temperature: 0} }
 
 func TestGenerateStreamsProse(t *testing.T) {
-	g, v := newGenerator([]string{"hello", "there", "<turn|>"}, 32)
+	g, v := newGenerator(t, []string{"hello", "there", "<turn|>"}, 32)
 	var seen []string
 	answer, err := g.Generate(context.Background(), v.Encode("a b", false, true), greedy(), nil,
 		func(text string) error { seen = append(seen, text); return nil })
@@ -101,7 +117,7 @@ func TestGenerateStreamsProse(t *testing.T) {
 
 func TestGenerateWithholdsAPartialCall(t *testing.T) {
 	script := []string{"Looking.", "CALL", "weather{city=Lyon}", "<turn|>"}
-	g, v := newGenerator(script, 32)
+	g, v := newGenerator(t, script, 32)
 	var seen []string
 	answer, err := g.Generate(context.Background(), v.Encode("a", false, true), greedy(), nil,
 		func(text string) error { seen = append(seen, text); return nil })
@@ -132,7 +148,7 @@ func TestGenerateWithholdsAPartialCall(t *testing.T) {
 // two names for them.
 func TestCallIdentifiersDoNotRepeat(t *testing.T) {
 	call := "CALLnow{}"
-	g, v := newGenerator([]string{call, "<turn|>", call, "<turn|>"}, 32)
+	g, v := newGenerator(t, []string{call, "<turn|>", call, "<turn|>"}, 32)
 	first, err := g.Generate(context.Background(), v.Encode("a", false, true), greedy(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -147,7 +163,7 @@ func TestCallIdentifiersDoNotRepeat(t *testing.T) {
 }
 
 func TestGenerateStopsOnTheTokenLimit(t *testing.T) {
-	g, v := newGenerator([]string{"and", "and", "and", "and"}, 2)
+	g, v := newGenerator(t, []string{"and", "and", "and", "and"}, 2)
 	answer, err := g.Generate(context.Background(), v.Encode("a", false, true), greedy(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -158,7 +174,7 @@ func TestGenerateStopsOnTheTokenLimit(t *testing.T) {
 }
 
 func TestGenerateStopsOnAStopString(t *testing.T) {
-	g, v := newGenerator([]string{"one", "two", "STOP", "three"}, 32)
+	g, v := newGenerator(t, []string{"one", "two", "STOP", "three"}, 32)
 	answer, err := g.Generate(context.Background(), v.Encode("a", false, true), greedy(), []string{"STOP"}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -175,7 +191,7 @@ func TestGenerateStopsWhenTheClientHangsUp(t *testing.T) {
 	for i := range script {
 		script[i] = "on"
 	}
-	g, v := newGenerator(script, 200)
+	g, v := newGenerator(t, script, 200)
 	ctx, cancel := context.WithCancel(context.Background())
 	drawn := 0
 	_, err := g.Generate(ctx, v.Encode("a", false, true), greedy(), nil,

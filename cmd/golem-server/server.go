@@ -84,6 +84,11 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 	defer s.pool.Release(slot)
 	waitedFor(w, waited, slot.index)
 
+	// The runner counts the conversations in flight, so that a pass built for
+	// one of them waits for the others rather than going alone.
+	slot.ctx.runner.Enter()
+	defer slot.ctx.runner.Leave()
+
 	s.mu.Lock()
 	s.served++
 	id := "chatcmpl-" + strconv.Itoa(s.served)

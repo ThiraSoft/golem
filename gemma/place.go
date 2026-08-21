@@ -28,3 +28,14 @@ func Run(cache *Cache, startPos, n int) []Place {
 	}
 	return at
 }
+
+// ForwardSlots is ForwardMixed for a caller that names the caches by index
+// rather than by pointer, which is what a package above the engines can do
+// without knowing what a cache of this architecture is.
+func (m *Model) ForwardSlots(tokens []int32, slots, positions []int) [][]float32 {
+	at := make([]Place, len(tokens))
+	for i := range tokens {
+		at[i] = Place{Cache: m.Slot(slots[i]), Pos: positions[i]}
+	}
+	return m.ForwardMixed(tokens, at)
+}

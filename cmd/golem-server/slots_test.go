@@ -9,14 +9,14 @@ import (
 // A pool of n slots over one recording engine, each holding what it is given.
 func poolOfHeld(t *testing.T, held ...[]int32) (*Pool, *recordingEngine) {
 	t.Helper()
-	e := &recordingEngine{}
+	r := running(t, &recordingEngine{})
 	slots := make([]*slot, len(held))
 	for i := range held {
-		c := NewSlotContext(e, i, 0, 64, time.Now, 0)
+		c := NewSlotContext(r, i, 0, 64, time.Now, 0)
 		c.held = held[i]
 		slots[i] = &slot{index: i, ctx: c, last: time.Unix(int64(i), 0)}
 	}
-	return NewPool(slots, time.Now), e
+	return NewPool(slots, time.Now), nil
 }
 
 // The slot that already holds most of this prompt is the one that answers it.
@@ -116,22 +116,23 @@ func TestAcquireGivesUpWhenTheClientDoes(t *testing.T) {
 // conversation may have run.
 func TestEachContextDrivesItsOwnSlot(t *testing.T) {
 	e := &recordingEngine{}
-	first := NewSlotContext(e, 0, 0, 64, time.Now, 0)
-	second := NewSlotContext(e, 1, 0, 64, time.Now, 0)
+	r := running(t, e)
+	first := NewSlotContext(r, 0, 0, 64, time.Now, 0)
+	second := NewSlotContext(r, 1, 0, 64, time.Now, 0)
 
-	if _, _, err := first.Prefill([]int32{1, 2}); err != nil {
+	if _, err := first.Prefill([]int32{1, 2}, scores()); err != nil {
 		t.Fatal(err)
 	}
 	if e.slot != 0 {
 		t.Errorf("the engine was pointed at slot %d, want 0", e.slot)
 	}
-	if _, _, err := second.Prefill([]int32{3, 4}); err != nil {
+	if _, err := second.Prefill([]int32{3, 4}, scores()); err != nil {
 		t.Fatal(err)
 	}
 	if e.slot != 1 {
 		t.Errorf("the engine was pointed at slot %d, want 1", e.slot)
 	}
-	first.Advance(5)
+	first.Advance(5, scores())
 	if e.slot != 0 {
 		t.Errorf("advancing wrote into slot %d, want 0", e.slot)
 	}

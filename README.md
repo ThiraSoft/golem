@@ -87,8 +87,9 @@ one: `-model` takes a GGUF, the file declares its own architecture, and
 
 The server keeps each conversation's tokens between stateless requests and
 prefills only what diverged, so a turn costs a turn rather than the whole
-prompt. `-parallel` gives it several such conversations at once, and picks the
-slot for a prompt by the longest prefix it already holds.
+prompt. `-parallel` gives it several conversations at once, picks the slot for
+a prompt by the longest prefix it already holds, and carries whatever is
+waiting through the model in a single pass.
 
 ## The shared layer
 
@@ -122,10 +123,11 @@ Worth knowing before you clone it:
   NEON kernels are the largest single thing missing here.
 - **No GPU, and none planned.** This is a CPU engine; that is the point of it,
   not a stage on the way somewhere.
-- **The server answers one request at a time.** `-parallel` keeps several
-  conversations cached, the way llama.cpp's does, so two clients stop evicting
-  each other's prefix — but one model draws one answer at a time, and there is
-  no batching between requests.
+- **The server is one process around one model.** `-parallel` answers several
+  conversations at once and batches them into one pass, the way llama.cpp's
+  does — 21.3 tokens a second for one client on E2B, 36.7 for two, 54.8 for
+  four — but there is no second model, no distribution and no scheduler beyond
+  that.
 - **Two language architectures, both dense.** Gemma 4 and Qwen3 dense. No
   mixture of experts, no vision, no embeddings endpoint, no `/v1/completions`.
 - **Q4_0, Q6_K, bf16 and float32.** The K-quants beyond Q6_K are not read.

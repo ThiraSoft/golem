@@ -62,7 +62,7 @@ func (g *Generator) WithMaxTokens(n int) *Generator {
 // waiting for — the next request is queued behind it.
 func (g *Generator) Generate(ctx context.Context, ids []int32, p sample.Params, stop []string, emit func(string) error) (Answer, error) {
 	start := time.Now()
-	hidden, fed, err := g.ctx.Prefill(ids)
+	fed, err := g.ctx.Prefill(ids, g.logits)
 	if err != nil {
 		return Answer{}, err
 	}
@@ -78,7 +78,6 @@ func (g *Generator) Generate(ctx context.Context, ids []int32, p sample.Params, 
 		if err := ctx.Err(); err != nil {
 			return answer, err
 		}
-		g.ctx.Logits(hidden, g.logits)
 		id := sampler.Pick(g.logits)
 		answer.Generated++
 		if g.vocab.IsEOG(id) {
@@ -106,7 +105,7 @@ func (g *Generator) Generate(ctx context.Context, ids []int32, p sample.Params, 
 			}
 			sent += len(text)
 		}
-		hidden = g.ctx.Advance(id)
+		g.ctx.Advance(id, g.logits)
 	}
 	if answer.Generated >= g.maxTokens {
 		answer.Reason = "length"

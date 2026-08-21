@@ -192,3 +192,23 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 	v.QuantizeK()
 	m.W.TokenEmbd.MatVec(v, out)
 }
+
+// LogitsBatch scores several hidden states in one read of the head, which is
+// what several conversations drawing at once need: the head is the largest
+// matrix in the model and reading it once per conversation is what reading it
+// once per token was before batches existed.
+func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
+	for _, o := range out {
+		if len(o) != m.Cfg.Vocab {
+			panic(fmt.Sprintf("qwen: logits need %d entries, given %d", m.Cfg.Vocab, len(o)))
+		}
+	}
+	m.reserve(len(hidden))
+	v := m.scratch.Batch(m.Cfg.Dim, len(hidden))
+	for i := range hidden {
+		copy(v.F[i], hidden[i])
+		v.QuantizeColumnRange(i, 0, m.Cfg.Dim)
+	}
+	v.QuantizeK()
+	m.W.TokenEmbd.MatVecBatch(v, out)
+}

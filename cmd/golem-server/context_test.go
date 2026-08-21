@@ -15,6 +15,13 @@ type recordingEngine struct {
 	resets int
 }
 
+// ForwardSlots is what the runner calls; the tests below drive one slot, and
+// TestEachContextDrivesItsOwnSlot is what watches several.
+func (e *recordingEngine) ForwardSlots(tokens []int32, slots, positions []int) [][]float32 {
+	e.slot = slots[0]
+	return e.ForwardBatch(tokens, positions[0])
+}
+
 func (e *recordingEngine) ForwardBatch(tokens []int32, startPos int) [][]float32 {
 	hidden := make([][]float32, len(tokens))
 	for i, token := range tokens {
@@ -25,9 +32,12 @@ func (e *recordingEngine) ForwardBatch(tokens []int32, startPos int) [][]float32
 	return hidden
 }
 
-func (e *recordingEngine) Logits(hidden, out []float32) {
-	for i := range out {
-		out[i] = 0
+// The score of a state is the state itself, so a test can say which token the
+// pass ended on.
+func (e *recordingEngine) LogitsBatch(hidden [][]float32, out [][]float32) {
+	for i, o := range out {
+		clear(o)
+		o[0] = hidden[i][0]
 	}
 }
 
@@ -39,8 +49,8 @@ func (e *recordingEngine) UseSlot(i int) { e.slot = i }
 
 func TestPrefillFeedsTheWholePromptTheFirstTime(t *testing.T) {
 	e := &recordingEngine{}
-	c := NewContext(e, 0, 4096, time.Now, 0)
-	_, fed, err := c.Prefill([]int32{1, 2, 3})
+	c := NewContext(running(t, e), 0, 4096, time.Now, 0)
+	fed, err := c.Prefill([]int32{1, 2, 3}, scores())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,19 +63,20 @@ func TestPrefillFeedsTheWholePromptTheFirstTime(t *testing.T) {
 // is fed.
 func TestPrefillReusesTheCommonPrefix(t *testing.T) {
 	e := &recordingEngine{}
-	c := NewContext(e, 0, 4096, time.Now, 0)
-	if _, _, err := c.Prefill([]int32{1, 2, 3}); err != nil {
+	c := NewContext(running(t, e), 0, 4096, time.Now, 0)
+	if _, err := c.Prefill([]int32{1, 2, 3}, scores()); err != nil {
 		t.Fatal(err)
 	}
-	hidden, fed, err := c.Prefill([]int32{1, 2, 3, 4, 5})
+	logits := scores()
+	fed, err := c.Prefill([]int32{1, 2, 3, 4, 5}, logits)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fed != 2 {
 		t.Fatalf("fed %d positions, want 2: the prefix was not reused", fed)
 	}
-	if hidden[0] != 5 {
-		t.Fatalf("the hidden state came from token %v, want the last one", hidden[0])
+	if logits[0] != 5 {
+		t.Fatalf("the state scored came from token %v, want the last one", logits[0])
 	}
 	if c.Pos() != 5 {
 		t.Fatalf("pos %d", c.Pos())
@@ -79,11 +90,11 @@ func TestPrefillReusesTheCommonPrefix(t *testing.T) {
 // hidden state of a position already in the cache was not kept.
 func TestPrefillOfAnIdenticalPromptFeedsOnePosition(t *testing.T) {
 	e := &recordingEngine{}
-	c := NewContext(e, 0, 4096, time.Now, 0)
-	if _, _, err := c.Prefill([]int32{1, 2, 3}); err != nil {
+	c := NewContext(running(t, e), 0, 4096, time.Now, 0)
+	if _, err := c.Prefill([]int32{1, 2, 3}, scores()); err != nil {
 		t.Fatal(err)
 	}
-	_, fed, err := c.Prefill([]int32{1, 2, 3})
+	fed, err := c.Prefill([]int32{1, 2, 3}, scores())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,11 +109,11 @@ func TestPrefillOfAnIdenticalPromptFeedsOnePosition(t *testing.T) {
 // A different conversation diverges early and is fed from the divergence.
 func TestPrefillFeedsFromTheDivergence(t *testing.T) {
 	e := &recordingEngine{}
-	c := NewContext(e, 0, 4096, time.Now, 0)
-	if _, _, err := c.Prefill([]int32{1, 2, 3, 4}); err != nil {
+	c := NewContext(running(t, e), 0, 4096, time.Now, 0)
+	if _, err := c.Prefill([]int32{1, 2, 3, 4}, scores()); err != nil {
 		t.Fatal(err)
 	}
-	_, fed, err := c.Prefill([]int32{1, 2, 9})
+	fed, err := c.Prefill([]int32{1, 2, 9}, scores())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,11 +129,11 @@ func TestPrefillFeedsFromTheDivergence(t *testing.T) {
 // overwrote have to be fed again, so prefill restarts a window early.
 func TestRewindingAWindowRestartsAWindowEarly(t *testing.T) {
 	e := &recordingEngine{}
-	c := NewContext(e, 4, 4096, time.Now, 0)
-	if _, _, err := c.Prefill([]int32{1, 2, 3, 4, 5, 6, 7, 8}); err != nil {
+	c := NewContext(running(t, e), 4, 4096, time.Now, 0)
+	if _, err := c.Prefill([]int32{1, 2, 3, 4, 5, 6, 7, 8}, scores()); err != nil {
 		t.Fatal(err)
 	}
-	_, fed, err := c.Prefill([]int32{1, 2, 3, 4, 5, 9})
+	fed, err := c.Prefill([]int32{1, 2, 3, 4, 5, 9}, scores())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,11 +150,11 @@ func TestRewindingAWindowRestartsAWindowEarly(t *testing.T) {
 // Appending never rewinds, even with a window.
 func TestAppendingWithAWindowFeedsOnlyTheAddition(t *testing.T) {
 	e := &recordingEngine{}
-	c := NewContext(e, 4, 4096, time.Now, 0)
-	if _, _, err := c.Prefill([]int32{1, 2, 3, 4, 5, 6}); err != nil {
+	c := NewContext(running(t, e), 4, 4096, time.Now, 0)
+	if _, err := c.Prefill([]int32{1, 2, 3, 4, 5, 6}, scores()); err != nil {
 		t.Fatal(err)
 	}
-	_, fed, err := c.Prefill([]int32{1, 2, 3, 4, 5, 6, 7})
+	fed, err := c.Prefill([]int32{1, 2, 3, 4, 5, 6, 7}, scores())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,12 +167,12 @@ func TestAppendingWithAWindowFeedsOnlyTheAddition(t *testing.T) {
 func TestTheTimeToLiveForgetsTheCache(t *testing.T) {
 	clock := time.Unix(0, 0)
 	e := &recordingEngine{}
-	c := NewContext(e, 0, 4096, func() time.Time { return clock }, time.Minute)
-	if _, _, err := c.Prefill([]int32{1, 2, 3}); err != nil {
+	c := NewContext(running(t, e), 0, 4096, func() time.Time { return clock }, time.Minute)
+	if _, err := c.Prefill([]int32{1, 2, 3}, scores()); err != nil {
 		t.Fatal(err)
 	}
 	clock = clock.Add(2 * time.Minute)
-	_, fed, err := c.Prefill([]int32{1, 2, 3, 4})
+	fed, err := c.Prefill([]int32{1, 2, 3, 4}, scores())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,12 +188,12 @@ func TestTheTimeToLiveForgetsTheCache(t *testing.T) {
 func TestTheTimeToLiveKeepsTheCacheUntilItExpires(t *testing.T) {
 	clock := time.Unix(0, 0)
 	e := &recordingEngine{}
-	c := NewContext(e, 0, 4096, func() time.Time { return clock }, time.Minute)
-	if _, _, err := c.Prefill([]int32{1, 2, 3}); err != nil {
+	c := NewContext(running(t, e), 0, 4096, func() time.Time { return clock }, time.Minute)
+	if _, err := c.Prefill([]int32{1, 2, 3}, scores()); err != nil {
 		t.Fatal(err)
 	}
 	clock = clock.Add(30 * time.Second)
-	if _, fed, _ := c.Prefill([]int32{1, 2, 3, 4}); fed != 1 {
+	if fed, _ := c.Prefill([]int32{1, 2, 3, 4}, scores()); fed != 1 {
 		t.Fatalf("fed %d, want 1", fed)
 	}
 	if e.resets != 0 {
@@ -192,8 +203,23 @@ func TestTheTimeToLiveKeepsTheCacheUntilItExpires(t *testing.T) {
 
 func TestAPromptPastTheContextIsRefused(t *testing.T) {
 	e := &recordingEngine{}
-	c := NewContext(e, 0, 4, time.Now, 0)
-	if _, _, err := c.Prefill([]int32{1, 2, 3, 4, 5}); err == nil {
+	c := NewContext(running(t, e), 0, 4, time.Now, 0)
+	if _, err := c.Prefill([]int32{1, 2, 3, 4, 5}, scores()); err == nil {
 		t.Fatal("a prompt past the context should be refused rather than wrap the cache")
 	}
 }
+
+// running is a runner over one engine, owning it for the test's lifetime.
+// Every conversation in these tests goes through one, because in the server
+// every conversation does.
+func running(tb testing.TB, e Engine) *Runner {
+	r := NewRunner(e)
+	stop := make(chan struct{})
+	go r.Run(stop)
+	tb.Cleanup(func() { close(stop) })
+	return r
+}
+
+// scores is a logits buffer for a test that does not read it. The fake engines
+// score into it and nothing looks: what these tests watch is what was fed.
+func scores() []float32 { return make([]float32, 8) }

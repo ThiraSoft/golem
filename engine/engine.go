@@ -37,7 +37,16 @@ type Vocabulary interface {
 // takes UseSlot(0), so a caller that does not care never has to know.
 type Forward interface {
 	ForwardBatch(tokens []int32, startPos int) [][]float32
+	// ForwardSlots carries tokens of several conversations through one pass:
+	// slots and positions say, for each token, which cache it writes to and
+	// where in it. What comes back is what each token would have been given
+	// alone.
+	ForwardSlots(tokens []int32, slots, positions []int) [][]float32
 	Logits(hidden, out []float32)
+	// LogitsBatch scores several states in one read of the head, which is what
+	// several conversations drawing at once want: the head is the largest
+	// matrix in the model.
+	LogitsBatch(hidden [][]float32, out [][]float32)
 	Reset()
 	SetSlots(n int) error
 	Slots() int

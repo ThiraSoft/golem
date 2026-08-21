@@ -22,7 +22,7 @@ func frames(t *testing.T, body string) []string {
 }
 
 func TestStreamSendsProseThenAFinishReasonThenDone(t *testing.T) {
-	s := newTestServer([]string{"one", "two", "<turn|>"})
+	s := newTestServer(t, []string{"one", "two", "<turn|>"})
 	w := post(t, s, `{"messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	if got := w.Header().Get("Content-Type"); got != "text/event-stream" {
 		t.Fatalf("content type %q", got)
@@ -64,7 +64,7 @@ func TestStreamSendsProseThenAFinishReasonThenDone(t *testing.T) {
 }
 
 func TestStreamSendsACallInOnePiece(t *testing.T) {
-	s := newTestServer([]string{"Looking.", "CALL", "weather{city=Lyon}", "<turn|>"})
+	s := newTestServer(t, []string{"Looking.", "CALL", "weather{city=Lyon}", "<turn|>"})
 	w := post(t, s, `{"messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	f := frames(t, w.Body.String())
 

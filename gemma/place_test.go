@@ -46,3 +46,23 @@ func TestMixedBatchAgreesWithOneAtATime(t *testing.T) {
 		t.Error("the second conversation's token came out of the mixed batch changed")
 	}
 }
+
+// The head read once for several states gives each of them what it would have
+// been given alone.
+func TestLogitsBatchAgreesWithOneAtATime(t *testing.T) {
+	f := loadFixture(t, "layers")
+	m := openEngine(t, 4096)
+	states := m.ForwardBatch(f.Tokens, 0)
+
+	first := make([]float32, m.Cfg.Vocab)
+	second := make([]float32, m.Cfg.Vocab)
+	m.Logits(states[0], first)
+	m.Logits(states[len(states)-1], second)
+
+	together := [][]float32{make([]float32, m.Cfg.Vocab), make([]float32, m.Cfg.Vocab)}
+	m.LogitsBatch([][]float32{states[0], states[len(states)-1]}, together)
+
+	if !same(first, together[0]) || !same(second, together[1]) {
+		t.Error("a state scored in a batch came out different from the same state scored alone")
+	}
+}

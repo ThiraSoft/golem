@@ -9,7 +9,7 @@ import (
 
 func TestLoggingWritesOneLinePerRequest(t *testing.T) {
 	var out strings.Builder
-	s := newTestServer([]string{"hi", "<turn|>"})
+	s := newTestServer(t, []string{"hi", "<turn|>"})
 	h := logging(&out, s.Handler())
 
 	w := httptest.NewRecorder()
@@ -25,7 +25,7 @@ func TestLoggingWritesOneLinePerRequest(t *testing.T) {
 // happened.
 func TestLoggingCarriesTheReasonOfARefusal(t *testing.T) {
 	var out strings.Builder
-	s := newTestServer(nil)
+	s := newTestServer(t, nil)
 	h := logging(&out, s.Handler())
 
 	w := httptest.NewRecorder()
@@ -41,7 +41,7 @@ func TestLoggingCarriesTheReasonOfARefusal(t *testing.T) {
 // would sit in a buffer until the whole thing was drawn.
 func TestLoggingKeepsTheStreamFlushable(t *testing.T) {
 	var out strings.Builder
-	s := newTestServer([]string{"one", "<turn|>"})
+	s := newTestServer(t, []string{"one", "<turn|>"})
 	h := logging(&out, s.Handler())
 
 	w := httptest.NewRecorder()
@@ -62,7 +62,7 @@ func TestLoggingKeepsTheStreamFlushable(t *testing.T) {
 // are the two halves of the wait and they have different remedies.
 func TestLoggingReportsWhatTheAnswerCost(t *testing.T) {
 	var out strings.Builder
-	s := newTestServer([]string{"one", "two", "<turn|>"})
+	s := newTestServer(t, []string{"one", "two", "<turn|>"})
 	h := logging(&out, s.Handler())
 
 	w := httptest.NewRecorder()

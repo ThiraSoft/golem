@@ -232,6 +232,29 @@ func (m *Model) LogitsAt(hidden []float32, ids []int32, out []float32) {
 	m.suppress(out, ids)
 }
 
+// LogitsBatch scores several hidden states in one read of the head, which is
+// what several conversations drawing at once need: the head is the largest
+// matrix in the model and reading it once per conversation is what reading it
+// once per token was before batches existed.
+func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
+	for _, o := range out {
+		if len(o) != m.Cfg.Vocab {
+			panic(fmt.Sprintf("gemma: logits need %d entries, given %d", m.Cfg.Vocab, len(o)))
+		}
+	}
+	m.reserve(len(hidden))
+	v := m.scratch.Batch(m.Cfg.Dim, len(hidden))
+	for i := range hidden {
+		copy(v.F[i], hidden[i])
+	}
+	v.QuantizeK()
+	m.W.TokenEmbd.MatVecBatch(v, out)
+	for _, o := range out {
+		nn.Softcap(o, m.Cfg.LogitSoftcap)
+		m.suppress(o, nil)
+	}
+}
+
 // Argmax is the greedy choice. Ties go to the lower identifier, as llama.cpp
 // does.
 func Argmax(logits []float32) int32 {
