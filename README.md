@@ -11,11 +11,12 @@ of weights.
 | | what it runs | measured |
 |---|---|---|
 | [`gemma/`](gemma/) | Gemma 4 E2B and 12B, from a GGUF | E2B: 22.6 tokens/s generated, 204 read — llama.cpp on the same CPU: 22.4 and 165. 12B: 5.0 and 42, against 4.83 and 31.7 |
+| [`qwen/`](qwen/) | Qwen3 dense, from a GGUF | 4B: 14.6 tokens/s generated, 110 read — llama.cpp on the same CPU: 14.6 and 97. 0.6B: 79.5 and 729, against 93.9 and 739 |
 | [`pockettts/`](pockettts/) | [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts), twelve languages, voice cloning included | ×2.82 real time on the 24-layer French model, ×6.55 on the 6-layer English one — PyTorch: ×1.27 and ×4.03 |
 
-Both figures are from an i7-9700K with eight threads, on Q4_0 weights. Each
+Every figure is from an i7-9700K with eight threads, on Q4_0 weights. Each
 engine's README says what it is measured against, where it still differs from
-its reference, and by how much.
+its reference, and by how much — including where it loses, which the 0.6B is.
 
 Each engine is self-contained. They do not import one another, and nothing in
 the shared layer knows they exist.
@@ -41,6 +42,10 @@ use it.
 | [`cmd/chat`](cmd/chat/) | a conversation with Gemma, streamed to the terminal |
 | [`cmd/serve`](cmd/serve/) | an OpenAI-compatible API over the same weights, tool calls included |
 | `cmd/pocket-tts` | text in, a WAV file out |
+
+Both language commands are wired to `gemma/` alone for now. `qwen/` runs from
+its own tests and its own API; giving the commands an architecture switch, and
+Qwen a chat template, is the work that comes next.
 
 ```bash
 go build ./cmd/chat
@@ -78,23 +83,30 @@ them, and they are between three hundred megabytes and three gigabytes each.
   12B one if you have both: the two checkpoints are tested separately, because
   they agree on the architecture's name and on very little else. Google's Gemma
   terms apply to them.
+- **Qwen3 dense** weights: a GGUF from Hugging Face declaring `qwen3`. The
+  tests want two of the same checkpoint — `GOLEM_MODEL_QWEN` at a bfloat16
+  build and `GOLEM_MODEL_QWEN_Q4` at a Q4_0 one made with `llama-quantize
+  --pure`, because the kernels and the architecture are two independent places
+  for a mistake to hide and bfloat16 removes one of them. Alibaba's Qwen terms
+  apply.
 - **Pocket TTS** weights, tokenizer and voice states: Kyutai publishes them on
   Hugging Face, and `pockettts/README.md` says which repositories and where the
   engine looks. A voice can also be cloned from any recording, which needs
   nothing but the weights.
 
 Neither are the recordings of the models themselves. `testdata/gemma/layers`,
-`layers12`, `quants` and `window` hold activations, logits and slabs of
-quantized weights as ggml computed them; `testdata/layer0`, `pipeline` and `pipeline_en` hold what
+`layers12`, `quants` and `window`, and `testdata/qwen/layers`, `long` and
+`layers_q4`, hold activations, logits and slabs of quantized weights as ggml
+computed them; `testdata/layer0`, `pipeline` and `pipeline_en` hold what
 PyTorch computes inside Pocket TTS. Those are the models' output, not this
-repository's, and each is one command away — `ref/gemma/README.md` and
+repository's, and each is one command away — `ref/README.md` and
 `pockettts/README.md` have them.
 
 What *is* versioned is what the models did not write: tokenizations and chat
 templates, which are text and integers. Tests that need a file which is not
-there skip rather than fail, so a fresh clone with no model at all still runs 73
-of them green — and a machine with both Gemma checkpoints, the voices and one
-run of the recorders runs 123.
+there skip rather than fail, so a fresh clone with no model at all still runs
+141 of them green — and a machine with both Gemma checkpoints, a Qwen3 in two
+quantizations, the voices and one run of the recorders runs 214.
 
 ## Building
 
