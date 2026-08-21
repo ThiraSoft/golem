@@ -1,12 +1,36 @@
-// Records the intermediate activations of a Gemma 4 forward pass, as llama.cpp
-// computes them, so that the Go engine can be checked against them without
+// Records the intermediate activations of a forward pass, as llama.cpp
+// computes them, so that a Go engine can be checked against them without
 // llama.cpp being present at test time.
 //
 // llama.cpp names every waypoint of its graph ("attn_norm-0", "l_out-34",
-// "result_norm"). A scheduler callback intercepts them by name and writes the
-// float32 contents out. Two runs are produced: a short prompt where every
-// waypoint of four representative blocks is kept, and a long one that exists
-// only to push past the 512-position window.
+// "result_norm"), and it uses the same names whatever the architecture. A
+// scheduler callback intercepts them by name and writes the float32 contents
+// out. So nothing here is specific to one model, and nothing here should be:
+// which waypoints to keep, on which prompt, is described by a run file the
+// caller names, and lives under ref/<model>/ beside the engine that wants it.
+//
+// One directive per line, '#' starts a comment, a blank line is ignored:
+//
+//   prompt        <text>        the prompt; \n is a newline, \s a space, \\ a
+//                               backslash. A leading or trailing space must be
+//                               written \s, because the line is trimmed.
+//   repeat        <n>           repeat the prompt n times (default 1)
+//   label         <text>        what index.json records as "prompt"; defaults
+//                               to the prompt itself
+//   add_special   <0|1>         llama_tokenize's add_special (default 1)
+//   min_tokens    <n>           fail if the run tokenizes to fewer (default 0)
+//   blocks        <i> <i> ...   the block indices the per-block names apply to
+//   all_blocks    <name>        a name recorded for every block, 0..n_layer-1
+//   require       <name>        a per-block name that must appear
+//   optional      <name>        a per-block name that may be absent
+//   global        <name>        a whole-model name that must appear
+//   global_opt    <name>        a whole-model name that may be absent
+//   last_column   <0|1>         keep only the last column of each recording
+//
+// A per-block name is expanded to "<name>-<index>" for each block listed. A
+// name that is required and never appears in the graph is an error: it means
+// the run file and llama.cpp disagree about what this architecture computes,
+// which is worth stopping for rather than recording a hole.
 
 #include "llama.h"
 #include "ggml.h"
@@ -85,66 +109,108 @@ static bool on_node(struct ggml_tensor * t, bool ask, void * user_data) {
     return true;
 }
 
-// The waypoints kept for the short run. Seven blocks cover every kind and
-// every pairing: in E2B, 0 and 13 own window caches, 4 and 14 own global ones,
-// 15 reads block 13's, 19 reads block 14's; blocks 13 and 14 are kept because
-// the sharing tests need the source's input in order to fill the cache the
-// sharer then reads, without running the whole stack first. Block 5 is there
-// for the 12B, where it is the first global block — the kind that publishes no
-// value projection and uses its keys as values.
-//
-// The two checkpoints do not agree on which of those blocks compute keys at
-// all, and only E2B has per-layer embeddings, so the waypoints that depend on
-// either are asked for and allowed to be absent rather than being predicted
-// from the block number.
-static std::set<std::string> short_run_names(int n_layer) {
-    std::set<std::string> names = { "inp_scaled", "result_norm" };
-    for (int il : {0, 4, 5, 13, 14, 15, 19}) {
-        if (il >= n_layer) continue;
-        const std::string s = "-" + std::to_string(il);
-        names.insert("attn_norm"          + s);
-        names.insert("Qcur_normed"        + s);
-        names.insert("Qcur_pos"           + s);
-        names.insert("kqv_out"            + s);
-        names.insert("attn_post_norm"     + s);
-        names.insert("attn_out"           + s);
-        names.insert("ffn_norm"           + s);
-        names.insert("ffn_out"            + s);
-        names.insert("ffn_post_norm"      + s);
-        names.insert("l_out"              + s);
+// The run file. Everything model-specific that used to live in this source
+// now arrives through one of these.
+struct run_spec {
+    std::string prompt;
+    std::string label;
+    int  repeat      = 1;
+    bool add_special = true;
+    int  min_tokens  = 0;
+    bool last_column = false;
+    std::vector<int>         blocks;
+    std::vector<std::string> all_blocks;
+    std::vector<std::string> require_names;
+    std::vector<std::string> optional_names;
+    std::vector<std::string> global_names;
+    std::vector<std::string> global_opt;
+};
+
+static std::string unescape(const std::string & s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] != '\\' || i + 1 == s.size()) { out += s[i]; continue; }
+        switch (s[++i]) {
+            case 'n':    out += '\n'; break;
+            case 's':    out += ' ';  break;
+            case '\\': out += '\\'; break;
+            default:     die("unknown escape in a run file");
+        }
     }
-    // Every block's output, for all thirty-five: it is what the next block
-    // reads, so a test can start any block from the reference's own input
-    // instead of running everything before it, and a divergence in the full
-    // stack says which block it began in.
-    for (int il = 0; il < 64; ++il) {
-        names.insert("l_out-" + std::to_string(il));
-    }
-    return names;
+    return out;
 }
 
-// The waypoints a checkpoint may or may not have: the keys and values of a
-// block that shares another's cache do not exist, and neither does anything
-// per-layer in a model that declares no per-layer width.
-static std::set<std::string> optional_names(int n_layer) {
-    std::set<std::string> names = { "per_layer_proj", "inp_per_layer" };
-    for (int il : {0, 4, 5, 13, 14, 15, 19}) {
-        if (il >= n_layer) continue;
-        const std::string s = "-" + std::to_string(il);
-        names.insert("Kcur_normed"        + s);
-        names.insert("Kcur_pos"           + s);
-        names.insert("Vcur_normed"        + s);
-        names.insert("pe_in"              + s);
-        names.insert("per_layer_embd_out" + s);
+static run_spec read_run(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "r");
+    if (!f) die(("cannot read " + path).c_str());
+
+    run_spec r;
+    bool have_label = false;
+    char line[8192];
+    while (fgets(line, sizeof(line), f)) {
+        std::string s(line);
+        // Trailing whitespace goes, which is why a significant trailing space
+        // has to be written \s.
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
+        if (s.empty() || s[0] == '#') continue;
+
+        const size_t sp  = s.find(' ');
+        const std::string key = s.substr(0, sp);
+        std::string val = sp == std::string::npos ? "" : s.substr(sp + 1);
+        // A directive and its value are separated by whitespace; the run files
+        // align their values into columns, and that alignment is not part of
+        // the value. A leading space that is part of a prompt is written \s,
+        // which survives this because it is not yet a space.
+        const size_t first = val.find_first_not_of(' ');
+        val = first == std::string::npos ? "" : val.substr(first);
+
+        if      (key == "prompt")      r.prompt = unescape(val);
+        else if (key == "label")     { r.label  = unescape(val); have_label = true; }
+        else if (key == "repeat")      r.repeat = atoi(val.c_str());
+        else if (key == "add_special") r.add_special = atoi(val.c_str()) != 0;
+        else if (key == "min_tokens")  r.min_tokens  = atoi(val.c_str());
+        else if (key == "last_column") r.last_column = atoi(val.c_str()) != 0;
+        else if (key == "require")     r.require_names.push_back(val);
+        else if (key == "optional")    r.optional_names.push_back(val);
+        else if (key == "global")      r.global_names.push_back(val);
+        else if (key == "global_opt")  r.global_opt.push_back(val);
+        else if (key == "all_blocks")  r.all_blocks.push_back(val);
+        else if (key == "blocks") {
+            const char * p   = val.c_str();
+            char       * end = nullptr;
+            for (long v = strtol(p, &end, 10); end != p; v = strtol(p, &end, 10)) {
+                r.blocks.push_back((int) v);
+                p = end;
+            }
+        } else die(("unknown directive: " + key).c_str());
     }
-    return names;
+    fclose(f);
+
+    if (r.prompt.empty()) die("the run file declares no prompt");
+    if (!have_label) r.label = r.prompt;
+    return r;
 }
 
-// The block count is not known before the model is loaded, so short_run_names
-// asks for more l_out entries than exist; prune the ones the graph never had.
-static void prune_absent_l_out(std::set<std::string> & names, int n_layer) {
-    for (int il = n_layer; il < 64; ++il) {
-        names.erase("l_out-" + std::to_string(il));
+// The wanted set, and the subset of it that is allowed to be absent. This is
+// given the real block count, so it never asks for a block that does not
+// exist — which is why nothing has to prune the set afterwards.
+static void expand_names(const run_spec & r, int n_layer,
+                         std::set<std::string> & wanted,
+                         std::set<std::string> & optional) {
+    for (const auto & n : r.global_names) wanted.insert(n);
+    for (const auto & n : r.global_opt) { wanted.insert(n); optional.insert(n); }
+
+    for (int il : r.blocks) {
+        if (il >= n_layer) continue;
+        const std::string s = "-" + std::to_string(il);
+        for (const auto & n : r.require_names) wanted.insert(n + s);
+        for (const auto & n : r.optional_names) {
+            wanted.insert(n + s);
+            optional.insert(n + s);
+        }
+    }
+    for (const auto & n : r.all_blocks) {
+        for (int il = 0; il < n_layer; ++il) wanted.insert(n + "-" + std::to_string(il));
     }
 }
 
@@ -195,13 +261,12 @@ static void write_index(const dump_state & st,
 
 int main(int argc, char ** argv) {
     if (argc != 4) {
-        fprintf(stderr, "usage: dump_layers <model.gguf> <out-dir> <short|window>\n");
+        fprintf(stderr, "usage: dump_layers <model.gguf> <out-dir> <run-file>\n");
         return 1;
     }
     const std::string model_path = argv[1];
     const std::string out_dir    = argv[2];
-    const std::string mode       = argv[3];
-    if (mode != "short" && mode != "window") die("mode must be short or window");
+    const run_spec    run        = read_run(argv[3]);
 
     llama_backend_init();
 
@@ -217,40 +282,28 @@ int main(int argc, char ** argv) {
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    // A short factual prompt for the parity run; the same sentence repeated
-    // until it passes 512 positions for the window run.
-    std::string prompt = "The capital of France is";
-    if (mode == "window") {
-        std::string one = " The capital of France is Paris and the capital of Japan is Tokyo.";
-        prompt = "";
-        for (int i = 0; i < 60; ++i) prompt += one;
-    }
+    std::string prompt;
+    for (int i = 0; i < run.repeat; ++i) prompt += run.prompt;
 
-    std::vector<llama_token> tokens(4096);
+    std::vector<llama_token> tokens(8192);
     int n = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(),
-                           tokens.data(), (int32_t) tokens.size(), true, false);
+                           tokens.data(), (int32_t) tokens.size(),
+                           run.add_special, false);
     if (n <= 0) die("tokenization failed");
     tokens.resize(n);
-    if (mode == "window" && n <= 512) die("the window run must exceed 512 tokens");
+    if (n < run.min_tokens) die("the run tokenized to fewer than min_tokens");
     fprintf(stderr, "dump_layers: %d tokens\n", n);
 
     dump_state st;
     st.dir = out_dir;
+    st.last_column_only = run.last_column;
     std::set<std::string> optional;
-    if (mode == "short") {
-        st.wanted = short_run_names(llama_model_n_layer(model));
-        prune_absent_l_out(st.wanted, llama_model_n_layer(model));
-        optional = optional_names(llama_model_n_layer(model));
-        st.wanted.insert(optional.begin(), optional.end());
-    } else {
-        st.wanted = {"l_out-0", "l_out-4", "l_out-15", "result_norm"};
-        st.last_column_only = true;
-    }
+    expand_names(run, llama_model_n_layer(model), st.wanted, optional);
 
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx             = 4096;
-    cparams.n_batch           = 4096;
-    cparams.n_ubatch          = 4096;   // one graph, so each name fires once
+    cparams.n_ctx             = 8192;
+    cparams.n_batch           = 8192;
+    cparams.n_ubatch          = 8192;   // one graph, so each name fires once
     cparams.n_threads         = 8;
     cparams.n_threads_batch   = 8;
     // Flash attention fuses the waypoints away; the graph has to stay legible.
@@ -295,7 +348,7 @@ int main(int argc, char ** argv) {
     }
 
     const size_t slash = model_path.find_last_of('/');
-    write_index(st, mode == "window" ? "(repeated sentence)" : prompt,
+    write_index(st, run.label,
                 slash == std::string::npos ? model_path : model_path.substr(slash + 1),
                 tokens, top, greedy,
                 llama_model_n_embd(model), llama_model_n_layer(model),

@@ -1,0 +1,46 @@
+# The waypoints kept for the short run. Seven blocks cover every kind and every
+# pairing: in E2B, 0 and 13 own window caches, 4 and 14 own global ones, 15
+# reads block 13's, 19 reads block 14's; blocks 13 and 14 are kept because the
+# sharing tests need the source's input in order to fill the cache the sharer
+# then reads, without running the whole stack first. Block 5 is there for the
+# 12B, where it is the first global block — the kind that publishes no value
+# projection and uses its keys as values.
+prompt      The capital of France is
+add_special 1
+
+blocks 0 4 5 13 14 15 19
+
+global inp_scaled
+global result_norm
+
+# The two checkpoints do not agree on which of those blocks compute keys at
+# all, and only E2B has per-layer embeddings, so the waypoints that depend on
+# either are asked for and allowed to be absent rather than being predicted
+# from the block number.
+global_opt per_layer_proj
+global_opt inp_per_layer
+
+require attn_norm
+require Qcur_normed
+require Qcur_pos
+require kqv_out
+require attn_post_norm
+require attn_out
+require ffn_norm
+require ffn_out
+require ffn_post_norm
+require l_out
+
+# A block that shares another's cache computes no keys and no values, and
+# nothing per-layer exists in a model that declares no per-layer width.
+optional Kcur_normed
+optional Kcur_pos
+optional Vcur_normed
+optional pe_in
+optional per_layer_embd_out
+
+# Every block's output, for all of them: it is what the next block reads, so a
+# test can start any block from the reference's own input instead of running
+# everything before it, and a divergence in the full stack says which block it
+# began in.
+all_blocks l_out

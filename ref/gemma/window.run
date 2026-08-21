@@ -1,0 +1,16 @@
+# The window run exists only to push past the 512-position window, so it keeps
+# four names and only the last column of each. The prompt begins with a space,
+# which has to be written \s: the parser trims its lines.
+prompt       \sThe capital of France is Paris and the capital of Japan is Tokyo.
+repeat       60
+label        (repeated sentence)
+add_special  1
+min_tokens   513
+last_column  1
+
+# Already qualified by block, so these are global names rather than a per-block
+# list: the run asks for four tensors, not for four blocks' worth of tensors.
+global l_out-0
+global l_out-4
+global l_out-15
+global result_norm
