@@ -220,6 +220,15 @@ superblocks of 256, integers all the way to one float per superblock — in
 `nn/dot_q6_k_amd64.s`. 128 ms became 10, which is the tensor's size divided by
 the memory bus.
 
+When several conversations draw at once the head is read for each of their
+states, and the six-bit magnitudes have to be shifted and masked out of the row
+before anything can multiply them — work that belongs to the weights, not to
+the activation, and that was being done once per state.
+`nn/dot_q6_k_x2_amd64.s` unpacks a row once and multiplies it against two
+activations: four states cost 13 ms of head instead of 16, eight cost 21
+instead of 29, and the products are the same integers in the same order, which
+`TestQ6KTwoColumnsAgreeWithOne` holds it to.
+
 The Q4_0 kernel stopped recomputing, once per row of every matrix, a recentring
 that depends on the activation alone: a Q4_0 weight is stored shifted by eight,
 and 8 × scale × sum(q) per block is now computed when the activation is

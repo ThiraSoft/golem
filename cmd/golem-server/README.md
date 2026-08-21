@@ -71,9 +71,10 @@ an eight-thread i7-9700K, clients asking for 64 tokens each at once:
 
 | clients | tokens a second, all together |
 |---|---|
-| 1 | 21.3 |
-| 2 | 36.7 |
-| 4 | 54.8 |
+| 1 | 20.7 |
+| 2 | 34.7 |
+| 4 | 54.2 |
+| 8 | 73.8 |
 
 Against llama.cpp's own server on the same machine and the same file
 (`llama-server -dev none -ngl 0 -t 8 -c 4096 -np 4 -cb`), three rounds, a
@@ -82,20 +83,21 @@ cache it filled a moment ago:
 
 | clients | golem | llama-server | golem ÷ llama-server |
 |---|---|---:|---|
-| 1 | 20.4 t/s | 20.4 | ×1.00 |
-| 2 | 34.9 | 33.3 | ×1.05 |
-| 4 | 52.7 | 59.7 | ×0.88 |
+| 1 | 20.7 t/s | 20.3 | ×1.02 |
+| 2 | 34.7 | 33.1 | ×1.05 |
+| 4 | 54.2 | 60.5 | ×0.90 |
+| 8 | 73.8 | 72.9 | ×1.01 |
 
 Where the four-client deficit is, exactly: `GOLEM_DEBUG_BATCHES=1` over that
 run says the batches are as wide as they can be — 63 of the 67 passes carried
 all four conversations, 3.88 on average — and that a pass with its head takes
-60ms, which is 66.7 tokens a second. The 52.7 measured is that, plus 655ms
-spent reading the four prompts. Generation is at parity; what is behind is the
-prompt, which `gemma/README.md` already says is the slower half of this engine.
+60ms. What is left is the 655ms spent reading the four prompts, which is not
+scheduling but the rate this engine reads prompts at. Generation is at parity;
+the prompt is the half that is behind, which `gemma/README.md` already says.
 
 The engine's own figure for generation, without a server around it, is
-`TestMixedBatchCost` in `gemma/`: 23.3 tokens a second for one conversation,
-37.4 for two, 69.5 for four, 89.3 for eight.
+`TestMixedBatchCost` in `gemma/`: 21.4 tokens a second for one conversation,
+42.3 for two, 73.3 for four, 104.1 for eight.
 
 Two things bound it. Generation is limited by reading the weights, so the first
 conversations added are nearly free and the later ones are not — by eight, the

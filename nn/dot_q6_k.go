@@ -76,9 +76,26 @@ func MatVecQ6_K(w []byte, b *Batch, outputs, inputs int, ys [][]float32) {
 // matVecQ6_KRows computes rows [start, end) on the caller's thread.
 func matVecQ6_KRows(w []byte, b *Batch, inputs int, ys [][]float32, start, end int) {
 	stride := inputs / SuperBlock * q6_kBlockBytes
+	var pair [2]float32
 	for r := start; r < end; r++ {
 		row := w[r*stride : (r+1)*stride]
-		for c := 0; c < b.Size; c++ {
+		c := 0
+		// Two columns at a time, which unpacks the row once for both. What
+		// this matrix costs is reading it, and the six-bit magnitudes have to
+		// be shifted and masked out of it before anything can multiply them;
+		// doing that once for a pair is the difference between a head read per
+		// conversation and a head read per pass.
+		for ; c+1 < b.Size; c += 2 {
+			if !dotQ6_Kx2(row,
+				b.QK[c*b.Width:], b.QK[(c+1)*b.Width:],
+				b.BSums[c*b.Width/16:], b.BSums[(c+1)*b.Width/16:],
+				b.KScales[c*b.Width/SuperBlock:], b.KScales[(c+1)*b.Width/SuperBlock:],
+				inputs, &pair) {
+				break
+			}
+			ys[c][r], ys[c+1][r] = pair[0], pair[1]
+		}
+		for ; c < b.Size; c++ {
 			ys[c][r] = dotQ6_K(row,
 				b.QK[c*b.Width:], b.BSums[c*b.Width/16:], b.KScales[c*b.Width/SuperBlock:], inputs)
 		}
