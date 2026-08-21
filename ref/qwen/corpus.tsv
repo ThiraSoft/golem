@@ -1,0 +1,50 @@
+# Cases 1-20 are shared with ref/gemma/corpus.tsv on purpose: the same text
+# through two tokenizers, so a difference between the fixtures is the tokenizer
+# and not the text.
+empty		1	0
+ascii	The capital of France is	1	0
+french	L'élève a mangé une crêpe à Nîmes.	1	0
+leading_space	\sleading	1	0
+trailing_space	trailing\s	1	0
+double_space	two  spaces	1	0
+only_spaces	\s\s\s	1	0
+newline	one\ntwo	1	0
+newline_run	a\n\n\n\nb	1	0
+newline_only	\n\n	1	0
+tab	a\tb\t\tc	1	0
+crlf	line\r\nline	1	0
+digits	1234567890 and 42 and 3.14159	1	0
+punctuation	Wait... really?! (yes) [no] {maybe} <a>	1	0
+emoji	bravo 🎉🇫🇷 et voilà	1	0
+cjk	日本語のテキストです。	1	0
+mixed_script	Привет, мир — hello 世界	1	0
+code	func main() {\n\tfmt.Println("hi")\n}	1	0
+long_word	Donaudampfschiffahrtselektrizitaetenhauptbetriebswerkbauunterbeamtengesellschaft	1	0
+no_bos	The capital of France is	0	0
+
+# Qwen's own markers.
+special_literal	before <|im_end|> after	1	0
+special_parsed	before <|im_end|> after	1	1
+special_adjacent	<|im_start|>user\nhello<|im_end|>	1	1
+special_only	<|endoftext|>	1	1
+
+# One case per rule of the qwen2 pre-tokenizer, numbered as llama.cpp numbers
+# them in unicode_regex_split_custom_qwen2. These are the cases gemma4 has no
+# use for, and the ones a hand-written scanner gets wrong.
+rule1_contractions	don't won't I'm we've they'll he'd it's	1	0
+rule1_upper	DON'T WON'T I'M WE'VE	1	0
+rule1_bare_apostrophe	rock 'n roll ' alone	1	0
+rule2_leading_punct	(hello) [world] {a}	1	0
+rule2_punct_letter	a,b c.d e!f	1	0
+rule3_digit_run	1234567890	1	0
+rule3_digit_mixed	abc123def 42x	1	0
+rule4_punct_newline	!!!\n\nx	1	0
+rule4_space_punct	a ... b	1	0
+rule5_newline_run	a\n\n\nb	1	0
+rule5_spaces_newline	a  \nb	1	0
+rule6_interior_run	a   b	1	0
+rule6_tab_then_word	a\t\tb	1	0
+rule7_trailing_space	word\s	1	0
+rule7_trailing_run	word\s\s\s	1	0
+mixed_space_digit	\s42\s7	1	0
+nbsp	a\xc2\xa0b	1	0
