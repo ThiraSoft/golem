@@ -1,6 +1,10 @@
 package bpe
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/ThiraSoft/golem/token/special"
+)
 
 // A special token cuts the text in three, and the halves are rescanned by the
 // shorter candidates. Taking the longest first is what keeps "<|turn>" from
@@ -13,11 +17,11 @@ func TestPartition(t *testing.T) {
 		t.Fatal("<turn|> is missing from the vocabulary")
 	}
 
-	got := v.partition("before <turn|> after", true)
-	want := []fragment{
-		{text: "before ", id: -1},
-		{id: turn},
-		{text: " after", id: -1},
+	got := special.Partition("before <turn|> after", v.specials, true)
+	want := []special.Fragment{
+		{Text: "before ", ID: -1},
+		{ID: turn},
+		{Text: " after", ID: -1},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %+v, want %+v", got, want)
@@ -33,8 +37,8 @@ func TestPartition(t *testing.T) {
 func TestPartitionLeavesControlTokensAloneWhenNotParsing(t *testing.T) {
 	v := openVocab(t)
 
-	got := v.partition("before <turn|> after", false)
-	if len(got) != 1 || got[0].id != -1 || got[0].text != "before <turn|> after" {
+	got := special.Partition("before <turn|> after", v.specials, false)
+	if len(got) != 1 || got[0].ID != -1 || got[0].Text != "before <turn|> after" {
 		t.Fatalf("got %+v", got)
 	}
 }
@@ -46,11 +50,11 @@ func TestPartitionAdjacentSpecials(t *testing.T) {
 	bos, _ := v.ID("<bos>")
 	turn, _ := v.ID("<turn|>")
 
-	got := v.partition("<bos><turn|>x", true)
+	got := special.Partition("<bos><turn|>x", v.specials, true)
 	if len(got) != 3 {
 		t.Fatalf("got %+v", got)
 	}
-	if got[0].id != bos || got[1].id != turn || got[2].text != "x" {
+	if got[0].ID != bos || got[1].ID != turn || got[2].Text != "x" {
 		t.Fatalf("got %+v", got)
 	}
 }

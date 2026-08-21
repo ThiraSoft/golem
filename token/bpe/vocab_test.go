@@ -101,9 +101,9 @@ func TestSpecialsAreSortedByDescendingLength(t *testing.T) {
 		t.Fatalf("%d specials", len(specials))
 	}
 	for i := 1; i < len(specials); i++ {
-		if len(v.Text(specials[i-1])) < len(v.Text(specials[i])) {
+		if len(specials[i-1].Text) < len(specials[i].Text) {
 			t.Fatalf("specials are not sorted: %q before %q",
-				v.Text(specials[i-1]), v.Text(specials[i]))
+				specials[i-1].Text, specials[i].Text)
 		}
 	}
 }

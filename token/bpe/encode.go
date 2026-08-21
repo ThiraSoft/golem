@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/ThiraSoft/golem/token/merge"
+	"github.com/ThiraSoft/golem/token/special"
 )
 
 // escapeSpaces replaces the ASCII space, and nothing else. The non-breaking
@@ -45,12 +46,12 @@ func (v *Vocab) Encode(text string, addBOS, parseSpecial bool) []int32 {
 	if addBOS && v.bos >= 0 {
 		out = append(out, v.bos)
 	}
-	for _, f := range v.partition(text, parseSpecial) {
-		if f.id >= 0 {
-			out = append(out, f.id)
+	for _, f := range special.Partition(text, v.specials, parseSpecial) {
+		if f.ID >= 0 {
+			out = append(out, f.ID)
 			continue
 		}
-		out = v.encodeRaw(f.text, out)
+		out = v.encodeRaw(f.Text, out)
 	}
 	return out
 }

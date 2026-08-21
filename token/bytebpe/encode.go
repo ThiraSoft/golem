@@ -13,6 +13,7 @@ package bytebpe
 
 import (
 	"github.com/ThiraSoft/golem/token/merge"
+	"github.com/ThiraSoft/golem/token/special"
 )
 
 // Encode turns text into identifiers. addBOS prepends the beginning-of-text
@@ -31,12 +32,12 @@ func (v *Vocab) Encode(text string, addBOS, parseSpecial bool) []int32 {
 	var m merge.Merger
 	symbols := make([]string, 0, len(text))
 
-	for _, f := range v.partition(text, parseSpecial) {
-		if f.id >= 0 {
-			out = append(out, f.id)
+	for _, f := range special.Partition(text, v.specials, parseSpecial) {
+		if f.ID >= 0 {
+			out = append(out, f.ID)
 			continue
 		}
-		for _, word := range splitQwen2(f.text) {
+		for _, word := range splitQwen2(f.Text) {
 			out, symbols = v.encodeWord(&m, symbols, word, out)
 		}
 	}

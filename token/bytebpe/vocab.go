@@ -14,11 +14,11 @@ package bytebpe
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/ThiraSoft/golem/tensors"
 	"github.com/ThiraSoft/golem/token/merge"
+	"github.com/ThiraSoft/golem/token/special"
 )
 
 // Kind is what the file says a piece is. The numbering is the format's, the
@@ -41,7 +41,7 @@ type Vocab struct {
 	kinds    []Kind
 	index    map[string]int32
 	ranks    map[merge.Pair]int
-	specials []int32 // control, unknown and user-defined, longest text first
+	specials []special.Token // control, unknown and user-defined, longest text first
 	eog      map[int32]bool
 
 	eos    int32
@@ -100,7 +100,11 @@ func Load(g *tensors.GGUF) (*Vocab, error) {
 		}
 		switch v.kinds[id] {
 		case Control, Unknown, UserDefined:
-			v.specials = append(v.specials, int32(id))
+			v.specials = append(v.specials, special.Token{
+				ID:     int32(id),
+				Text:   text,
+				Hidden: v.kinds[id] != UserDefined,
+			})
 		}
 	}
 
@@ -121,9 +125,7 @@ func Load(g *tensors.GGUF) (*Vocab, error) {
 
 	// Longest first: a short special token may be a substring of a longer one,
 	// and taking it first would cut the longer one in half.
-	sort.SliceStable(v.specials, func(i, j int) bool {
-		return len(v.texts[v.specials[i]]) > len(v.texts[v.specials[j]])
-	})
+	special.Sort(v.specials)
 
 	v.bos = metaID(g, "tokenizer.ggml.bos_token_id")
 	v.eos = metaID(g, "tokenizer.ggml.eos_token_id")
