@@ -18,9 +18,13 @@ in a file under `ref/<model>/`, named on the command line.
 | `dump_tokens.cpp` | the tokenizer | a model, an output directory, a `.tsv` corpus |
 | `dump_quants.cpp` | the kernels | a model, an output directory |
 
-The per-model files are in [`gemma/`](gemma/), alongside the one recorder that
-is not shared — `dump_chats.py`, which goes through Jinja rather than llama.cpp
-because the question a chat fixture settles is what *that template* renders.
+The per-model files are in [`gemma/`](gemma/) and [`qwen/`](qwen/), alongside
+the one recorder that is not shared — each architecture's own `dump_chats.py`,
+which goes through Jinja rather than llama.cpp because the question a chat
+fixture settles is what *that template* renders. `ref/qwen/dump_chats.py` reads
+the GGUF header with the same code as Gemma's and writes
+`testdata/qwen/chat/cases.json`; its docstring says which of its two
+disagreements with llama.cpp is deliberate.
 
 ## Building
 
@@ -45,6 +49,10 @@ build/ref/dump_layers "$GOLEM_MODEL"     testdata/gemma/window    ref/gemma/wind
 build/ref/dump_layers "$GOLEM_MODEL_12B" testdata/gemma/layers12  ref/gemma/short.run
 build/ref/dump_tokens "$GOLEM_MODEL"     testdata/gemma/tokenizer ref/gemma/corpus.tsv
 build/ref/dump_quants "$GOLEM_MODEL"     testdata/gemma/quants
+
+python3 ref/gemma/dump_chats.py "$GOLEM_MODEL"      testdata/gemma/chat/cases.json
+python3 ref/gemma/dump_chats.py "$GOLEM_MODEL_12B"  testdata/gemma/chat12/cases.json
+python3 ref/qwen/dump_chats.py  "$GOLEM_MODEL_QWEN" testdata/qwen/chat/cases.json
 ```
 
 ## dump_layers — recording a forward pass

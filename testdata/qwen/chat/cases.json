@@ -1,0 +1,634 @@
+{
+ "cases": [
+  {
+   "name": "user_only",
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "tools": null,
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "system_user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "tools": null,
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "multi_turn",
+   "messages": [
+    {
+     "role": "user",
+     "content": "one"
+    },
+    {
+     "role": "assistant",
+     "content": "two"
+    },
+    {
+     "role": "user",
+     "content": "three"
+    }
+   ],
+   "tools": null,
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>user\none<|im_end|>\n<|im_start|>assistant\ntwo<|im_end|>\n<|im_start|>user\nthree<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "no_generation_prompt",
+   "messages": [
+    {
+     "role": "user",
+     "content": "one"
+    },
+    {
+     "role": "assistant",
+     "content": "two"
+    }
+   ],
+   "tools": null,
+   "enable_thinking": false,
+   "add_generation_prompt": false,
+   "rendered": "<|im_start|>user\none<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\ntwo<|im_end|>\n"
+  },
+  {
+   "name": "thinking",
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "tools": null,
+   "enable_thinking": true,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "thinking_with_system",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "tools": null,
+   "enable_thinking": true,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "assistant_with_think_block",
+   "messages": [
+    {
+     "role": "user",
+     "content": "one"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nhidden\n</think>\n\nafter"
+    },
+    {
+     "role": "user",
+     "content": "three"
+    }
+   ],
+   "tools": null,
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>user\none<|im_end|>\n<|im_start|>assistant\nafter<|im_end|>\n<|im_start|>user\nthree<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "empty_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": ""
+    }
+   ],
+   "tools": null,
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "unicode",
+   "messages": [
+    {
+     "role": "user",
+     "content": "héllo — 世界 🙂"
+    }
+   ],
+   "tools": null,
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>user\nhéllo — 世界 🙂<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "whitespace",
+   "messages": [
+    {
+     "role": "system",
+     "content": "  padded  \n"
+    },
+    {
+     "role": "user",
+     "content": "\n  spaced  \n"
+    }
+   ],
+   "tools": null,
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\n  padded  \n<|im_end|>\n<|im_start|>user\n\n  spaced  \n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "tools_declared",
+   "messages": [
+    {
+     "role": "user",
+     "content": "weather in Lyon?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "weather",
+      "description": "Today's weather in a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "Which city."
+        },
+        "unit": {
+         "type": "string",
+         "description": "Scale.",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"function\": {\"description\": \"Today\\u0027s weather in a city.\", \"name\": \"weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"Which city.\", \"type\": \"string\"}, \"unit\": {\"description\": \"Scale.\", \"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nweather in Lyon?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "tools_no_parameters",
+   "messages": [
+    {
+     "role": "user",
+     "content": "what time is it?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "now",
+      "description": "The current time."
+     }
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"function\": {\"description\": \"The current time.\", \"name\": \"now\"}, \"type\": \"function\"}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nwhat time is it?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "tools_array_and_boolean",
+   "messages": [
+    {
+     "role": "user",
+     "content": "tag it"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "tags",
+      "description": "Tag a note.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "labels": {
+         "type": "array",
+         "description": "The labels.",
+         "items": {
+          "type": "string"
+         }
+        },
+        "pinned": {
+         "type": "boolean",
+         "description": "Keep it on top."
+        }
+       }
+      }
+     }
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"function\": {\"description\": \"Tag a note.\", \"name\": \"tags\", \"parameters\": {\"properties\": {\"labels\": {\"description\": \"The labels.\", \"items\": {\"type\": \"string\"}, \"type\": \"array\"}, \"pinned\": {\"description\": \"Keep it on top.\", \"type\": \"boolean\"}}, \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\ntag it<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "tools_two_declarations",
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "weather",
+      "description": "Today's weather in a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "Which city."
+        },
+        "unit": {
+         "type": "string",
+         "description": "Scale.",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "now",
+      "description": "The current time."
+     }
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"function\": {\"description\": \"Today\\u0027s weather in a city.\", \"name\": \"weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"Which city.\", \"type\": \"string\"}, \"unit\": {\"description\": \"Scale.\", \"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n{\"function\": {\"description\": \"The current time.\", \"name\": \"now\"}, \"type\": \"function\"}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "tools_with_system",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "weather",
+      "description": "Today's weather in a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "Which city."
+        },
+        "unit": {
+         "type": "string",
+         "description": "Scale.",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are terse.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"function\": {\"description\": \"Today\\u0027s weather in a city.\", \"name\": \"weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"Which city.\", \"type\": \"string\"}, \"unit\": {\"description\": \"Scale.\", \"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "tool_call_unanswered",
+   "messages": [
+    {
+     "role": "user",
+     "content": "weather in Lyon?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "weather",
+        "arguments": {
+         "city": "Lyon",
+         "unit": "celsius"
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "weather",
+      "description": "Today's weather in a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "Which city."
+        },
+        "unit": {
+         "type": "string",
+         "description": "Scale.",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": false,
+   "rendered": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"function\": {\"description\": \"Today\\u0027s weather in a city.\", \"name\": \"weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"Which city.\", \"type\": \"string\"}, \"unit\": {\"description\": \"Scale.\", \"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nweather in Lyon?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n{\"name\": \"weather\", \"arguments\": {\"city\": \"Lyon\", \"unit\": \"celsius\"}}\n</tool_call><|im_end|>\n"
+  },
+  {
+   "name": "tool_call_answered",
+   "messages": [
+    {
+     "role": "user",
+     "content": "weather in Lyon?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "weather",
+        "arguments": {
+         "city": "Lyon"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "name": "weather",
+     "content": "18 degrees, clear"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "weather",
+      "description": "Today's weather in a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "Which city."
+        },
+        "unit": {
+         "type": "string",
+         "description": "Scale.",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"function\": {\"description\": \"Today\\u0027s weather in a city.\", \"name\": \"weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"Which city.\", \"type\": \"string\"}, \"unit\": {\"description\": \"Scale.\", \"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nweather in Lyon?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"weather\", \"arguments\": {\"city\": \"Lyon\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18 degrees, clear\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "tool_call_two_calls_answered",
+   "messages": [
+    {
+     "role": "user",
+     "content": "both please"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "weather",
+        "arguments": {
+         "city": "Lyon"
+        }
+       }
+      },
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "now",
+        "arguments": {}
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "name": "weather",
+     "content": "18 degrees"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_2",
+     "name": "now",
+     "content": "14:03"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "weather",
+      "description": "Today's weather in a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "Which city."
+        },
+        "unit": {
+         "type": "string",
+         "description": "Scale.",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "now",
+      "description": "The current time."
+     }
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"function\": {\"description\": \"Today\\u0027s weather in a city.\", \"name\": \"weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"Which city.\", \"type\": \"string\"}, \"unit\": {\"description\": \"Scale.\", \"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n{\"function\": {\"description\": \"The current time.\", \"name\": \"now\"}, \"type\": \"function\"}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nboth please<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"weather\", \"arguments\": {\"city\": \"Lyon\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"now\", \"arguments\": {}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18 degrees\n</tool_response>\n<tool_response>\n14:03\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "tool_call_then_answer",
+   "messages": [
+    {
+     "role": "user",
+     "content": "weather in Lyon?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "weather",
+        "arguments": {
+         "city": "Lyon"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "name": "weather",
+     "content": "18 degrees"
+    },
+    {
+     "role": "assistant",
+     "content": "It is 18 degrees."
+    },
+    {
+     "role": "user",
+     "content": "and tomorrow?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "weather",
+      "description": "Today's weather in a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "Which city."
+        },
+        "unit": {
+         "type": "string",
+         "description": "Scale.",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "enable_thinking": false,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"function\": {\"description\": \"Today\\u0027s weather in a city.\", \"name\": \"weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"Which city.\", \"type\": \"string\"}, \"unit\": {\"description\": \"Scale.\", \"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nweather in Lyon?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"weather\", \"arguments\": {\"city\": \"Lyon\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18 degrees\n</tool_response><|im_end|>\n<|im_start|>assistant\nIt is 18 degrees.<|im_end|>\n<|im_start|>user\nand tomorrow?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ ]
+}
