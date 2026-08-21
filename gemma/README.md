@@ -169,7 +169,7 @@ On an i7-9700K, eight threads, Q4_0 weights. E2B first:
 |---|---|
 | `Forward` — 35 blocks, a prompt already in the cache | 37 ms |
 | `Logits` — the whole vocabulary | 10 ms |
-| `ForwardBatch` — 64 positions of a prompt at once | 9.8 ms |
+| `ForwardBatch` — 64 positions of a prompt at once | 7.4 ms |
 
 The first two are within a quarter of what the memory bus on this machine can
 deliver: a token being generated reads 999 MB of block weights and 315 MB of
@@ -188,8 +188,8 @@ build 9603 held to the CPU (`-dev none -ngl 0`):
 
 | | llama.cpp | golem | |
 |---|---:|---:|---|
-| prompt, 64 tokens | 172 t/s | 102 t/s | ×1.7 |
-| generation, 32 tokens | 22.3 t/s | 21.3 t/s | ×1.05 |
+| prompt, 64 tokens | 172 t/s | 134 t/s | ×1.28 |
+| generation, 32 tokens | 22.3 t/s | 21.5 t/s | ×1.04 |
 
 ```bash
 llama-bench -m "$MODEL" -dev none -ngl 0 -t 8 -p 64 -n 32 -r 3
@@ -200,8 +200,8 @@ The 12B on the same machine, the same way, `gemma-4-12B-it-QAT-Q4_0.gguf`:
 
 | | llama.cpp | golem | |
 |---|---:|---:|---|
-| prompt, 64 tokens | 29.8 t/s | 20.7 t/s | ×1.4 |
-| generation, 32 tokens | 4.81 t/s | 4.75 t/s | ×1.01 |
+| prompt, 64 tokens | 29.8 t/s | 27.0 t/s | ×1.10 |
+| generation, 32 tokens | 4.81 t/s | 4.74 t/s | ×1.01 |
 
 Per token of generation that is 191 ms in the blocks and 24 ms in the logit
 head. Both engines are reading 6.5 GB of weights for every token here, and at
@@ -238,7 +238,7 @@ over the same twelve thousand values, four of which used to run on one core
 while seven waited. Attention is a head to a core, which matters little at a
 hundred positions and is what matters at four thousand.
 
-**The prompt** was a factor of eleven and is a factor of one and two thirds. It
+**The prompt** was a factor of eleven and is a factor of one and a quarter. It
 was eleven because every kernel here took a vector: sixty-four tokens meant
 sixty-four passes over a gigabyte of weights for arithmetic that needed one.
 `nn.Batch` is the answer — a set of activations quantized together and
@@ -248,11 +248,11 @@ every column of the batch while it is still in the first-level cache. What
 together; the batch is causal within itself, which is why a block stores all of
 its keys and values before any of its scores are computed.
 
-Two things about that path are worth naming, because both were measured rather
-than assumed:
+Three things about that path are worth naming, because all three were measured
+rather than assumed:
 
-- **The tiles matter as much as the kernel.** Four columns of a feed-forward
-  output are forty-eight kilobytes of activation, which is past the
+- **The tiles matter as much as the kernel.** A group of columns of a
+  feed-forward output is tens of kilobytes of activation, which is past the
   first-level cache, and the down projection of this model is exactly that
   shape: it ran at 97 GMAC/s against 250 for every other matrix until the input
   was cut into stretches of two thousand. The cut is decided by the width alone,
@@ -264,11 +264,24 @@ than assumed:
   in the caches and every position attends to every position before it, and the
   rate falls.
 
+- **The width of a pass is what the row costs.** Unpacking the nibbles,
+  converting the fp16 scale and folding the correction happen once per block
+  whatever the width of the group, so at four columns they were a third of the
+  instructions in the loop and at eight they are a seventh. `dotQ4_0x8AVX2`
+  reads a row once for eight positions; a batch that is not a multiple of eight
+  finishes on the four-column and one-column kernels, which sum in the same
+  order, so the bit-for-bit agreement holds. That, and folding the multiply and
+  the add of each block into one `VFMADD231PS`, took the prompt from 102 t/s to
+  134 on E2B and from 20.7 to 27.0 on the 12B.
+
 What is left between golem and llama.cpp on a prompt is the shape of the weights
 themselves. ggml repacks Q4_0 into an interleaved layout at load time, so that
-one pass of its kernel serves eight rows with contiguous nibbles; golem reads
-the file's own layout and unpacks a row for every four columns. That is the next
-thing to write, and it is worth about the factor that remains.
+one pass of its kernel serves eight rows with contiguous nibbles: the scale of
+each row lands in its own lane, and the conversion to floats is paid once for
+eight rows rather than once for each. golem reads the file's own layout, which
+leaves that conversion per row and per column — a quarter of its inner loop, and
+about the factor that remains. Repacking is the next thing to write, and it
+costs a second copy of the weights in memory.
 
 ## The chat template
 

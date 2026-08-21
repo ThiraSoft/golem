@@ -22,7 +22,7 @@ func TestMatVecQ4_0PartialTiles(t *testing.T) {
 	rng := rand.New(rand.NewSource(11))
 
 	for _, inputs := range []int{2048, 2080, 3840, 4096, 6144, 15360} {
-		for _, size := range []int{1, 2, 6} {
+		for _, size := range []int{1, 2, 6, 8, 13} {
 			const rows = 5
 			blocks := inputs / QuantBlock
 			rowBytes := blocks * q4_0BlockBytes

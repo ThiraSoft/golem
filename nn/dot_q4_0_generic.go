@@ -23,3 +23,15 @@ func dotQ4_0x4(w []byte, b *Batch, block, column, n int, state []float32, mode M
 		}
 	}
 }
+
+func dotQ4_0x8(w []byte, b *Batch, block, column, n int, state []float32, mode Mode) {
+	if mode&Begin != 0 {
+		clear(state)
+	}
+	dotQ4_0x8Go(w, b, block, column, n, state)
+	if mode&Finish != 0 {
+		for c := 0; c < 8; c++ {
+			state[c] = fold(state[c*8:], state[64+c])
+		}
+	}
+}

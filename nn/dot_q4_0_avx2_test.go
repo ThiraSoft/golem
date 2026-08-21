@@ -18,7 +18,7 @@ func TestDotQ4_0AVX2(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
 
 	for _, n := range []int{32, 64, 256, 1536, 4096} {
-		for _, size := range []int{1, 3, 4, 7} {
+		for _, size := range []int{1, 3, 4, 7, 8, 11, 16} {
 			blocks := n / QuantBlock
 			w := make([]byte, blocks*q4_0BlockBytes)
 			for i := range w {
@@ -64,12 +64,38 @@ func TestDotQ4_0AVX2(t *testing.T) {
 				}
 			}
 
+			for c := 0; c+8 <= size; c += 8 {
+				var state [72]float32
+				dotQ4_0x8(w, batch, 0, c, n, state[:], Begin|Finish)
+				for j := 0; j < 8; j++ {
+					got, want := state[j], portable(c+j)
+					if gap := math.Abs(float64(got - want)); gap > 1e-3*math.Abs(float64(want))+1e-6 {
+						t.Fatalf("n=%d size=%d eight columns at %d, %d: %.8f against %.8f",
+							n, size, c, j, got, want)
+					}
+				}
+			}
+
 			// A row cut into stretches of input has to give exactly what the
 			// same row gives in one call: the lanes are carried, not folded and
 			// added.
 			if n >= 2*QuantBlock {
 				half := n / 2
 				if half%QuantBlock == 0 {
+					var wide [72]float32
+					for c := 0; c+8 <= size; c += 8 {
+						dotQ4_0x8(w, batch, 0, c, half, wide[:], Begin)
+						dotQ4_0x8(w[half/QuantBlock*q4_0BlockBytes:], batch, half/QuantBlock, c, n-half, wide[:], Finish)
+						var whole [72]float32
+						dotQ4_0x8(w, batch, 0, c, n, whole[:], Begin|Finish)
+						for j := 0; j < 8; j++ {
+							if wide[j] != whole[j] {
+								t.Fatalf("n=%d size=%d column %d: in two stretches %v, in one %v",
+									n, size, c+j, wide[j], whole[j])
+							}
+						}
+					}
+
 					var state [36]float32
 					for c := 0; c+4 <= size; c += 4 {
 						dotQ4_0x4(w, batch, 0, c, half, state[:], Begin)
