@@ -107,6 +107,22 @@ func (f *fixture) column(t *testing.T, name string, index int) []float32 {
 	return all[index*n : (index+1)*n]
 }
 
+// lastColumn returns the final column of a recording, whatever its width.
+//
+// The last block's waypoints hold one column rather than one per token:
+// llama.cpp narrows the graph to the output row before block 27's feed
+// forward, because that row is the only one whose logits anyone wants. So a
+// test that wants "the last position" has to ask for the last column rather
+// than for column len(tokens)-1.
+func (f *fixture) lastColumn(t *testing.T, name string) []float32 {
+	t.Helper()
+	e, ok := f.Tensors[name]
+	if !ok {
+		t.Fatalf("the fixture holds no tensor named %q", name)
+	}
+	return f.column(t, name, int(e.NE[1])-1)
+}
+
 // heads returns one token's worth of a head-shaped recording — a tensor of
 // [head_dim, n_head, tokens], which is how llama.cpp names the queries, keys
 // and values. The heads are contiguous, so this is the same concatenation the
