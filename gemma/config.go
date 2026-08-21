@@ -56,6 +56,28 @@ type Config struct {
 	// thinking is off. It is read from the Jinja rather than from the model's
 	// name, because that is where the difference actually is.
 	EmptyThought bool
+	// ImageOpen, ImageClose and ImageSoft are the identifiers of the three
+	// markers a picture is written with, or zero in a vocabulary that has
+	// none. The soft one is never embedded — the row is given — but it has to
+	// be a real token, because the cache and the per-layer lookup hold
+	// identifiers rather than rows.
+	ImageOpen, ImageClose, ImageSoft int32
+}
+
+// tokenNamed finds one piece in the vocabulary, and answers 0 when the file
+// has no such token — which is a vocabulary that was never taught to carry a
+// picture, not an error at load time.
+func tokenNamed(g *tensors.GGUF, piece string) int32 {
+	pieces, err := g.Strings("tokenizer.ggml.tokens")
+	if err != nil {
+		return 0
+	}
+	for i, p := range pieces {
+		if p == piece {
+			return int32(i)
+		}
+	}
+	return 0
 }
 
 // perBlock reads a value that the format may have stored once for the whole
@@ -158,6 +180,9 @@ func LoadConfig(g *tensors.GGUF, maxContext int) (*Config, error) {
 	if t, err := g.String("tokenizer.chat_template"); err == nil {
 		cfg.EmptyThought = strings.Contains(t, emptyThoughtJinja)
 	}
+	cfg.ImageOpen = tokenNamed(g, imageOpen)
+	cfg.ImageClose = tokenNamed(g, imageClose)
+	cfg.ImageSoft = tokenNamed(g, imageSoft)
 	if ids, err := g.Uint32Slice("tokenizer.ggml.suppress_tokens"); err == nil {
 		cfg.Suppress = make([]int32, len(ids))
 		for i, id := range ids {

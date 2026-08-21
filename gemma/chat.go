@@ -9,8 +9,12 @@ package gemma
 // itself makes of that template, so this file is checked against the original
 // rather than against a reading of it.
 //
-// What is not covered — images, audio, video, and the reasoning channel of a
-// past answer — is refused rather than approximated.
+// What is not covered — audio, video, and the reasoning channel of a past
+// answer — is refused rather than approximated. Images are covered: a turn
+// carrying them opens each with <|image> and closes it with <image|>, and the
+// soft tokens that go between the two are spliced in after the string is
+// encoded, by whoever ran the tower. The template writes where a picture goes;
+// it does not know how large one is.
 
 import (
 	"fmt"
@@ -64,6 +68,12 @@ const (
 	toolResponseOpen  = "<|tool_response>"
 	toolResponseClose = "<tool_response|>"
 	quote             = `<|"|>`
+	imageOpen         = "<|image>"
+	imageClose        = "<image|>"
+	// imageSoft holds one soft token's place between the two. Its identifier
+	// is never embedded — the row is given — but a real token has to stand
+	// there for the cache and the per-layer lookup to have something to hold.
+	imageSoft = "<|image|>"
 )
 
 // RenderChat writes the conversation the way Gemma's template does, leading
@@ -154,6 +164,18 @@ func RenderChat(messages []Message, opt ChatOptions) (string, error) {
 			content = StripThinking(content)
 		} else {
 			content = strings.TrimSpace(content)
+		}
+		// The pictures come before the text of the turn they belong to, each
+		// as an empty pair of markers. A model turn has none: a model does not
+		// send pictures.
+		if len(m.Images) > 0 {
+			if role == roleModel {
+				return "", fmt.Errorf("gemma: message %d is a model turn carrying %d images, which a model does not send", i, len(m.Images))
+			}
+			for range m.Images {
+				b.WriteString(imageOpen + imageClose + "\n")
+			}
+			lastWritten = "content"
 		}
 		b.WriteString(content)
 		if content != "" {

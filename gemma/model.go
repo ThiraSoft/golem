@@ -31,6 +31,8 @@ type Model struct {
 	ple         [][]float32
 	outputs     [][]float32 // one per block, for the tests that locate a divergence
 	batch       int
+	vision      *VisionTower // nil until OpenVision
+	visionFile  *tensors.GGUF
 }
 
 // Open maps a GGUF file and binds it. maxContext caps the cache; the file
@@ -92,7 +94,13 @@ func (m *Model) reserve(batch int) {
 	m.ple = rows(batch, len(m.Cfg.Blocks)*m.Cfg.PLEDim)
 }
 
-func (m *Model) Close() error { return m.file.Close() }
+func (m *Model) Close() error {
+	if m.visionFile != nil {
+		m.visionFile.Close()
+		m.visionFile = nil
+	}
+	return m.file.Close()
+}
 
 // File is the mapped GGUF. The tokenizer lives in the same file as the weights,
 // and a caller that wants both should not have to open it twice.
