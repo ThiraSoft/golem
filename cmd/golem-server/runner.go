@@ -114,6 +114,12 @@ func (r *Runner) inFlight() int {
 	return r.waiting
 }
 
+func (r *Runner) lastSpan() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.span
+}
+
 func (r *Runner) window() time.Duration {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -211,8 +217,8 @@ func (r *Runner) run(batch []*pass) {
 		}
 	}
 	if debugBatches {
-		fmt.Fprintf(os.Stderr, "pass: %d tokens from %d conversation(s), window %s\n",
-			len(tokens), len(distinct(slots)), r.window())
+		fmt.Fprintf(os.Stderr, "pass: %d tokens from %d conversation(s), last took %s, window %s\n",
+			len(tokens), len(distinct(slots)), r.lastSpan().Round(time.Millisecond), r.window())
 	}
 	start := time.Now()
 	states := r.engine.ForwardSlots(tokens, slots, at)

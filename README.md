@@ -125,9 +125,9 @@ Worth knowing before you clone it:
   not a stage on the way somewhere.
 - **The server is one process around one model.** `-parallel` answers several
   conversations at once and batches them into one pass, the way llama.cpp's
-  does — 21.3 tokens a second for one client on E2B, 36.7 for two, 54.8 for
-  four — but there is no second model, no distribution and no scheduler beyond
-  that.
+  does — on E2B, 20.4 tokens a second for one client, 34.9 for two, 52.7 for
+  four, against llama-server's 20.4, 33.3 and 59.7 on the same machine — but
+  there is no second model, no distribution and no scheduler beyond that.
 - **Two language architectures, both dense.** Gemma 4 and Qwen3 dense. No
   mixture of experts, no vision, no embeddings endpoint, no `/v1/completions`.
 - **Q4_0, Q6_K, bf16 and float32.** The K-quants beyond Q6_K are not read.
