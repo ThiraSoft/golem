@@ -172,6 +172,70 @@ func TestVisionBlocksMatchTheReference(t *testing.T) {
 		for _, row := range xs {
 			flat = append(flat, row...)
 		}
-		closeRelative(t, fmt.Sprintf("block %d", i), flat, f.tensor(t, fmt.Sprintf("layer_out-%d", i)), 1e-3)
+		closeRelative(t, fmt.Sprintf("block %d", i), flat, f.tensor(t, fmt.Sprintf("layer_out-%d", i)), 5e-4)
 	}
+}
+
+// The pooler and the projector, each started from the reference's own input,
+// which is what separates their arithmetic from what the blocks before them
+// accumulated.
+func TestVisionPoolAndProjectMatchTheReference(t *testing.T) {
+	f := loadVisionFixture(t)
+	tower := openTower(t)
+	cfg := tower.Cfg
+	_, cols, rows := cfg.Prepare(testImage(t))
+
+	last := f.tensor(t, fmt.Sprintf("layer_out-%d", cfg.Blocks-1))
+	xs := make([][]float32, cols*rows)
+	for p := range xs {
+		xs[p] = append([]float32(nil), last[p*cfg.Dim:(p+1)*cfg.Dim]...)
+	}
+	pooled := tower.Pool(xs, cols, rows)
+	flat := make([]float32, 0, len(pooled)*cfg.Dim)
+	for _, r := range pooled {
+		flat = append(flat, r...)
+	}
+	closeRelative(t, "pooled", flat, f.tensor(t, "pooled"), 1e-4)
+
+	refPooled := f.tensor(t, "pooled")
+	tokens := make([][]float32, len(pooled))
+	for i := range tokens {
+		tokens[i] = append([]float32(nil), refPooled[i*cfg.Dim:(i+1)*cfg.Dim]...)
+	}
+	projected := tower.Project(tokens)
+	flat = flat[:0]
+	for _, r := range projected {
+		flat = append(flat, r...)
+	}
+	closeRelative(t, "projected", flat, f.tensor(t, "projected"), 1e-3)
+}
+
+// And the whole tower at once. The bar is twenty times looser than any single
+// stage's, and that factor is measured rather than chosen: a block started
+// from the reference's own input lands within a ten-thousandth of its range,
+// and letting sixteen of them feed one another compounds that to eight
+// thousandths by the last. Nothing in the tower rounds more than ggml does —
+// the products take their activation in bfloat16, as ggml's kernel for a
+// bfloat16 weight does — so what is left is the order the sums are taken in,
+// and a residual stack sixteen deep is what turns that into a visible number.
+//
+// The proof that eight thousandths is small enough to be nothing is not here:
+// it is TestVisionGenerationMatchesTheReference, which draws the same tokens.
+func TestVisionEncodeMatchesTheReference(t *testing.T) {
+	f := loadVisionFixture(t)
+	tower := openTower(t)
+	want := f.tensor(t, "projected")
+
+	got := tower.Encode(testImage(t))
+	if len(got) != f.NImageTokens {
+		t.Fatalf("this engine made %d tokens, llama.cpp %d", len(got), f.NImageTokens)
+	}
+	if len(got) < tower.Cfg.MinTokens || len(got) > tower.Cfg.MaxTokens {
+		t.Fatalf("%d tokens is outside %d..%d", len(got), tower.Cfg.MinTokens, tower.Cfg.MaxTokens)
+	}
+	flat := make([]float32, 0, len(got)*tower.Cfg.ProjDim)
+	for _, row := range got {
+		flat = append(flat, row...)
+	}
+	closeRelative(t, "the whole tower", flat, want, 1e-2)
 }

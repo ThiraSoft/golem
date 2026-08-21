@@ -38,9 +38,15 @@ type VisionLinear struct {
 // Apply computes y = clamp(W * clamp(x)). tmp holds the clamped input and must
 // be as wide as one; the caller owns it so that a per-patch loop allocates
 // nothing.
+//
+// The input is rounded to bfloat16 on the way in. ggml's kernel for a bf16
+// weight takes both operands in bf16 — vec_dot_type is BF16 — so an activation
+// that kept its float32 mantissa here would not be more accurate than the
+// reference, it would be a thousandth away from it, and a thousandth
+// compounded over sixteen blocks is visible at the end.
 func (l VisionLinear) Apply(x, tmp, y []float32) {
 	for i, v := range x {
-		tmp[i] = clampF32(v, l.Clamp.InMin, l.Clamp.InMax)
+		tmp[i] = nn.RoundBF16(clampF32(v, l.Clamp.InMin, l.Clamp.InMax))
 	}
 	l.ApplyRows(tmp, y, 1, 0, l.Outputs)
 	for i, v := range y {

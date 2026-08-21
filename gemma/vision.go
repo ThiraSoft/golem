@@ -8,6 +8,9 @@ package gemma
 // is repacked, quantized or cached. What it costs is read once and forgotten.
 
 import (
+	"math"
+
+	"github.com/ThiraSoft/golem/imageio"
 	"github.com/ThiraSoft/golem/nn"
 )
 
@@ -177,4 +180,70 @@ func (v *VisionTower) Block(i int, xs [][]float32, cols int) {
 			}
 		}
 	})
+}
+
+// Encode is the whole tower: an image in, one row per soft token out, each as
+// wide as the language model's embedding.
+func (v *VisionTower) Encode(im *imageio.Image) [][]float32 {
+	cfg := v.Cfg
+	pixels, cols, rows := cfg.Prepare(im)
+	xs := v.Patches(pixels, cols, rows)
+	for i := 0; i < cfg.Blocks; i++ {
+		v.Block(i, xs, cols)
+	}
+	return v.Project(v.Pool(xs, cols, rows))
+}
+
+// Pool averages each Merge by Merge square of patches into one token and
+// scales by the square root of the width, which is where the tower stops
+// having a grid.
+func (v *VisionTower) Pool(xs [][]float32, cols, rows int) [][]float32 {
+	cfg := v.Cfg
+	m := cfg.Merge
+	outCols, outRows := cols/m, rows/m
+	scale := float32(math.Sqrt(float64(cfg.Dim))) / float32(m*m)
+
+	out := make([][]float32, outCols*outRows)
+	for t := range out {
+		row := make([]float32, cfg.Dim)
+		ox, oy := t%outCols, t/outCols
+		for dy := 0; dy < m; dy++ {
+			for dx := 0; dx < m; dx++ {
+				for i, val := range xs[(oy*m+dy)*cols+ox*m+dx] {
+					row[i] += val
+				}
+			}
+		}
+		for i := range row {
+			row[i] *= scale
+		}
+		out[t] = row
+	}
+	return out
+}
+
+// Project standardizes, norms and projects into the language model's width.
+//
+// The standardisation is skipped when the file carries no ranges for it, which
+// is the case for E2B: llama.cpp treats those two tensors as a pair and so
+// does this.
+func (v *VisionTower) Project(tokens [][]float32) [][]float32 {
+	cfg, w := v.Cfg, v.W
+	out := make([][]float32, len(tokens))
+	nn.InParallel(len(tokens), len(tokens)*cfg.Dim*cfg.ProjDim, func(first, last int) {
+		tmp := make([]float32, cfg.Dim)
+		for t := first; t < last; t++ {
+			row := append([]float32(nil), tokens[t]...)
+			if w.StdBias != nil {
+				for i := range row {
+					row[i] = (row[i] - w.StdBias[i]) * w.StdScale[i]
+				}
+			}
+			nn.RMSNormPlain(row, nil, cfg.Eps)
+			dst := make([]float32, cfg.ProjDim)
+			w.Proj.Apply(row, tmp, dst)
+			out[t] = dst
+		}
+	})
+	return out
 }
