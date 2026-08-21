@@ -1,0 +1,23 @@
+# The suite a machine with no weights on it can run: every test that needs a
+# GGUF, a voice or a recorded activation skips rather than fails, which leaves
+# 164 of them. What this guards is the code that does not need a model —
+# tokenizers, kernels against their own reference vectors, chat templates
+# against recorded fixtures, both commands against scripted engines.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
