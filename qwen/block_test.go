@@ -8,11 +8,10 @@ import (
 
 // The feed forward on its own, from the reference's own normed input.
 //
-// This is where the non-linearity is settled. ggml's AVX2 path computes SiLU
-// through a polynomial exponential good to about one and a half units in the
-// last place; nn.SiLURange uses float64 and is exact. The gap that leaves is
-// what this test prints, and it is meant to be far below the summation-order
-// noise rather than zero.
+// This is where the non-linearity is settled. nn.SwiGLURange reproduces both
+// halves of ggml_vec_swiglu_f32: the polynomial exponential, and the fusion of
+// the gate's activation with the up projection into one pass. The gap it
+// leaves is what this test prints.
 func TestFeedForwardMatchesReference(t *testing.T) {
 	f := loadFixture(t, "layers")
 	cfg, w := loadForTest(t)
@@ -32,10 +31,7 @@ func TestFeedForwardMatchesReference(t *testing.T) {
 		up := make([]float32, bc.FFN)
 		bw.Gate.MatVecRows(normed, gate.F, 0, bc.FFN)
 		bw.Up.MatVecRows(normed, [][]float32{up}, 0, bc.FFN)
-		nn.SiLU(gate.F[0])
-		for i := range gate.F[0] {
-			gate.F[0][i] *= up[i]
-		}
+		nn.SwiGLURange(gate.F[0], up, 0, bc.FFN)
 		gate.QuantizeColumnRange(0, 0, bc.FFN)
 
 		out := [][]float32{make([]float32, cfg.Dim)}

@@ -74,8 +74,8 @@ func Block(
 	// four cheap ones would run on one core while the others waited at four
 	// barriers.
 	//
-	// SiLU on the gate, times the up projection — ggml's swiglu, where Gemma
-	// has a tabulated GELU.
+	// SiLU on the gate, times the up projection, in one pass — ggml's
+	// swiglu, where Gemma has a tabulated GELU.
 	gate := s.Batch(bc.FFN, batch)
 	up := s.up[:batch]
 	blocks := bc.FFN / nn.QuantBlock
@@ -84,10 +84,7 @@ func Block(
 		bw.Gate.MatVecRows(normed, gate.F, from, to)
 		bw.Up.MatVecRows(normed, up, from, to)
 		for t := 0; t < batch; t++ {
-			nn.SiLURange(gate.F[t], from, to)
-			for i := from; i < to; i++ {
-				gate.F[t][i] *= up[t][i]
-			}
+			nn.SwiGLURange(gate.F[t], up[t], from, to)
 			gate.QuantizeColumnRange(t, from, to)
 		}
 	})

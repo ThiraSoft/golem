@@ -55,16 +55,25 @@ func TestQuantizedWeightsLoad(t *testing.T) {
 	}
 }
 
-// The tolerances here are twice the bfloat16 run's, and the reason is the
+// The tolerances here are wider than the bfloat16 run's, and the reason is the
 // quantizer rather than the engine. Every product on this path quantizes its
 // activation to Q8_0 in blocks of thirty-two, and a value sitting near a step
 // rounds the other way from llama.cpp's now and then; twenty-eight blocks
-// accumulate that. The observed worst is 1.1e-2 at block 22, against 4.2e-3
+// accumulate that. The observed worst is 2.7e-2 at block 27, against 4.2e-3
 // for the same architecture in bfloat16.
 //
-// What says this is drift and not a mistake is not the tolerance: it is that
-// the top sixty-four logits still land within 0.26 and that all sixteen greedy
-// tokens are still llama.cpp's, both below.
+// That path is chaotic rather than biased, which is worth knowing before
+// reading a change in these numbers as a regression. Computing the feed
+// forward's activation with the exact exponential instead of ggml's polynomial
+// — a difference of about two units in the last place per element — moves this
+// figure between 1.1e-2 and 2.7e-2, while leaving ffn_out itself agreeing with
+// the reference to exactly the same seven digits either way. Neither is closer
+// to llama.cpp; the buckets simply fall differently.
+//
+// So what says this is drift and not a mistake is not the tolerance, and not
+// this number moving. It is the two assertions below that do not move at all:
+// the top sixty-four logits land within 0.26, and all sixteen greedy tokens are
+// the ones llama.cpp drew.
 func TestQuantizedFullStackMatchesReference(t *testing.T) {
 	f := loadFixture(t, "layers_q4")
 	m := openQuantized(t)
@@ -74,9 +83,9 @@ func TestQuantizedFullStackMatchesReference(t *testing.T) {
 
 	for i := 0; i < f.NLayer; i++ {
 		name := "l_out-" + itoa(i)
-		compareRelative(t, name+" at the last position", m.BlockOutput(i), f.lastColumn(t, name), 2e-2)
+		compareRelative(t, name+" at the last position", m.BlockOutput(i), f.lastColumn(t, name), 3.5e-2)
 	}
-	compareRelative(t, "result_norm", hidden[last], f.lastColumn(t, "result_norm"), 4e-2)
+	compareRelative(t, "result_norm", hidden[last], f.lastColumn(t, "result_norm"), 5e-2)
 }
 
 func TestQuantizedLogitsMatchReference(t *testing.T) {
