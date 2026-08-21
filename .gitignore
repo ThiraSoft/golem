@@ -9,8 +9,8 @@
 # says where to get one.
 /testdata/voices/
 
-# The reference recorder builds against a local llama.cpp checkout.
-/ref/gemma/build/
+# The reference recorders build against a local llama.cpp checkout.
+/build/
 
 # What the references record of the models themselves: activations, logits, and
 # slabs of quantized weights. Those belong to whoever published the weights, not
