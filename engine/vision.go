@@ -23,6 +23,10 @@ type Vision interface {
 	EncodeImage(data []byte) ([][]float32, error)
 	Prompt(tokens []int32, images [][][]float32) (*gemma.Prompt, error)
 	ForwardPrompt(p *gemma.Prompt, startPos int) [][]float32
+	// ForwardEmbeddedSlots is the same pass for a server, which names its
+	// caches by index and may carry several conversations at once.
+	ForwardEmbeddedSlots(tokens []int32, embeds [][]float32, ple []int32,
+		slots, positions, until []int) [][]float32
 }
 
 // visionOf is the adapter, and the one place that names an engine's own types.
@@ -36,6 +40,11 @@ func (v visionOf) Prompt(tokens []int32, images [][][]float32) (*gemma.Prompt, e
 
 func (v visionOf) ForwardPrompt(p *gemma.Prompt, startPos int) [][]float32 {
 	return v.m.ForwardPrompt(p, startPos)
+}
+
+func (v visionOf) ForwardEmbeddedSlots(tokens []int32, embeds [][]float32, ple []int32,
+	slots, positions, until []int) [][]float32 {
+	return v.m.ForwardEmbeddedSlots(tokens, embeds, ple, slots, positions, until)
 }
 
 // OpenVision gives this model a projector. An engine that cannot take one says

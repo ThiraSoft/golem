@@ -176,3 +176,32 @@ func (p *Prompt) Boundary(from, want int) int {
 	}
 	return want
 }
+
+// ForwardEmbeddedSlots is ForwardPrompt for a caller that names the caches by
+// index rather than by pointer, and that may carry several conversations in
+// one pass — which is what a server does. slots and positions say where each
+// token goes, until how far forward it may look.
+func (m *Model) ForwardEmbeddedSlots(tokens []int32, embeds [][]float32, ple []int32,
+	slots, positions, until []int) [][]float32 {
+	at := make([]Place, len(tokens))
+	for i := range tokens {
+		at[i] = Place{Cache: m.Slot(slots[i]), Pos: positions[i], Until: until[i]}
+	}
+	return m.ForwardEmbedded(tokens, embeds, ple, at)
+}
+
+// Until is the upper bound of each position of the prompt, given the position
+// its first token is fed at: its own for text, the end of the picture for a
+// token inside one.
+func (p *Prompt) Until(startPos int) []int {
+	out := make([]int, len(p.Tokens))
+	for i := range out {
+		out[i] = startPos + i
+	}
+	for _, span := range p.Spans {
+		for i := span[0]; i <= span[1]; i++ {
+			out[i] = startPos + span[1]
+		}
+	}
+	return out
+}

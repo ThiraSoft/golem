@@ -28,6 +28,7 @@ import (
 
 func main() {
 	model := flag.String("model", os.Getenv("GOLEM_MODEL"), "GGUF file, gemma4 or qwen3 (or GOLEM_MODEL)")
+	mmproj := flag.String("mmproj", os.Getenv("GOLEM_MMPROJ"), "projector GGUF, which is what lets a model see (or GOLEM_MMPROJ)")
 	addr := flag.String("addr", "127.0.0.1:8080", "address to listen on")
 	context := flag.Int("context", 4096, "positions to keep; the files declare far more than any machine here would survive")
 	maxTokens := flag.Int("n", 1024, "most tokens to draw for one answer, when the request names no limit")
@@ -54,7 +55,15 @@ func main() {
 
 	// One goroutine owns the model; every conversation asks it for its passes,
 	// and what is waiting at the moment a pass is built goes into it together.
+	if *mmproj != "" {
+		if err := m.OpenVision(*mmproj); err != nil {
+			fail(err)
+		}
+	}
 	runner := NewRunner(m.Forward)
+	if v, ok := m.Vision(); ok {
+		runner.SetVision(v)
+	}
 	stop := make(chan struct{})
 	defer close(stop)
 	go runner.Run(stop)
@@ -72,6 +81,9 @@ func main() {
 	pool := NewPool(slots, time.Now)
 	name := strings.TrimSuffix(filepath.Base(*model), ".gguf")
 	server := NewServer(pool, m.Vocab, name, m.Template, params)
+	if v, ok := m.Vision(); ok {
+		server.SetVision(v)
+	}
 
 	fmt.Fprintf(os.Stderr, "%s: %s, %d blocks, %d positions in %d slot(s) of %d, loaded in %s on %d cores\n",
 		name, m.Name, m.Blocks, *context, m.Slots(), m.SlotContext(),

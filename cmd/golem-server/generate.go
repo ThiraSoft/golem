@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/chat"
+	"github.com/ThiraSoft/golem/gemma"
 	"github.com/ThiraSoft/golem/sample"
 )
 
@@ -61,8 +62,13 @@ func (g *Generator) WithMaxTokens(n int) *Generator {
 // with one model and one lock cannot afford to finish an answer nobody is
 // waiting for — the next request is queued behind it.
 func (g *Generator) Generate(ctx context.Context, ids []int32, p sample.Params, stop []string, emit func(string) error) (Answer, error) {
+	return g.GeneratePrompt(ctx, &gemma.Prompt{Tokens: ids}, p, stop, emit)
+}
+
+// GeneratePrompt is the same for a prompt that may hold pictures.
+func (g *Generator) GeneratePrompt(ctx context.Context, prompt *gemma.Prompt, p sample.Params, stop []string, emit func(string) error) (Answer, error) {
 	start := time.Now()
-	fed, err := g.ctx.Prefill(ids, g.logits)
+	fed, err := g.ctx.PrefillPrompt(prompt, g.logits)
 	if err != nil {
 		return Answer{}, err
 	}

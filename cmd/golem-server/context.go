@@ -18,6 +18,8 @@ package main
 import (
 	"fmt"
 	"time"
+
+	"github.com/ThiraSoft/golem/gemma"
 )
 
 // Vocabulary is the part of bpe.Vocab the server uses.
@@ -61,6 +63,13 @@ func (c *Context) Pos() int { return len(c.held) }
 // Prefill brings the cache up to ids, scores the last position into logits,
 // and returns how many positions it had to feed.
 func (c *Context) Prefill(ids []int32, logits []float32) (int, error) {
+	return c.PrefillPrompt(&gemma.Prompt{Tokens: ids}, logits)
+}
+
+// PrefillPrompt is the same for a prompt that may hold pictures: the rows go
+// in where the soft tokens are, and a batch is never cut inside one.
+func (c *Context) PrefillPrompt(p *gemma.Prompt, logits []float32) (int, error) {
+	ids := p.Tokens
 	if len(ids) == 0 {
 		return 0, fmt.Errorf("serve: an empty prompt")
 	}
@@ -88,15 +97,25 @@ func (c *Context) Prefill(ids []int32, logits []float32) (int, error) {
 		}
 	}
 
-	for at := from; at < len(ids); at += promptBatch {
-		to := min(at+promptBatch, len(ids))
+	for at := from; at < len(ids); {
+		// A batch may not be cut inside a picture: every key of a span has to
+		// be in the cache before any of its queries is scored, which holds
+		// within one pass and not across two.
+		to := p.Boundary(at, at+promptBatch)
 		// Only the chunk that ends the prompt is scored: the ones before it
 		// are read for their keys and values alone.
 		var out []float32
 		if to == len(ids) {
 			out = logits
 		}
-		c.runner.Forward(c.slot, ids[at:to], span(at, to-at), out)
+		if len(p.Spans) == 0 {
+			c.runner.Forward(c.slot, ids[at:to], span(at, to-at), out)
+		} else {
+			chunk := p.Slice(at, to)
+			c.runner.ForwardEmbedded(c.slot, chunk.Tokens, chunk.Embeds, chunk.PLE,
+				span(at, to-at), chunk.Until(at), out)
+		}
+		at = to
 	}
 	c.held = append(c.held[:0], ids...)
 	c.last = c.now()
