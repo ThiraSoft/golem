@@ -37,14 +37,25 @@ func Open(path string, maxContext int) (*Model, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := LoadConfig(g, maxContext)
+	m, err := New(g, maxContext)
 	if err != nil {
 		g.Close()
 		return nil, err
 	}
+	return m, nil
+}
+
+// New binds a GGUF the caller already opened, so that something reading the
+// architecture first can hand the file straight over. The model takes
+// ownership from there: its Close closes the file. A New that fails closes
+// nothing, and the caller still holds the file it opened.
+func New(g *tensors.GGUF, maxContext int) (*Model, error) {
+	cfg, err := LoadConfig(g, maxContext)
+	if err != nil {
+		return nil, err
+	}
 	w, err := LoadWeights(g, cfg)
 	if err != nil {
-		g.Close()
 		return nil, err
 	}
 	w.Repack()
