@@ -22,6 +22,8 @@ package gemma
 
 import (
 	"math"
+	"runtime"
+	"sync"
 
 	"github.com/ThiraSoft/golem/imageio"
 	"github.com/ThiraSoft/golem/nn"
@@ -63,6 +65,16 @@ func ffnTile(cfg *VisionConfig, n int) int {
 type VisionTower struct {
 	Cfg *VisionConfig
 	W   *VisionWeights
+	// scratches holds the working memory of images already encoded, so that
+	// the second picture does not allocate what the first one did: eighty
+	// megabytes a time, which is five per cent of what a picture costs.
+	//
+	// A reserve rather than a field, because a server encodes several pictures
+	// at once and two encodings writing into one buffer would corrupt each
+	// other. A reserve rather than a permanent buffer, because a pool gives
+	// its contents back to the collector when nobody asks for a while, and an
+	// idle server has no business holding eighty megabytes.
+	scratches sync.Pool
 }
 
 func NewVisionTower(cfg *VisionConfig, w *VisionWeights) *VisionTower {
@@ -81,25 +93,79 @@ type scratch struct {
 	qh, kh, vh     []float32 // heads by patches by HeadDim
 	tmp            []float32 // the clamped input of whichever product is running
 	gate, up, down []float32 // ffnTile by FFN, and by Dim for the last
+	// heads lends the attention its two per-core buffers. They were allocated
+	// inside the parallel section, which is once per core per range per block
+	// — five hundred times for one picture — and they are the same two buffers
+	// every time. Whoever takes a range takes a pair and gives it back; the
+	// reserve is this image's own, so nothing here is shared with another.
+	heads chan *headScratch
 }
 
-func (v *VisionTower) newScratch(n int) *scratch {
+// headScratch is one core's room for the attention of one group of patches.
+type headScratch struct{ scores, mixed []float32 }
+
+// takeHeads lends a pair, making one if the reserve is empty — which happens
+// as many times as there are cores at work, and then never again.
+func (s *scratch) takeHeads(n, hd int) *headScratch {
+	select {
+	case h := <-s.heads:
+		h.scores = fitTo(h.scores, queryGroup*n)
+		h.mixed = fitTo(h.mixed, queryGroup*hd)
+		return h
+	default:
+		return &headScratch{
+			scores: make([]float32, queryGroup*n),
+			mixed:  make([]float32, queryGroup*hd),
+		}
+	}
+}
+
+func (s *scratch) giveHeads(h *headScratch) {
+	select {
+	case s.heads <- h:
+	default:
+	}
+}
+
+// fitTo returns a slice of exactly n floats, reusing the one it is given when
+// that one is large enough.
+func fitTo(b []float32, n int) []float32 {
+	if cap(b) < n {
+		return make([]float32, n)
+	}
+	return b[:n]
+}
+
+// takeScratch is this image's working memory: one already made if a previous
+// image has given its own back, grown to this image's size if that one was
+// smaller.
+func (v *VisionTower) takeScratch(n int) *scratch {
+	s, _ := v.scratches.Get().(*scratch)
+	if s == nil {
+		s = &scratch{heads: make(chan *headScratch, runtime.NumCPU())}
+	}
 	cfg := v.Cfg
 	tile := ffnTile(cfg, n)
-	return &scratch{
-		normed: make([]float32, n*cfg.Dim),
-		q:      make([]float32, n*cfg.Dim),
-		k:      make([]float32, n*cfg.Dim),
-		v:      make([]float32, n*cfg.Dim),
-		attn:   make([]float32, n*cfg.Dim),
-		qh:     make([]float32, n*cfg.Dim),
-		kh:     make([]float32, n*cfg.Dim),
-		vh:     make([]float32, n*cfg.Dim),
-		tmp:    make([]float32, max(n*cfg.Dim, tile*cfg.FFN)),
-		gate:   make([]float32, tile*cfg.FFN),
-		up:     make([]float32, tile*cfg.FFN),
-		down:   make([]float32, tile*cfg.Dim),
+	for _, f := range []struct {
+		dst  *[]float32
+		size int
+	}{
+		{&s.normed, n * cfg.Dim},
+		{&s.q, n * cfg.Dim},
+		{&s.k, n * cfg.Dim},
+		{&s.v, n * cfg.Dim},
+		{&s.attn, n * cfg.Dim},
+		{&s.qh, n * cfg.Dim},
+		{&s.kh, n * cfg.Dim},
+		{&s.vh, n * cfg.Dim},
+		{&s.tmp, max(n*cfg.Dim, tile*cfg.FFN)},
+		{&s.gate, tile * cfg.FFN},
+		{&s.up, tile * cfg.FFN},
+		{&s.down, tile * cfg.Dim},
+	} {
+		*f.dst = fitTo(*f.dst, f.size)
 	}
+	return s
 }
 
 // Patches cuts the image into patches, projects each of them, and adds the two
@@ -257,8 +323,9 @@ func (v *VisionTower) Block(i int, xs []float32, cols int, s *scratch) {
 	// group's queries all read them.
 	groups := (n + queryGroup - 1) / queryGroup
 	nn.InParallel(groups*cfg.Heads, 2*n*n*cfg.Heads*hd, func(first, last int) {
-		scores := make([]float32, queryGroup*n)
-		mixed := make([]float32, queryGroup*hd)
+		buf := s.takeHeads(n, hd)
+		defer s.giveHeads(buf)
+		scores, mixed := buf.scores, buf.mixed
 		for u := first; u < last; u++ {
 			h, g := u/groups, u%groups
 			head := h * n * hd
@@ -366,10 +433,11 @@ func (v *VisionTower) Encode(im *imageio.Image) [][]float32 {
 		// followed are the language model's own.
 		return v.Project(xs)
 	}
-	s := v.newScratch(cols * rows)
+	s := v.takeScratch(cols * rows)
 	for i := 0; i < cfg.Blocks; i++ {
 		v.Block(i, xs, cols, s)
 	}
+	v.scratches.Put(s)
 	return v.Project(v.Pool(xs, cols, rows))
 }
 
