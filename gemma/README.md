@@ -214,6 +214,22 @@ Two things the file says that the reference source does not:
   folds it into that weight — one multiplication instead of two thousand eight
   hundred and sixteen.
 
+Its projector declares `gemma4v` and took no code at all: `LoadVisionConfig`
+reads twenty-seven blocks of 1152 out of the file as it reads E2B's sixteen of
+768. Its tower ends up twenty-eight thousandths of the range from ggml's
+against E2B's eight, and that is depth rather than a missing step — every block
+started from the reference's own input lands within two ten-thousandths, the
+same bar E2B's blocks hold to, the pooling is exact to a part in ten million,
+and the same instrument run over E2B draws the same curve eleven blocks
+shorter. `TestMoEVisionBlocks` and `TestMoEVisionPoolAndProject` are that
+measurement, kept so the next person does not have to take it on trust.
+
+The one place the two projectors differ in arithmetic is the standardisation:
+this one carries `v.std_bias` and `v.std_scale`, and subtracting a bias from a
+value near it loses digits — a few parts in a hundred thousand, where E2B's
+projection is a part in ten million. llama.cpp subtracts in float32 and loses
+the same ones.
+
 The expert stacks are the one kind of matrix `Repack` leaves alone. Only eight
 of a hundred and twenty-eight are read per position, so the interleaved second
 copy that pays for itself elsewhere would double the resident weights to speed

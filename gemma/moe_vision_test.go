@@ -8,6 +8,7 @@ package gemma
 // written for this model, and nothing had to be.
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
@@ -60,12 +61,15 @@ func TestMoEVisionTowerMatchesTheReference(t *testing.T) {
 		t.Fatalf("this engine made %d values, the reference %d", len(flat), len(want))
 	}
 	// This tower ends up further from the reference than the E2B's does:
-	// thirty-six thousandths of the range against eight. Where that comes from
-	// is not settled — TestMoEVisionStages shows the resize and the patch
-	// embedding agreeing to a part in a thousand, so it accumulates through
-	// the twenty-seven blocks rather than starting somewhere nameable.
+	// thirty-six thousandths of the range against eight. It is depth, and the
+	// measurement is in TestMoEVisionBlocks and TestMoEVisionStages below —
+	// every block on its own lands within two ten-thousandths, the same as
+	// E2B's do, the pooling is exact to a part in ten million, and what is
+	// left is twenty-seven residual blocks feeding one another where E2B has
+	// sixteen. Run the same instrument over E2B and the curve has the same
+	// shape, ending at eight thousandths instead of twenty-eight.
 	//
-	// What it costs is settled, and by the only test that can settle it:
+	// What it costs is settled by the only test that can settle it:
 	// TestMoEVisionGeneration draws llama.cpp's own answer about the picture,
 	// token for token.
 	closeRelative(t, "the whole tower", flat, want, 5e-2)
@@ -124,6 +128,82 @@ func TestMoEVisionGeneration(t *testing.T) {
 		last = m.Forward(want, pos)
 		pos++
 	}
+}
+
+// TestMoEVisionBlocks starts each block from the reference's own input, so a
+// divergence is attributed to the block it happened in rather than to
+// everything before it. This is the test that would catch a step this engine
+// had missed; that it passes at a bar E2B's blocks also hold to is why the
+// whole tower's looser number is depth and not a bug.
+func TestMoEVisionBlocks(t *testing.T) {
+	f := loadVisionFixture(t, "vision26")
+	g, err := tensors.OpenGGUF(mmproj26BPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	cfg, err := LoadVisionConfig(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := LoadVisionWeights(g, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tower := NewVisionTower(cfg, w)
+
+	_, cols, rows := cfg.Prepare(testImage(t))
+	s := tower.takeScratch(cols * rows)
+	for i := 0; i < cfg.Blocks; i++ {
+		name := "pos_embd"
+		if i > 0 {
+			name = fmt.Sprintf("layer_out-%d", i-1)
+		}
+		xs := append([]float32(nil), f.tensor(t, name)...)
+		tower.Block(i, xs, cols, s)
+		closeRelative(t, fmt.Sprintf("block %d", i), xs,
+			f.tensor(t, fmt.Sprintf("layer_out-%d", i)), 1e-3)
+	}
+}
+
+// TestMoEVisionPoolAndProject takes each of the last two stages from the
+// reference's own input, which is what separates their arithmetic from what
+// the blocks accumulated.
+//
+// The projection is a few parts in a hundred thousand where E2B's is a part in
+// ten million, and the difference is the one step E2B does not have: this
+// projector standardises before the norm, and subtracting a bias from a value
+// near it loses digits. llama.cpp subtracts in float32 too and loses the same
+// ones. Beside the twenty-eight thousandths the blocks bring, it is nothing.
+func TestMoEVisionPoolAndProject(t *testing.T) {
+	f := loadVisionFixture(t, "vision26")
+	g, err := tensors.OpenGGUF(mmproj26BPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	cfg, err := LoadVisionConfig(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := LoadVisionWeights(g, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tower := NewVisionTower(cfg, w)
+	_, cols, rows := cfg.Prepare(testImage(t))
+
+	// The tower's last output. "result_norm" in this recording belongs to the
+	// text model and is 2816 wide, which is a trap worth one line of comment.
+	last := append([]float32(nil), f.tensor(t, fmt.Sprintf("layer_out-%d", cfg.Blocks-1))...)
+	closeRelative(t, "pooled", tower.Pool(last, cols, rows), f.tensor(t, "pooled"), 1e-6)
+
+	projected := tower.Project(append([]float32(nil), f.tensor(t, "pooled")...))
+	flat := make([]float32, 0, len(projected)*cfg.ProjDim)
+	for _, r := range projected {
+		flat = append(flat, r...)
+	}
+	closeRelative(t, "projected", flat, f.tensor(t, "projected"), 1e-3)
 }
 
 // TestMoEVisionStages walks the tower one stage at a time, so that a gap at
