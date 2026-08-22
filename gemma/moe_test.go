@@ -45,6 +45,7 @@ func randomMoEBlock(cfg *Config, seed int64) *BlockWeights {
 		Router:       nn.Matrix{Data: f32(cfg.Experts * cfg.Dim), Quant: nn.F32, Rows: cfg.Experts, Cols: cfg.Dim},
 		RouterScale:  gains(cfg.Dim),
 		PreFFWNorm2:  gains(cfg.Dim),
+		PostFFWNorm:  gains(cfg.Dim),
 		PostFFWNorm1: gains(cfg.Dim),
 		PostFFWNorm2: gains(cfg.Dim),
 		GateUpExps:   stack(2*cfg.ExpertFFN, cfg.Dim),
@@ -305,11 +306,20 @@ func TestMoEHalfAddsBothBranches(t *testing.T) {
 	if same {
 		t.Fatal("the two branches computed the same thing; one is reading the other's buffer")
 	}
-	// The norms are inside each branch, so the sum is an exact identity.
+	// The sum of the two branches goes through the block's own post-norm
+	// before joining the stream — the norm a dense block applies to its one
+	// branch. Leaving it out is a block whose every inner waypoint matches the
+	// reference and whose output does not, so the identity is pinned here.
+	combined := make([]float32, cfg.Dim)
+	for i := range combined {
+		combined[i] = shared[i] + experts[i]
+	}
+	nn.RMSNormPlain(combined, bw.PostFFWNorm, cfg.Eps)
 	for i := range xs[0] {
-		want := resid[i] + shared[i] + experts[i]
+		want := resid[i] + combined[i]
 		if d := math.Abs(float64(want - xs[0][i])); d > 1e-5 {
-			t.Fatalf("element %d: the block gave %v, the two branches sum to %v", i, xs[0][i], want)
+			t.Fatalf("element %d: the block gave %v, the branches under post_ffw_norm give %v",
+				i, xs[0][i], want)
 		}
 	}
 }

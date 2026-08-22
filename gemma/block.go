@@ -147,9 +147,13 @@ func denseHalf(cfg *Config, bc BlockConfig, bw *BlockWeights, s *Scratch, xs [][
 //
 // Two branches leave the same residual: the dense feed forward through
 // ffn_norm and post_ffw_norm_1, the experts through pre_ffw_norm_2 and
-// post_ffw_norm_2. Their outputs are added, and the sum joins the stream —
-// models/gemma4.cpp builds it in that order, and calls the result
-// ffn_moe_combined.
+// post_ffw_norm_2. Their outputs are added — models/gemma4.cpp calls that
+// ffn_moe_combined — and the sum then goes through post_ffw_norm, the same
+// norm a dense block applies to its one branch, before joining the stream.
+//
+// That outer norm is why a mixture block carries three post-norms and not
+// two, and it is the whole of the difference between a block whose every
+// inner waypoint matches the reference and one whose output does.
 //
 // The dense branch is the shared expert. It reads exactly what denseHalf
 // reads, under the same norm, which is why the shared expert needs no code of
@@ -185,12 +189,17 @@ func moeHalf(cfg *Config, bc BlockConfig, bw *BlockWeights, s *Scratch, xs [][]f
 	experts := s.moeExperts[:batch]
 	ExpertFFN(cfg, bw, s, expIn, experts)
 
+	combined := s.ffn[:batch]
 	nn.InParallel(batch, batch*cfg.Dim*perPosition, func(first, last int) {
 		for t := first; t < last; t++ {
 			nn.RMSNormPlain(shared[t], bw.PostFFWNorm1, cfg.Eps)
 			nn.RMSNormPlain(experts[t], bw.PostFFWNorm2, cfg.Eps)
+			for i := range combined[t] {
+				combined[t][i] = shared[t][i] + experts[t][i]
+			}
+			nn.RMSNormPlain(combined[t], bw.PostFFWNorm, cfg.Eps)
 			for i := range xs[t] {
-				xs[t][i] = s.resid[t][i] + shared[t][i] + experts[t][i]
+				xs[t][i] = s.resid[t][i] + combined[t][i]
 			}
 		}
 	})
