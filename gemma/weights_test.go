@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/ThiraSoft/golem/nn"
+	"github.com/ThiraSoft/golem/tensors"
 )
 
 func TestLoadWeightsE2B(t *testing.T) {
@@ -92,5 +93,77 @@ func TestLoadWeightsRejectsAMissingTensor(t *testing.T) {
 	delete(g.Tensors, "blk.3.attn_k.weight")
 	if _, err := LoadWeights(g, cfg); err == nil {
 		t.Fatal("a missing key projection should be an error")
+	}
+}
+
+// TestExpertStackIsAView pins that slicing one expert out of the
+// three-dimensional tensor costs no copy and lands on the right bytes.
+func TestExpertStackIsAView(t *testing.T) {
+	e := ExpertStack{
+		Data:  make([]byte, 3*2*18), // three experts, two rows, one Q4_0 block each
+		Quant: nn.Q4_0,
+		Rows:  2,
+		Cols:  32,
+		Count: 3,
+	}
+	for i := range e.Data {
+		e.Data[i] = byte(i)
+	}
+	m := e.At(1)
+	if m.Rows != 2 || m.Cols != 32 || m.Quant != nn.Q4_0 {
+		t.Fatalf("the view is %dx%d %s", m.Rows, m.Cols, m.Quant)
+	}
+	if len(m.Data) != 36 {
+		t.Fatalf("the view is %d bytes, expected 36", len(m.Data))
+	}
+	if &m.Data[0] != &e.Data[36] {
+		t.Fatal("the view does not begin where the second expert does")
+	}
+	if &e.At(2).Data[35] != &e.Data[107] {
+		t.Fatal("the last expert does not end at the last byte")
+	}
+}
+
+// TestLoad26BExpertShapes checks the expert tensors against the geometry. A
+// stride read from the wrong dimension is the failure this catches, and it is
+// one that produces numbers rather than an error.
+func TestLoad26BExpertShapes(t *testing.T) {
+	g, err := tensors.OpenGGUF(model26BPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	cfg, err := LoadConfig(g, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := LoadWeights(g, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, bc := range cfg.Blocks {
+		b := &w.Blocks[i]
+		if !bc.MoE {
+			if b.Router.Rows != 0 {
+				t.Fatalf("block %d is dense and carries a router", i)
+			}
+			continue
+		}
+		if b.Router.Rows != cfg.Experts || b.Router.Cols != cfg.Dim {
+			t.Fatalf("block %d: router is %dx%d, expected %dx%d",
+				i, b.Router.Rows, b.Router.Cols, cfg.Experts, cfg.Dim)
+		}
+		if len(b.RouterScale) != cfg.Dim {
+			t.Fatalf("block %d: the router scale has %d entries for a width of %d",
+				i, len(b.RouterScale), cfg.Dim)
+		}
+		if b.GateExps.Count != cfg.Experts || b.GateExps.Rows != cfg.ExpertFFN || b.GateExps.Cols != cfg.Dim {
+			t.Fatalf("block %d: gate experts are %d of %dx%d, expected %d of %dx%d",
+				i, b.GateExps.Count, b.GateExps.Rows, b.GateExps.Cols, cfg.Experts, cfg.ExpertFFN, cfg.Dim)
+		}
+		if b.DownExps.Rows != cfg.Dim || b.DownExps.Cols != cfg.ExpertFFN {
+			t.Fatalf("block %d: down experts are %dx%d, expected %dx%d",
+				i, b.DownExps.Rows, b.DownExps.Cols, cfg.Dim, cfg.ExpertFFN)
+		}
 	}
 }
