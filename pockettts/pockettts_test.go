@@ -95,6 +95,13 @@ func testFullSynthesis(t *testing.T, set string) {
 	// next, so that the rounding gap does not repeat, it accumulates — from 5e-6
 	// on the first frame to 3e-4 on the eighth. It is numerical drift, not a
 	// divergence of computation: the stages, tested in isolation, stay at 5e-7.
+	//
+	// What that leaves is worth writing down, because it is what tells whoever
+	// touches nn's kernels how much room is left: the worst frame here sits at
+	// 0.194% of the scale, against the 0.5% below. It was 0.159% before
+	// nn.MatMatBF16Rows learned to block its rows and columns, which changed
+	// the order of its sums and therefore what this engine emits. Two engines
+	// share that kernel and this is the narrower of them.
 	for i := 0; i < f.Frames; i++ {
 		start, end := i*mimi.SamplesPerFrame, (i+1)*mimi.SamplesPerFrame
 		reference.Compare(t, "audio", sound[start:end], wantAudio[start:end], 5e-3)

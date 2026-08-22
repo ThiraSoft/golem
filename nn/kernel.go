@@ -109,6 +109,21 @@ func panelOf(inputs int) int {
 }
 
 // MatMatBF16Rows is the same for rows [start, end) on the caller's thread.
+//
+// Two engines read this one, and they are not held to the same bar. Gemma's
+// vision tower is checked against llama.cpp, whose own arithmetic is float32
+// sums of bfloat16 products and whose fixtures leave room for a different
+// order of them. Pocket TTS is checked against PyTorch, frame by frame,
+// through a loop that feeds each frame's latent into the next — so a rounding
+// difference there does not merely appear, it accumulates.
+//
+// The blocking below changes the order the sums are taken in, and therefore
+// changes what the speech engine emits. It was measured before it was kept:
+// the synthesis it produces is indistinguishable by ear, it is six percent
+// faster on identical work, and its worst gap against PyTorch moved from
+// 0.159% of the scale to 0.194%, against a bar of 0.5%. Anyone widening this
+// kernel again should measure that gap again — it is the narrower of the two
+// consumers, and it is the one that will run out of room first.
 func MatMatBF16Rows(w []byte, x []float32, outputs, inputs, batch int, y []float32, start, end int) {
 	weights := unsafe.Slice((*uint16)(unsafe.Pointer(&w[0])), len(w)/2)
 

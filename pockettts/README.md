@@ -61,12 +61,21 @@ voice `alba`, and the same end-of-speech threshold on both sides:
 
 | | golem | pocket_tts, PyTorch |
 |---|---:|---:|
-| `french_24l` — 24 transformer layers | **×2.82** real time | ×1.27 |
-| `english_2026-01` — 6 layers | **×6.55** | ×4.03 |
+| `french_24l` — 24 transformer layers | **×2.94** real time | ×1.27 |
+| `english_2026-01` — 6 layers | **×6.81** | ×4.03 |
 | cloning: encoding a recording | **×7.72** real time | — |
 | first sound, `french_24l` | **175 ms** | 320 ms |
 | first sound, `english_2026-01` | **66 ms** | 90 ms |
 | ready to speak, warm | **30 ms** | 3.5 s |
+
+The two speaking figures were ×2.82 and ×6.55 until `nn.MatMatBF16Rows` learned
+to block its rows and columns for Gemma's vision tower. That kernel is shared,
+and the six percent it gave this engine was measured on identical work — the
+same text and the same seed, both sides producing 14.2 seconds of sound — not
+on the benchmark above, whose output length moves with the arithmetic. What the
+same change cost is written beside the tolerance in `pockettts_test.go`: the
+worst frame against PyTorch went from 0.159% of the scale to 0.194%, against a
+bar of 0.5%.
 
 ```bash
 go test ./pockettts -run xxx -bench 'Synthesis|FirstFrame' -benchtime 8x
