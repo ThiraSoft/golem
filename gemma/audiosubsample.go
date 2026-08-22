@@ -38,12 +38,12 @@ func audioPositions(frames int) int {
 // preEncode runs the subsampling over a mel of `frames` frames, laid out
 // mel-major — value (m, t) at mel[m*frames+t] — and returns n positions of
 // Cfg.Dim, the position the slower index.
-func (a *AudioTower) preEncode(melIn []float32, frames int) ([]float32, int) {
+func (a *AudioTower) preEncode(melIn []float32, frames int, s *audioScratch) []float32 {
 	// The convolution wants the grid the other way round from the front end:
 	// the frequency the faster index, where the mel comes mel-major. llama.cpp
 	// opens its graph with exactly this transpose.
 	freq, time := a.Cfg.MelBins, frames
-	cur := make([]float32, freq*time)
+	cur := s.grid[:freq*time]
 	for m := 0; m < freq; m++ {
 		row := melIn[m*frames:]
 		for t := 0; t < time; t++ {
@@ -55,7 +55,7 @@ func (a *AudioTower) preEncode(melIn []float32, frames int) ([]float32, int) {
 	for i := range a.W.Conv {
 		c := a.W.Conv[i]
 		outFreq, outTime := (freq-1)/2+1, (time-1)/2+1
-		next := make([]float32, outFreq*outTime*c.Out)
+		next := s.conv[i][:outFreq*outTime*c.Out]
 		a.subsample(cur, next, c, freq, time, channels, outFreq, outTime)
 		cur, freq, time, channels = next, outFreq, outTime, c.Out
 	}
@@ -65,9 +65,9 @@ func (a *AudioTower) preEncode(melIn []float32, frames int) ([]float32, int) {
 	// the channel the faster index — which is what the points, running
 	// frequency-fastest, already are. So this is a copy, and it is here rather
 	// than folded into the caller because the projection wants a matrix.
-	out := make([]float32, time*a.Cfg.Dim)
-	a.W.InputProj.apply(cur[:time*freq*channels], out, time)
-	return out, time
+	out := s.pre[:time*a.Cfg.Dim]
+	a.W.InputProj.apply(cur[:time*freq*channels], s.held[:time*a.W.InputProj.Inputs], out, time)
+	return out
 }
 
 // subsample is one 3x3 stride-2 convolution with its LayerNorm and its ReLU,
@@ -169,8 +169,7 @@ func layerNorm(x, gain []float32, eps float32) {
 // product: written inside the loop over the output channels it is applied a
 // thousand times to every value instead of once, which is a thousand times
 // nothing per value and half a second per recording.
-func (l AudioLinear) apply(x, y []float32, batch int) {
-	held := make([]float32, batch*l.Inputs)
+func (l AudioLinear) apply(x, held, y []float32, batch int) {
 	lo, hi := l.Clamp.InMin, l.Clamp.InMax
 	nn.InParallel(len(held), len(held), func(first, last int) {
 		for i := first; i < last; i++ {

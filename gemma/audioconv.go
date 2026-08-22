@@ -31,7 +31,7 @@ func (a *AudioTower) convModule(b *AudioBlock, x, out []float32, n int, s *audio
 	})
 
 	wide := s.gated[:n*2*dim]
-	b.ConvPW1.Apply(norm, s.wide, wide, n)
+	b.ConvPW1.Apply(norm, s.wideIn, wide, n)
 
 	// The gate. The two halves are the two halves of one row, not two
 	// interleaved sets: the first dim values are the signal and the next dim
@@ -44,31 +44,17 @@ func (a *AudioTower) convModule(b *AudioBlock, x, out []float32, n int, s *audio
 		}
 	})
 
-	// The depthwise convolution wants a channel's frames next to each other,
-	// where everything else here wants a frame's channels next to each other.
-	// One transpose, four zeros of history in front of it, and each channel is
-	// a signal of its own.
-	line := s.transposed[:(n+taps-1)*dim]
-	for i := range line[:(taps-1)*dim] {
-		line[i] = 0
-	}
-	nn.InParallel(dim, n*dim, func(first, last int) {
-		for c := first; c < last; c++ {
-			row := line[c*(n+taps-1)+taps-1:]
-			for p := 0; p < n; p++ {
-				row[p] = gated[p*dim+c]
-			}
-		}
-	})
+	// Depthwise causal convolution with kernel size 5: each channel reads
+	// positions p-4 to p (with zero padding for p-j < 0).
+	// We run directly over channels without full transpose into memory.
 	nn.InParallel(dim, n*dim*taps, func(first, last int) {
 		for c := first; c < last; c++ {
-			row := line[c*(n+taps-1):]
 			k := b.ConvDW[c*taps : (c+1)*taps]
+			var h0, h1, h2, h3 float32
 			for p := 0; p < n; p++ {
-				var sum float32
-				for j := 0; j < taps; j++ {
-					sum += k[j] * row[p+j]
-				}
+				cur := gated[p*dim+c]
+				sum := k[0]*h0 + k[1]*h1 + k[2]*h2 + k[3]*h3 + k[4]*cur
+				h0, h1, h2, h3 = h1, h2, h3, cur
 				out[p*dim+c] = sum
 			}
 		}
@@ -82,5 +68,5 @@ func (a *AudioTower) convModule(b *AudioBlock, x, out []float32, n int, s *audio
 		}
 	})
 	copy(gated, out[:n*dim])
-	b.ConvPW2.Apply(gated, s.wide, out[:n*dim], n)
+	b.ConvPW2.Apply(gated, s.wideIn, out[:n*dim], n)
 }

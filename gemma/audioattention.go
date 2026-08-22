@@ -43,7 +43,7 @@ func (a *AudioTower) attention(b *AudioBlock, x, out []float32, n int, s *audioS
 	})
 
 	q, k, v := s.q[:n*dim], s.k[:n*dim], s.v[:n*dim]
-	ApplyShared([]VisionLinear{b.Q, b.K, b.V}, norm, s.wide, [][]float32{q, k, v}, n)
+	ApplyShared([]VisionLinear{b.Q, b.K, b.V}, norm, s.wideIn, [][]float32{q, k, v}, n)
 
 	// The scales llama.cpp applies to the operands rather than to the scores:
 	// the usual one over the root of the head width, divided by ln 2 because
@@ -80,7 +80,7 @@ func (a *AudioTower) attention(b *AudioBlock, x, out []float32, n int, s *audioS
 	// The chunk the blocking rounded up is dropped, the projection applied,
 	// and the norm that closes the branch. The residual itself is the
 	// caller's.
-	b.Out.Apply(ctx[:n*dim], s.wide, out[:n*dim], n)
+	b.Out.Apply(ctx[:n*dim], s.wideIn, out[:n*dim], n)
 	nn.InParallel(n, n*dim, func(first, last int) {
 		for p := first; p < last; p++ {
 			nn.RMSNormPlain(out[p*dim:(p+1)*dim], b.AttnPostNorm, cfg.Eps)
@@ -94,30 +94,28 @@ func (a *AudioTower) attendOneChunk(b *AudioBlock, q, k, v, rel, ctx, scores []f
 	dim, hd := cfg.Dim, cfg.HeadDim
 	C, P, S, R := cfg.Chunk, cfg.Past, cfg.Context, cfg.RPE
 	relH := rel[h*R*hd:]
+	cap := cfg.Softcap
 
 	for qi := 0; qi < C; qi++ {
 		gq := blk*C + qi
 		if gq >= n {
-			// A query past the end of the signal: its chunk exists because the
-			// blocking rounded up, and nothing reads what it produces.
 			continue
 		}
 		row := scores[qi*S : (qi+1)*S]
 		qh := q[gq*dim+h*hd : gq*dim+(h+1)*hd]
-		cap := cfg.Softcap
+
 		for ki := 0; ki < S; ki++ {
 			gk := blk*C - P + ki
 			if !audioVisible(gq, gk, n, P) {
 				row[ki] = float32(math.Inf(-1))
 				continue
 			}
-			// The content score, and on top of it the relative one: the
-			// distance between the two is the row of the relative table this
-			// pair reads, counted down from the past horizon.
+			dist := gq - gk
 			sum := nn.DotF32(qh, k[gk*dim+h*hd:][:hd]) +
-				nn.DotF32(qh, relH[(P-(gq-gk))*hd:][:hd])
+				nn.DotF32(qh, relH[(P-dist)*hd:][:hd])
 			row[ki] = cap * float32(math.Tanh(float64(sum/cap)))
 		}
+
 		nn.SoftmaxGGML(row)
 
 		dst := ctx[gq*dim+h*hd:][:hd]

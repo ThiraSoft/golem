@@ -9,7 +9,10 @@ func TestSubsamplingMatchesTheReference(t *testing.T) {
 	f := loadAudioFixture(t, "audio")
 	tower := openAudioTower(t)
 	melIn, frames := f.melInput(t)
-	got, n := tower.preEncode(melIn, frames)
+	n := audioPositions(frames)
+	s := tower.takeScratchFor(frames, n)
+	defer tower.putScratch(s)
+	got := tower.preEncode(melIn, frames, s)
 	if want := f.frames(t, "pre_encode"); n != want {
 		t.Fatalf("the subsampling gave %d positions, the reference %d", n, want)
 	}

@@ -30,8 +30,9 @@ func (a *AudioTower) encodeUnified(samples []float32) [][]float32 {
 		}
 	})
 
+	tmp := make([]float32, n*frame)
 	out := make([]float32, n*cfg.ProjDim)
-	a.W.MMProj.Apply(framed, make([]float32, n*frame), out, n)
+	a.W.MMProj.Apply(framed, tmp, out, n)
 
 	rows := make([][]float32, n)
 	for p := range rows {

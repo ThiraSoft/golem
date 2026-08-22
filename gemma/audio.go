@@ -34,16 +34,21 @@ func NewAudioTower(cfg *AudioConfig, w *AudioWeights) *AudioTower {
 // the positions it was made for and grown when a longer chunk arrives, which
 // happens at most once: the first chunk of a recording is the longest one.
 type audioScratch struct {
-	n int
+	n, frames int
+
+	grid    []float32    // MelBins by frames, the mel turned frequency-fastest
+	conv    [2][]float32 // what each subsampling convolution produces
+	pre     []float32    // n by Dim, the tower's input
+	held    []float32    // n by the input projection's width, its clamped input
+	wide    []float32    // n by the output projection's width
 
 	norm, q, k, v []float32 // n by Dim
 	ctx           []float32 // blocks*Chunk by Dim, the attention's answer
 	branch        []float32 // n by Dim, what a branch hands back
-	wide          []float32 // n by max(Dim, FFN), the projections' input
+	wideIn        []float32 // n by max(Dim, FFN), the projections' input
 	ffn           []float32 // n by FFN
 	gated         []float32 // n by 2*Dim, the convolution module's expansion
 	gate          []float32 // n by Dim, what the gating leaves of it
-	transposed    []float32 // Dim by n, the depthwise convolution's layout
 	scores        []float32 // heads*blocks by Chunk*Context
 	rel           []float32 // heads*RPE by HeadDim
 	pos, posTmp   []float32 // RPE by Dim
@@ -51,12 +56,17 @@ type audioScratch struct {
 }
 
 // takeScratch borrows a scratch big enough for n positions.
-func (a *AudioTower) takeScratch(n int) *audioScratch {
+func (a *AudioTower) takeScratch(n int) *audioScratch { return a.takeScratchFor(0, n) }
+
+// takeScratchFor borrows one big enough for a mel of `frames` frames and the n
+// positions it becomes.
+func (a *AudioTower) takeScratchFor(frames, n int) *audioScratch {
 	s, _ := a.scratches.Get().(*audioScratch)
 	if s == nil {
 		s = &audioScratch{}
 	}
 	a.resize(s, n)
+	a.resizeFront(s, frames)
 	return s
 }
 
@@ -78,17 +88,39 @@ func (a *AudioTower) resize(s *audioScratch, n int) {
 	s.v = make([]float32, n*dim)
 	s.ctx = make([]float32, padded*dim)
 	s.branch = make([]float32, n*dim)
-	s.wide = make([]float32, n*max(dim, ffn))
+	s.wideIn = make([]float32, n*max(dim, ffn))
 	s.ffn = make([]float32, n*ffn)
 	s.gated = make([]float32, n*2*dim)
 	s.gate = make([]float32, n*dim)
-	s.gate = make([]float32, n*dim)
-	s.transposed = make([]float32, (n+4)*dim)
 	s.scores = make([]float32, cfg.Heads*blocks*cfg.Chunk*cfg.Context)
 	s.rel = make([]float32, cfg.Heads*cfg.RPE*cfg.HeadDim)
 	s.pos = make([]float32, cfg.RPE*dim)
 	s.posTmp = make([]float32, cfg.RPE*dim)
 	s.posOut = make([]float32, cfg.RPE*dim)
+	s.pre = make([]float32, n*dim)
+	s.held = make([]float32, n*a.W.InputProj.Inputs)
+	s.wide = make([]float32, n*a.W.OutProj.Outputs)
+}
+
+// resizeFront grows what the mel and the two convolutions need, which is sized
+// by the frames of the spectrogram rather than by the positions they become.
+//
+// It is the largest thing here by far: the first convolution's answer is a
+// hundred and twenty-eight planes of a grid half the mel's, twenty-eight
+// megabytes for half a minute of sound. Allocated per recording it was most of
+// what the collector had to do, and the collector was costing more than the
+// spectrogram it was collecting.
+func (a *AudioTower) resizeFront(s *audioScratch, frames int) {
+	if frames == 0 || s.frames >= frames {
+		return
+	}
+	s.frames = frames
+	freq, time := a.Cfg.MelBins, frames
+	s.grid = make([]float32, freq*time)
+	for i := range a.W.Conv {
+		freq, time = (freq-1)/2+1, (time-1)/2+1
+		s.conv[i] = make([]float32, freq*time*a.W.Conv[i].Out)
+	}
 }
 
 // Encode runs the whole front end and encoder over 16 kHz mono samples and
@@ -113,12 +145,13 @@ func (a *AudioTower) Encode(samples []float32) [][]float32 {
 // encodeChunk is one thirty-second chunk's mel through the whole encoder.
 func (a *AudioTower) encodeChunk(melIn []float32, frames int) [][]float32 {
 	cfg := a.Cfg
-	x, n := a.preEncode(melIn, frames)
+	n := audioPositions(frames)
 	if n == 0 {
 		return nil
 	}
-	s := a.takeScratch(n)
+	s := a.takeScratchFor(frames, n)
 	defer a.putScratch(s)
+	x := a.preEncode(melIn, frames, s)
 
 	for i := range a.W.Blocks {
 		a.block(&a.W.Blocks[i], x, n, s)
@@ -127,8 +160,8 @@ func (a *AudioTower) encodeChunk(melIn []float32, frames int) [][]float32 {
 	// The tail: the output projection with its bias, an RMS norm that scales
 	// by mm.a.soft_emb_norm when the file carries one — E2B's does not, and
 	// the norm then stands alone — and the projection into the model's width.
-	wide := make([]float32, n*a.W.OutProj.Outputs)
-	a.W.OutProj.Apply(x[:n*cfg.Dim], s.wide, wide, n)
+	wide := s.wide[:n*a.W.OutProj.Outputs]
+	a.W.OutProj.Apply(x[:n*cfg.Dim], s.wideIn, wide, n)
 	width := a.W.OutProj.Outputs
 	nn.InParallel(n, n*width, func(first, last int) {
 		for p := first; p < last; p++ {
@@ -139,8 +172,10 @@ func (a *AudioTower) encodeChunk(melIn []float32, frames int) [][]float32 {
 			nn.RMSNormPlain(row, a.W.SoftEmbNorm, cfg.Eps)
 		}
 	})
+	// The rows outlive the scratch, so this one is allocated: it is what the
+	// prompt holds until the conversation ends.
 	out := make([]float32, n*cfg.ProjDim)
-	a.W.MMProj.Apply(wide, make([]float32, n*width), out, n)
+	a.W.MMProj.Apply(wide, s.wideIn[:n*width], out, n)
 
 	rows := make([][]float32, n)
 	for p := range rows {
@@ -184,12 +219,12 @@ func (a *AudioTower) halfStepFFN(pre, post []float32, up, down VisionLinear, x [
 		}
 	})
 	hidden := s.ffn[:n*ffn]
-	up.Apply(norm, s.wide, hidden, n)
+	up.Apply(norm, s.wideIn, hidden, n)
 	nn.InParallel(n*ffn, n*ffn*4, func(first, last int) {
 		nn.SiLUGGMLRange(hidden, first, last)
 	})
 	branch := s.branch[:n*dim]
-	down.Apply(hidden, s.wide, branch, n)
+	down.Apply(hidden, s.wideIn, branch, n)
 	nn.InParallel(n, n*dim, func(first, last int) {
 		for p := first; p < last; p++ {
 			nn.RMSNormPlain(branch[p*dim:(p+1)*dim], post, cfg.Eps)

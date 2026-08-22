@@ -1,6 +1,11 @@
 package mel
 
-import "math"
+import (
+	"math"
+	"sync"
+
+	"github.com/ThiraSoft/golem/nn"
+)
 
 // The front end of the Gemma 4 conformer, transcribed from
 // mtmd_audio_preprocessor_gemma4a and log_mel_spectrogram rather than designed
@@ -62,14 +67,8 @@ func Gemma4A(samples []float32) [][]float32 {
 	if len(samples) == 0 {
 		return nil
 	}
-	fft := NewFFT(FFTSize)
-	window := HannPeriodic(Window, FFTSize)
-	filters := Filterbank(Bins, FFTSize, Rate, true)
+	window, filters := gemma4aTables()
 	nfb := FFTSize/2 + 1
-
-	spectrum := make([]complex64, nfb)
-	magnitude := make([]float32, nfb)
-	frame := make([]float32, FFTSize)
 
 	var out [][]float32
 	for off := 0; off < len(samples); off += Chunk {
@@ -89,39 +88,97 @@ func Gemma4A(samples []float32) [][]float32 {
 		if totalPad < padLeft {
 			totalPad = padLeft
 		}
-		padded := make([]float32, totalPad+len(chunk))
+		padded := take(&pads, totalPad+len(chunk))
+		clear(padded)
 		copy(padded[padLeft:], chunk)
 
+		// One frame is a transform, a magnitude and a filterbank, and it
+		// shares nothing with its neighbours: the split is over the frames,
+		// and each core builds the scratch a transform needs — the twiddle
+		// table costs five hundred sines against a frame's hundred and thirty
+		// thousand multiply-adds, so building one per core rather than
+		// per frame is where the line falls.
 		mel := make([]float32, Bins*frames)
-		for t := 0; t < frames; t++ {
-			at := t * Hop
-			for j := range frame {
-				if at+j < len(padded) {
-					frame[j] = window[j] * padded[at+j]
-				} else {
-					frame[j] = 0
+		nn.InParallel(frames, frames*(FFTSize*10+Bins*nfb), func(first, last int) {
+			w, _ := scratches.Get().(*worker)
+			if w == nil {
+				w = &worker{
+					fft:       NewFFT(FFTSize),
+					spectrum:  make([]complex64, nfb),
+					magnitude: make([]float32, nfb),
+					frame:     make([]float32, FFTSize),
 				}
 			}
-			fft.Real(frame, spectrum)
-			for k, c := range spectrum {
-				re, im := real(c), imag(c)
-				// The magnitude, not the power: params.use_magnitude is set
-				// for this projector and for no other Gemma one.
-				magnitude[k] = float32(math.Sqrt(float64(re*re + im*im)))
-			}
-			for m := 0; m < Bins; m++ {
-				row := filters[m*nfb : (m+1)*nfb]
-				var sum float64
-				for k, w := range row {
-					sum += float64(magnitude[k]) * float64(w)
+			defer scratches.Put(w)
+			fft, spectrum, magnitude, frame := w.fft, w.spectrum, w.magnitude, w.frame
+			for t := first; t < last; t++ {
+				at := t * Hop
+				for j := range frame {
+					if at+j < len(padded) {
+						frame[j] = window[j] * padded[at+j]
+					} else {
+						frame[j] = 0
+					}
 				}
-				if sum < Floor {
-					sum = Floor
+				fft.Real(frame, spectrum)
+				for k, c := range spectrum {
+					re, im := real(c), imag(c)
+					// The magnitude, not the power: params.use_magnitude is
+					// set for this projector and for no other Gemma one.
+					magnitude[k] = float32(math.Sqrt(float64(re*re + im*im)))
 				}
-				mel[m*frames+t] = float32(math.Log(sum))
+				for m := 0; m < Bins; m++ {
+					sum := filters.Apply(m, magnitude)
+					if sum < Floor {
+						sum = Floor
+					}
+					mel[m*frames+t] = float32(math.Log(sum))
+				}
 			}
-		}
+		})
 		out = append(out, mel)
+		pads.Put(&padded)
 	}
 	return out
+}
+
+// The window and the filterbank depend on nothing but the constants above, and
+// building them is five milliseconds against a spectrogram's three. They are
+// built once.
+var (
+	gemma4aOnce   sync.Once
+	gemma4aWindow []float32
+	gemma4aBank   *Bank
+)
+
+func gemma4aTables() ([]float32, *Bank) {
+	gemma4aOnce.Do(func() {
+		gemma4aWindow = HannPeriodic(Window, FFTSize)
+		gemma4aBank = NewBank(Bins, FFTSize, Rate, true)
+	})
+	return gemma4aWindow, gemma4aBank
+}
+
+// worker is what one core needs to turn frames into rows of the spectrogram.
+// A transform owns scratch and is not safe for two goroutines, so each core
+// takes one; the pool hands the memory back when nobody is transcribing.
+type worker struct {
+	fft       *FFT
+	spectrum  []complex64
+	magnitude []float32
+	frame     []float32
+}
+
+var (
+	scratches sync.Pool
+	pads      sync.Pool
+)
+
+// take borrows a buffer of at least n from a pool, and grows it when the
+// longest chunk so far was shorter.
+func take(p *sync.Pool, n int) []float32 {
+	if b, _ := p.Get().(*[]float32); b != nil && cap(*b) >= n {
+		return (*b)[:n]
+	}
+	return make([]float32, n)
 }

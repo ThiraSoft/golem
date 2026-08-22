@@ -244,8 +244,15 @@ int main(int argc, char ** argv) {
     mtext.add_special   = true;
     mtext.parse_special = true;
 
+    // Timed, because the front end is on this side of the line: mtmd computes
+    // the mel here and the "slice encoded in" line further down covers only
+    // the graph. A comparison against an engine that does both in one call
+    // needs the two numbers.
     mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    const int64_t t_tok = ggml_time_ms();
     if (mtmd_tokenize(vctx, chunks, &mtext, bitmaps, 1)) die("tokenization failed");
+    fprintf(stderr, "dump_audio: preprocessed and tokenized in %lld ms\n",
+            (long long) (ggml_time_ms() - t_tok));
 
     std::vector<llama_token> tokens;
     int audio_start = -1, audio_len = 0;

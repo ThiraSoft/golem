@@ -66,3 +66,56 @@ func HannPeriodic(length, padTo int) []float32 {
 	}
 	return w
 }
+
+// Bank is a filterbank stored by the span each filter is not zero over.
+//
+// The dense matrix Filterbank returns is 128 rows of 257, and all but two of
+// the values in any column are zero: the triangles rise to one and fall to
+// their neighbours' centres, so a bin is covered twice and no more. Walking
+// the whole row costs sixty-four times what the filter is worth, which for
+// seventeen seconds of speech is a hundred million multiply-adds against a
+// million. The reference implementation walks the whole row; this does not,
+// and the two agree because the values skipped are zeros.
+type Bank struct {
+	Weights  []float32 // each filter's span, laid end to end
+	Offset   []int     // where filter m's span starts in Weights
+	From, To []int     // the bins filter m covers, [From, To)
+}
+
+// NewBank builds the same filters Filterbank does, kept by their spans.
+func NewBank(bins, fftSize, rate int, htk bool) *Bank {
+	dense := Filterbank(bins, fftSize, rate, htk)
+	nBins := fftSize/2 + 1
+	b := &Bank{
+		Offset: make([]int, bins),
+		From:   make([]int, bins),
+		To:     make([]int, bins),
+	}
+	for m := 0; m < bins; m++ {
+		row := dense[m*nBins : (m+1)*nBins]
+		from, to := 0, 0
+		for k, v := range row {
+			if v != 0 {
+				if to == 0 {
+					from = k
+				}
+				to = k + 1
+			}
+		}
+		b.Offset[m] = len(b.Weights)
+		b.From[m], b.To[m] = from, to
+		b.Weights = append(b.Weights, row[from:to]...)
+	}
+	return b
+}
+
+// Apply returns filter m's energy over a spectrum's magnitudes.
+func (b *Bank) Apply(m int, magnitude []float32) float64 {
+	w := b.Weights[b.Offset[m] : b.Offset[m]+b.To[m]-b.From[m]]
+	x := magnitude[b.From[m]:b.To[m]]
+	var sum float64
+	for k, v := range w {
+		sum += float64(x[k]) * float64(v)
+	}
+	return sum
+}

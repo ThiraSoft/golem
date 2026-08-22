@@ -22,9 +22,11 @@ func TestEveryConformerBlockMatchesTheReference(t *testing.T) {
 	f := loadAudioFixture(t, "audio")
 	tower := openAudioTower(t)
 	melIn, frames := f.melInput(t)
-	x, n := tower.preEncode(melIn, frames)
+	n := audioPositions(frames)
+	s := tower.takeScratchFor(frames, n)
+	defer tower.putScratch(s)
+	x := tower.preEncode(melIn, frames, s)
 	closeRelative(t, "pre_encode", x[:n*tower.Cfg.Dim], f.tensor(t, "pre_encode"), 1e-5)
-	s := tower.takeScratch(n)
 	for i := range tower.W.Blocks {
 		tolerance := float32(1.5e-3)
 		if i == len(tower.W.Blocks)-1 {
