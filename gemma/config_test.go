@@ -191,3 +191,63 @@ func TestLoadConfigRejectsAnotherArchitecture(t *testing.T) {
 		t.Fatal("a llama file should not load as a Gemma configuration")
 	}
 }
+
+// model26BPath names the 26B A4B, whose feed forward is a mixture of experts.
+// A machine without it skips, as with the 12B.
+func model26BPath(tb testing.TB) string {
+	tb.Helper()
+	path := os.Getenv("GOLEM_MODEL_26B")
+	if path == "" {
+		tb.Skip("set GOLEM_MODEL_26B to a Gemma 4 26B A4B GGUF to run this test")
+	}
+	if _, err := os.Stat(path); err != nil {
+		tb.Skipf("GOLEM_MODEL_26B names %s, which is not there", path)
+	}
+	return path
+}
+
+// TestConfigDenseHasNoExperts pins that a checkpoint without the expert keys
+// reads as dense rather than as a mixture with nothing in it.
+func TestConfigDenseHasNoExperts(t *testing.T) {
+	g := openModel(t)
+	cfg, err := LoadConfig(g, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Experts != 0 || cfg.ExpertsUsed != 0 || cfg.ExpertFFN != 0 {
+		t.Fatalf("E2B declares experts: %d, %d used, %d wide",
+			cfg.Experts, cfg.ExpertsUsed, cfg.ExpertFFN)
+	}
+	for _, b := range cfg.Blocks {
+		if b.MoE {
+			t.Fatalf("block %d of E2B carries a router", b.Index)
+		}
+	}
+}
+
+// TestConfig26BExperts reads the geometry of the mixture out of the file.
+func TestConfig26BExperts(t *testing.T) {
+	g, err := tensors.OpenGGUF(model26BPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	cfg, err := LoadConfig(g, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Experts != 128 || cfg.ExpertsUsed != 8 || cfg.ExpertFFN != 704 {
+		t.Fatalf("experts: %d, %d used, %d wide; expected 128, 8, 704",
+			cfg.Experts, cfg.ExpertsUsed, cfg.ExpertFFN)
+	}
+	moe := 0
+	for _, b := range cfg.Blocks {
+		if b.MoE {
+			moe++
+		}
+	}
+	if moe == 0 {
+		t.Fatal("no block carries a router")
+	}
+	t.Logf("%d of %d blocks are mixture blocks", moe, len(cfg.Blocks))
+}

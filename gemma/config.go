@@ -32,17 +32,24 @@ type BlockConfig struct {
 	OwnsKV     bool
 	KVSource   int  // the block whose cache this one reads; Index when OwnsKV
 	ValueIsKey bool // no value projection: the key projection serves as both
+	MoE        bool // a router, and a second feed forward beside the dense one
 }
 
 type Config struct {
-	Arch         string
-	Dim          int
-	Vocab        int
-	Eps          float32
-	PLEDim       int // 0 when the model has no per-layer embeddings
-	LogitSoftcap float32
-	MaxContext   int
-	Blocks       []BlockConfig
+	Arch   string
+	Dim    int
+	Vocab  int
+	Eps    float32
+	PLEDim int // 0 when the model has no per-layer embeddings
+	// Experts, ExpertsUsed and ExpertFFN are zero on a checkpoint whose feed
+	// forward is dense. The 26B A4B declares a hundred and twenty-eight
+	// experts of which eight are read per position, each seven hundred and
+	// four wide, beside a shared expert that is the ordinary dense feed
+	// forward and goes on using FFN.
+	Experts, ExpertsUsed, ExpertFFN int
+	LogitSoftcap                    float32
+	MaxContext                      int
+	Blocks                          []BlockConfig
 	// Sampling is what the file asks to be sampled with. A checkpoint that
 	// declares none of the three keys gets sample.Defaults().
 	Sampling sample.Params
@@ -174,6 +181,15 @@ func LoadConfig(g *tensors.GGUF, maxContext int) (*Config, error) {
 	if v, err := g.Uint32(key("embedding_length_per_layer_input")); err == nil {
 		cfg.PLEDim = int(v)
 	}
+	if v, err := g.Uint32(key("expert_count")); err == nil {
+		cfg.Experts = int(v)
+	}
+	if v, err := g.Uint32(key("expert_used_count")); err == nil {
+		cfg.ExpertsUsed = int(v)
+	}
+	if v, err := g.Uint32(key("expert_feed_forward_length")); err == nil {
+		cfg.ExpertFFN = int(v)
+	}
 	if v, err := g.Float32(key("final_logit_softcapping")); err == nil {
 		cfg.LogitSoftcap = v
 	}
@@ -250,6 +266,18 @@ func LoadConfig(g *tensors.GGUF, maxContext int) (*Config, error) {
 			// reads the same absence the same way.
 			_, hasV := g.Tensors[fmt.Sprintf("blk.%d.attn_v.weight", i)]
 			b.ValueIsKey = !hasV
+		}
+		// A mixture block is one that carries a router. llama.cpp decides the
+		// same way — models/gemma4.cpp reads is_moe_layer as ffn_gate_inp
+		// being present — because the pattern of mixture blocks is in no key.
+		if _, ok := g.Tensors[fmt.Sprintf("blk.%d.ffn_gate_inp.weight", i)]; ok {
+			b.MoE = true
+			if cfg.Experts == 0 || cfg.ExpertsUsed == 0 || cfg.ExpertFFN == 0 {
+				return nil, fmt.Errorf("block %d has a router and the file declares no expert geometry", i)
+			}
+			if cfg.ExpertsUsed > cfg.Experts {
+				return nil, fmt.Errorf("the file uses %d of %d experts", cfg.ExpertsUsed, cfg.Experts)
+			}
 		}
 		if b.Heads%b.KVHeads != 0 {
 			return nil, fmt.Errorf("block %d: %d query heads do not divide among %d key-value heads", i, b.Heads, b.KVHeads)
