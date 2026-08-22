@@ -96,6 +96,17 @@ are the same, the span is attended to in both directions the same way, and
 were given. `VisionConfig.Unified` is read from the file, and it is the only
 place the difference is a branch.
 
+The working memory is lent rather than made. One image's scratch is eighty
+megabytes — twelve buffers of patches by width, and a feed-forward tile that is
+four times as wide again — and the tower used to allocate it per picture and
+throw it away, along with two small buffers per core *per block* for the
+attention. Both are now taken from a reserve and given back: `sync.Pool` for
+the scratch, because a server encodes several pictures at once and two
+encodings sharing one buffer would corrupt each other, and a pool hands the
+memory back to the collector when an idle server stops asking. A picture
+allocates 22 megabytes where it allocated 103, and the tower went from 0.77
+seconds to 0.72.
+
 Reaching the language model costs two changes to it and no more. A position may
 be handed the row itself instead of a token identifier — the per-layer input of
 such a position is the padding token's, which is what llama.cpp uses for an

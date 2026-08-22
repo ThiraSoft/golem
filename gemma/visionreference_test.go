@@ -151,7 +151,7 @@ func TestVisionBlocksMatchTheReference(t *testing.T) {
 	cfg := tower.Cfg
 
 	_, cols, rows := cfg.Prepare(testImage(t))
-	s := tower.newScratch(cols * rows)
+	s := tower.takeScratch(cols * rows)
 
 	for i := 0; i < cfg.Blocks; i++ {
 		name := "pos_embd"
