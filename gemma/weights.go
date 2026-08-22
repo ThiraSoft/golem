@@ -28,6 +28,47 @@ type BlockWeights struct {
 	InpGate, Proj  nn.Matrix
 	PLENorm        []float32
 	OutScale       float32
+
+	// A mixture block only, and zero on every other. The router reads the
+	// residual rather than either branch's normed input, and its scale vector
+	// stands in for the gain of a norm that has none.
+	Router                     nn.Matrix
+	RouterScale                []float32
+	PreFFWNorm2                []float32
+	PostFFWNorm1, PostFFWNorm2 []float32
+	// GateUpExps holds both halves of one product: an expert's first
+	// ExpertFFN rows are its gate, the next ExpertFFN its up. The file fuses
+	// them and the reference splits them back into two views; keeping the
+	// fusion is one product over 1408 rows rather than two over 704, on an
+	// input read once.
+	GateUpExps, DownExps ExpertStack
+	// DownScale is one scalar per expert, multiplying that expert's whole
+	// output. llama.cpp applies it just before the routing weight, so this
+	// engine folds it into that weight.
+	DownScale []float32
+}
+
+// A stack of expert matrices, kept as the one three-dimensional tensor the
+// file stores rather than split at load time.
+//
+// Splitting would mean thirty blocks times three hundred and eighty-four
+// matrices, and would buy nothing: only eight experts of a hundred and
+// twenty-eight are read per position, so Repack — which pays for itself on a
+// matrix every token reads whole — would double the resident weights to speed
+// up six percent of the rows. At goes to the bytes instead.
+type ExpertStack struct {
+	Data       []byte
+	Quant      nn.Quant
+	Rows, Cols int // one expert's shape: Rows outputs, each reading Cols inputs
+	Count      int
+}
+
+// At is one expert's matrix, as a view over the mapping.
+func (e ExpertStack) At(i int) nn.Matrix {
+	m := nn.Matrix{Quant: e.Quant, Rows: e.Rows, Cols: e.Cols}
+	size := m.RowBytes() * e.Rows
+	m.Data = e.Data[i*size : (i+1)*size]
+	return m
 }
 
 type Weights struct {
@@ -43,6 +84,11 @@ type Weights struct {
 // Repack builds the interleaved form of every matrix a product reads, which
 // nn/pack_q4_0.go describes. The embedding tables are left alone: they are read
 // a row at a time and never multiplied.
+//
+// The expert stacks are left out as well, for a different reason than the
+// embedding tables: they are multiplied, but only eight of a hundred and
+// twenty-eight per position, so a second copy of them would cost more memory
+// than the product it saves.
 //
 // It is a second copy of the weights in memory and a few seconds of work at
 // load time, and it is what makes a prompt a third faster. The matrices are
@@ -77,6 +123,29 @@ func matrix(g *tensors.GGUF, name string) (nn.Matrix, error) {
 		return nn.Matrix{}, fmt.Errorf("tensor %q is %s, which is not a weight format", name, t.DType)
 	}
 	return nn.Matrix{Data: t.Raw, Quant: q, Rows: t.Shape[1], Cols: t.Shape[0]}, nil
+}
+
+// experts binds a three-dimensional tensor. GGUF writes the fastest dimension
+// first, so the shape is inputs, outputs, experts.
+func experts(g *tensors.GGUF, name string) (ExpertStack, error) {
+	t, ok := g.Tensors[name]
+	if !ok {
+		return ExpertStack{}, fmt.Errorf("tensor %q is absent", name)
+	}
+	if len(t.Shape) != 3 {
+		return ExpertStack{}, fmt.Errorf("tensor %q has %d dimensions, expected 3", name, len(t.Shape))
+	}
+	q, ok := nn.QuantOf(t.DType)
+	if !ok {
+		return ExpertStack{}, fmt.Errorf("tensor %q is %s, which is not a weight format", name, t.DType)
+	}
+	e := ExpertStack{Data: t.Raw, Quant: q, Rows: t.Shape[1], Cols: t.Shape[0], Count: t.Shape[2]}
+	row := nn.Matrix{Quant: q, Cols: e.Cols}
+	if want := row.RowBytes() * e.Rows * e.Count; want != len(t.Raw) {
+		return ExpertStack{}, fmt.Errorf("tensor %q holds %d bytes for %d experts of %dx%d, expected %d",
+			name, len(t.Raw), e.Count, e.Rows, e.Cols, want)
+	}
+	return e, nil
 }
 
 // floats copies an F32 tensor out of the mapping.
@@ -173,6 +242,32 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 		if b.PostFFWNorm, err = floats(g, p+"post_ffw_norm.weight"); err != nil {
 			return nil, err
 		}
+		if bc.MoE {
+			if b.Router, err = matrix(g, p+"ffn_gate_inp.weight"); err != nil {
+				return nil, err
+			}
+			if b.RouterScale, err = floats(g, p+"ffn_gate_inp.scale"); err != nil {
+				return nil, err
+			}
+			if b.PreFFWNorm2, err = floats(g, p+"pre_ffw_norm_2.weight"); err != nil {
+				return nil, err
+			}
+			if b.PostFFWNorm1, err = floats(g, p+"post_ffw_norm_1.weight"); err != nil {
+				return nil, err
+			}
+			if b.PostFFWNorm2, err = floats(g, p+"post_ffw_norm_2.weight"); err != nil {
+				return nil, err
+			}
+			if b.GateUpExps, err = experts(g, p+"ffn_gate_up_exps.weight"); err != nil {
+				return nil, err
+			}
+			if b.DownExps, err = experts(g, p+"ffn_down_exps.weight"); err != nil {
+				return nil, err
+			}
+			if b.DownScale, err = floats(g, p+"ffn_down_exps.scale"); err != nil {
+				return nil, err
+			}
+		}
 		if cfg.PLEDim > 0 {
 			if b.InpGate, err = matrix(g, p+"inp_gate.weight"); err != nil {
 				return nil, err
@@ -205,6 +300,33 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 		}
 		if b.Gate.Rows != bc.FFN || b.Down.Cols != bc.FFN {
 			return nil, fmt.Errorf("block %d: feed forward is %d wide, expected %d", i, b.Gate.Rows, bc.FFN)
+		}
+		if bc.MoE {
+			if b.Router.Rows != cfg.Experts || b.Router.Cols != cfg.Dim {
+				return nil, fmt.Errorf("block %d: router is %dx%d, expected %dx%d",
+					i, b.Router.Rows, b.Router.Cols, cfg.Experts, cfg.Dim)
+			}
+			if len(b.RouterScale) != cfg.Dim {
+				return nil, fmt.Errorf("block %d: the router scale has %d entries for a width of %d",
+					i, len(b.RouterScale), cfg.Dim)
+			}
+			if len(b.DownScale) != cfg.Experts {
+				return nil, fmt.Errorf("block %d: the down scale has %d entries for %d experts",
+					i, len(b.DownScale), cfg.Experts)
+			}
+			for _, e := range []struct {
+				name       string
+				stack      ExpertStack
+				rows, cols int
+			}{
+				{"gate and up", b.GateUpExps, 2 * cfg.ExpertFFN, cfg.Dim},
+				{"down", b.DownExps, cfg.Dim, cfg.ExpertFFN},
+			} {
+				if e.stack.Count != cfg.Experts || e.stack.Rows != e.rows || e.stack.Cols != e.cols {
+					return nil, fmt.Errorf("block %d: %s experts are %d of %dx%d, expected %d of %dx%d",
+						i, e.name, e.stack.Count, e.stack.Rows, e.stack.Cols, cfg.Experts, e.rows, e.cols)
+				}
+			}
 		}
 		if len(b.QNorm) != bc.HeadDim {
 			return nil, fmt.Errorf("block %d: query norm has %d entries for a head of %d", i, len(b.QNorm), bc.HeadDim)

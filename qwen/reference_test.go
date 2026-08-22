@@ -6,6 +6,7 @@ package qwen
 import (
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -24,7 +25,9 @@ type logitProbe struct {
 }
 
 type fixture struct {
-	dir       string
+	dir string
+	// Model is the base name of the checkpoint the recording was made from.
+	Model     string                   `json:"model"`
 	Tokens    []int32                  `json:"tokens"`
 	NEmbd     int                      `json:"n_embd"`
 	NLayer    int                      `json:"n_layer"`
@@ -234,3 +237,35 @@ func TestFixturesAreReadable(t *testing.T) {
 }
 
 func itoa(i int) string { return strconv.Itoa(i) }
+
+// modelMismatch answers whether this fixture was recorded from a checkpoint
+// other than the one about to be read, on the base name alone.
+func (f *fixture) modelMismatch(path string) error {
+	if f.Model == "" || filepath.Base(path) == f.Model {
+		return nil
+	}
+	return fmt.Errorf("these fixtures were recorded from %s, and %s was opened instead",
+		f.Model, filepath.Base(path))
+}
+
+// TestFixturesNameTheirCheckpoint is the guard this package earned the hard
+// way. GOLEM_MODEL_QWEN pointed at the 4B once; testdata/qwen/layers was
+// recorded from the 0.6B, and nine tests failed with "activation length
+// mismatch" from a function that knows nothing about checkpoints. The
+// recordings have always named their model. Now something reads it.
+func TestFixturesNameTheirCheckpoint(t *testing.T) {
+	for _, c := range []struct{ dir, env string }{
+		{"layers", "GOLEM_MODEL_QWEN"},
+		{"long", "GOLEM_MODEL_QWEN"},
+		{"layers_q4", "GOLEM_MODEL_QWEN_Q4"},
+	} {
+		path := os.Getenv(c.env)
+		if path == "" {
+			continue
+		}
+		f := loadFixture(t, c.dir)
+		if err := f.modelMismatch(path); err != nil {
+			t.Errorf("%s: %s names the wrong checkpoint: %v", c.dir, c.env, err)
+		}
+	}
+}

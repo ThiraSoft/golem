@@ -36,6 +36,35 @@ type Scratch struct {
 	pe    [][]float32 // the stream before the per-layer fold, Dim
 	up    [][]float32 // the ungated half of the feed forward, at most maxFFN
 
+	// The mixture's buffers. Route and ExpertFFN run once per block per
+	// token, so nothing here is allocated on that path: the two batches are
+	// per position, because an expert's matrix is read for one position and
+	// no other, and a column taken from a wider batch would be strided.
+	expIDs     [][]int32
+	expWeights [][]float32
+	expLogits  [][]float32
+	// These are per unit of work, and a unit is one expert of one position:
+	// ExpertsUsed of them per position, so that decoding one token has eight
+	// pieces to share out rather than one. expGateUp holds both halves of the
+	// first product, the gate in the first ExpertFFN elements and the up in
+	// the next; expPartial is that expert's own output, which the reduction
+	// weights and sums.
+	expGateUp  [][]float32
+	expPartial [][]float32
+	// The same two rows, each wrapped in the slice of one that MatVecRows
+	// takes. The wrapper does not escape, so building it in the loop would
+	// cost nothing; it is here because the loop reads better without it.
+	expGateUpRow  [][][]float32
+	expPartialRow [][][]float32
+	routerIn      map[int]*nn.Batch
+	expBranch     map[int]*nn.Batch
+	expertIn      []*nn.Batch
+	expertMid     []*nn.Batch
+	moeShared     [][]float32 // the dense branch's output, Dim
+	moeExperts    [][]float32 // the expert branch's output, Dim
+
+	experts, expertsUsed, expertFFN int
+
 	dim, maxContext               int
 	maxQ, maxKV, maxFFN, maxHeads int
 }
@@ -45,6 +74,8 @@ func NewScratch(cfg *Config) *Scratch {
 		batches:    map[[2]int]*nn.Batch{},
 		ropes:      map[float64][]*nn.RoPETable{},
 		bf16:       map[int]*nn.Batch{},
+		routerIn:   map[int]*nn.Batch{},
+		expBranch:  map[int]*nn.Batch{},
 		dim:        cfg.Dim,
 		maxContext: cfg.MaxContext,
 	}
@@ -54,6 +85,7 @@ func NewScratch(cfg *Config) *Scratch {
 		s.maxKV = max(s.maxKV, b.KVHeads*b.HeadDim)
 		s.maxFFN = max(s.maxFFN, b.FFN)
 	}
+	s.experts, s.expertsUsed, s.expertFFN = cfg.Experts, cfg.ExpertsUsed, cfg.ExpertFFN
 	s.Reserve(1)
 	return s
 }
@@ -76,6 +108,24 @@ func (s *Scratch) Reserve(batch int) {
 	s.pe = rows(batch, s.dim)
 	s.up = rows(batch, s.maxFFN)
 	s.scores = rows(batch*s.maxHeads, s.maxContext)
+	if s.experts > 0 {
+		s.expIDs = ints(batch, s.expertsUsed)
+		s.expWeights = rows(batch, s.expertsUsed)
+		s.expLogits = rows(batch, s.experts)
+		units := batch * s.expertsUsed
+		s.expGateUp = rows(units, 2*s.expertFFN)
+		s.expPartial = rows(units, s.dim)
+		s.expGateUpRow = make([][][]float32, units)
+		s.expPartialRow = make([][][]float32, units)
+		for u := 0; u < units; u++ {
+			s.expGateUpRow[u] = [][]float32{s.expGateUp[u]}
+			s.expPartialRow[u] = [][]float32{s.expPartial[u]}
+		}
+		s.moeShared = rows(batch, s.dim)
+		s.moeExperts = rows(batch, s.dim)
+		s.expertIn = batches(batch, s.dim)
+		s.expertMid = batches(units, s.expertFFN)
+	}
 	for base := range s.ropes {
 		s.ropes[base] = tables(batch)
 	}
@@ -87,6 +137,23 @@ func rows(count, width int) [][]float32 {
 		r[i] = make([]float32, width)
 	}
 	return r
+}
+
+func ints(count, width int) [][]int32 {
+	r := make([][]int32, count)
+	for i := range r {
+		r[i] = make([]int32, width)
+	}
+	return r
+}
+
+// batches allocates one single-column batch per position.
+func batches(count, width int) []*nn.Batch {
+	b := make([]*nn.Batch, count)
+	for i := range b {
+		b[i] = nn.NewBatch(width, 1)
+	}
+	return b
 }
 
 func tables(count int) []*nn.RoPETable {
@@ -139,6 +206,42 @@ func (s *Scratch) RoPE(bc BlockConfig, at []Place, freqs []float32) []*nn.RoPETa
 	}
 	return t
 }
+
+// RouterIn is the batch the router's matrix reads: the residual, normalized
+// without a gain and scaled. It is kept by batch size for the reason Batch is.
+func (s *Scratch) RouterIn(batch int) *nn.Batch {
+	b, ok := s.routerIn[batch]
+	if !ok {
+		b = nn.NewBatch(s.dim, batch)
+		s.routerIn[batch] = b
+	}
+	return b
+}
+
+// ExpertBranch is the expert branch's input: the residual under its own norm.
+// It is a batch of its own rather than the one the dense branch reads, because
+// the two branches are computed one after the other from the same residual and
+// sharing would have the second overwrite what the first still needs.
+func (s *Scratch) ExpertBranch(batch int) *nn.Batch {
+	b, ok := s.expBranch[batch]
+	if !ok {
+		b = nn.NewBatch(s.dim, batch)
+		s.expBranch[batch] = b
+	}
+	return b
+}
+
+// MoEShared and MoEExperts expose the two branches of a mixture block for the
+// first position of the last batch — llama.cpp calls these waypoints ffn_mlp
+// and ffn_moe, and the reference tests stand on them.
+func (s *Scratch) MoEShared() []float32  { return s.moeShared[0] }
+func (s *Scratch) MoEExperts() []float32 { return s.moeExperts[0] }
+
+// ExpertIn is one position's own single-column batch, holding the input every
+// one of its experts reads. ExpertMid is one unit's, holding the gated half
+// that expert's down projection reads.
+func (s *Scratch) ExpertIn(t int) *nn.Batch  { return s.expertIn[t] }
+func (s *Scratch) ExpertMid(u int) *nn.Batch { return s.expertMid[u] }
 
 // Q, K and V expose what the last call to Attention computed for the first
 // position of its batch, for the tests that compare against llama.cpp's

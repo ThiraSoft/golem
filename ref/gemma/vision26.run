@@ -1,0 +1,40 @@
+# The waypoints kept for one image through the 26B A4B's vision tower.
+#
+# The tower does not depend on the language model it is attached to, so this
+# file is vision.run with a different checkpoint behind it. It is a file of its
+# own only because the recording is. The names are the
+# ones models/gemma4v.cpp gives its nodes, so this file changes when that graph
+# does and nothing else has to.
+image       testdata/gemma/shapes.png
+prompt      Describe this image.
+n_predict   16
+
+# Every block: the tower is short enough that keeping all of them costs little,
+# and a divergence then says which block it began in.
+blocks all
+
+global inp_raw_scaled
+global pos_embd
+global pooled
+global projected
+
+# std_scaled exists only if the projector carries the two standardisation
+# tensors, which E2B's does not.
+global_opt std_scaled
+
+require layer_inp_normed
+require Qcur
+require Qcur_norm_per_head
+require Qcur_pos
+require Kcur_pos
+require Vcur_normed
+require attn_out
+require ffn_out
+require layer_out
+
+# And the text model, for the same prompt: the last chunk's activations, which
+# are the ones the answer is drawn from.
+global inp_scaled
+global result_norm
+global l_out-0
+global l_out-4

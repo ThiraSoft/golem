@@ -52,12 +52,14 @@ says where each one comes from.
 
 | | what it runs | against its reference, on the same CPU |
 |---|---|---|
-| [`gemma/`](gemma/) | Gemma 4 E2B and 12B, from a GGUF, pictures included | E2B ×1.01 generating, ×1.24 reading a prompt. 12B ×1.04 and ×1.33. A picture through the vision tower, ×1.50 — vs llama.cpp |
+| [`gemma/`](gemma/) | Gemma 4 E2B, 12B and 26B A4B, from a GGUF, pictures included | E2B ×1.01 generating, ×1.24 reading a prompt. 12B ×1.04 and ×1.33. 26B A4B ×1.06 and ×1.06. A picture through the vision tower, ×1.50 — vs llama.cpp |
 | [`qwen/`](qwen/) | Qwen3 dense, from a GGUF | 4B ×1.00 and ×1.13. 0.6B ×0.85 and ×0.99 — vs llama.cpp |
 | [`pockettts/`](pockettts/) | [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts), twelve languages, voice cloning included | ×2.22 and ×1.63 the speed of PyTorch, on the 24- and 6-layer models |
 
 In absolute terms, on an i7-9700K with eight threads and Q4_0 weights: Gemma
-E2B draws 22.6 tokens a second and reads 204; the 12B, 5.0 and 42. Qwen3 4B,
+E2B draws 22.6 tokens a second and reads 204; the 12B, 5.0 and 42; the 26B
+A4B, whose feed forward is a mixture of a hundred and twenty-eight experts,
+13.1 and 51. Qwen3 4B,
 14.6 and 110. Pocket TTS speaks at ×2.94 real time in French, ×6.81 in English.
 A 640×426 picture goes through E2B's vision tower in 0.72 seconds, against
 llama.cpp's 1.08; through the 12B's embedder, which is one product against a
@@ -148,8 +150,13 @@ Worth knowing before you clone it:
   four and 73.8 for eight, against llama-server's 20.3, 33.1, 60.5 and 72.9 on
   the same machine — but there is no second model, no distribution and no
   scheduler beyond that.
-- **Two language architectures, both dense.** Gemma 4 and Qwen3 dense. No
-  mixture of experts, no vision, no embeddings endpoint, no `/v1/completions`.
+- **Two language architectures.** Gemma 4 — E2B, E4B, 12B and the 26B A4B,
+  whose feed forward is a mixture of a hundred and twenty-eight experts — and
+  Qwen3 dense. Qwen3's own mixture checkpoints are not read: the mixture here
+  is Gemma 4's, which is not the usual shape and is not a general one.
+- **The server speaks two endpoints.** `/v1/chat/completions`, images included
+  when a projector is given, and `/v1/models`. No embeddings endpoint and no
+  `/v1/completions`.
 - **Q4_0, Q6_K, bf16 and float32.** The K-quants beyond Q6_K are not read.
 - **The prompt path on Gemma is a factor of one and two thirds behind ggml's
   best**, even where it beats the default build; `gemma/README.md` says where
@@ -162,10 +169,12 @@ them, and they are between three hundred megabytes and three gigabytes each.
 
 - **Gemma 4** weights: a GGUF from Hugging Face, whatever quantization you like
   — the engine reads Q4_0, Q6_K, bf16 and float32, and the tests want the
-  QAT Q4_0 build. Point `GOLEM_MODEL` at the file, and `GOLEM_MODEL_12B` at a
-  12B one if you have both: the two checkpoints are tested separately, because
-  they agree on the architecture's name and on very little else. Google's Gemma
-  terms apply to them.
+  QAT Q4_0 build. Point `GOLEM_MODEL` at the file, `GOLEM_MODEL_12B` at a 12B
+  one and `GOLEM_MODEL_26B` at a 26B A4B, with `GOLEM_MMPROJ` and
+  `GOLEM_MMPROJ_26B` at their projectors: the checkpoints are tested
+  separately, because they agree on the architecture's name and on very little
+  else. A machine with only some of them skips the others' tests. Google's
+  Gemma terms apply to them.
 - **Qwen3 dense** weights: a GGUF from Hugging Face declaring `qwen3`. The
   tests want two of the same checkpoint — `GOLEM_MODEL_QWEN` at a bfloat16
   build and `GOLEM_MODEL_QWEN_Q4` at a Q4_0 one made with `llama-quantize

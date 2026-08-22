@@ -1,0 +1,44 @@
+# The waypoints kept for the 26B A4B, whose feed forward is a mixture.
+#
+# Every one of its thirty blocks is a mixture block, so the choice of blocks is
+# about the attention rather than the experts: 0 and 1 are window blocks, 5 is
+# the first global one — sixteen query heads of five hundred and twelve over
+# two key-value heads, a geometry no other checkpoint here has — and 6 and 17
+# are two more, far apart, because a router that is right at block 0 and wrong
+# at block 17 is a stride bug rather than an arithmetic one.
+prompt      The capital of France is
+add_special 1
+
+blocks 0 1 5 6 17
+
+global inp_scaled
+global result_norm
+
+require attn_norm
+require Qcur_normed
+require Qcur_pos
+require kqv_out
+require attn_post_norm
+require attn_out
+require l_out
+
+# The mixture's own nodes, named by models/gemma4.cpp. ffn_moe_logits is the
+# one that matters most: a wrong choice of experts produces fluent text, so a
+# test comparing only l_out would pass a long way past the bug.
+require ffn_norm_1
+require ffn_norm_2
+require ffn_moe_logits
+require ffn_mlp
+require ffn_moe
+require ffn_moe_combined
+require ffn_post_norm
+
+# A global block computes no value projection of its own: its keys are its
+# values. So these are asked for and allowed to be absent.
+optional Kcur_normed
+optional Kcur_pos
+optional Vcur_normed
+
+# Every block's output, so that a divergence in the full stack says which block
+# it began in.
+all_blocks l_out
