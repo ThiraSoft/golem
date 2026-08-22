@@ -1,0 +1,56 @@
+# The waypoints kept for one piece of audio through the E2B conformer.
+#
+# clip_graph_gemma4a names almost none of its nodes, so these are positions in
+# the sequence the evaluation callback is handed rather than names. That
+# sequence is what `dump_audio --list` prints, and ref/gemma/audio.nodes is a
+# copy of it: regenerate that file whenever llama.cpp's graph changes, and this
+# one follows it. A node that moved is caught, not silently recorded from the
+# wrong place — the recorder checks the label it was asked for against the
+# shape it found nothing at.
+#
+# Block 0 begins at node 36 and every block after it is 117 nodes further on.
+audio       testdata/audio/speech.wav
+prompt      What does the speaker say?
+n_predict   16
+
+# The front end, before any block: the mel the preprocessor built, materialized
+# by the transpose that opens the graph. It is [128 mel, 1743 frames],
+# frequency the faster index.
+node 1      mel
+
+# After each of the two subsampling convolutions' ReLU, and after the input
+# projection that flattens them into the tower's width.
+node 15     sscp_0
+node 29     sscp_1
+node 35     pre_encode
+
+# Block 0 in pieces: what the attention and the convolution module are each
+# handed, and what each gives back before its residual is added.
+node 48     blk.0.attn_in
+node 114    blk.0.attn_out
+node 115    blk.0.conv_in
+node 136    blk.0.conv_out
+
+# Every block's output, after its own ln2.
+node 152    blk.0.out
+node 269    blk.1.out
+node 386    blk.2.out
+node 503    blk.3.out
+node 620    blk.4.out
+node 737    blk.5.out
+node 854    blk.6.out
+node 971    blk.7.out
+node 1088   blk.8.out
+node 1205   blk.9.out
+node 1322   blk.10.out
+node 1439   blk.11.out
+
+# The tail: the output projection with its bias, the soft-embedding norm, and
+# the projection to the model's width.
+node 1443   audio_out_proj
+node 1444   soft_emb_norm
+node 1447   projected
+
+# And the text model, for the same prompt.
+global inp_scaled
+global result_norm

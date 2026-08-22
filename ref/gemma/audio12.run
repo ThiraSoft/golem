@@ -1,0 +1,16 @@
+# The same recording through the 12B's projector, which has no encoder at all.
+#
+# Four nodes: the waveform cut into frames of 640 samples and transposed, an
+# RMS norm over each frame, and one projection to the model's width. The
+# indices are positions in dump_audio's callback sequence, as in audio.run.
+audio       testdata/audio/speech.wav
+prompt      What does the speaker say?
+n_predict   16
+
+node 1      framed
+node 2      framed_norm
+node 3      projected
+
+# And the text model, for the same prompt.
+global inp_scaled
+global result_norm

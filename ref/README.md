@@ -12,7 +12,8 @@ in a file under `ref/<model>/`, named on the command line.
 
 **A new architecture adds a directory here, not a recorder.**
 
-`dump_vision.cpp` is the one exception, and it is a different graph engine
+`dump_vision.cpp` and `dump_audio.cpp` are the exceptions, and they are a
+different graph engine
 rather than a different architecture: a vision tower is built by `clip.cpp`,
 whose nodes `llama_decode` never sees. The way in is `mtmd` — a prompt carrying
 a media marker, tokenized into chunks, the picture encoded and handed to the
@@ -21,12 +22,22 @@ headers, where the other three link `llama` alone. It records the tower's
 waypoints, the token layout the prompt became, and the greedy continuation,
 which is what an end-to-end test replays.
 
+`dump_audio.cpp` is that program with a sound file in place of a picture, and
+it differs in one thing: `clip_graph_gemma4a` names almost none of its nodes,
+so a waypoint cannot be asked for by name. `dump_audio --list` runs the graph
+and prints the sequence its evaluation callback is handed — index, operation,
+name if any, dimensions — and the run file names indices from it.
+`ref/gemma/audio.nodes` is a copy of that listing, kept so a reader can see
+what node 1443 was; regenerate it whenever llama.cpp's graph changes, and
+`audio.run` follows.
+
 | | pins | takes |
 |---|---|---|
 | `dump_layers.cpp` | the engine | a model, an output directory, a `.run` file |
 | `dump_tokens.cpp` | the tokenizer | a model, an output directory, a `.tsv` corpus |
 | `dump_quants.cpp` | the kernels | a model, an output directory |
 | `dump_vision.cpp` | the vision tower | a model, a projector, an output directory, a `.run` file |
+| `dump_audio.cpp` | the audio tower | a model, a projector, an output directory, a `.run` file |
 
 The per-model files are in [`gemma/`](gemma/) and [`qwen/`](qwen/), alongside
 the one recorder that is not shared — each architecture's own `dump_chats.py`,
@@ -53,7 +64,7 @@ From the repository root, with `GOLEM_MODEL` and `GOLEM_MODEL_12B` set, and
 `GOLEM_MMPROJ` and `GOLEM_MMPROJ_12B` naming each one's projector:
 
 ```bash
-mkdir -p testdata/gemma/{layers,layers12,window,tokenizer,quants,vision,vision12}
+mkdir -p testdata/gemma/{layers,layers12,window,tokenizer,quants,vision,vision12,audio,audio12}
 
 build/ref/dump_layers "$GOLEM_MODEL"     testdata/gemma/layers    ref/gemma/short.run
 build/ref/dump_layers "$GOLEM_MODEL"     testdata/gemma/window    ref/gemma/window.run
@@ -63,6 +74,12 @@ build/ref/dump_quants "$GOLEM_MODEL"     testdata/gemma/quants
 
 build/ref/dump_vision "$GOLEM_MODEL"     "$GOLEM_MMPROJ"     testdata/gemma/vision   ref/gemma/vision.run
 build/ref/dump_vision "$GOLEM_MODEL_12B" "$GOLEM_MMPROJ_12B" testdata/gemma/vision12 ref/gemma/vision12.run
+
+# The audio fixtures need one recording, which is not committed either:
+#   ffmpeg -i /path/to/llama.cpp/tools/mtmd/test-2.mp3 -ar 16000 -ac 1 \
+#       testdata/audio/speech.wav
+build/ref/dump_audio  "$GOLEM_MODEL"     "$GOLEM_MMPROJ"     testdata/gemma/audio    ref/gemma/audio.run
+build/ref/dump_audio  "$GOLEM_MODEL_12B" "$GOLEM_MMPROJ_12B" testdata/gemma/audio12  ref/gemma/audio12.run
 
 python3 ref/gemma/dump_chats.py "$GOLEM_MODEL"      testdata/gemma/chat/cases.json
 python3 ref/gemma/dump_chats.py "$GOLEM_MODEL_12B"  testdata/gemma/chat12/cases.json

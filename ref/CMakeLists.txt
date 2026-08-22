@@ -44,3 +44,15 @@ target_link_directories(dump_vision PRIVATE ${LLAMA_DIR}/build/bin)
 target_link_libraries(dump_vision PRIVATE mtmd llama ggml ggml-base ggml-cpu)
 set_target_properties(dump_vision PROPERTIES
     BUILD_RPATH ${LLAMA_DIR}/build/bin)
+
+# The fifth. Same linkage as dump_vision, and the same reason; what it records
+# is a conformer whose nodes have no names, so it counts them instead.
+add_executable(dump_audio dump_audio.cpp)
+target_include_directories(dump_audio PRIVATE
+    ${LLAMA_DIR}/include
+    ${LLAMA_DIR}/ggml/include
+    ${LLAMA_DIR}/tools/mtmd)
+target_link_directories(dump_audio PRIVATE ${LLAMA_DIR}/build/bin)
+target_link_libraries(dump_audio PRIVATE mtmd llama ggml ggml-base ggml-cpu)
+set_target_properties(dump_audio PROPERTIES
+    BUILD_RPATH ${LLAMA_DIR}/build/bin)
