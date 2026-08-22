@@ -36,3 +36,10 @@
 
 # Python bytecode from the reference scripts.
 __pycache__/
+
+# Recordings the audio front end is tested against. Same rule as the rest of
+# testdata: they are made with one ffmpeg command each, and every test that
+# reads them skips until they are there.
+/testdata/audio/
+/testdata/gemma/audio/
+/testdata/gemma/audio12/

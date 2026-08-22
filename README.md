@@ -5,8 +5,10 @@
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **CPU inference engines in pure Go.** No Python, no cgo, no GPU, no runtime to
-install: `go build`, one static binary, a GGUF file, an answer. One dependency
-outside the standard library, `golang.org/x/image`, and only to read a WebP. On an eight-core
+install: `go build`, one static binary, a GGUF file, an answer. Three
+dependencies outside the standard library, each a file format the standard
+library does not read: `golang.org/x/image` for a WebP, `hajimehoshi/go-mp3`
+for an MP3 and `mewkiz/flac` for a FLAC. On an eight-core
 desktop CPU that binary keeps pace with llama.cpp — ahead on the models large
 enough for memory bandwidth to be the limit, behind on the smallest, and every
 number below is a benchmark in this repository rather than an estimate.

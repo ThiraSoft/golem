@@ -15,18 +15,41 @@ import (
 //
 // Several channels are mixed down to one by averaging: the models here listen
 // in mono, and a caller that wanted a particular channel would have had to say
-// which.
+// which. A caller that would rather do its own downmix asks ReadChannels.
 //
 // Integer PCM of 8, 16, 24 and 32 bits is understood, and 32-bit floating
 // point. Anything else — compressed formats above all — is refused by name
 // rather than decoded wrongly.
 func Read(r io.Reader) ([]float32, int, error) {
+	samples, rate, channels, err := ReadChannels(r)
+	if err != nil {
+		return nil, 0, err
+	}
+	if channels == 1 {
+		return samples, rate, nil
+	}
+	frames := len(samples) / channels
+	mono := make([]float32, frames)
+	for f := 0; f < frames; f++ {
+		var sum float32
+		for c := 0; c < channels; c++ {
+			sum += samples[f*channels+c]
+		}
+		mono[f] = sum / float32(channels)
+	}
+	return mono, rate, nil
+}
+
+// ReadChannels returns the samples of a WAV interleaved, its sampling rate and
+// how many channels it carries. It is Read without the downmix: a front end
+// that resamples wants to know what it was given.
+func ReadChannels(r io.Reader) ([]float32, int, int, error) {
 	var riff [12]byte
 	if _, err := io.ReadFull(r, riff[:]); err != nil {
-		return nil, 0, fmt.Errorf("reading the RIFF header: %w", err)
+		return nil, 0, 0, fmt.Errorf("reading the RIFF header: %w", err)
 	}
 	if string(riff[0:4]) != "RIFF" || string(riff[8:12]) != "WAVE" {
-		return nil, 0, fmt.Errorf("not a WAV file")
+		return nil, 0, 0, fmt.Errorf("not a WAV file")
 	}
 
 	var (
@@ -40,9 +63,9 @@ func Read(r io.Reader) ([]float32, int, error) {
 		var head [8]byte
 		if _, err := io.ReadFull(r, head[:]); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				return nil, 0, fmt.Errorf("no data chunk in the file")
+				return nil, 0, 0, fmt.Errorf("no data chunk in the file")
 			}
-			return nil, 0, err
+			return nil, 0, 0, err
 		}
 		id := string(head[0:4])
 		size := int(binary.LittleEndian.Uint32(head[4:8]))
@@ -51,10 +74,10 @@ func Read(r io.Reader) ([]float32, int, error) {
 		case "fmt ":
 			chunk := make([]byte, size)
 			if _, err := io.ReadFull(r, chunk); err != nil {
-				return nil, 0, fmt.Errorf("reading the format chunk: %w", err)
+				return nil, 0, 0, fmt.Errorf("reading the format chunk: %w", err)
 			}
 			if len(chunk) < 16 {
-				return nil, 0, fmt.Errorf("format chunk of %d bytes, want at least 16", len(chunk))
+				return nil, 0, 0, fmt.Errorf("format chunk of %d bytes, want at least 16", len(chunk))
 			}
 			format = binary.LittleEndian.Uint16(chunk[0:2])
 			channels = int(binary.LittleEndian.Uint16(chunk[2:4]))
@@ -69,30 +92,30 @@ func Read(r io.Reader) ([]float32, int, error) {
 
 		case "data":
 			if !haveFormat {
-				return nil, 0, fmt.Errorf("data chunk before the format chunk")
+				return nil, 0, 0, fmt.Errorf("data chunk before the format chunk")
 			}
 			data := make([]byte, size)
 			if _, err := io.ReadFull(r, data); err != nil {
-				return nil, 0, fmt.Errorf("reading %d bytes of samples: %w", size, err)
+				return nil, 0, 0, fmt.Errorf("reading %d bytes of samples: %w", size, err)
 			}
 			samples, err := decode(data, format, bits, channels)
 			if err != nil {
-				return nil, 0, err
+				return nil, 0, 0, err
 			}
-			return samples, sampleRate, nil
+			return samples, sampleRate, channels, nil
 
 		default:
 			// Chunks are padded to an even length, and the padding byte is not
 			// counted in the size.
 			skip := int64(size + size%2)
 			if _, err := io.CopyN(io.Discard, r, skip); err != nil {
-				return nil, 0, fmt.Errorf("skipping chunk %q: %w", id, err)
+				return nil, 0, 0, fmt.Errorf("skipping chunk %q: %w", id, err)
 			}
 		}
 	}
 }
 
-// decode turns the raw bytes of the data chunk into mono samples.
+// decode turns the raw bytes of the data chunk into interleaved samples.
 func decode(data []byte, format uint16, bits, channels int) ([]float32, error) {
 	if channels < 1 {
 		return nil, fmt.Errorf("%d channels", channels)
@@ -110,10 +133,9 @@ func decode(data []byte, format uint16, bits, channels int) ([]float32, error) {
 		return nil, fmt.Errorf("%d bytes for %d channels of %d bits", len(data), channels, bits)
 	}
 	frames := len(data) / (width * channels)
-	out := make([]float32, frames)
+	out := make([]float32, frames*channels)
 
 	for f := 0; f < frames; f++ {
-		var sum float32
 		for c := 0; c < channels; c++ {
 			at := (f*channels + c) * width
 			var v float32
@@ -136,9 +158,8 @@ func decode(data []byte, format uint16, bits, channels int) ([]float32, error) {
 			default:
 				return nil, fmt.Errorf("%d bits per sample", bits)
 			}
-			sum += v
+			out[f*channels+c] = v
 		}
-		out[f] = sum / float32(channels)
 	}
 	return out, nil
 }
