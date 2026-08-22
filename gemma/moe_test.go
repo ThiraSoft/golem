@@ -263,3 +263,62 @@ func TestExpertFFNDoesNotAllocate(t *testing.T) {
 		t.Fatalf("%v allocations per call, above the %d parallel sections", n, sections)
 	}
 }
+
+// TestMoEHalfAddsBothBranches pins the shape of the mixture block: the dense
+// feed forward and the experts leave the same residual, each through its own
+// pair of norms, and the block's output is the sum of the two — not one after
+// the other, and not the experts alone.
+func TestMoEHalfAddsBothBranches(t *testing.T) {
+	cfg := moeConfig()
+	bw := randomMoEBlock(cfg, 4)
+	// The shared expert is the ordinary feed forward, so this block needs the
+	// dense projections too.
+	dense := randomMoEBlock(cfg, 5)
+	bw.Gate = nn.Matrix{Data: dense.GateUpExps.Data[:4*cfg.Blocks[0].FFN*cfg.Dim], Quant: nn.F32, Rows: cfg.Blocks[0].FFN, Cols: cfg.Dim}
+	bw.Up = nn.Matrix{Data: dense.GateUpExps.Data[4*cfg.Blocks[0].FFN*cfg.Dim : 8*cfg.Blocks[0].FFN*cfg.Dim], Quant: nn.F32, Rows: cfg.Blocks[0].FFN, Cols: cfg.Dim}
+	bw.Down = nn.Matrix{Data: dense.DownExps.Data[:4*cfg.Dim*cfg.Blocks[0].FFN], Quant: nn.F32, Rows: cfg.Dim, Cols: cfg.Blocks[0].FFN}
+
+	s := NewScratch(cfg)
+	resid := wave(cfg.Dim, 0.2)
+	copy(s.resid[0], resid)
+
+	normed := nn.NewBatch(cfg.Dim, 1)
+	normed.Set(0, wave(cfg.Dim, 0.9))
+
+	xs := [][]float32{make([]float32, cfg.Dim)}
+	moeHalf(cfg, cfg.Blocks[0], bw, s, xs, normed, 1)
+
+	shared, experts := s.MoEShared(), s.MoEExperts()
+	if allZero(shared) {
+		t.Fatal("the shared expert contributed nothing")
+	}
+	if allZero(experts) {
+		t.Fatal("the expert branch contributed nothing")
+	}
+	same := true
+	for i := range shared {
+		if shared[i] != experts[i] {
+			same = false
+			break
+		}
+	}
+	if same {
+		t.Fatal("the two branches computed the same thing; one is reading the other's buffer")
+	}
+	// The norms are inside each branch, so the sum is an exact identity.
+	for i := range xs[0] {
+		want := resid[i] + shared[i] + experts[i]
+		if d := math.Abs(float64(want - xs[0][i])); d > 1e-5 {
+			t.Fatalf("element %d: the block gave %v, the two branches sum to %v", i, xs[0][i], want)
+		}
+	}
+}
+
+func allZero(x []float32) bool {
+	for _, v := range x {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}

@@ -53,8 +53,11 @@ type Scratch struct {
 	expGateUpRow [][][]float32
 	expDownRow   [][][]float32
 	routerIn     map[int]*nn.Batch
+	expBranch    map[int]*nn.Batch
 	expertIn     []*nn.Batch
 	expertMid    []*nn.Batch
+	moeShared    [][]float32 // the dense branch's output, Dim
+	moeExperts   [][]float32 // the expert branch's output, Dim
 
 	experts, expertsUsed, expertFFN int
 
@@ -68,6 +71,7 @@ func NewScratch(cfg *Config) *Scratch {
 		ropes:      map[float64][]*nn.RoPETable{},
 		bf16:       map[int]*nn.Batch{},
 		routerIn:   map[int]*nn.Batch{},
+		expBranch:  map[int]*nn.Batch{},
 		dim:        cfg.Dim,
 		maxContext: cfg.MaxContext,
 	}
@@ -112,6 +116,8 @@ func (s *Scratch) Reserve(batch int) {
 			s.expGateUpRow[t] = [][]float32{s.expGateUp[t]}
 			s.expDownRow[t] = [][]float32{s.expDown[t]}
 		}
+		s.moeShared = rows(batch, s.dim)
+		s.moeExperts = rows(batch, s.dim)
 		s.expertIn = batches(batch, s.dim)
 		s.expertMid = batches(batch, s.expertFFN)
 	}
@@ -206,6 +212,25 @@ func (s *Scratch) RouterIn(batch int) *nn.Batch {
 	}
 	return b
 }
+
+// ExpertBranch is the expert branch's input: the residual under its own norm.
+// It is a batch of its own rather than the one the dense branch reads, because
+// the two branches are computed one after the other from the same residual and
+// sharing would have the second overwrite what the first still needs.
+func (s *Scratch) ExpertBranch(batch int) *nn.Batch {
+	b, ok := s.expBranch[batch]
+	if !ok {
+		b = nn.NewBatch(s.dim, batch)
+		s.expBranch[batch] = b
+	}
+	return b
+}
+
+// MoEShared and MoEExperts expose the two branches of a mixture block for the
+// first position of the last batch — llama.cpp calls these waypoints ffn_mlp
+// and ffn_moe, and the reference tests stand on them.
+func (s *Scratch) MoEShared() []float32  { return s.moeShared[0] }
+func (s *Scratch) MoEExperts() []float32 { return s.moeExperts[0] }
 
 // ExpertIn and ExpertMid are one position's own single-column batches: the
 // input an expert's gate and up read, and the gated half its down reads.
