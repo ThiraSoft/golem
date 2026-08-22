@@ -22,6 +22,8 @@
 /testdata/gemma/window/
 /testdata/gemma/vision/
 /testdata/gemma/vision12/
+/testdata/gemma/moe26/
+/testdata/gemma/vision26/
 /testdata/qwen/layers/
 /testdata/qwen/long/
 /testdata/qwen/layers_q4/
