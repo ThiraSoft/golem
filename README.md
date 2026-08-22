@@ -43,8 +43,24 @@ GGUF, and both commands take it the same way:
     -image photo.png -p "What is in this picture?"
 ```
 
-The server reads the OpenAI content parts a client sends, as a `data:` URI or a
-path on the machine it runs on. It does not fetch pictures over the network: a
+Gemma also listens, and the same file carries both encoders: E2B's projector
+holds a twelve-block conformer, the 12B's a single projection with no encoder
+behind it — forty milliseconds of waveform a token — and the 26B's holds no
+audio weights at all, so that checkpoint sees and does not hear.
+
+```bash
+./golem-cli -model gemma-4-E2B-it-QAT-Q4_0.gguf \
+    -mmproj mmproj-gemma-4-E2B-it-QAT-BF16.gguf \
+    -audio question.wav -p "Answer what is asked."
+```
+
+WAV, MP3 and FLAC, at any rate and any number of channels; the front end
+downmixes and resamples to sixteen kilohertz mono before the encoder sees
+anything.
+
+The server reads the OpenAI content parts a client sends — `image_url` for a
+picture, `input_audio` for a recording — as a `data:` URI, as base64, or as a
+path on the machine it runs on. It does not fetch either over the network: a
 server that fetches what a prompt names is a server that can be aimed.
 
 Weights are not in this repository; [what is here, and what is not](#what-is-here-and-what-is-not)
@@ -54,7 +70,7 @@ says where each one comes from.
 
 | | what it runs | against its reference, on the same CPU |
 |---|---|---|
-| [`gemma/`](gemma/) | Gemma 4 E2B, 12B and 26B A4B, from a GGUF, pictures included | E2B ×1.01 generating, ×1.24 reading a prompt. 12B ×1.04 and ×1.33. 26B A4B ×1.06 and ×1.06. A picture through the vision tower, ×1.50 — vs llama.cpp |
+| [`gemma/`](gemma/) | Gemma 4 E2B, 12B and 26B A4B, from a GGUF, pictures and sound included | E2B ×1.01 generating, ×1.24 reading a prompt. 12B ×1.04 and ×1.33. 26B A4B ×1.06 and ×1.06. A picture through the vision tower, ×1.50 — vs llama.cpp |
 | [`qwen/`](qwen/) | Qwen3 dense, from a GGUF | 4B ×1.00 and ×1.13. 0.6B ×0.85 and ×0.99 — vs llama.cpp |
 | [`pockettts/`](pockettts/) | [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts), twelve languages, voice cloning included | ×2.22 and ×1.63 the speed of PyTorch, on the 24- and 6-layer models |
 

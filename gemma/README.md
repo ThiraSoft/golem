@@ -32,12 +32,13 @@ next := gemma.Argmax(logits)
 
 Gemma 4 can look at a picture, and the encoder that lets it is a second GGUF —
 `mmproj-gemma-4-E2B-it-QAT-BF16.gguf`, whose `general.architecture` is `clip`.
-`OpenVision` binds one to a model that is already loaded; a projector whose
-output is not the model's width is refused rather than run.
+`OpenProjector` binds one to a model that is already loaded; a projector whose
+output is not the model's width is refused rather than run. The same file
+carries the audio encoder, and one call opens both.
 
 ```go
 m, _ := gemma.Open("gemma-4-E2B-it-QAT-Q4_0.gguf", 4096)
-_ = m.OpenVision("mmproj-gemma-4-E2B-it-QAT-BF16.gguf")
+_ = m.OpenProjector("mmproj-gemma-4-E2B-it-QAT-BF16.gguf")
 
 rows, _ := m.EncodeImage(png)              // one row per soft token
 prompt, _ := m.BuildPrompt(ids, [][][]float32{rows})
@@ -92,8 +93,8 @@ encoding from 76 milliseconds to 35. llama.cpp does the same work in 22.
 
 Everything around it is shared. The image is sized by the same rule, the markers
 are the same, the span is attended to in both directions the same way, and
-`OpenVision`, `EncodeImage` and `BuildPrompt` do not know which of the two they
-were given. `VisionConfig.Unified` is read from the file, and it is the only
+`OpenProjector`, `EncodeImage` and `BuildPrompt` do not know which of the two
+they were given. `VisionConfig.Unified` is read from the file, and it is the only
 place the difference is a branch.
 
 The working memory is lent rather than made. One image's scratch is eighty
@@ -113,6 +114,73 @@ such a position is the padding token's, which is what llama.cpp uses for an
 embedding batch — and **a picture is attended to in both directions**: every
 token of one carries the last position of the span, and the window is measured
 from there. It is a wider window, not a new mask.
+
+## Hearing
+
+The same projector file carries an audio encoder, and the same two shapes: E2B
+holds a **conformer**, the 12B holds a **projection with nothing behind it**,
+and the 26B holds neither — its projector has no `clip.has_audio_encoder` key
+at all, so that checkpoint sees and does not hear. `HasAudio` says which,
+`EncodeAudio` runs whichever was opened, and a recording goes between `<|audio>`
+and `<audio|>` exactly as a picture goes between the image markers, attended to
+in both directions the same way.
+
+```go
+m, _ := gemma.Open("gemma-4-E2B-it-QAT-Q4_0.gguf", 4096)
+_ = m.OpenProjector("mmproj-gemma-4-E2B-it-QAT-BF16.gguf")
+rows, _ := m.EncodeAudio(os.ReadFile("question.wav"))
+```
+
+**The front end is in `audio/`, and knows nothing about Gemma.** A file is
+sniffed by its first bytes rather than by its name — WAV, MP3 or FLAC —
+downmixed to mono and resampled to sixteen kilohertz by a windowed sinc whose
+kernel stretches when the rate drops, because the alternative is a tone the
+recording never held. Then `mel.Gemma4A` builds the log-mel spectrogram: 128
+HTK filters over a 512-point transform, a 20-millisecond window rather than the
+usual 25, a hop of 10, the magnitude rather than the power, and three paddings
+that exist only because PyTorch's `unfold` produced a particular frame count
+that the weights were trained on. It agrees with llama.cpp's own preprocessor
+to a ten-thousandth over ninety-nine hundredths of the values.
+
+**The conformer is twelve blocks and four branches each.** A half-step feed
+forward whose answer is halved before it is added; a blocked local attention;
+a convolution module; a second half-step feed forward; and the block's own
+norm. The feed forwards have no gate — `build_ffn` with three null arguments is
+SiLU on the up projection alone, not the SwiGLU the language model uses — and
+the residual is never normalized between the branches, which is why the
+rounding of one block is carried into the next: block nought's output sits a
+hundredth of a unit from llama.cpp's on a stream whose values run to three
+hundred, and block ten's a quarter of a unit.
+
+**The attention is local and blocked, and the mask is narrower than the
+window.** Positions are cut into chunks of twelve; a query is offered its own
+chunk and the twelve frames before the chunk begins, a window of twenty-four,
+and then the mask takes back everything twelve frames or more away. So the
+window is twenty-four wide and no query ever uses more than twelve of it. On
+top of the content scores sits a relative term: thirteen sinusoidal rows, one
+per distance, projected and dotted with the queries, and shifted the way
+Transformer-XL's appendix B shifts such a table. That shift is written here as
+one line rather than as a pad and two reshapes, and there is a test that says
+the two agree — on every key a query can see, the entry the shift lands on is
+that query's own row at the distance between them.
+
+**Before all of it, two convolutions quarter the mel.** 3×3, stride two,
+symmetric padding — not the causal padding the block's convolution uses — each
+followed by a LayerNorm across the channels alone and a ReLU, and then a
+flatten whose order is the one trap in the file: the channel is the faster
+index inside a row and the frequency the slower. The other way round runs, and
+gives numbers that look plausible.
+
+Two names in the file read backwards from what they do, and both are read here
+the way clip.cpp reads them. `a.pre_encode.out` is the projection *after* the
+twelve blocks; `a.input_projection` is the one that flattens the subsampled mel
+into the tower's width. And `conv_norm` and `norm_conv` are swapped by the
+conversion script — the first is the norm before the pointwise expansion, the
+second the one after the depthwise convolution.
+
+The 12B's path is four lines: cut the waveform into frames of 640 samples,
+RMS-normalize each frame across its own 640 values, project once, done. Every
+block those rows go through afterwards is the language model's.
 
 ## The model, in the two places it is unusual
 

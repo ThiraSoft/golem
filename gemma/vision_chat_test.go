@@ -16,7 +16,7 @@ func testImageBytes(t *testing.T) []byte {
 	return raw
 }
 
-func TestOpenVisionAndEncode(t *testing.T) {
+func TestOpenProjectorAndEncode(t *testing.T) {
 	path := os.Getenv("GOLEM_MMPROJ")
 	if path == "" {
 		t.Skip("set GOLEM_MMPROJ to run this test")
