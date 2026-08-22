@@ -112,3 +112,14 @@ func audioTowerFrom(t *testing.T, g *tensors.GGUF) *AudioTower {
 	}
 	return NewAudioTower(cfg, w)
 }
+
+// compareRows flattens what Encode gave back and compares it to a recording
+// laid out the same way — one row per token, the width the faster index.
+func compareRows(t *testing.T, what string, rows [][]float32, want []float32, fraction float32) {
+	t.Helper()
+	flat := make([]float32, 0, len(want))
+	for _, r := range rows {
+		flat = append(flat, r...)
+	}
+	closeRelative(t, what, flat, want, fraction)
+}

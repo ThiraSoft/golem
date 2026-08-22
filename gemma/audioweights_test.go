@@ -39,8 +39,8 @@ func TestAudioWeightsAreAllThere(t *testing.T) {
 	if w.MMProj.Outputs != cfg.ProjDim {
 		t.Errorf("the projection produces %d-wide tokens, want %d", w.MMProj.Outputs, cfg.ProjDim)
 	}
-	if w.OutProj.Bias == nil {
-		t.Error("the output projection carries a bias in the file and none was bound")
+	if len(w.OutProjBias) != w.OutProj.Outputs {
+		t.Errorf("the output projection's bias has %d entries for %d outputs", len(w.OutProjBias), w.OutProj.Outputs)
 	}
 	// The two subsampling convolutions: 3x3, one channel in, then that many.
 	if w.Conv[0].KW != 3 || w.Conv[0].KH != 3 || w.Conv[0].In != 1 {

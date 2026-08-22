@@ -77,7 +77,8 @@ type AudioWeights struct {
 
 	Blocks []AudioBlock
 
-	OutProj     VisionLinear // a.pre_encode.out, with its bias
+	OutProj     VisionLinear // a.pre_encode.out
+	OutProjBias []float32    // added after the projection's output clamp, not before
 	SoftEmbNorm []float32    // mm.a.soft_emb_norm, absent from E2B's projector
 	MMProj      VisionLinear // mm.a.input_projection
 }
@@ -194,8 +195,11 @@ func LoadAudioWeights(g *tensors.GGUF, cfg *AudioConfig) (*AudioWeights, error) 
 	if w.OutProj, err = linear(g, "a.pre_encode.out.weight"); err != nil {
 		return nil, err
 	}
-	if bias, err := floats(g, "a.pre_encode.out.bias"); err == nil {
-		w.OutProj.Bias = bias
+	// The bias is kept beside the projection rather than inside it. clip.cpp
+	// adds it after build_mm has clamped the output, and a bias folded into
+	// the product would be clamped along with it.
+	if w.OutProjBias, err = floats(g, "a.pre_encode.out.bias"); err != nil {
+		return nil, err
 	}
 	if w.OutProj.Inputs != cfg.Dim || w.OutProj.Outputs != w.MMProj.Inputs {
 		return nil, fmt.Errorf("the output projection is %dx%d, expected %d into the embedder's %d",

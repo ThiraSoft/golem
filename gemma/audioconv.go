@@ -40,7 +40,7 @@ func (a *AudioTower) convModule(b *AudioBlock, x, out []float32, n int, s *audio
 	// The gate. The two halves are the two halves of one row, not two
 	// interleaved sets: the first dim values are the signal and the next dim
 	// are what closes over it.
-	gated := s.branch[:n*dim]
+	gated := s.gate[:n*dim]
 	nn.InParallel(n, n*dim, func(first, last int) {
 		for p := first; p < last; p++ {
 			row := wide[p*2*dim : (p+1)*2*dim]
