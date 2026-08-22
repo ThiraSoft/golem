@@ -15,6 +15,8 @@ import (
 	"io"
 
 	_ "golang.org/x/image/webp"
+
+	"github.com/ThiraSoft/golem/nn"
 )
 
 // Image is eight-bit RGB, interleaved, no alpha and no stride: a decoder's
@@ -56,10 +58,14 @@ func (im *Image) PlanarRGB(dst []float32) {
 	if len(dst) != 3*n {
 		panic(fmt.Sprintf("imageio: a %dx%d image needs %d floats, given %d", im.W, im.H, 3*n, len(dst)))
 	}
-	for c := 0; c < 3; c++ {
-		plane := dst[c*n : (c+1)*n]
-		for i := 0; i < n; i++ {
-			plane[i] = float32(im.Pix[3*i+c]) / 255
+	// Three planes of a megapixel is a pass long enough to be worth sharing
+	// out, and each pixel is written once by whoever reads it.
+	nn.InParallel(n, 3*n*4, func(first, last int) {
+		for c := 0; c < 3; c++ {
+			plane := dst[c*n : (c+1)*n]
+			for i := first; i < last; i++ {
+				plane[i] = float32(im.Pix[3*i+c]) / 255
+			}
 		}
-	}
+	})
 }

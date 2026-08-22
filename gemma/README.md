@@ -44,7 +44,7 @@ prompt, _ := m.BuildPrompt(ids, [][][]float32{rows})
 hidden := m.ForwardPrompt(prompt, 0)
 ```
 
-The tower is sixteen blocks of 768, and four things separate it from the
+E2B's tower is sixteen blocks of 768, and four things separate it from the
 language model beside it. **The image keeps its shape**: there is no fixed
 input size — `clip.vision.image_size` says 224 and means nothing — so the
 picture is scaled until the patch grid holds between 40 and 280 pooled tokens,
@@ -62,6 +62,39 @@ with a comment saying where they come from: the pooling kernel of 3, the RoPE
 base of 100, and the token range of 40 … 280. They are what llama.cpp
 hardcodes for this projector, and a file that disagreed with them would run
 under llama.cpp with those values anyway.
+
+### Two projectors, and only one of them is a tower
+
+The 12B's projector is not the same architecture as E2B's. It declares
+`clip.vision.projector_type = "gemma4uv"` — "unified" — carries eleven tensors,
+and says `block_count = 0` and `head_count = 0` because it means them: there is
+no tower. What the file holds is an embedder, and the blocks that would have
+followed it are the language model's own, which is why its projection lands on
+3840 and leaves it there.
+
+It cuts patches of 48 rather than 16 — the merging of three by three is the
+convolution's here, so nothing is pooled afterwards — normalizes the raw patch,
+projects it with a bias, normalizes that, adds the same two position lookups,
+normalizes again, and projects. The three norms are layer norms, mean subtracted
+and bias added, where every norm in the tower is an RMS norm with a gain alone:
+that part of the model is written in PyTorch's `nn.LayerNorm`, whose epsilon of
+1e-5 is hardcoded in `clip.cpp` and here. And its pixels are not scaled to
+-1 … 1: `gemma4v` scales them and `gemma4uv` does not.
+
+What it costs is one product: 117 patches against a weight of 3840 by 6912,
+which is three billion multiply-accumulates and a hundred megabytes read once.
+Four output rows are taken at a time, by `nn.Scores4` — the kernel E2B's
+attention already uses, four rows against two columns with every column loaded
+once for four products. One row at a time would pull the three-megabyte grid
+through the shared cache once per row, three thousand eight hundred times for
+one picture; four rows at a time is a quarter of that, and it is what takes the
+encoding from 76 milliseconds to 35. llama.cpp does the same work in 22.
+
+Everything around it is shared. The image is sized by the same rule, the markers
+are the same, the span is attended to in both directions the same way, and
+`OpenVision`, `EncodeImage` and `BuildPrompt` do not know which of the two they
+were given. `VisionConfig.Unified` is read from the file, and it is the only
+place the difference is a branch.
 
 Reaching the language model costs two changes to it and no more. A position may
 be handed the row itself instead of a token identifier — the per-layer input of
@@ -115,6 +148,9 @@ with it about nearly everything the code could have assumed:
   `Logits`. Without it the 12B answers a chat turn with one marker repeated to
   the token limit, which is the whole visible symptom of a missing line.
 - **A template with one more rule.** See "The chat template" below.
+- **A projector of another kind.** It sees, but not through a tower: its mmproj
+  declares `gemma4uv` and holds an embedder alone. See "Two projectors, and only
+  one of them is a tower" above.
 
 Its widths are also what found a real bug in the shared kernel: 3840 and 15360
 inputs, neither a multiple of the 2048-input tile the Q4_0 product cuts a wide

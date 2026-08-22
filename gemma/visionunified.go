@@ -57,16 +57,43 @@ func (v *VisionTower) embedPatches(pixels []float32, cols, rows int) []float32 {
 		}
 	})
 
-	// The projection, split over its output rows so the weight — a hundred
-	// megabytes of it — is read once for the whole grid rather than once per
-	// patch.
+	// The projection. Four output rows at a time, against the whole grid: the
+	// weight is a hundred megabytes and is read once either way, but the grid
+	// is three megabytes that no core's own cache holds, and one row at a time
+	// would pull it through the shared cache once per row — three thousand
+	// eight hundred times for one picture.
+	//
+	// nn.Scores4 is that product: four rows against every column, two columns
+	// at a time, each column loaded once for four multiply-accumulates. It was
+	// written for the attention of E2B's tower, where the shape of the problem
+	// is the same one — a few queries against a great many keys — and the
+	// arithmetic it wants here is the arithmetic ggml uses for this tensor,
+	// which is fused.
+	//
+	// It writes rows, and the grid is held in columns, so a block's four rows
+	// land in a staging buffer and are turned as they are copied out. That is
+	// four floats written per patch against six thousand nine hundred read,
+	// and it does not show.
 	out := make([]float32, n*cfg.Dim)
 	nn.InParallel(cfg.Dim, n*area*cfg.Dim, func(start, end int) {
-		for o := start; o < end; o++ {
-			row := w.PatchEmbd[o*area : (o+1)*area]
-			bias := w.PatchBias[o]
-			for p := 0; p < n; p++ {
-				out[p*cfg.Dim+o] = nn.DotF32(flat[p*area:(p+1)*area], row) + bias
+		block := make([]float32, 4*n)
+		for o := start; o < end; o += 4 {
+			rows := min(4, end-o)
+			if rows == 4 && nn.Scores4(w.PatchEmbd[o*area:], flat, area, n, block, n) {
+				for p := 0; p < n; p++ {
+					dst := out[p*cfg.Dim+o:]
+					for i := 0; i < 4; i++ {
+						dst[i] = block[i*n+p] + w.PatchBias[o+i]
+					}
+				}
+				continue
+			}
+			for i := 0; i < rows; i++ {
+				row := w.PatchEmbd[(o+i)*area : (o+i+1)*area]
+				bias := w.PatchBias[o+i]
+				for p := 0; p < n; p++ {
+					out[p*cfg.Dim+o+i] = nn.DotF32(flat[p*area:(p+1)*area], row) + bias
+				}
 			}
 		}
 	})
