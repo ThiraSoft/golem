@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/chat"
+	"github.com/ThiraSoft/golem/engine"
+	"github.com/ThiraSoft/golem/gemma"
 	"github.com/ThiraSoft/golem/sample"
 )
 
@@ -28,10 +30,45 @@ type Server struct {
 	tpl      chat.Template
 	defaults sample.Params
 	served   int
+	// vision is nil unless a projector was opened, and images is what the
+	// tower has already made of the pictures it was sent.
+	vision engine.Vision
+	images *imageCache
 }
 
 func NewServer(pool *Pool, v Vocabulary, name string, tpl chat.Template, defaults sample.Params) *Server {
-	return &Server{pool: pool, vocab: v, name: name, tpl: tpl, defaults: defaults}
+	return &Server{pool: pool, vocab: v, name: name, tpl: tpl, defaults: defaults,
+		images: newImageCache(32)}
+}
+
+// SetVision lets this server answer about pictures.
+func (s *Server) SetVision(v engine.Vision) { s.vision = v }
+
+// look runs the tower over every picture the conversation carries, in the
+// order the turns carry them, which is the order the markers appear in the
+// rendered prompt.
+func (s *Server) look(msgs []chat.Message) ([][][]float32, error) {
+	var out [][][]float32
+	for _, m := range msgs {
+		for _, raw := range m.Images {
+			rows, err := s.images.Encode(raw, s.vision.EncodeImage)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, rows)
+		}
+	}
+	return out, nil
+}
+
+// carriesImages reports whether any turn brought a picture.
+func carriesImages(msgs []chat.Message) bool {
+	for _, m := range msgs {
+		if len(m.Images) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) Handler() http.Handler {
@@ -75,6 +112,28 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ids := s.vocab.Encode(prompt, false, true)
+
+	// The rendered conversation carries an empty pair of markers where each
+	// picture goes, and the rows go between them.
+	built := &gemma.Prompt{Tokens: ids}
+	if carriesImages(req.Messages) {
+		if s.vision == nil {
+			refuse(w, http.StatusBadRequest, "invalid_request_error",
+				"this model was started without a projector, so it cannot look at a picture: start the server with -mmproj")
+			return
+		}
+		rows, err := s.look(req.Messages)
+		if err != nil {
+			refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		built, err = s.vision.Prompt(ids, rows)
+		if err != nil {
+			refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		ids = built.Tokens
+	}
 	slot, waited, err := s.pool.Acquire(r.Context(), ids)
 	if err != nil {
 		// The client hung up while waiting for a slot. Nobody is left to read
@@ -100,10 +159,10 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 		gen = gen.WithMaxTokens(*req.MaxTokens)
 	}
 	if req.Stream {
-		s.stream(r.Context(), w, gen, id, ids, params, req.Stop)
+		s.stream(r.Context(), w, gen, id, built, params, req.Stop)
 		return
 	}
-	answer, err := gen.Generate(r.Context(), ids, params, req.Stop, nil)
+	answer, err := gen.GeneratePrompt(r.Context(), built, params, req.Stop, nil)
 	if err != nil {
 		// A client that hung up gets no answer, and no error either: there is
 		// nobody left to read one.

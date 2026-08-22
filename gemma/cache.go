@@ -93,20 +93,28 @@ func NewCache(cfg *Config) *Cache {
 // Visible gives the inclusive range of positions a block may attend to from
 // pos. llama.cpp masks a key position p0 when p1 - p0 >= the window, so a
 // window of 512 leaves 512 positions counting the query's own.
-func (c *Cache) Visible(b BlockConfig, pos int) (first, last int) {
-	first = 0
-	if b.Window && pos-b.WindowSize+1 > 0 {
-		first = pos - b.WindowSize + 1
+//
+// until is how far forward the query may look: its own position for text, and
+// the last position of the picture for a token inside one. The window is
+// measured from there rather than from pos, so that every token of a span is
+// given the same range — a ring cannot hold two.
+func (c *Cache) Visible(b BlockConfig, pos, until int) (first, last int) {
+	if until < pos {
+		until = pos
 	}
-	return first, pos
+	first = 0
+	if b.Window && until-b.WindowSize+1 > 0 {
+		first = until - b.WindowSize + 1
+	}
+	return first, until
 }
 
 // Reset forgets everything without releasing the memory. Distinct pointers
 // only: a shared cache would otherwise be cleared as many times as it is read.
 //
 // Only the positions that were written are cleared. Nothing beyond them can be
-// read — Visible stops at the query's own position, and a position is always
-// stored before it is attended to — but clearing them is what makes that an
+// read — Visible stops at the end of the query's own span, and every position
+// of a batch is stored before any of them is attended to — but clearing them is what makes that an
 // invariant of the cache rather than a property of the caller. A window block
 // wraps, so its count is clamped to what it holds.
 func (c *Cache) Reset() {

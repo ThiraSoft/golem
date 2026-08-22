@@ -28,6 +28,48 @@ m.Logits(hidden, logits)
 next := gemma.Argmax(logits)
 ```
 
+## Sight
+
+Gemma 4 can look at a picture, and the encoder that lets it is a second GGUF —
+`mmproj-gemma-4-E2B-it-QAT-BF16.gguf`, whose `general.architecture` is `clip`.
+`OpenVision` binds one to a model that is already loaded; a projector whose
+output is not the model's width is refused rather than run.
+
+```go
+m, _ := gemma.Open("gemma-4-E2B-it-QAT-Q4_0.gguf", 4096)
+_ = m.OpenVision("mmproj-gemma-4-E2B-it-QAT-BF16.gguf")
+
+rows, _ := m.EncodeImage(png)              // one row per soft token
+prompt, _ := m.BuildPrompt(ids, [][][]float32{rows})
+hidden := m.ForwardPrompt(prompt, 0)
+```
+
+The tower is sixteen blocks of 768, and four things separate it from the
+language model beside it. **The image keeps its shape**: there is no fixed
+input size — `clip.vision.image_size` says 224 and means nothing — so the
+picture is scaled until the patch grid holds between 40 and 280 pooled tokens,
+rounded to a whole number of them, and what the rounding leaves over becomes a
+black border rather than a stretch. **The rotation is two-dimensional**: the
+low half of each head turns with the patch's column and the high half with its
+row, at base 100. **Every product is clipped** to the range it was quantized
+under — the four scalars beside each weight in the file — because `gemma4v`
+overrides `build_mm`, not only the final projection. And the feed forward is a
+quick-GELU gate, which is the default `clip.cpp` falls to for a projector
+declaring neither `use_gelu` nor `use_silu`.
+
+Three numbers the file does not carry are written down in `visionconfig.go`
+with a comment saying where they come from: the pooling kernel of 3, the RoPE
+base of 100, and the token range of 40 … 280. They are what llama.cpp
+hardcodes for this projector, and a file that disagreed with them would run
+under llama.cpp with those values anyway.
+
+Reaching the language model costs two changes to it and no more. A position may
+be handed the row itself instead of a token identifier — the per-layer input of
+such a position is the padding token's, which is what llama.cpp uses for an
+embedding batch — and **a picture is attended to in both directions**: every
+token of one carries the last position of the span, and the window is measured
+from there. It is a wider window, not a new mask.
+
 ## The model, in the two places it is unusual
 
 **Two attention geometries alternate.** Four blocks that see the last 512
@@ -170,6 +212,62 @@ On an i7-9700K, eight threads, Q4_0 weights. E2B first:
 | `Forward` — 35 blocks, a prompt already in the cache | 35 ms |
 | `Logits` — the whole vocabulary | 10 ms |
 | `ForwardBatch` — 64 positions of a prompt at once | 5.0 ms |
+
+And the vision tower, per picture rather than per token:
+
+| | per image |
+|---|---|
+| `VisionTower.Encode` — a 640×426 picture, 1053 patches, 117 soft tokens | 0.78 s |
+| llama.cpp's `mtmd_encode_chunk`, the same picture | 1.08 s |
+
+**×1.38, and the comparison is if anything against this engine**: the figure
+above includes resizing the picture, and llama.cpp's does not — its
+preprocessing happens in `mtmd_tokenize`, before that timer starts. Both are
+the best of four runs on eight cores with no accelerator.
+
+A warning for anyone repeating this. `llama-mtmd-cli` prints two durations for
+one picture, and only the first is the tower: `image slice encoded in …` is
+`mtmd_encode_chunk`, and `image decoded (batch 1/1) in …` is the *language*
+model reading the embeddings the tower produced. They are different
+computations, and the second is the smaller one.
+
+Where this began, before any of the work below, `Encode` took 3.2 s — three
+times llama.cpp's tower rather than a third under it. The tower is 318 GFLOP
+of matrix products and 54 of attention, and four fifths of what it costs now
+is the one kernel that multiplies bfloat16 weights by float32 activations, at
+785 GFLOP/s on the shapes the blocks are made of, against a machine peak near
+1100. What got it there, in the order the measurements asked for it:
+
+- **Whole matrices, not one patch at a time.** A thousand patches arrive
+  together, so the weight is read once for all of them rather than a thousand
+  times. This is the difference between a tower and a language model: one
+  draws a token at a time and waits on the bus, the other is handed a grid and
+  waits on the arithmetic.
+- **Two rows against four columns.** One row against one column spends ten
+  loads on eight multiply-accumulates, and this machine issues two of each per
+  cycle: the loads finished last. Blocking both ways makes it six loads for
+  eight. 260 GFLOP/s to 495.
+- **An interleave instead of a shift.** A bfloat16 becomes a float32 by moving
+  into the high half of a word pair, which interleaving it with zeros does on
+  the shuffle port — where the shift it replaces ran on the two ports the
+  multiply-accumulate itself needs. The order that comes out of the interleave
+  is the order the activation is written in, which costs nothing.
+- **The columns outside, the rows inside.** Four columns are twelve kilobytes
+  and stay in the first cache while a core's whole share of the rows sweeps
+  past them. That swap alone: 644 GFLOP/s to 785.
+- **A panel that fits the second cache.** A batch wider than it streams past
+  every row of weights; cut to 128 KB it is read once and answers them all.
+  Measured at 64, 128 and 256.
+
+The attention is blocked twice for the same reason: a head's keys and values
+are a quarter of a megabyte each, so the queries sweep them in groups of eight
+rather than one at a time, and each sweep is cut into blocks of 256 keys that
+sit in a core's own cache.
+
+And three loops that were the library's are ggml's own, eight values at a
+time: the softmax's exponential — called two hundred million times for one
+picture — the quick-GELU gate of the feed forward, and the clamp-and-round
+that prepares every activation.
 
 The first two are within a quarter of what the memory bus on this machine can
 deliver: a token being generated reads 999 MB of block weights and 315 MB of

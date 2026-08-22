@@ -29,6 +29,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/ThiraSoft/golem/engine"
 )
 
 // debugBatches says what went into each pass, for measuring how well the
@@ -62,6 +64,13 @@ type pass struct {
 	positions []int
 	logits    []float32     // where to score the last token, or nil for a chunk
 	reply     chan struct{} // closed once the pass has run
+	// A conversation carrying a picture brings three more things: the rows to
+	// use instead of the embedding table, the identifiers the per-layer inputs
+	// are looked up with, and how far forward each position may attend. They
+	// are nil for text, and a batch with none of them takes the plain path.
+	embeds [][]float32
+	ple    []int32
+	until  []int
 }
 
 // aside is anything else the model has to do, which cannot overlap a pass:
@@ -73,6 +82,9 @@ type aside struct {
 
 type Runner struct {
 	engine Engine
+	// vision is set when the model was given a projector, and is what carries
+	// a batch that holds one. A batch that holds none never touches it.
+	vision engine.Vision
 	passes chan *pass
 	asides chan *aside
 
@@ -94,6 +106,9 @@ const budget = promptBatch
 // gatherShare is the fraction of a pass the runner will spend waiting for
 // company before going without it.
 const gatherShare = 8
+
+// SetVision says which encoder carries the batches that hold a picture.
+func (r *Runner) SetVision(v engine.Vision) { r.vision = v }
 
 func NewRunner(e Engine) *Runner {
 	return &Runner{
@@ -136,6 +151,15 @@ func (r *Runner) window() time.Duration {
 func (r *Runner) Forward(slot int, tokens []int32, positions []int, logits []float32) {
 	p := &pass{slot: slot, tokens: tokens, positions: positions, logits: logits,
 		reply: make(chan struct{})}
+	r.passes <- p
+	<-p.reply
+}
+
+// ForwardEmbedded is the same, for a chunk that carries a picture.
+func (r *Runner) ForwardEmbedded(slot int, tokens []int32, embeds [][]float32, ple []int32,
+	positions, until []int, logits []float32) {
+	p := &pass{slot: slot, tokens: tokens, positions: positions, logits: logits,
+		embeds: embeds, ple: ple, until: until, reply: make(chan struct{})}
 	r.passes <- p
 	<-p.reply
 }
@@ -208,12 +232,29 @@ func (r *Runner) gather(batch, held []*pass) (now, later []*pass) {
 // of its own last token.
 func (r *Runner) run(batch []*pass) {
 	var tokens []int32
-	var slots, at []int
+	var slots, at, until []int
+	var embeds [][]float32
+	var ple []int32
+	pictures := false
 	for _, p := range batch {
 		tokens = append(tokens, p.tokens...)
 		at = append(at, p.positions...)
 		for range p.tokens {
 			slots = append(slots, p.slot)
+		}
+		if p.embeds != nil {
+			pictures = true
+			embeds = append(embeds, p.embeds...)
+			ple = append(ple, p.ple...)
+			until = append(until, p.until...)
+			continue
+		}
+		// A pass with no picture still has to fill the three parallel slices,
+		// because a batch is one pass whatever its conversations carry.
+		for i := range p.tokens {
+			embeds = append(embeds, nil)
+			ple = append(ple, p.tokens[i])
+			until = append(until, p.positions[i])
 		}
 	}
 	if debugBatches {
@@ -221,7 +262,12 @@ func (r *Runner) run(batch []*pass) {
 			len(tokens), len(distinct(slots)), r.lastSpan().Round(time.Millisecond), r.window())
 	}
 	start := time.Now()
-	states := r.engine.ForwardSlots(tokens, slots, at)
+	var states [][]float32
+	if pictures {
+		states = r.vision.ForwardEmbeddedSlots(tokens, embeds, ple, slots, at, until)
+	} else {
+		states = r.engine.ForwardSlots(tokens, slots, at)
+	}
 
 	// And one read of the head for everything in the batch that is waiting to
 	// be scored.

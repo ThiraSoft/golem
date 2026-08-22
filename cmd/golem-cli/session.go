@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/chat"
+	"github.com/ThiraSoft/golem/engine"
+	"github.com/ThiraSoft/golem/gemma"
 	"github.com/ThiraSoft/golem/sample"
 )
 
@@ -46,7 +48,12 @@ type vocabulary interface {
 }
 
 type Session struct {
-	model      forward
+	model forward
+	// vision is nil unless a projector was opened. When it is not, a turn goes
+	// through it whether or not this conversation has ever held a picture:
+	// the tokens are the same either way, and one path is easier to trust
+	// than two.
+	vision     engine.Vision
 	vocab      vocabulary
 	tpl        chat.Template
 	sampler    *sample.Sampler
@@ -62,7 +69,17 @@ type Session struct {
 	// whole conversation and feeds only what is not already a prefix of this.
 	held   []int32
 	logits []float32
+	// encoded is what the tower made of each picture, kept for as long as the
+	// conversation holds it. A picture costs a second to look at and the
+	// conversation is re-rendered every turn; looking again each time would
+	// make the third turn about a picture cost what the first did.
+	encoded [][][]float32
 }
+
+// SetVision gives this conversation an encoder for the pictures its turns
+// carry. Without one, a turn carrying a picture is refused rather than
+// answered about nothing.
+func (s *Session) SetVision(v engine.Vision) { s.vision = v }
 
 // Turn is what one exchange cost.
 type Turn struct {
@@ -95,7 +112,25 @@ func NewSession(m forward, v vocabulary, tpl chat.Template, p sample.Params,
 
 // Ask feeds one user message and writes the answer to w as it comes.
 func (s *Session) Ask(text string, w io.Writer) (Turn, error) {
-	s.history = append(s.history, chat.Message{Role: "user", Content: strings.TrimSpace(text)})
+	return s.AskWith(text, nil, w)
+}
+
+// AskWith is Ask with pictures attached to the turn, each still in the bytes
+// some encoder wrote.
+func (s *Session) AskWith(text string, images [][]byte, w io.Writer) (Turn, error) {
+	if len(images) > 0 && s.vision == nil {
+		return Turn{}, fmt.Errorf("this model was opened without a projector, so it cannot look at a picture: pass -mmproj")
+	}
+	for _, raw := range images {
+		rows, err := s.vision.EncodeImage(raw)
+		if err != nil {
+			return Turn{}, err
+		}
+		s.encoded = append(s.encoded, rows)
+	}
+	s.history = append(s.history, chat.Message{
+		Role: "user", Content: strings.TrimSpace(text), Images: images,
+	})
 	rendered, err := s.tpl.Render(s.history, chat.Options{
 		EnableThinking:      s.thinking,
 		AddGenerationPrompt: true,
@@ -104,6 +139,18 @@ func (s *Session) Ask(text string, w io.Writer) (Turn, error) {
 		return Turn{}, err
 	}
 	ids := s.vocab.Encode(rendered, false, true)
+
+	// The rendered conversation carries an empty pair of markers where each
+	// picture goes; the soft tokens go between them, and what comes back is
+	// the prompt the model actually reads.
+	var prompt *gemma.Prompt
+	if s.vision != nil {
+		p, err := s.vision.Prompt(ids, s.encoded)
+		if err != nil {
+			return Turn{}, err
+		}
+		prompt, ids = p, p.Tokens
+	}
 	if len(ids) >= s.maxContext {
 		return Turn{}, fmt.Errorf("the conversation no longer fits in %d positions: pass a larger -context, or start again", s.maxContext)
 	}
@@ -124,10 +171,22 @@ func (s *Session) Ask(text string, w io.Writer) (Turn, error) {
 
 	start := time.Now()
 	var hidden []float32
-	for at := from; at < len(ids); at += promptBatch {
-		to := min(at+promptBatch, len(ids))
-		states := s.model.ForwardBatch(ids[at:to], at)
-		hidden = states[len(states)-1]
+	if prompt != nil {
+		// A batch may not be cut inside a picture: every key of a span has to
+		// be in the cache before any of its queries is scored, which holds
+		// within one pass and not across two.
+		for at := from; at < len(ids); {
+			to := prompt.Boundary(at, at+promptBatch)
+			states := s.vision.ForwardPrompt(prompt.Slice(at, to), at)
+			hidden = states[len(states)-1]
+			at = to
+		}
+	} else {
+		for at := from; at < len(ids); at += promptBatch {
+			to := min(at+promptBatch, len(ids))
+			states := s.model.ForwardBatch(ids[at:to], at)
+			hidden = states[len(states)-1]
+		}
 	}
 	s.held = append(s.held[:0], ids...)
 	turn := Turn{Prompt: len(ids) - from, Prefill: time.Since(start)}

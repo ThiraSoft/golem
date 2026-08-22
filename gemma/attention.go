@@ -100,7 +100,7 @@ func Attention(
 			t, h := u/bc.Heads, u%bc.Heads
 			lc := at[t].Cache.Layers[bc.Index]
 			pos := at[t].Pos
-			first, last := at[t].Cache.Visible(bc, pos)
+			first, last := at[t].Cache.Visible(bc, pos, at[t].Until)
 			n := last - first + 1
 			scores := s.scores[t*s.maxHeads+h][:n]
 			query := qh[t][h*bc.HeadDim : (h+1)*bc.HeadDim]
@@ -131,12 +131,16 @@ func Attention(
 }
 
 // deepest is the furthest into a conversation this batch reaches, which is
-// what the attention of it costs.
+// what the attention of it costs. A token inside a picture reaches to the end
+// of it, which is further than its own position.
 func deepest(at []Place) int {
 	n := 0
 	for _, p := range at {
 		if p.Pos > n {
 			n = p.Pos
+		}
+		if p.Until > n {
+			n = p.Until
 		}
 	}
 	return n

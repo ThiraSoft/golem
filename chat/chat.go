@@ -13,6 +13,14 @@ type Message struct {
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 	// ToolCallID ties a tool result to the call it answers.
 	ToolCallID string `json:"tool_call_id,omitempty"`
+	// Images are pictures attached to this turn, each still in the bytes some
+	// encoder wrote — PNG, JPEG, GIF or WebP. They are rendered before the
+	// text, in this order. A template whose checkpoint cannot see refuses them
+	// rather than dropping them silently.
+	//
+	// They do not travel over the wire in this shape: a server decodes its own
+	// request format into them, and never writes them back out.
+	Images [][]byte `json:"-"`
 }
 
 // Options are what every template reads. What only one checkpoint spells —

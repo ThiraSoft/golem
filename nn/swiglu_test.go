@@ -154,3 +154,41 @@ func BenchmarkBenchSourceCopy(b *testing.B) {
 		copy(gate, src)
 	}
 }
+
+func TestGEGLUQuickRange(t *testing.T) {
+	gate := []float32{0, 1, -1, 2.5}
+	up := []float32{1, 2, 3, 4}
+	want := make([]float32, len(gate))
+	for i, g := range gate {
+		want[i] = float32(float64(g) / (1 + math.Exp(-1.702*float64(g))) * float64(up[i]))
+	}
+	GEGLUQuickRange(gate, up, 0, len(gate))
+	for i := range want {
+		if diff := gate[i] - want[i]; diff > 1e-5 || diff < -1e-5 {
+			t.Errorf("element %d is %g, expected %g", i, gate[i], want[i])
+		}
+	}
+}
+
+// The vectorized quick-GELU gate against the scalar one it replaces.
+func TestGEGLUQuickRangeVectorAgreesWithScalar(t *testing.T) {
+	for _, n := range []int{8, 16, 3072} {
+		gate := make([]float32, n)
+		up := make([]float32, n)
+		for i := range gate {
+			gate[i] = float32(i%97)*0.25 - 12
+			up[i] = float32(i%13)*0.5 - 3
+		}
+		want := make([]float32, n)
+		for i := range want {
+			g := gate[i]
+			want[i] = g / (1 + expf(-1.702*g)) * up[i]
+		}
+		GEGLUQuickRange(gate, up, 0, n)
+		for i := range want {
+			if diff := gate[i] - want[i]; diff > 1e-5 || diff < -1e-5 {
+				t.Fatalf("n=%d element %d is %g, expected %g", n, i, gate[i], want[i])
+			}
+		}
+	}
+}

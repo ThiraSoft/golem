@@ -82,18 +82,32 @@ func TestCacheVisibleRange(t *testing.T) {
 	global := BlockConfig{Window: false}
 	c := &Cache{}
 
-	if first, last := c.Visible(window, 3); first != 0 || last != 3 {
+	if first, last := c.Visible(window, 3, 3); first != 0 || last != 3 {
 		t.Fatalf("early window: %d..%d", first, last)
 	}
 	// Position 600 sees 89..600: five hundred and twelve positions, itself
 	// included, which is what llama.cpp's mask allows.
-	if first, last := c.Visible(window, 600); first != 89 || last != 600 {
+	if first, last := c.Visible(window, 600, 600); first != 89 || last != 600 {
 		t.Fatalf("late window: %d..%d, want 89..600", first, last)
 	}
 	if n := 600 - 89 + 1; n != 512 {
 		t.Fatalf("the window is %d positions wide", n)
 	}
-	if first, last := c.Visible(global, 600); first != 0 || last != 600 {
+	if first, last := c.Visible(global, 600, 600); first != 0 || last != 600 {
 		t.Fatalf("global: %d..%d", first, last)
+	}
+
+	// A token inside a picture looks forward to the end of it, and the window
+	// is measured from there, so that every token of the span is given the
+	// same range.
+	if first, last := c.Visible(window, 500, 600); first != 89 || last != 600 {
+		t.Fatalf("a span's first token: %d..%d, want 89..600", first, last)
+	}
+	if first, last := c.Visible(global, 500, 600); first != 0 || last != 600 {
+		t.Fatalf("a global block's span: %d..%d", first, last)
+	}
+	// An Until behind the position is a caller's slip, not a narrower window.
+	if first, last := c.Visible(global, 600, 0); first != 0 || last != 600 {
+		t.Fatalf("an Until left behind: %d..%d", first, last)
 	}
 }
