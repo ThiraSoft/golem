@@ -150,8 +150,13 @@ Worth knowing before you clone it:
   four and 73.8 for eight, against llama-server's 20.3, 33.1, 60.5 and 72.9 on
   the same machine — but there is no second model, no distribution and no
   scheduler beyond that.
-- **Two language architectures, both dense.** Gemma 4 and Qwen3 dense. No
-  mixture of experts, no vision, no embeddings endpoint, no `/v1/completions`.
+- **Two language architectures.** Gemma 4 — E2B, E4B, 12B and the 26B A4B,
+  whose feed forward is a mixture of a hundred and twenty-eight experts — and
+  Qwen3 dense. Qwen3's own mixture checkpoints are not read: the mixture here
+  is Gemma 4's, which is not the usual shape and is not a general one.
+- **The server speaks two endpoints.** `/v1/chat/completions`, images included
+  when a projector is given, and `/v1/models`. No embeddings endpoint and no
+  `/v1/completions`.
 - **Q4_0, Q6_K, bf16 and float32.** The K-quants beyond Q6_K are not read.
 - **The prompt path on Gemma is a factor of one and two thirds behind ggml's
   best**, even where it beats the default build; `gemma/README.md` says where
@@ -164,10 +169,12 @@ them, and they are between three hundred megabytes and three gigabytes each.
 
 - **Gemma 4** weights: a GGUF from Hugging Face, whatever quantization you like
   — the engine reads Q4_0, Q6_K, bf16 and float32, and the tests want the
-  QAT Q4_0 build. Point `GOLEM_MODEL` at the file, and `GOLEM_MODEL_12B` at a
-  12B one if you have both: the two checkpoints are tested separately, because
-  they agree on the architecture's name and on very little else. Google's Gemma
-  terms apply to them.
+  QAT Q4_0 build. Point `GOLEM_MODEL` at the file, `GOLEM_MODEL_12B` at a 12B
+  one and `GOLEM_MODEL_26B` at a 26B A4B, with `GOLEM_MMPROJ` and
+  `GOLEM_MMPROJ_26B` at their projectors: the checkpoints are tested
+  separately, because they agree on the architecture's name and on very little
+  else. A machine with only some of them skips the others' tests. Google's
+  Gemma terms apply to them.
 - **Qwen3 dense** weights: a GGUF from Hugging Face declaring `qwen3`. The
   tests want two of the same checkpoint — `GOLEM_MODEL_QWEN` at a bfloat16
   build and `GOLEM_MODEL_QWEN_Q4` at a Q4_0 one made with `llama-quantize
