@@ -49,16 +49,20 @@ cmake --build build/ref -j8
 
 ## Regenerating every fixture
 
-From the repository root, with `GOLEM_MODEL` and `GOLEM_MODEL_12B` set:
+From the repository root, with `GOLEM_MODEL` and `GOLEM_MODEL_12B` set, and
+`GOLEM_MMPROJ` and `GOLEM_MMPROJ_12B` naming each one's projector:
 
 ```bash
-mkdir -p testdata/gemma/{layers,layers12,window,tokenizer,quants}
+mkdir -p testdata/gemma/{layers,layers12,window,tokenizer,quants,vision,vision12}
 
 build/ref/dump_layers "$GOLEM_MODEL"     testdata/gemma/layers    ref/gemma/short.run
 build/ref/dump_layers "$GOLEM_MODEL"     testdata/gemma/window    ref/gemma/window.run
 build/ref/dump_layers "$GOLEM_MODEL_12B" testdata/gemma/layers12  ref/gemma/short.run
 build/ref/dump_tokens "$GOLEM_MODEL"     testdata/gemma/tokenizer ref/gemma/corpus.tsv
 build/ref/dump_quants "$GOLEM_MODEL"     testdata/gemma/quants
+
+build/ref/dump_vision "$GOLEM_MODEL"     "$GOLEM_MMPROJ"     testdata/gemma/vision   ref/gemma/vision.run
+build/ref/dump_vision "$GOLEM_MODEL_12B" "$GOLEM_MMPROJ_12B" testdata/gemma/vision12 ref/gemma/vision12.run
 
 python3 ref/gemma/dump_chats.py "$GOLEM_MODEL"      testdata/gemma/chat/cases.json
 python3 ref/gemma/dump_chats.py "$GOLEM_MODEL_12B"  testdata/gemma/chat12/cases.json

@@ -224,3 +224,38 @@ func Softcap(x []float32, limit float32) {
 		x[i] = float32(float64(limit) * math.Tanh(float64(v)*inv))
 	}
 }
+
+// LayerNormGGML is the other normalization ggml performs — ggml_norm, which
+// the vision embedder of the 12B's projector uses where everything else in
+// Gemma uses RMSNormPlain: the mean is subtracted, the denominator is the
+// variance around it, and a gain and a bias follow.
+//
+// It stands beside the LayerNorm type above for the same reason RMSNormPlain
+// stands beside RMSNorm: that one carries the double through every
+// multiplication because Moshi's PyTorch does, and this one takes the mean and
+// the reciprocal square root in float32 because ggml does. The gain and the
+// bias may each be absent.
+func LayerNormGGML(x []float32, gain, bias []float32, eps float32) {
+	var sum float64
+	for _, v := range x {
+		sum += float64(v)
+	}
+	mean := float32(sum / float64(len(x)))
+	var sum2 float64
+	for i, v := range x {
+		d := v - mean
+		x[i] = d
+		sum2 += float64(d * d)
+	}
+	variance := float32(sum2 / float64(len(x)))
+	scale := float32(1 / math.Sqrt(float64(variance+eps)))
+	for i, v := range x {
+		x[i] = v * scale
+		if gain != nil {
+			x[i] *= gain[i]
+		}
+		if bias != nil {
+			x[i] += bias[i]
+		}
+	}
+}

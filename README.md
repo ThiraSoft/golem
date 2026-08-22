@@ -30,8 +30,10 @@ go build ./cmd/golem-server
 ./golem-server -model Qwen3-4B-Q4_0.gguf -addr 127.0.0.1:8080
 ```
 
-Gemma also looks at pictures. The encoder is a second GGUF, and both commands
-take it the same way:
+Gemma also looks at pictures — both checkpoints, though not through the same
+encoder: E2B's projector is a sixteen-block vision tower, the 12B's is an
+embedder whose blocks are the language model's own. The encoder is a second
+GGUF, and both commands take it the same way:
 
 ```bash
 ./golem-cli -model gemma-4-E2B-it-QAT-Q4_0.gguf \
@@ -57,8 +59,9 @@ says where each one comes from.
 In absolute terms, on an i7-9700K with eight threads and Q4_0 weights: Gemma
 E2B draws 22.6 tokens a second and reads 204; the 12B, 5.0 and 42. Qwen3 4B,
 14.6 and 110. Pocket TTS speaks at ×2.94 real time in French, ×6.81 in English.
-A 640×426 picture goes through Gemma's vision tower in 0.78 seconds, against
-llama.cpp's 1.08.
+A 640×426 picture goes through E2B's vision tower in 0.78 seconds, against
+llama.cpp's 1.08; through the 12B's embedder, which is one product against a
+hundred-megabyte weight, in 35 milliseconds against llama.cpp's 22.
 
 **The 0.6B is the one this engine loses**, and `qwen/README.md` says why: at
 320 MB the weights fit close enough that the memory bus stops being the limit,

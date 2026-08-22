@@ -35,6 +35,26 @@ window block and a global one attend to the same positions, and a missing mask
 would go unnoticed. `min_tokens 513` is what refuses to record a run that
 failed to be long enough.
 
+## vision.run and vision12.run — the two projectors
+
+One picture, `testdata/gemma/shapes.png`, and the prompt "Describe this image."
+through `dump_vision`, which goes in by mtmd and records the vision graph, the
+token layout the prompt became and the greedy continuation.
+
+Two files because the two checkpoints do not carry the same kind of projector.
+E2B's declares `gemma4v` — a sixteen-block tower, so `vision.run` asks for every
+waypoint of every block, and a divergence says which block it began in.
+
+The 12B's declares `gemma4uv`, the "unified" variant: no block at all. Its
+projector is an embedder whose output goes straight into the language model, and
+`models/gemma4uv.cpp` names two nodes in the whole graph — `pos_embd`, the
+patches with their positions added, and `projected`. `vision12.run` asks for
+those two and for the text side, which is all there is to ask for.
+
+Both also keep `inp_scaled`, `result_norm` and two block outputs of the language
+model, so a divergence can be blamed on the projector or on what it was spliced
+into.
+
 ## corpus.tsv — twenty-six segmentations
 
 Escaping, runs of newlines and tabs, digits, punctuation, emoji, CJK, byte

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/ThiraSoft/golem/imageio"
+	"github.com/ThiraSoft/golem/tensors"
 )
 
 // One picture through the whole tower, which is what a multimodal prompt pays
@@ -14,7 +15,20 @@ func BenchmarkVisionEncode(b *testing.B) {
 	if os.Getenv("GOLEM_MMPROJ") == "" {
 		b.Skip("set GOLEM_MMPROJ to run this benchmark")
 	}
-	g := openMMProj(b)
+	benchmarkEncode(b, openMMProj(b))
+}
+
+// And the 12B's projector, which is not a tower: one product against a
+// hundred-megabyte weight, and three norms. What it costs is what reading that
+// weight costs.
+func BenchmarkUnifiedVisionEncode(b *testing.B) {
+	if os.Getenv("GOLEM_MMPROJ_12B") == "" {
+		b.Skip("set GOLEM_MMPROJ_12B to run this benchmark")
+	}
+	benchmarkEncode(b, openMMProj12(b))
+}
+
+func benchmarkEncode(b *testing.B, g *tensors.GGUF) {
 	cfg, err := LoadVisionConfig(g)
 	if err != nil {
 		b.Fatal(err)

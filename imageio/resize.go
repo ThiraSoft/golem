@@ -1,5 +1,7 @@
 package imageio
 
+import "github.com/ThiraSoft/golem/nn"
+
 // ResizeBilinear is the resampling clip.cpp performs, and is written to agree
 // with it rather than to be the best resampling available.
 //
@@ -27,7 +29,18 @@ func (im *Image) ResizeBilinear(w, h int) *Image {
 	if h > 1 {
 		yRatio = float32(im.H-1) / float32(h-1)
 	}
-	for y := 0; y < h; y++ {
+	// One output row reads the input and writes nothing another row writes, so
+	// the rows are shared out. The arithmetic is untouched by that, and so is
+	// every pixel it produces.
+	nn.InParallel(h, w*h*3*8, func(first, last int) {
+		resizeRows(im, out, first, last, xRatio, yRatio)
+	})
+	return out
+}
+
+func resizeRows(im, out *Image, first, last int, xRatio, yRatio float32) {
+	w := out.W
+	for y := first; y < last; y++ {
 		py := float32(y) * yRatio
 		y0 := minInt(int(py), im.H-1)
 		y1 := minInt(y0+1, im.H-1)
@@ -48,7 +61,6 @@ func (im *Image) ResizeBilinear(w, h int) *Image {
 			}
 		}
 	}
-	return out
 }
 
 // PadInto centres this image on a canvas of w by h filled with one colour, and

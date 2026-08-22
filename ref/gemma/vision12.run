@@ -1,0 +1,19 @@
+# The waypoints kept for one image through the 12B's projector, which is not a
+# tower. Its projector_type is gemma4uv — "unified" — and models/gemma4uv.cpp
+# builds an embedder and nothing else: patches, three layer norms, the two
+# position lookups, and the projection. The blocks that would have followed
+# belong to the language model, so there is no block to ask for here and only
+# two nodes carry a name.
+image       testdata/gemma/shapes.png
+prompt      Describe this image.
+n_predict   16
+
+global pos_embd
+global projected
+
+# And the text model, for the same prompt: the last chunk's activations, which
+# are the ones the answer is drawn from.
+global inp_scaled
+global result_norm
+global l_out-0
+global l_out-4
