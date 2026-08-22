@@ -53,7 +53,7 @@ type Session struct {
 	// through it whether or not this conversation has ever held a picture:
 	// the tokens are the same either way, and one path is easier to trust
 	// than two.
-	vision     engine.Vision
+	vision     engine.Media
 	vocab      vocabulary
 	tpl        chat.Template
 	sampler    *sample.Sampler
@@ -74,12 +74,15 @@ type Session struct {
 	// conversation is re-rendered every turn; looking again each time would
 	// make the third turn about a picture cost what the first did.
 	encoded [][][]float32
+	// heard is the same for the recordings, kept for the same reason: a
+	// conformer is slower than a vision tower, not faster.
+	heard [][][]float32
 }
 
 // SetVision gives this conversation an encoder for the pictures its turns
 // carry. Without one, a turn carrying a picture is refused rather than
 // answered about nothing.
-func (s *Session) SetVision(v engine.Vision) { s.vision = v }
+func (s *Session) SetVision(v engine.Media) { s.vision = v }
 
 // Turn is what one exchange cost.
 type Turn struct {
@@ -118,8 +121,17 @@ func (s *Session) Ask(text string, w io.Writer) (Turn, error) {
 // AskWith is Ask with pictures attached to the turn, each still in the bytes
 // some encoder wrote.
 func (s *Session) AskWith(text string, images [][]byte, w io.Writer) (Turn, error) {
-	if len(images) > 0 && s.vision == nil {
-		return Turn{}, fmt.Errorf("this model was opened without a projector, so it cannot look at a picture: pass -mmproj")
+	return s.AskWithMedia(text, images, nil, w)
+}
+
+// AskWithMedia is Ask with pictures and recordings attached to the turn, each
+// still in the bytes some encoder wrote.
+func (s *Session) AskWithMedia(text string, images, audio [][]byte, w io.Writer) (Turn, error) {
+	if len(images) > 0 && (s.vision == nil || !s.vision.CanSee()) {
+		return Turn{}, fmt.Errorf("this model was opened without a projector that can see, so it cannot look at a picture: pass -mmproj")
+	}
+	if len(audio) > 0 && (s.vision == nil || !s.vision.CanHear()) {
+		return Turn{}, fmt.Errorf("this model was opened without a projector that can hear, so it cannot listen: pass -mmproj")
 	}
 	for _, raw := range images {
 		rows, err := s.vision.EncodeImage(raw)
@@ -128,8 +140,15 @@ func (s *Session) AskWith(text string, images [][]byte, w io.Writer) (Turn, erro
 		}
 		s.encoded = append(s.encoded, rows)
 	}
+	for _, raw := range audio {
+		rows, err := s.vision.EncodeAudio(raw)
+		if err != nil {
+			return Turn{}, err
+		}
+		s.heard = append(s.heard, rows)
+	}
 	s.history = append(s.history, chat.Message{
-		Role: "user", Content: strings.TrimSpace(text), Images: images,
+		Role: "user", Content: strings.TrimSpace(text), Images: images, Audio: audio,
 	})
 	rendered, err := s.tpl.Render(s.history, chat.Options{
 		EnableThinking:      s.thinking,
@@ -145,7 +164,7 @@ func (s *Session) AskWith(text string, images [][]byte, w io.Writer) (Turn, erro
 	// the prompt the model actually reads.
 	var prompt *gemma.Prompt
 	if s.vision != nil {
-		p, err := s.vision.Prompt(ids, s.encoded)
+		p, err := s.vision.Prompt(ids, s.encoded, s.heard)
 		if err != nil {
 			return Turn{}, err
 		}

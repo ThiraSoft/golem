@@ -16,13 +16,13 @@ func TestGemmaOffersVisionOnceItHasAProjector(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	if _, ok := m.Vision(); ok {
+	if _, ok := m.Media(); ok {
 		t.Fatal("a model opened without a projector offers vision")
 	}
-	if err := m.OpenVision(proj); err != nil {
+	if err := m.OpenProjector(proj); err != nil {
 		t.Fatal(err)
 	}
-	v, ok := m.Vision()
+	v, ok := m.Media()
 	if !ok {
 		t.Fatal("a model given a projector does not offer vision")
 	}
@@ -50,10 +50,10 @@ func TestQwenRefusesAProjector(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	if err := m.OpenVision(proj); err == nil {
+	if err := m.OpenProjector(proj); err == nil {
 		t.Fatal("a Qwen model accepted a projector")
 	}
-	if _, ok := m.Vision(); ok {
+	if _, ok := m.Media(); ok {
 		t.Fatal("a Qwen model offers vision")
 	}
 }

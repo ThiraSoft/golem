@@ -25,7 +25,7 @@ func TestOpenVisionAndEncode(t *testing.T) {
 	if m.HasVision() {
 		t.Fatal("a model opened without a projector claims to see")
 	}
-	if err := m.OpenVision(path); err != nil {
+	if err := m.OpenProjector(path); err != nil {
 		t.Fatal(err)
 	}
 	if !m.HasVision() {
@@ -98,7 +98,7 @@ func TestBuildPromptSplicesTheRowsIn(t *testing.T) {
 		}
 		return out
 	}
-	p, err := m.BuildPrompt(tokens, [][][]float32{rows(2), rows(3)})
+	p, err := m.BuildPrompt(tokens, [][][]float32{rows(2), rows(3)}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,11 +137,11 @@ func TestBuildPromptSplicesTheRowsIn(t *testing.T) {
 func TestBuildPromptRefusesAMiscount(t *testing.T) {
 	m := openTextModel(t)
 	tokens := []int32{2, m.Cfg.ImageOpen, m.Cfg.ImageClose}
-	if _, err := m.BuildPrompt(tokens, nil); err == nil {
+	if _, err := m.BuildPrompt(tokens, nil, nil); err == nil {
 		t.Fatal("a prompt that opens a picture was built with none given")
 	}
 	rows := [][][]float32{{make([]float32, m.Cfg.Dim)}, {make([]float32, m.Cfg.Dim)}}
-	if _, err := m.BuildPrompt(tokens, rows); err == nil {
+	if _, err := m.BuildPrompt(tokens, rows, nil); err == nil {
 		t.Fatal("two pictures went into a prompt that opens one")
 	}
 }

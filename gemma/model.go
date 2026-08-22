@@ -31,8 +31,9 @@ type Model struct {
 	ple         [][]float32
 	outputs     [][]float32 // one per block, for the tests that locate a divergence
 	batch       int
-	vision      *VisionTower // nil until OpenVision
-	visionFile  *tensors.GGUF
+	vision      *VisionTower // nil until OpenProjector, or when the file has no eyes
+	audio       *AudioTower  // nil until OpenProjector, or when the file has no ears
+	projFile    *tensors.GGUF
 }
 
 // Open maps a GGUF file and binds it. maxContext caps the cache; the file
@@ -95,9 +96,9 @@ func (m *Model) reserve(batch int) {
 }
 
 func (m *Model) Close() error {
-	if m.visionFile != nil {
-		m.visionFile.Close()
-		m.visionFile = nil
+	if m.projFile != nil {
+		m.projFile.Close()
+		m.projFile = nil
 	}
 	return m.file.Close()
 }

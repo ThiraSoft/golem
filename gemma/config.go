@@ -69,6 +69,10 @@ type Config struct {
 	// be a real token, because the cache and the per-layer lookup hold
 	// identifiers rather than rows.
 	ImageOpen, ImageClose, ImageSoft int32
+	// AudioOpen, AudioClose and AudioSoft are the same three for a recording,
+	// and are read the same way: zero in a vocabulary that was never taught to
+	// carry one.
+	AudioOpen, AudioClose, AudioSoft int32
 }
 
 // tokenNamed finds one piece in the vocabulary, and answers 0 when the file
@@ -199,6 +203,9 @@ func LoadConfig(g *tensors.GGUF, maxContext int) (*Config, error) {
 	cfg.ImageOpen = tokenNamed(g, imageOpen)
 	cfg.ImageClose = tokenNamed(g, imageClose)
 	cfg.ImageSoft = tokenNamed(g, imageSoft)
+	cfg.AudioOpen = tokenNamed(g, audioOpen)
+	cfg.AudioClose = tokenNamed(g, audioClose)
+	cfg.AudioSoft = tokenNamed(g, audioSoft)
 	if ids, err := g.Uint32Slice("tokenizer.ggml.suppress_tokens"); err == nil {
 		cfg.Suppress = make([]int32, len(ids))
 		for i, id := range ids {

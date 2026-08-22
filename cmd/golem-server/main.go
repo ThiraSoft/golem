@@ -56,12 +56,12 @@ func main() {
 	// One goroutine owns the model; every conversation asks it for its passes,
 	// and what is waiting at the moment a pass is built goes into it together.
 	if *mmproj != "" {
-		if err := m.OpenVision(*mmproj); err != nil {
+		if err := m.OpenProjector(*mmproj); err != nil {
 			fail(err)
 		}
 	}
 	runner := NewRunner(m.Forward)
-	if v, ok := m.Vision(); ok {
+	if v, ok := m.Media(); ok {
 		runner.SetVision(v)
 	}
 	stop := make(chan struct{})
@@ -81,7 +81,7 @@ func main() {
 	pool := NewPool(slots, time.Now)
 	name := strings.TrimSuffix(filepath.Base(*model), ".gguf")
 	server := NewServer(pool, m.Vocab, name, m.Template, params)
-	if v, ok := m.Vision(); ok {
+	if v, ok := m.Media(); ok {
 		server.SetVision(v)
 	}
 

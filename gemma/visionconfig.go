@@ -43,6 +43,14 @@ type VisionConfig struct {
 	Unified bool
 }
 
+// HasVision says whether a projector declares a vision encoder. Every Gemma 4
+// projector so far does; the key is read rather than assumed because the audio
+// half is read the same way and one of the two files has no audio.
+func HasVision(g *tensors.GGUF) bool {
+	v, err := g.Bool("clip.has_vision_encoder")
+	return err == nil && v
+}
+
 // LoadVisionConfig reads an opened mmproj GGUF.
 func LoadVisionConfig(g *tensors.GGUF) (*VisionConfig, error) {
 	arch, err := g.String("general.architecture")

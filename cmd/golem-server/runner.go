@@ -84,7 +84,7 @@ type Runner struct {
 	engine Engine
 	// vision is set when the model was given a projector, and is what carries
 	// a batch that holds one. A batch that holds none never touches it.
-	vision engine.Vision
+	vision engine.Media
 	passes chan *pass
 	asides chan *aside
 
@@ -108,7 +108,7 @@ const budget = promptBatch
 const gatherShare = 8
 
 // SetVision says which encoder carries the batches that hold a picture.
-func (r *Runner) SetVision(v engine.Vision) { r.vision = v }
+func (r *Runner) SetVision(v engine.Media) { r.vision = v }
 
 func NewRunner(e Engine) *Runner {
 	return &Runner{

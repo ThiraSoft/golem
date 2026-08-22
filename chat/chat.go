@@ -21,6 +21,11 @@ type Message struct {
 	// They do not travel over the wire in this shape: a server decodes its own
 	// request format into them, and never writes them back out.
 	Images [][]byte `json:"-"`
+	// Audio are recordings attached to this turn, each still in the bytes some
+	// encoder wrote — WAV, MP3 or FLAC, at any rate and any number of
+	// channels. They are rendered after the pictures and before the text, in
+	// this order, and travel no more over the wire than the pictures do.
+	Audio [][]byte `json:"-"`
 }
 
 // Options are what every template reads. What only one checkpoint spells —

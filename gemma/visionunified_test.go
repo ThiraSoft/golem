@@ -122,7 +122,7 @@ func TestUnifiedVisionGenerationMatchesTheReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { m.Close() })
-	if err := m.OpenVision(os.Getenv("GOLEM_MMPROJ_12B")); err != nil {
+	if err := m.OpenProjector(os.Getenv("GOLEM_MMPROJ_12B")); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := m.EncodeImage(testImageBytes(t))
@@ -136,7 +136,7 @@ func TestUnifiedVisionGenerationMatchesTheReference(t *testing.T) {
 	var text []int32
 	text = append(text, f.Tokens[:f.ImageStart]...)
 	text = append(text, f.Tokens[f.ImageStart+f.NImageTokens:]...)
-	p, err := m.BuildPrompt(text, [][][]float32{rows})
+	p, err := m.BuildPrompt(text, [][][]float32{rows}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

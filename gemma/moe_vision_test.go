@@ -87,7 +87,7 @@ func TestMoEVisionGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	if err := m.OpenVision(proj); err != nil {
+	if err := m.OpenProjector(proj); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := m.EncodeImage(testImageBytes(t))
@@ -101,7 +101,7 @@ func TestMoEVisionGeneration(t *testing.T) {
 	var text []int32
 	text = append(text, f.Tokens[:f.ImageStart]...)
 	text = append(text, f.Tokens[f.ImageStart+f.NImageTokens:]...)
-	p, err := m.BuildPrompt(text, [][][]float32{rows})
+	p, err := m.BuildPrompt(text, [][][]float32{rows}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

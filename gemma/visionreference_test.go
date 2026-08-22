@@ -230,7 +230,7 @@ func TestVisionGenerationMatchesTheReference(t *testing.T) {
 		t.Skip("set GOLEM_MMPROJ to run this test")
 	}
 	m := openTextModel(t)
-	if err := m.OpenVision(os.Getenv("GOLEM_MMPROJ")); err != nil {
+	if err := m.OpenProjector(os.Getenv("GOLEM_MMPROJ")); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := m.EncodeImage(testImageBytes(t))
@@ -249,7 +249,7 @@ func TestVisionGenerationMatchesTheReference(t *testing.T) {
 	var text []int32
 	text = append(text, f.Tokens[:f.ImageStart]...)
 	text = append(text, f.Tokens[f.ImageStart+f.NImageTokens:]...)
-	p, err := m.BuildPrompt(text, [][][]float32{rows})
+	p, err := m.BuildPrompt(text, [][][]float32{rows}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

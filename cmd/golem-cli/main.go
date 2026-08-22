@@ -82,7 +82,7 @@ func main() {
 	}
 	defer m.Close()
 	if *mmproj != "" {
-		if err := m.OpenVision(*mmproj); err != nil {
+		if err := m.OpenProjector(*mmproj); err != nil {
 			fail(err)
 		}
 	}
@@ -114,7 +114,7 @@ func main() {
 	newSession := func() *Session {
 		s := NewSession(m.Forward, m.Vocab, m.Template, params,
 			m.Vocabulary, *context, *maxTokens, *system, *think)
-		if v, ok := m.Vision(); ok {
+		if v, ok := m.Media(); ok {
 			s.SetVision(v)
 		}
 		return s

@@ -32,7 +32,7 @@ type Server struct {
 	served   int
 	// vision is nil unless a projector was opened, and images is what the
 	// tower has already made of the pictures it was sent.
-	vision engine.Vision
+	vision engine.Media
 	images *imageCache
 }
 
@@ -42,7 +42,7 @@ func NewServer(pool *Pool, v Vocabulary, name string, tpl chat.Template, default
 }
 
 // SetVision lets this server answer about pictures.
-func (s *Server) SetVision(v engine.Vision) { s.vision = v }
+func (s *Server) SetVision(v engine.Media) { s.vision = v }
 
 // look runs the tower over every picture the conversation carries, in the
 // order the turns carry them, which is the order the markers appear in the
@@ -127,7 +127,7 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 			refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
-		built, err = s.vision.Prompt(ids, rows)
+		built, err = s.vision.Prompt(ids, rows, nil)
 		if err != nil {
 			refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return

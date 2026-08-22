@@ -15,34 +15,73 @@ import (
 	"github.com/ThiraSoft/golem/tensors"
 )
 
-// OpenVision maps a projector file and binds it to this model.
-func (m *Model) OpenVision(path string) error {
+// OpenProjector maps a projector file and binds whichever encoders it
+// declares: a vision tower, an audio encoder, or both. One file carries the
+// two, and which of them it holds is the file's business rather than the
+// caller's — the commands pass -mmproj and ask afterwards what the model can
+// do.
+//
+// It is an error only when the file declares neither, or when an encoder it
+// does declare produces rows of the wrong width for this model.
+func (m *Model) OpenProjector(path string) error {
 	g, err := tensors.OpenGGUF(path)
 	if err != nil {
 		return err
 	}
-	cfg, err := LoadVisionConfig(g)
-	if err != nil {
+	hasVision, hasAudio := HasVision(g), HasAudio(g)
+	if !hasVision && !hasAudio {
 		g.Close()
-		return err
+		return fmt.Errorf("gemma: %s declares neither a vision encoder nor an audio one", path)
 	}
-	if cfg.ProjDim != m.Cfg.Dim {
-		g.Close()
-		return fmt.Errorf("gemma: the projector produces %d-wide tokens and this model reads %d; they are not a pair",
-			cfg.ProjDim, m.Cfg.Dim)
+	var vision *VisionTower
+	var audio *AudioTower
+	if hasVision {
+		cfg, err := LoadVisionConfig(g)
+		if err != nil {
+			g.Close()
+			return err
+		}
+		if cfg.ProjDim != m.Cfg.Dim {
+			g.Close()
+			return fmt.Errorf("gemma: the projector produces %d-wide picture tokens and this model reads %d; they are not a pair",
+				cfg.ProjDim, m.Cfg.Dim)
+		}
+		w, err := LoadVisionWeights(g, cfg)
+		if err != nil {
+			g.Close()
+			return err
+		}
+		vision = NewVisionTower(cfg, w)
 	}
-	w, err := LoadVisionWeights(g, cfg)
-	if err != nil {
-		g.Close()
-		return err
+	if hasAudio {
+		cfg, err := LoadAudioConfig(g)
+		if err != nil {
+			g.Close()
+			return err
+		}
+		if cfg.ProjDim != m.Cfg.Dim {
+			g.Close()
+			return fmt.Errorf("gemma: the projector produces %d-wide sound tokens and this model reads %d; they are not a pair",
+				cfg.ProjDim, m.Cfg.Dim)
+		}
+		w, err := LoadAudioWeights(g, cfg)
+		if err != nil {
+			g.Close()
+			return err
+		}
+		audio = NewAudioTower(cfg, w)
 	}
-	m.visionFile = g
-	m.vision = NewVisionTower(cfg, w)
+	m.projFile = g
+	m.vision = vision
+	m.audio = audio
 	return nil
 }
 
-// HasVision reports whether a projector was opened.
+// HasVision reports whether an opened projector carries a vision tower.
 func (m *Model) HasVision() bool { return m.vision != nil }
+
+// HasAudio reports whether an opened projector carries an audio encoder.
+func (m *Model) HasAudio() bool { return m.audio != nil }
 
 // EncodeImage decodes one encoded image and runs the tower over it. What comes
 // back is one row per soft token, each as wide as the model's embedding.
@@ -72,31 +111,50 @@ type Prompt struct {
 	Spans  [][2]int
 }
 
-// BuildPrompt splices encoded images into an encoded prompt.
+// BuildPrompt splices encoded media into an encoded prompt.
 //
 // tokens is the rendered conversation as the vocabulary encoded it, markers
-// and all: RenderChat wrote an empty <|image><image|> pair for each picture,
-// and this fills the pairs in, in order. images[i] is what EncodeImage
-// returned for the i-th of them.
-func (m *Model) BuildPrompt(tokens []int32, images [][][]float32) (*Prompt, error) {
-	open, closed, soft := m.Cfg.ImageOpen, m.Cfg.ImageClose, m.Cfg.ImageSoft
-	if len(images) > 0 && (open == 0 || closed == 0 || soft == 0) {
+// and all: RenderChat wrote an empty <|image><image|> pair for each picture
+// and an empty <|audio><audio|> pair for each recording, and this fills the
+// pairs in, in order. images[i] is what EncodeImage returned for the i-th
+// picture and audio[i] what EncodeAudio returned for the i-th recording; the
+// two are counted separately because the markers are.
+func (m *Model) BuildPrompt(tokens []int32, images, audio [][][]float32) (*Prompt, error) {
+	if len(images) > 0 && (m.Cfg.ImageOpen == 0 || m.Cfg.ImageClose == 0 || m.Cfg.ImageSoft == 0) {
 		return nil, fmt.Errorf("gemma: this vocabulary has no image markers, so nothing can carry a picture")
 	}
+	if len(audio) > 0 && (m.Cfg.AudioOpen == 0 || m.Cfg.AudioClose == 0 || m.Cfg.AudioSoft == 0) {
+		return nil, fmt.Errorf("gemma: this vocabulary has no audio markers, so nothing can carry a recording")
+	}
 	p := &Prompt{}
-	seen := 0
+	seenImages, seenAudio := 0, 0
 	for i := 0; i < len(tokens); i++ {
 		p.Tokens = append(p.Tokens, tokens[i])
 		p.PLE = append(p.PLE, tokens[i])
 		p.Embeds = append(p.Embeds, nil)
-		if tokens[i] != open {
+
+		var rows [][]float32
+		switch {
+		case m.Cfg.ImageOpen != 0 && tokens[i] == m.Cfg.ImageOpen:
+			if seenImages >= len(images) {
+				return nil, fmt.Errorf("gemma: the prompt opens %d pictures and %d were given", seenImages+1, len(images))
+			}
+			rows = images[seenImages]
+			seenImages++
+		case m.Cfg.AudioOpen != 0 && tokens[i] == m.Cfg.AudioOpen:
+			if seenAudio >= len(audio) {
+				return nil, fmt.Errorf("gemma: the prompt opens %d recordings and %d were given", seenAudio+1, len(audio))
+			}
+			rows = audio[seenAudio]
+			seenAudio++
+		default:
 			continue
 		}
-		if seen >= len(images) {
-			return nil, fmt.Errorf("gemma: the prompt opens %d pictures and %d were given", seen+1, len(images))
+
+		soft := m.Cfg.ImageSoft
+		if tokens[i] == m.Cfg.AudioOpen {
+			soft = m.Cfg.AudioSoft
 		}
-		rows := images[seen]
-		seen++
 		first := len(p.Tokens)
 		for _, row := range rows {
 			if len(row) != m.Cfg.Dim {
@@ -112,8 +170,11 @@ func (m *Model) BuildPrompt(tokens []int32, images [][][]float32) (*Prompt, erro
 		// The closing marker follows in the rendered string, and is copied by
 		// the next turn of the loop.
 	}
-	if seen != len(images) {
-		return nil, fmt.Errorf("gemma: %d pictures were given and the prompt opens %d", len(images), seen)
+	if seenImages != len(images) {
+		return nil, fmt.Errorf("gemma: %d pictures were given and the prompt opens %d", len(images), seenImages)
+	}
+	if seenAudio != len(audio) {
+		return nil, fmt.Errorf("gemma: %d recordings were given and the prompt opens %d", len(audio), seenAudio)
 	}
 	return p, nil
 }

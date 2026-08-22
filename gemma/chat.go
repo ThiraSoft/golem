@@ -9,12 +9,13 @@ package gemma
 // itself makes of that template, so this file is checked against the original
 // rather than against a reading of it.
 //
-// What is not covered — audio, video, and the reasoning channel of a past
-// answer — is refused rather than approximated. Images are covered: a turn
-// carrying them opens each with <|image> and closes it with <image|>, and the
-// soft tokens that go between the two are spliced in after the string is
-// encoded, by whoever ran the tower. The template writes where a picture goes;
-// it does not know how large one is.
+// What is not covered — video, and the reasoning channel of a past answer — is
+// refused rather than approximated. Pictures and sound are covered, and the
+// same way: a turn carrying them opens each with <|image> or <|audio> and
+// closes it with <image|> or <audio|>, and the soft tokens that go between the
+// two are spliced in after the string is encoded, by whoever ran the encoder.
+// The template writes where a picture or a recording goes; it does not know
+// how large one is.
 
 import (
 	"fmt"
@@ -73,7 +74,10 @@ const (
 	// imageSoft holds one soft token's place between the two. Its identifier
 	// is never embedded — the row is given — but a real token has to stand
 	// there for the cache and the per-layer lookup to have something to hold.
-	imageSoft = "<|image|>"
+	imageSoft  = "<|image|>"
+	audioOpen  = "<|audio>"
+	audioClose = "<audio|>"
+	audioSoft  = "<|audio|>"
 )
 
 // RenderChat writes the conversation the way Gemma's template does, leading
@@ -174,6 +178,15 @@ func RenderChat(messages []Message, opt ChatOptions) (string, error) {
 			}
 			for range m.Images {
 				b.WriteString(imageOpen + imageClose + "\n")
+			}
+			lastWritten = "content"
+		}
+		if len(m.Audio) > 0 {
+			if role == roleModel {
+				return "", fmt.Errorf("gemma: message %d is a model turn carrying %d recordings, which a model does not send", i, len(m.Audio))
+			}
+			for range m.Audio {
+				b.WriteString(audioOpen + audioClose + "\n")
 			}
 			lastWritten = "content"
 		}
