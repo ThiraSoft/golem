@@ -22,9 +22,11 @@ type visionFixture struct {
 	NImageTokens int `json:"n_image_tokens"`
 }
 
-func loadVisionFixture(t *testing.T) *visionFixture {
+// loadVisionFixture reads one of the vision recordings: "vision" for E2B's
+// tower, "vision12" for the 12B's embedder.
+func loadVisionFixture(t *testing.T, name string) *visionFixture {
 	t.Helper()
-	f := loadFixture(t, "vision")
+	f := loadFixture(t, name)
 	v := &visionFixture{fixture: f}
 	raw, err := os.ReadFile(filepath.Join(f.dir, "index.json"))
 	if err != nil {
@@ -116,7 +118,7 @@ func abs32(v float32) float32 {
 // The pixels first. A resize that differs makes every later comparison
 // meaningless, so this is the test that runs before the others are believed.
 func TestVisionPixelsMatchTheReference(t *testing.T) {
-	f := loadVisionFixture(t)
+	f := loadVisionFixture(t, "vision")
 	tower := openTower(t)
 	want := f.tensor(t, "inp_raw_scaled")
 
@@ -133,7 +135,7 @@ func TestVisionPixelsMatchTheReference(t *testing.T) {
 }
 
 func TestVisionPatchesMatchTheReference(t *testing.T) {
-	f := loadVisionFixture(t)
+	f := loadVisionFixture(t, "vision")
 	tower := openTower(t)
 	want := f.tensor(t, "pos_embd")
 
@@ -144,7 +146,7 @@ func TestVisionPatchesMatchTheReference(t *testing.T) {
 // Each block is started from the reference's own input, so a divergence is
 // attributed to the block it happened in rather than to everything before it.
 func TestVisionBlocksMatchTheReference(t *testing.T) {
-	f := loadVisionFixture(t)
+	f := loadVisionFixture(t, "vision")
 	tower := openTower(t)
 	cfg := tower.Cfg
 
@@ -166,7 +168,7 @@ func TestVisionBlocksMatchTheReference(t *testing.T) {
 // which is what separates their arithmetic from what the blocks before them
 // accumulated.
 func TestVisionPoolAndProjectMatchTheReference(t *testing.T) {
-	f := loadVisionFixture(t)
+	f := loadVisionFixture(t, "vision")
 	tower := openTower(t)
 	cfg := tower.Cfg
 	_, cols, rows := cfg.Prepare(testImage(t))
@@ -194,7 +196,7 @@ func TestVisionPoolAndProjectMatchTheReference(t *testing.T) {
 // The proof that eight thousandths is small enough to be nothing is not here:
 // it is TestVisionGenerationMatchesTheReference, which draws the same tokens.
 func TestVisionEncodeMatchesTheReference(t *testing.T) {
-	f := loadVisionFixture(t)
+	f := loadVisionFixture(t, "vision")
 	tower := openTower(t)
 	want := f.tensor(t, "projected")
 
@@ -223,7 +225,7 @@ func TestVisionEncodeMatchesTheReference(t *testing.T) {
 // to sit a fraction of a logit apart, and a choice decided inside that is not
 // a fault.
 func TestVisionGenerationMatchesTheReference(t *testing.T) {
-	f := loadVisionFixture(t)
+	f := loadVisionFixture(t, "vision")
 	if os.Getenv("GOLEM_MMPROJ") == "" {
 		t.Skip("set GOLEM_MMPROJ to run this test")
 	}

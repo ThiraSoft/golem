@@ -113,30 +113,12 @@ func (v *VisionTower) newScratch(n int) *scratch {
 // stream past it.
 func (v *VisionTower) Patches(pixels []float32, cols, rows int) []float32 {
 	cfg, w := v.Cfg, v.W
-	ps := cfg.PatchSize
-	width := cols * ps
-	plane := width * rows * ps
+	if cfg.Unified {
+		return v.patchesUnified(pixels, cols, rows)
+	}
 	n := cols * rows
-	area := ps * ps * 3
-
-	// The patches, cut out and scaled to -1..1, in the order the weight was
-	// written in: x fastest, then y, then the channel.
-	flat := make([]float32, n*area)
-	nn.InParallel(n, n*area, func(first, last int) {
-		for p := first; p < last; p++ {
-			px, py := p%cols, p/cols
-			patch := flat[p*area : (p+1)*area]
-			for c := 0; c < 3; c++ {
-				for y := 0; y < ps; y++ {
-					src := c*plane + (py*ps+y)*width + px*ps
-					dst := (c*ps + y) * ps
-					for x := 0; x < ps; x++ {
-						patch[dst+x] = pixels[src+x]*2 - 1
-					}
-				}
-			}
-		}
-	})
+	area := cfg.PatchSize * cfg.PatchSize * 3
+	flat := cutPatches(pixels, cols, rows, cfg.PatchSize, true)
 
 	out := make([]float32, n*cfg.Dim)
 	nn.InParallel(cfg.Dim, n*area*cfg.Dim, func(start, end int) {
@@ -148,7 +130,48 @@ func (v *VisionTower) Patches(pixels []float32, cols, rows int) []float32 {
 		}
 	})
 
-	// Two lookups, both added: x by column, y by row.
+	v.addPositions(out, cols, n)
+	return out
+}
+
+// cutPatches lays the image out patch by patch, in the order the weight was
+// written in: x fastest, then y, then the channel — which is ggml's im2col,
+// and what its convolution reads. scaled says whether the pixels are taken to
+// -1..1 on the way, which the tower does and the unified embedder does not:
+// its graph starts from build_inp_raw with no scale_bias after it.
+func cutPatches(pixels []float32, cols, rows, ps int, scaled bool) []float32 {
+	width := cols * ps
+	plane := width * rows * ps
+	n := cols * rows
+	area := ps * ps * 3
+
+	flat := make([]float32, n*area)
+	nn.InParallel(n, n*area, func(first, last int) {
+		for p := first; p < last; p++ {
+			px, py := p%cols, p/cols
+			patch := flat[p*area : (p+1)*area]
+			for c := 0; c < 3; c++ {
+				for y := 0; y < ps; y++ {
+					src := c*plane + (py*ps+y)*width + px*ps
+					dst := (c*ps + y) * ps
+					for x := 0; x < ps; x++ {
+						if scaled {
+							patch[dst+x] = pixels[src+x]*2 - 1
+						} else {
+							patch[dst+x] = pixels[src+x]
+						}
+					}
+				}
+			}
+		}
+	})
+	return flat
+}
+
+// addPositions adds the two learned lookups to a grid of n patches: x by
+// column, y by row. Both projectors carry the same pair of tables.
+func (v *VisionTower) addPositions(out []float32, cols, n int) {
+	cfg, w := v.Cfg, v.W
 	nn.InParallel(n, n*cfg.Dim, func(first, last int) {
 		for p := first; p < last; p++ {
 			px, py := p%cols, p/cols
@@ -160,7 +183,6 @@ func (v *VisionTower) Patches(pixels []float32, cols, rows int) []float32 {
 			}
 		}
 	})
-	return out
 }
 
 // Block runs one block over every patch, in place. xs is the grid, flat.
@@ -339,6 +361,11 @@ func (v *VisionTower) Encode(im *imageio.Image) [][]float32 {
 	cfg := v.Cfg
 	pixels, cols, rows := cfg.Prepare(im)
 	xs := v.Patches(pixels, cols, rows)
+	if cfg.Unified {
+		// There is no tower and nothing to pool: the blocks that would have
+		// followed are the language model's own.
+		return v.Project(xs)
+	}
 	s := v.newScratch(cols * rows)
 	for i := 0; i < cfg.Blocks; i++ {
 		v.Block(i, xs, cols, s)

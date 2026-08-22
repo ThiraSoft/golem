@@ -34,6 +34,13 @@ type VisionConfig struct {
 	// is what decides the size it is resized to. clip.cpp:
 	// hparams.set_limit_image_tokens(40, 280).
 	MinTokens, MaxTokens int
+	// Unified says the file is a gemma4uv projector rather than a gemma4v
+	// one: an embedder with no tower behind it, whose blocks are the language
+	// model's own. The 12B ships one of those, E2B a tower. Everything the two
+	// share — the sizing of the image, the markers, the span attended to in
+	// both directions — is the same; what one has and the other does not is
+	// sixteen blocks and a pooling.
+	Unified bool
 }
 
 // LoadVisionConfig reads an opened mmproj GGUF.
@@ -49,10 +56,11 @@ func LoadVisionConfig(g *tensors.GGUF) (*VisionConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	if proj != "gemma4v" {
-		return nil, fmt.Errorf("gemma: projector %q is not implemented; gemma4v is", proj)
+	if proj != "gemma4v" && proj != "gemma4uv" {
+		return nil, fmt.Errorf("gemma: projector %q is not implemented; gemma4v and gemma4uv are", proj)
 	}
 	cfg := &VisionConfig{
+		Unified:   proj == "gemma4uv",
 		Merge:     3,
 		RoPEBase:  100,
 		MinTokens: 40,
@@ -74,6 +82,20 @@ func LoadVisionConfig(g *tensors.GGUF) (*VisionConfig, error) {
 			return nil, err
 		}
 		*f.dst = int(v)
+	}
+	if cfg.Unified {
+		// The merging of three by three patches is done by the convolution
+		// itself, on a patch three times as wide; nothing is pooled
+		// afterwards. clip.cpp folds it the same way, in the GEMMA4UV arm of
+		// the same switch the three constants above come from.
+		cfg.PatchSize *= cfg.Merge
+		cfg.Merge = 1
+		eps, err := g.Float32("clip.vision.attention.layer_norm_epsilon")
+		if err != nil {
+			return nil, err
+		}
+		cfg.Eps = eps
+		return cfg, nil
 	}
 	if cfg.Heads == 0 || cfg.Dim%cfg.Heads != 0 {
 		return nil, fmt.Errorf("gemma: %d vision heads do not divide a width of %d", cfg.Heads, cfg.Dim)

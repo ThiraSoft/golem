@@ -141,6 +141,10 @@ type VisionBlockWeights struct {
 	Gate, Up, Down            VisionLinear
 }
 
+// VisionNorm is one layer normalization of the unified embedder: a gain and a
+// bias, where every norm of the tower has a gain alone.
+type VisionNorm struct{ Gain, Bias []float32 }
+
 type VisionWeights struct {
 	PatchEmbd  []float32
 	PosX, PosY []float32
@@ -149,6 +153,12 @@ type VisionWeights struct {
 	Proj       VisionLinear
 	StdBias    []float32
 	StdScale   []float32
+
+	// The unified embedder's own, and nothing else's: a bias on the patch
+	// projection, and three layer norms — one over the raw patch, one over the
+	// projection, one over the positions once they are added.
+	PatchBias                    []float32
+	PatchNorm, EmbdNorm, PosNorm VisionNorm
 }
 
 // linear binds a BF16 matrix as a projection with no bias. GGUF writes the row
@@ -217,6 +227,12 @@ func LoadVisionWeights(g *tensors.GGUF, cfg *VisionConfig) (*VisionWeights, erro
 	w.PosX = pos[:w.Positions*cfg.Dim]
 	w.PosY = pos[w.Positions*cfg.Dim:]
 
+	if cfg.Unified {
+		if err := loadUnified(g, w); err != nil {
+			return nil, err
+		}
+	}
+
 	for i := range w.Blocks {
 		p := fmt.Sprintf("v.blk.%d.", i)
 		b := VisionBlockWeights{}
@@ -280,4 +296,28 @@ func LoadVisionWeights(g *tensors.GGUF, cfg *VisionConfig) (*VisionWeights, erro
 		w.StdBias, w.StdScale = bias, scale
 	}
 	return w, nil
+}
+
+// loadUnified binds what the gemma4uv projector has and the tower has not: the
+// patch projection's bias, and the three layer norms around it.
+func loadUnified(g *tensors.GGUF, w *VisionWeights) error {
+	var err error
+	if w.PatchBias, err = floats(g, "v.patch_embd.bias"); err != nil {
+		return err
+	}
+	// clip.cpp numbers them 1, 2 and 3, and calls the third one pos_norm: over
+	// the raw patch, over its projection, and over the positions once added.
+	for i, n := range []*VisionNorm{&w.PatchNorm, &w.EmbdNorm, &w.PosNorm} {
+		p := fmt.Sprintf("v.patch_norm.%d.", i+1)
+		if n.Gain, err = floats(g, p+"weight"); err != nil {
+			return err
+		}
+		if n.Bias, err = floats(g, p+"bias"); err != nil {
+			return err
+		}
+		if len(n.Gain) != len(n.Bias) {
+			return fmt.Errorf("%sweight is %d wide and %sbias %d", p, len(n.Gain), p, len(n.Bias))
+		}
+	}
+	return nil
 }
