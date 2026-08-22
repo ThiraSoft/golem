@@ -104,30 +104,24 @@ func (a *AudioTower) attendOneChunk(b *AudioBlock, q, k, v, rel, ctx, scores []f
 		}
 		row := scores[qi*S : (qi+1)*S]
 		qh := q[gq*dim+h*hd : gq*dim+(h+1)*hd]
+		cap := cfg.Softcap
 		for ki := 0; ki < S; ki++ {
 			gk := blk*C - P + ki
 			if !audioVisible(gq, gk, n, P) {
 				row[ki] = float32(math.Inf(-1))
 				continue
 			}
-			kh := k[gk*dim+h*hd:]
-			var sum float32
-			for d := 0; d < hd; d++ {
-				sum += qh[d] * kh[d]
-			}
-			// The distance between the two is the row of the relative table
-			// this pair reads, counted down from the past horizon.
-			ph := relH[(P-(gq-gk))*hd:]
-			for d := 0; d < hd; d++ {
-				sum += qh[d] * ph[d]
-			}
-			cap := cfg.Softcap
+			// The content score, and on top of it the relative one: the
+			// distance between the two is the row of the relative table this
+			// pair reads, counted down from the past horizon.
+			sum := nn.DotF32(qh, k[gk*dim+h*hd:][:hd]) +
+				nn.DotF32(qh, relH[(P-(gq-gk))*hd:][:hd])
 			row[ki] = cap * float32(math.Tanh(float64(sum/cap)))
 		}
 		nn.SoftmaxGGML(row)
 
-		dst := ctx[gq*dim+h*hd:]
-		for d := 0; d < hd; d++ {
+		dst := ctx[gq*dim+h*hd:][:hd]
+		for d := range dst {
 			dst[d] = 0
 		}
 		for ki := 0; ki < S; ki++ {
@@ -136,8 +130,8 @@ func (a *AudioTower) attendOneChunk(b *AudioBlock, q, k, v, rel, ctx, scores []f
 			if w == 0 || !audioVisible(gq, gk, n, P) {
 				continue
 			}
-			vh := v[gk*dim+h*hd:]
-			for d := 0; d < hd; d++ {
+			vh := v[gk*dim+h*hd:][:hd]
+			for d := range dst {
 				dst[d] += w * vh[d]
 			}
 		}

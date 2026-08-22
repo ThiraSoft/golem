@@ -10,26 +10,29 @@ import (
 // Every block of the tower, against the recording. A divergence names its
 // block, which is the whole point of keeping all twelve.
 //
-// The bound is on the drift itself rather than on a fraction of each block's
-// own range, and it is written as a table because the drift is worth seeing.
-// This tower adds four unscaled branches per block and never normalizes the
-// residual between them, so one block's bfloat16 rounding is carried into the
-// next: a hundredth of a unit after block nought, a quarter after block ten,
-// on a stream whose values run to three hundred. Block eleven is the odd one —
-// its own ln2 divides the range by four, which would make the same drift read
-// four times worse against its own scale and says nothing about the
-// arithmetic.
+// The bound is a fraction of each block's own range, and it is a rule rather
+// than a table because a table fitted to one day's rounding breaks the next
+// time a sum is reordered. This tower adds four unscaled branches per block
+// and never normalizes the residual between them, so one block's bfloat16
+// rounding is carried into the next: the first blocks sit a ten-thousandth of
+// their range from llama.cpp's and block ten a thousandth. Block eleven is the
+// exception, and not because its arithmetic is worse — its own ln2 divides the
+// range by four, so the same drift reads four times larger against it.
 func TestEveryConformerBlockMatchesTheReference(t *testing.T) {
 	f := loadAudioFixture(t, "audio")
 	tower := openAudioTower(t)
 	melIn, frames := f.melInput(t)
 	x, n := tower.preEncode(melIn, frames)
+	closeRelative(t, "pre_encode", x[:n*tower.Cfg.Dim], f.tensor(t, "pre_encode"), 1e-5)
 	s := tower.takeScratch(n)
-	drift := []float32{0.05, 0.05, 0.05, 0.2, 0.2, 0.2, 0.2, 0.2, 0.3, 0.3, 0.4, 1.0}
 	for i := range tower.W.Blocks {
+		tolerance := float32(1.5e-3)
+		if i == len(tower.W.Blocks)-1 {
+			tolerance = 1.5e-2
+		}
 		tower.block(&tower.W.Blocks[i], x, n, s)
-		close(t, fmt.Sprintf("blk.%d.out", i), x[:n*tower.Cfg.Dim],
-			f.tensor(t, fmt.Sprintf("blk.%d.out", i)), drift[i])
+		closeRelative(t, fmt.Sprintf("blk.%d.out", i), x[:n*tower.Cfg.Dim],
+			f.tensor(t, fmt.Sprintf("blk.%d.out", i)), tolerance)
 	}
 }
 

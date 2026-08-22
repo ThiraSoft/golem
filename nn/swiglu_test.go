@@ -176,7 +176,10 @@ func TestGEGLUQuickRangeVectorAgreesWithScalar(t *testing.T) {
 		gate := make([]float32, n)
 		up := make([]float32, n)
 		for i := range gate {
-			gate[i] = float32(i%97)*0.25 - 12
+			// Wide enough to reach where the exponential saturates: the slope
+			// is -1.702, so a gate of -60 asks for exp(102), which is past
+			// what a float32 exponent holds.
+			gate[i] = float32(i%97)*1.5 - 72
 			up[i] = float32(i%13)*0.5 - 3
 		}
 		want := make([]float32, n)
@@ -184,11 +187,96 @@ func TestGEGLUQuickRangeVectorAgreesWithScalar(t *testing.T) {
 			g := gate[i]
 			want[i] = g / (1 + expf(-1.702*g)) * up[i]
 		}
+		args := append([]float32(nil), gate...)
 		GEGLUQuickRange(gate, up, 0, n)
 		for i := range want {
+			// Past the saturation the two divide by 6e37 and by 2e44; both are
+			// nothing, and the same reasoning as agree()'s applies. What must
+			// never happen is the answer coming back as the gate itself, which
+			// is what an unclamped exponent field gives.
+			if -1.702*args[i] > 87 {
+				if abs32f(gate[i]) > 1e-30 || abs32f(want[i]) > 1e-30 {
+					t.Fatalf("n=%d element %d saturates at gate %v: %g against %g, and neither is nothing",
+						n, i, args[i], gate[i], want[i])
+				}
+				continue
+			}
 			if diff := gate[i] - want[i]; diff > 1e-5 || diff < -1e-5 {
 				t.Fatalf("n=%d element %d is %g, expected %g", n, i, gate[i], want[i])
 			}
 		}
 	}
+}
+
+// The vectorized sigmoid gate is the scalar one, or it is wrong. Both
+// activations that use it are checked: a SiLU, which passes one slice three
+// times, and the halving of a conformer's convolution module, which passes
+// two.
+func TestGatedSigmoidMatchesTheScalarPath(t *testing.T) {
+	if !avx2 {
+		t.Skip("no AVX2 on this machine")
+	}
+	const n = 256
+	x := make([]float32, n)
+	over := make([]float32, n)
+	for i := range x {
+		// A wide range on purpose: the feed forward of a conformer hands this
+		// values in the hundreds, where a polynomial exponential either
+		// saturates cleanly or does not.
+		x[i] = float32(i-n/2) * 3
+		over[i] = float32(n/2-i) * 3
+	}
+
+	got := append([]float32(nil), x...)
+	SiLUGGMLRange(got, 0, n)
+	for i := range x {
+		agree(t, "silu", x[i], got[i], x[i]/(1+expf(-x[i])))
+	}
+
+	gotG := make([]float32, n)
+	GLURange(gotG, x, over, 0, n)
+	for i := range x {
+		agree(t, "gate", over[i], gotG[i], x[i]/(1+expf(-over[i])))
+	}
+}
+
+// A length that is not a multiple of eight falls back rather than reading past
+// the end of the slice.
+func TestGatedSigmoidTakesAnOddLength(t *testing.T) {
+	x := []float32{1, -2, 3, -4, 5}
+	got := append([]float32(nil), x...)
+	SiLUGGMLRange(got, 0, len(got))
+	for i, v := range x {
+		if w := v / (1 + expf(-v)); got[i] != w {
+			t.Fatalf("at %d: %v against %v", i, got[i], w)
+		}
+	}
+}
+
+// agree holds the vectorized answer to the scalar one where the two can agree,
+// and to nothing where they cannot.
+//
+// Beyond an argument of 87 the scalar routine hands the tail to the exact
+// exponential and the vectorized one saturates, so the two divide by 6e37 and
+// by 4e55 respectively. Both answers are zero as far as anything downstream is
+// concerned, and demanding that they be the same zero would be demanding that
+// the kernel branch, which is the one thing a kernel is for not doing.
+func agree(t *testing.T, what string, arg, got, want float32) {
+	t.Helper()
+	if arg < -87 {
+		if abs32f(got) > 1e-30 || abs32f(want) > 1e-30 {
+			t.Fatalf("%s at a saturated %v: %v against %v, and neither is nothing", what, arg, got, want)
+		}
+		return
+	}
+	if got != want {
+		t.Fatalf("%s at %v: %v against %v", what, arg, got, want)
+	}
+}
+
+func abs32f(v float32) float32 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }

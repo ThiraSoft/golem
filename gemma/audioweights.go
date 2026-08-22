@@ -29,10 +29,43 @@ import (
 
 // AudioConv is one of the two subsampling convolutions: a 3x3 kernel over
 // In channels producing Out, and the gain of the layer norm that follows it.
+//
+// The file writes it column, row, input channel, output channel. Neither of
+// the two ways the tower reads it wants that order, so both are built once at
+// load: doing it per point of the grid would mean doing it fifty-six thousand
+// times.
+//
+// Packed is output-channel-major, one contiguous row of KH*KW*In per output
+// channel, which is a dot product against a gathered patch. PackedT is the
+// transpose of it — one row of Out per tap — which is the other way to
+// compute the same thing: scale each tap into every accumulator at once. A
+// convolution with few taps and many channels wants the second, because a dot
+// product of nine would spend its time being called.
 type AudioConv struct {
 	W               []float32 // KW*KH*In*Out, the first dimension fastest
+	Packed          []float32 // Out by KH*KW*In, the input channel fastest
+	PackedT         []float32 // KH*KW*In by Out
 	Norm            []float32 // Out gains; the norm has no bias
 	KW, KH, In, Out int
+}
+
+// pack reorders a convolution's weight for the gather the tower does.
+func (c *AudioConv) pack() {
+	taps := c.KH * c.KW * c.In
+	c.Packed = make([]float32, c.Out*taps)
+	c.PackedT = make([]float32, c.Out*taps)
+	for o := 0; o < c.Out; o++ {
+		for ic := 0; ic < c.In; ic++ {
+			for kh := 0; kh < c.KH; kh++ {
+				for kw := 0; kw < c.KW; kw++ {
+					tap := (kh*c.KW+kw)*c.In + ic
+					v := c.W[((o*c.In+ic)*c.KH+kh)*c.KW+kw]
+					c.Packed[o*taps+tap] = v
+					c.PackedT[tap*c.Out+o] = v
+				}
+			}
+		}
+	}
 }
 
 // AudioLinear is a projection whose weight the file stores as F32 rather than
@@ -121,6 +154,7 @@ func LoadAudioWeights(g *tensors.GGUF, cfg *AudioConfig) (*AudioWeights, error) 
 		if len(c.Norm) != c.Out {
 			return nil, fmt.Errorf("%snorm.weight has %d gains for %d channels", p, len(c.Norm), c.Out)
 		}
+		c.pack()
 		w.Conv[i] = c
 	}
 	if w.InputProj, err = audioLinear(g, "a.input_projection.weight"); err != nil {

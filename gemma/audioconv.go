@@ -13,11 +13,7 @@ package gemma
 // would look plausible, and would let every frame hear two frames of its own
 // future.
 
-import (
-	"math"
-
-	"github.com/ThiraSoft/golem/nn"
-)
+import "github.com/ThiraSoft/golem/nn"
 
 // convModule reads x — n positions of Cfg.Dim — and writes what the block adds
 // to its residual into out.
@@ -41,13 +37,10 @@ func (a *AudioTower) convModule(b *AudioBlock, x, out []float32, n int, s *audio
 	// interleaved sets: the first dim values are the signal and the next dim
 	// are what closes over it.
 	gated := s.gate[:n*dim]
-	nn.InParallel(n, n*dim, func(first, last int) {
+	nn.InParallel(n, n*dim*4, func(first, last int) {
 		for p := first; p < last; p++ {
 			row := wide[p*2*dim : (p+1)*2*dim]
-			dst := gated[p*dim : (p+1)*dim]
-			for i := 0; i < dim; i++ {
-				dst[i] = row[i] / (1 + float32(math.Exp(float64(-row[dim+i]))))
-			}
+			nn.GLURange(gated[p*dim:], row, row[dim:], 0, dim)
 		}
 	})
 
@@ -81,11 +74,11 @@ func (a *AudioTower) convModule(b *AudioBlock, x, out []float32, n int, s *audio
 		}
 	})
 
-	nn.InParallel(n, n*dim, func(first, last int) {
+	nn.InParallel(n, n*dim*4, func(first, last int) {
 		for p := first; p < last; p++ {
 			row := out[p*dim : (p+1)*dim]
 			nn.RMSNormPlain(row, b.ConvInnerNorm, cfg.Eps)
-			nn.SiLU(row)
+			nn.SiLUGGMLRange(row, 0, dim)
 		}
 	})
 	copy(gated, out[:n*dim])

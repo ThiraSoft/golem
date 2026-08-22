@@ -95,3 +95,6 @@ func Mix4(dst []float32, dstStride int, v, w []float32, wStride, hd, n int) bool
 
 //go:noescape
 func gegluQuickAVX2(gate, up *float32, n int)
+
+//go:noescape
+func gatedSigmoidAVX2(dst, num, arg *float32, n int)

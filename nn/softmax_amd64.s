@@ -316,7 +316,14 @@ TEXT ·gegluQuickAVX2(SB), NOSPLIT, $0-24
 g8:
 	VMOVUPS (DI)(AX*4), Y0          // g
 	VMULPS  gegluc<>+0x00(SB), Y0, Y1
-	VMAXPS  expc<>+0x140(SB), Y1, Y1 // held at -87, where the exponential is nothing
+
+	// Held inside [-87, 87]. Below -87 the exponential is nothing; above +87
+	// it is more than a float32 exponent field can hold, and the shift that
+	// builds 2^n further down would wrap the sign bit and answer with a small
+	// number where an enormous one belongs — which reads as g rather than as
+	// zero, and is the whole value of the activation instead of none of it.
+	VMAXPS  expc<>+0x140(SB), Y1, Y1
+	VMINPS  plus87<>+0x00(SB), Y1, Y1
 
 	VMOVUPS Y1, Y2
 	VMULPS  expc<>+0x00(SB), Y2, Y2
@@ -359,6 +366,105 @@ g8:
 	ADDQ $8, AX
 	CMPQ AX, CX
 	JLT  g8
+
+	VZEROUPPER
+	RET
+
+DATA plus87<>+0x00(SB)/4, $0x42ae0000  // +87, where the exponential is all it can be
+DATA plus87<>+0x04(SB)/4, $0x42ae0000
+DATA plus87<>+0x08(SB)/4, $0x42ae0000
+DATA plus87<>+0x0c(SB)/4, $0x42ae0000
+DATA plus87<>+0x10(SB)/4, $0x42ae0000
+DATA plus87<>+0x14(SB)/4, $0x42ae0000
+DATA plus87<>+0x18(SB)/4, $0x42ae0000
+DATA plus87<>+0x1c(SB)/4, $0x42ae0000
+
+GLOBL plus87<>(SB), RODATA|NOPTR, $32
+
+DATA negone<>+0x00(SB)/4, $0xbf800000  // -1.0
+DATA negone<>+0x04(SB)/4, $0xbf800000
+DATA negone<>+0x08(SB)/4, $0xbf800000
+DATA negone<>+0x0c(SB)/4, $0xbf800000
+DATA negone<>+0x10(SB)/4, $0xbf800000
+DATA negone<>+0x14(SB)/4, $0xbf800000
+DATA negone<>+0x18(SB)/4, $0xbf800000
+DATA negone<>+0x1c(SB)/4, $0xbf800000
+
+GLOBL negone<>(SB), RODATA|NOPTR, $32
+
+// func gatedSigmoidAVX2(dst, num, arg *float32, n int)
+//
+// dst = num / (1 + exp(-arg)), eight at a time, with the same exponential the
+// softmax and the quick GELU above use — ggml's, which is what a conformer
+// read out of a GGUF is compared against.
+//
+// One kernel for two activations, because they are the same expression:
+// a SiLU passes the same pointer as num and as arg, and the halving that opens
+// a conformer's convolution module passes the two halves of one row. It lives
+// in this file rather than beside them because expc<> is file-static, and a
+// second copy of ggml's polynomial is a second thing to keep right.
+//
+// n must be a multiple of eight, and dst may alias num or arg.
+TEXT ·gatedSigmoidAVX2(SB), NOSPLIT, $0-32
+	MOVQ dst+0(FP), DX
+	MOVQ num+8(FP), DI
+	MOVQ arg+16(FP), SI
+	MOVQ n+24(FP), CX
+	XORQ AX, AX
+
+s8:
+	VMOVUPS (SI)(AX*4), Y1
+	VMULPS  negone<>+0x00(SB), Y1, Y1
+
+	// Held inside [-87, 87], and both ends matter. Below -87 the exponential
+	// is nothing; above +87 it is more than a float32 exponent field can
+	// hold, and the shift that builds 2^n further down would wrap the sign bit
+	// and give a small number where an enormous one belongs. The activation
+	// this feeds sees values in the hundreds, so that end is reached.
+	VMAXPS  expc<>+0x140(SB), Y1, Y1
+	VMINPS  plus87<>+0x00(SB), Y1, Y1
+
+	VMOVUPS Y1, Y2
+	VMULPS  expc<>+0x00(SB), Y2, Y2
+	VADDPS  expc<>+0x20(SB), Y2, Y2
+	VSUBPS  expc<>+0x20(SB), Y2, Y3
+
+	VMOVUPS Y3, Y4
+	VMULPS  expc<>+0x40(SB), Y4, Y4
+	VSUBPS  Y4, Y1, Y4
+	VMOVUPS Y3, Y5
+	VMULPS  expc<>+0x60(SB), Y5, Y5
+	VSUBPS  Y5, Y4, Y4
+
+	VPSLLD $23, Y2, Y5
+	VPADDD expc<>+0x120(SB), Y5, Y5
+
+	VMULPS Y4, Y4, Y6
+
+	VMOVUPS expc<>+0x100(SB), Y7
+	VMULPS  Y4, Y7, Y7
+	VADDPS  expc<>+0xe0(SB), Y7, Y7
+	VMOVUPS expc<>+0xc0(SB), Y8
+	VMULPS  Y4, Y8, Y8
+	VADDPS  expc<>+0xa0(SB), Y8, Y8
+	VMULPS  Y6, Y7, Y7
+	VADDPS  Y8, Y7, Y7
+	VMULPS  Y6, Y7, Y7
+	VMOVUPS expc<>+0x80(SB), Y9
+	VMULPS  Y4, Y9, Y9
+	VADDPS  Y9, Y7, Y7
+
+	VMULPS Y5, Y7, Y7
+	VADDPS Y5, Y7, Y7               // exp(-arg)
+
+	VADDPS  expc<>+0x120(SB), Y7, Y7 // 1 + it
+	VMOVUPS (DI)(AX*4), Y0
+	VDIVPS  Y7, Y0, Y0
+	VMOVUPS Y0, (DX)(AX*4)
+
+	ADDQ $8, AX
+	CMPQ AX, CX
+	JLT  s8
 
 	VZEROUPPER
 	RET

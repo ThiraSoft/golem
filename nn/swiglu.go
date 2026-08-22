@@ -98,3 +98,39 @@ func GEGLUQuickRange(gate, up []float32, start, end int) {
 		gate[i] = g / (1 + expf(-1.702*g)) * up[i]
 	}
 }
+
+// SiLUGGMLRange writes x/(1+exp(-x)) over one stretch, with ggml's own
+// exponential rather than the exact one.
+//
+// It sits beside SiLU rather than replacing it, and the difference is which
+// reference each answers to. SiLU is PyTorch's, computed in float64, and
+// pockettts is checked against PyTorch. This one is ggml's, and a conformer
+// read out of a GGUF is checked against llama.cpp — so using the exact
+// exponential there would not be more accurate, it would be a couple of units
+// in the last place away from the thing being compared to, and forty
+// nanoseconds slower per value.
+func SiLUGGMLRange(x []float32, start, end int) {
+	if n := end - start; avx2 && n > 0 && n%8 == 0 {
+		gatedSigmoidAVX2(&x[start], &x[start], &x[start], n)
+		return
+	}
+	for i := start; i < end; i++ {
+		v := x[i]
+		x[i] = v / (1 + expf(-v))
+	}
+}
+
+// GLURange writes gate*sigmoid(over) into dst, with the same exponential.
+//
+// It is the halving a conformer's convolution module opens with: one
+// projection to twice the width, the first half kept and the second turned
+// into what closes over it.
+func GLURange(dst, gate, over []float32, start, end int) {
+	if n := end - start; avx2 && n > 0 && n%8 == 0 {
+		gatedSigmoidAVX2(&dst[start], &gate[start], &over[start], n)
+		return
+	}
+	for i := start; i < end; i++ {
+		dst[i] = gate[i] / (1 + expf(-over[i]))
+	}
+}

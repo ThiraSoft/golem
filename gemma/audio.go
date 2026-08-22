@@ -185,10 +185,8 @@ func (a *AudioTower) halfStepFFN(pre, post []float32, up, down VisionLinear, x [
 	})
 	hidden := s.ffn[:n*ffn]
 	up.Apply(norm, s.wide, hidden, n)
-	nn.InParallel(n, n*ffn, func(first, last int) {
-		for p := first; p < last; p++ {
-			nn.SiLU(hidden[p*ffn : (p+1)*ffn])
-		}
+	nn.InParallel(n*ffn, n*ffn*4, func(first, last int) {
+		nn.SiLUGGMLRange(hidden, first, last)
 	})
 	branch := s.branch[:n*dim]
 	down.Apply(hidden, s.wide, branch, n)
