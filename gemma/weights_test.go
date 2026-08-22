@@ -157,9 +157,13 @@ func TestLoad26BExpertShapes(t *testing.T) {
 			t.Fatalf("block %d: the router scale has %d entries for a width of %d",
 				i, len(b.RouterScale), cfg.Dim)
 		}
-		if b.GateExps.Count != cfg.Experts || b.GateExps.Rows != cfg.ExpertFFN || b.GateExps.Cols != cfg.Dim {
-			t.Fatalf("block %d: gate experts are %d of %dx%d, expected %d of %dx%d",
-				i, b.GateExps.Count, b.GateExps.Rows, b.GateExps.Cols, cfg.Experts, cfg.ExpertFFN, cfg.Dim)
+		if b.GateUpExps.Count != cfg.Experts || b.GateUpExps.Rows != 2*cfg.ExpertFFN || b.GateUpExps.Cols != cfg.Dim {
+			t.Fatalf("block %d: gate-and-up experts are %d of %dx%d, expected %d of %dx%d",
+				i, b.GateUpExps.Count, b.GateUpExps.Rows, b.GateUpExps.Cols, cfg.Experts, 2*cfg.ExpertFFN, cfg.Dim)
+		}
+		if len(b.DownScale) != cfg.Experts {
+			t.Fatalf("block %d: the down scale has %d entries for %d experts",
+				i, len(b.DownScale), cfg.Experts)
 		}
 		if b.DownExps.Rows != cfg.Dim || b.DownExps.Cols != cfg.ExpertFFN {
 			t.Fatalf("block %d: down experts are %dx%d, expected %dx%d",

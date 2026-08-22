@@ -34,14 +34,18 @@ type BlockWeights struct {
 	// stands in for the gain of a norm that has none.
 	Router                     nn.Matrix
 	RouterScale                []float32
-	FFNPreNorm2                []float32
+	PreFFWNorm2                []float32
 	PostFFWNorm1, PostFFWNorm2 []float32
-	GateExps, UpExps, DownExps ExpertStack
-
-	// RoPEFactors are this block's frequency factors, when the file carries
-	// them per block. The older checkpoints publish one tensor for the whole
-	// model, which Weights.RoPEFreqs holds and which stays the fallback.
-	RoPEFactors []float32
+	// GateUpExps holds both halves of one product: an expert's first
+	// ExpertFFN rows are its gate, the next ExpertFFN its up. The file fuses
+	// them and the reference splits them back into two views; keeping the
+	// fusion is one product over 1408 rows rather than two over 704, on an
+	// input read once.
+	GateUpExps, DownExps ExpertStack
+	// DownScale is one scalar per expert, multiplying that expert's whole
+	// output. llama.cpp applies it just before the routing weight, so this
+	// engine folds it into that weight.
+	DownScale []float32
 }
 
 // A stack of expert matrices, kept as the one three-dimensional tensor the
@@ -245,29 +249,24 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 			if b.RouterScale, err = floats(g, p+"ffn_gate_inp.scale"); err != nil {
 				return nil, err
 			}
-			if b.FFNPreNorm2, err = floats(g, p+"ffn_pre_norm_2.weight"); err != nil {
+			if b.PreFFWNorm2, err = floats(g, p+"pre_ffw_norm_2.weight"); err != nil {
 				return nil, err
 			}
-			if b.PostFFWNorm1, err = floats(g, p+"ffn_post_norm_1.weight"); err != nil {
+			if b.PostFFWNorm1, err = floats(g, p+"post_ffw_norm_1.weight"); err != nil {
 				return nil, err
 			}
-			if b.PostFFWNorm2, err = floats(g, p+"ffn_post_norm_2.weight"); err != nil {
+			if b.PostFFWNorm2, err = floats(g, p+"post_ffw_norm_2.weight"); err != nil {
 				return nil, err
 			}
-			if b.GateExps, err = experts(g, p+"ffn_gate_exps.weight"); err != nil {
-				return nil, err
-			}
-			if b.UpExps, err = experts(g, p+"ffn_up_exps.weight"); err != nil {
+			if b.GateUpExps, err = experts(g, p+"ffn_gate_up_exps.weight"); err != nil {
 				return nil, err
 			}
 			if b.DownExps, err = experts(g, p+"ffn_down_exps.weight"); err != nil {
 				return nil, err
 			}
-		}
-		// A checkpoint that publishes frequency factors per block rather than
-		// once for the model; the 26B's global blocks do.
-		if f, err := floats(g, p+"rope_freqs.weight"); err == nil {
-			b.RoPEFactors = f
+			if b.DownScale, err = floats(g, p+"ffn_down_exps.scale"); err != nil {
+				return nil, err
+			}
 		}
 		if cfg.PLEDim > 0 {
 			if b.InpGate, err = matrix(g, p+"inp_gate.weight"); err != nil {
@@ -311,13 +310,16 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 				return nil, fmt.Errorf("block %d: the router scale has %d entries for a width of %d",
 					i, len(b.RouterScale), cfg.Dim)
 			}
+			if len(b.DownScale) != cfg.Experts {
+				return nil, fmt.Errorf("block %d: the down scale has %d entries for %d experts",
+					i, len(b.DownScale), cfg.Experts)
+			}
 			for _, e := range []struct {
 				name       string
 				stack      ExpertStack
 				rows, cols int
 			}{
-				{"gate", b.GateExps, cfg.ExpertFFN, cfg.Dim},
-				{"up", b.UpExps, cfg.ExpertFFN, cfg.Dim},
+				{"gate and up", b.GateUpExps, 2 * cfg.ExpertFFN, cfg.Dim},
 				{"down", b.DownExps, cfg.Dim, cfg.ExpertFFN},
 			} {
 				if e.stack.Count != cfg.Experts || e.stack.Rows != e.rows || e.stack.Cols != e.cols {
