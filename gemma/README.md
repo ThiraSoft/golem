@@ -399,9 +399,16 @@ And the vision tower, per picture rather than per token:
 | `VisionTower.Encode` — a 640×426 picture, 1053 patches, 117 soft tokens | 0.78 s |
 | llama.cpp's `mtmd_encode_chunk`, the same picture | 1.08 s |
 
-**×1.38, and the comparison is if anything against this engine**: the figure
-above includes resizing the picture, and llama.cpp's does not — its
-preprocessing happens in `mtmd_tokenize`, before that timer starts. Both are
+And the audio conformer, per recording:
+
+| | per recording |
+|---|---|
+| `AudioTower.Encode` — a 17.4-second clip, 1743 mel frames, 436 soft tokens | 0.58 s |
+| llama.cpp's `mtmd_encode_chunk`, the same clip | 0.58 s |
+| Mel front end — 1743 frames of 128 mel bins | 15 ms |
+| llama.cpp's `mtmd_tokenize` mel preprocessing | 20 ms |
+
+**×1.38 on vision, parity on audio conformer, and faster on the mel front end.** Both are
 the best of four runs on eight cores with no accelerator.
 
 A warning for anyone repeating this. `llama-mtmd-cli` prints two durations for

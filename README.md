@@ -81,7 +81,10 @@ A4B, whose feed forward is a mixture of a hundred and twenty-eight experts,
 14.6 and 110. Pocket TTS speaks at ×2.94 real time in French, ×6.81 in English.
 A 640×426 picture goes through E2B's vision tower in 0.72 seconds, against
 llama.cpp's 1.08; through the 12B's embedder, which is one product against a
-hundred-megabyte weight, in 35 milliseconds against llama.cpp's 22.
+hundred-megabyte weight, in 35 milliseconds against llama.cpp's 22. A 17-second
+audio clip goes through E2B's conformer in 0.58 seconds, matching llama.cpp's
+0.58; its mel front end builds 1743 frames in 15 milliseconds against
+llama.cpp's 20.
 
 **The 0.6B is the one this engine loses**, and `qwen/README.md` says why: at
 320 MB the weights fit close enough that the memory bus stops being the limit,
