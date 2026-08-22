@@ -171,6 +171,54 @@ returning sums with no bound at all. E2B never showed it, because 1536, 6144 and
 12288 all divide. `nn.TestMatVecQ4_0PartialTiles` is that case, with both
 operands padded so an overrun meets numbers rather than zeros.
 
+## The 26B A4B, and the one thing it has
+
+The 26B declares `gemma4` too, has no per-layer embeddings and no sharing, and
+alternates five window blocks of 1024 for one global — sixteen query heads over
+eight key-value heads of 256 in a window block and *two* of 512 in a global one,
+where the 12B has one. Its global blocks publish no value projection either.
+None of that needed a line: the geometry is read, and a number the code never
+wrote down cannot be wrong about a checkpoint it has not met.
+
+What it has that nothing else here does is a **mixture of experts**, and it is
+not the usual one. The shared expert is the ordinary dense feed forward, and
+the experts run *beside* it rather than after it:
+
+    attn_out -> ffn_norm       -> dense FFN       -> post_ffw_norm_1 -\
+                                                                      + -> post_ffw_norm -> + attn_out
+    attn_out -> pre_ffw_norm_2 -> chosen experts  -> post_ffw_norm_2 -/
+
+Three post-norms, not two. The sum of the branches goes through the block's own
+`post_ffw_norm` — the same norm a dense block applies to its one branch —
+before joining the stream. Leaving that out gives a block whose every inner
+waypoint matches the reference to a part in a million and whose output does
+not, which is exactly how it was found.
+
+The router is the other place to read twice. It reads `attn_out`, the residual,
+not either branch's normed input: an RMS norm with no gain, scaled by one over
+the square root of the width, multiplied elementwise by `ffn_gate_inp.scale`
+which stands in for that missing gain, then the router's matrix, then a softmax
+over the largest eight of a hundred and twenty-eight, renormalized over those
+eight alone. Routing on the branch's input instead gives a model that answers
+fluently and wrongly, and nothing announces it — which is why
+`ffn_moe_logits` is a recorded waypoint and not an inference from `l_out`.
+
+Two things the file says that the reference source does not:
+
+- **Gate and up are fused.** There is no `ffn_gate_exps` and no `ffn_up_exps`,
+  one `ffn_gate_up_exps` of Q4_0 [2816, 1408, 128]: an expert's first 704 rows
+  are its gate, the next 704 its up. So one product does both halves on an
+  input read once.
+- **A scalar per expert.** `ffn_down_exps.scale` multiplies that expert's whole
+  output. llama.cpp applies it just before the routing weight, so this engine
+  folds it into that weight — one multiplication instead of two thousand eight
+  hundred and sixteen.
+
+The expert stacks are the one kind of matrix `Repack` leaves alone. Only eight
+of a hundred and twenty-eight are read per position, so the interleaved second
+copy that pays for itself elsewhere would double the resident weights to speed
+up six percent of the rows.
+
 ## How it is known to be right
 
 Not against PyTorch. The weights on disk are quantized, and comparing a Q4_0
@@ -450,6 +498,28 @@ mapping's own pages are clean and the kernel can drop them under pressure, so
 what the machine has to find is one copy plus what it is using. It is the same
 trade ggml makes with its repacked buffer types, and it is what the prompt is
 worth here.
+
+### What the mixture costs
+
+Eight threads, Q4_0, prompt of 64, warm page cache — the second measurement,
+because the first is a measurement of the disk:
+
+| | golem | llama.cpp `-ngl 0` |
+|---|---|---|
+| generating | 8.3 tokens a second | 12.6 |
+| reading a prompt | 51.3 | 48.2 |
+
+Reading a prompt is where this engine is ahead, by about seven percent, and it
+is ahead for the ordinary reason: the batch reads each weight once for
+sixty-four positions.
+
+Generating is where it is behind, and the cause is in this code rather than in
+the arithmetic. `ExpertFFN` spreads its work over the positions, because each
+position reads a different eight matrices and a section per expert would be a
+barrier per expert. At a batch of one there is one position — so one core does
+all eight products while seven wait. The fix is to parallelize over the chosen
+experts' rows when the batch is small, which is a change to one function and
+has not been made.
 
 ## The chat template
 
