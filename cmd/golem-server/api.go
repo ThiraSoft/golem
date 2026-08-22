@@ -42,6 +42,13 @@ type contentPart struct {
 	ImageURL struct {
 		URL string `json:"url"`
 	} `json:"image_url"`
+	// InputAudio is OpenAI's own part for sound. Data is base64 of a whole
+	// file, and Format names what encoded it — which this server does not
+	// need, because audio/decode reads the header instead of being told.
+	InputAudio struct {
+		Data   string `json:"data"`
+		Format string `json:"format"`
+	} `json:"input_audio"`
 }
 
 func (m *requestMessages) UnmarshalJSON(raw []byte) error {
@@ -79,6 +86,12 @@ func (m *requestMessages) UnmarshalJSON(raw []byte) error {
 						return fmt.Errorf("message %d: %w", i, err)
 					}
 					msg.Images = append(msg.Images, data)
+				case "input_audio":
+					data, err := readInputAudio(part.InputAudio.Data)
+					if err != nil {
+						return fmt.Errorf("message %d: %w", i, err)
+					}
+					msg.Audio = append(msg.Audio, data)
 				default:
 					return fmt.Errorf("message %d holds a content part of type %q, which this server does not read", i, part.Type)
 				}
@@ -109,6 +122,25 @@ func readImageURL(url string) ([]byte, error) {
 		return base64.StdEncoding.DecodeString(url[comma+1:])
 	}
 	return os.ReadFile(url)
+}
+
+// readInputAudio takes the two forms this server accepts for a recording, and
+// refuses the one it will not, for the same reason readImageURL refuses it: a
+// server that fetches what a prompt names is a server that can be aimed.
+//
+// OpenAI's part carries bare base64 rather than a data: URI, and this server
+// also accepts a path on its own filesystem, as it does for a picture.
+func readInputAudio(data string) ([]byte, error) {
+	if strings.HasPrefix(data, "http://") || strings.HasPrefix(data, "https://") {
+		return nil, fmt.Errorf("this server does not fetch audio over the network; send the bytes as base64")
+	}
+	if strings.HasPrefix(data, "data:") {
+		return readImageURL(data)
+	}
+	if raw, err := base64.StdEncoding.DecodeString(data); err == nil && len(raw) > 0 {
+		return raw, nil
+	}
+	return os.ReadFile(data)
 }
 
 // stopStrings reads the two spellings the API allows: one string, or a list.

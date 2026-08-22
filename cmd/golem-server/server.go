@@ -61,10 +61,36 @@ func (s *Server) look(msgs []chat.Message) ([][][]float32, error) {
 	return out, nil
 }
 
+// listen runs the encoder over every recording the conversation carries, in
+// the order the turns carry them.
+func (s *Server) listen(msgs []chat.Message) ([][][]float32, error) {
+	var out [][][]float32
+	for _, m := range msgs {
+		for _, raw := range m.Audio {
+			rows, err := s.vision.EncodeAudio(raw)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, rows)
+		}
+	}
+	return out, nil
+}
+
 // carriesImages reports whether any turn brought a picture.
 func carriesImages(msgs []chat.Message) bool {
 	for _, m := range msgs {
 		if len(m.Images) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// carriesAudio reports whether any turn brought a recording.
+func carriesAudio(msgs []chat.Message) bool {
+	for _, m := range msgs {
+		if len(m.Audio) > 0 {
 			return true
 		}
 	}
@@ -114,20 +140,35 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 	ids := s.vocab.Encode(prompt, false, true)
 
 	// The rendered conversation carries an empty pair of markers where each
-	// picture goes, and the rows go between them.
+	// picture and each recording goes, and the rows go between them.
 	built := &gemma.Prompt{Tokens: ids}
-	if carriesImages(req.Messages) {
-		if s.vision == nil {
+	if seen, heard := carriesImages(req.Messages), carriesAudio(req.Messages); seen || heard {
+		if seen && (s.vision == nil || !s.vision.CanSee()) {
 			refuse(w, http.StatusBadRequest, "invalid_request_error",
-				"this model was started without a projector, so it cannot look at a picture: start the server with -mmproj")
+				"this model was started without a projector that can see, so it cannot look at a picture: start the server with -mmproj")
 			return
 		}
-		rows, err := s.look(req.Messages)
-		if err != nil {
-			refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		if heard && (s.vision == nil || !s.vision.CanHear()) {
+			refuse(w, http.StatusBadRequest, "invalid_request_error",
+				"this model was started without a projector that can hear, so it cannot listen: start the server with -mmproj")
 			return
 		}
-		built, err = s.vision.Prompt(ids, rows, nil)
+		var pictures, recordings [][][]float32
+		if seen {
+			pictures, err = s.look(req.Messages)
+			if err != nil {
+				refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				return
+			}
+		}
+		if heard {
+			recordings, err = s.listen(req.Messages)
+			if err != nil {
+				refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				return
+			}
+		}
+		built, err = s.vision.Prompt(ids, pictures, recordings)
 		if err != nil {
 			refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
