@@ -506,20 +506,34 @@ because the first is a measurement of the disk:
 
 | | golem | llama.cpp `-ngl 0` |
 |---|---|---|
-| generating | 8.3 tokens a second | 12.6 |
-| reading a prompt | 51.3 | 48.2 |
+| generating | 13.1 tokens a second | 12.4 |
+| reading a prompt | 51.0 | 48.1 |
 
-Reading a prompt is where this engine is ahead, by about seven percent, and it
-is ahead for the ordinary reason: the batch reads each weight once for
-sixty-four positions.
+A token is 76.6 ms: 58.9 in the thirty blocks and 17.7 in the logit head, which
+reads a Q4_0 matrix of 262144 rows by 2816 and is the same fifth of the cost
+for either engine.
 
-Generating is where it is behind, and the cause is in this code rather than in
-the arithmetic. `ExpertFFN` spreads its work over the positions, because each
-position reads a different eight matrices and a section per expert would be a
-barrier per expert. At a batch of one there is one position — so one core does
-all eight products while seven wait. The fix is to parallelize over the chosen
-experts' rows when the batch is small, which is a change to one function and
-has not been made.
+### Why the unit of work is one expert and not one position
+
+`ExpertFFN` splits its work by *(position, expert)* — eight units per position
+rather than one. That is the difference between 121 ms a token and 59, and the
+reason is that decoding is a batch of one: split by position, seven cores of
+eight spin while the eighth does the majority of the arithmetic in the model,
+forty-seven million products a block against the dense branch's eighteen. The
+profile said so plainly before the change — two thirds of all samples were in
+`spinPause`.
+
+Eight units cannot accumulate into one vector, so each writes its own and a
+second section sums them. That reduction is `Dim` adds per unit against `Dim`
+times `ExpertFFN` products, a part in seven hundred.
+
+The doubling is not eightfold, and the profile says why that too: with the
+cores busy, the expert path costs about twice the CPU it did on one core for
+the same arithmetic. Eight cores each pull a different expert's 3.3 MB of
+weights at once, and what they wait on afterwards is memory rather than each
+other. A token reads about 1.7 GB — 800 MB of it experts, 415 MB the logit
+head — so this is now a bandwidth number, and the next honest gain would have
+to read fewer bytes rather than spread them better.
 
 ## The chat template
 

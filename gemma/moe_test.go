@@ -247,10 +247,11 @@ func TestChooseExpertsIsStableInTies(t *testing.T) {
 // checked where it is easiest to break: a buffer taken with make inside the
 // loop would cost a hundred thousand allocations a generation.
 //
-// The floor is three, and they are not this file's doing: a closure handed to
+// The floor is five, and they are not this file's doing: a closure handed to
 // nn.InParallel is one allocation, the whole engine pays it in every section,
-// and there are three sections here — the router's norm, the router's product,
-// and the experts.
+// and there are five here — the router's norm, the router's product, the
+// quantizing of each position's input, the experts, and the reduction that
+// sums them.
 func TestExpertFFNDoesNotAllocate(t *testing.T) {
 	cfg := moeConfig()
 	bw := randomMoEBlock(cfg, 3)
@@ -259,7 +260,7 @@ func TestExpertFFNDoesNotAllocate(t *testing.T) {
 	in.Set(0, wave(cfg.Dim, 0))
 	out := [][]float32{make([]float32, cfg.Dim)}
 	ExpertFFN(cfg, bw, s, in, out) // the first call fills the lazy buffers
-	const sections = 3
+	const sections = 5
 	if n := testing.AllocsPerRun(20, func() { ExpertFFN(cfg, bw, s, in, out) }); n > sections {
 		t.Fatalf("%v allocations per call, above the %d parallel sections", n, sections)
 	}

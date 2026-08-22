@@ -43,21 +43,25 @@ type Scratch struct {
 	expIDs     [][]int32
 	expWeights [][]float32
 	expLogits  [][]float32
-	// expGateUp holds both halves of one expert's first product: the gate in
-	// the first ExpertFFN elements, the up in the next.
-	expGateUp [][]float32
-	expDown   [][]float32
+	// These are per unit of work, and a unit is one expert of one position:
+	// ExpertsUsed of them per position, so that decoding one token has eight
+	// pieces to share out rather than one. expGateUp holds both halves of the
+	// first product, the gate in the first ExpertFFN elements and the up in
+	// the next; expPartial is that expert's own output, which the reduction
+	// weights and sums.
+	expGateUp  [][]float32
+	expPartial [][]float32
 	// The same two rows, each wrapped in the slice of one that MatVecRows
 	// takes. The wrapper does not escape, so building it in the loop would
 	// cost nothing; it is here because the loop reads better without it.
-	expGateUpRow [][][]float32
-	expDownRow   [][][]float32
-	routerIn     map[int]*nn.Batch
-	expBranch    map[int]*nn.Batch
-	expertIn     []*nn.Batch
-	expertMid    []*nn.Batch
-	moeShared    [][]float32 // the dense branch's output, Dim
-	moeExperts   [][]float32 // the expert branch's output, Dim
+	expGateUpRow  [][][]float32
+	expPartialRow [][][]float32
+	routerIn      map[int]*nn.Batch
+	expBranch     map[int]*nn.Batch
+	expertIn      []*nn.Batch
+	expertMid     []*nn.Batch
+	moeShared     [][]float32 // the dense branch's output, Dim
+	moeExperts    [][]float32 // the expert branch's output, Dim
 
 	experts, expertsUsed, expertFFN int
 
@@ -108,18 +112,19 @@ func (s *Scratch) Reserve(batch int) {
 		s.expIDs = ints(batch, s.expertsUsed)
 		s.expWeights = rows(batch, s.expertsUsed)
 		s.expLogits = rows(batch, s.experts)
-		s.expGateUp = rows(batch, 2*s.expertFFN)
-		s.expDown = rows(batch, s.dim)
-		s.expGateUpRow = make([][][]float32, batch)
-		s.expDownRow = make([][][]float32, batch)
-		for t := 0; t < batch; t++ {
-			s.expGateUpRow[t] = [][]float32{s.expGateUp[t]}
-			s.expDownRow[t] = [][]float32{s.expDown[t]}
+		units := batch * s.expertsUsed
+		s.expGateUp = rows(units, 2*s.expertFFN)
+		s.expPartial = rows(units, s.dim)
+		s.expGateUpRow = make([][][]float32, units)
+		s.expPartialRow = make([][][]float32, units)
+		for u := 0; u < units; u++ {
+			s.expGateUpRow[u] = [][]float32{s.expGateUp[u]}
+			s.expPartialRow[u] = [][]float32{s.expPartial[u]}
 		}
 		s.moeShared = rows(batch, s.dim)
 		s.moeExperts = rows(batch, s.dim)
 		s.expertIn = batches(batch, s.dim)
-		s.expertMid = batches(batch, s.expertFFN)
+		s.expertMid = batches(units, s.expertFFN)
 	}
 	for base := range s.ropes {
 		s.ropes[base] = tables(batch)
@@ -232,10 +237,11 @@ func (s *Scratch) ExpertBranch(batch int) *nn.Batch {
 func (s *Scratch) MoEShared() []float32  { return s.moeShared[0] }
 func (s *Scratch) MoEExperts() []float32 { return s.moeExperts[0] }
 
-// ExpertIn and ExpertMid are one position's own single-column batches: the
-// input an expert's gate and up read, and the gated half its down reads.
+// ExpertIn is one position's own single-column batch, holding the input every
+// one of its experts reads. ExpertMid is one unit's, holding the gated half
+// that expert's down projection reads.
 func (s *Scratch) ExpertIn(t int) *nn.Batch  { return s.expertIn[t] }
-func (s *Scratch) ExpertMid(t int) *nn.Batch { return s.expertMid[t] }
+func (s *Scratch) ExpertMid(u int) *nn.Batch { return s.expertMid[u] }
 
 // Q, K and V expose what the last call to Attention computed for the first
 // position of its batch, for the tests that compare against llama.cpp's

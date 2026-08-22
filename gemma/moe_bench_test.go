@@ -51,3 +51,17 @@ func BenchmarkMoEPrefill(b *testing.B) {
 		m.ForwardBatch(tokens, 0)
 	}
 }
+
+// The logit head alone. It reads a Q4_0 matrix of 262144 rows by 2816 — four
+// hundred megabytes a token, against the seven hundred the thirty blocks read
+// — so at this size it is a fifth of what generating a token costs, and it is
+// the same fifth for llama.cpp.
+func BenchmarkMoELogits(b *testing.B) {
+	m := open26BEngine(b)
+	hidden := m.Forward(2, 0)
+	out := make([]float32, m.Cfg.Vocab)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m.Logits(hidden, out)
+	}
+}

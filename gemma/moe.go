@@ -113,40 +113,67 @@ func ExpertFFN(cfg *Config, bw *BlockWeights, s *Scratch, in *nn.Batch, out [][]
 	batch := len(out)
 	Route(cfg, bw, s, s.resid[:batch], s.expIDs[:batch], s.expWeights[:batch])
 
-	work := batch * cfg.ExpertsUsed * cfg.ExpertFFN * cfg.Dim * 2
-	nn.InParallel(batch, work, func(first, last int) {
+	// Each position's input, quantized once and read by all eight of its
+	// experts. A column of a wider batch would be strided, and the products
+	// below want it contiguous.
+	nn.InParallel(batch, batch*cfg.Dim*perPosition, func(first, last int) {
 		for t := first; t < last; t++ {
-			// One column of the batch, on its own, because an expert's matrix
-			// is read for this position and no other.
-			one, mid := s.ExpertIn(t), s.ExpertMid(t)
+			one := s.ExpertIn(t)
 			copy(one.F[0], in.F[t])
 			one.QuantizeColumnRange(0, 0, cfg.Dim)
+		}
+	})
 
-			gateUp, down := s.expGateUp[t], s.expDown[t]
+	// One unit of work is one expert of one position, and there are eight of
+	// them per position rather than one. That is the whole of why this is
+	// split this way: a token is decoded a position at a time, so splitting by
+	// position leaves seven cores of eight spinning while the eighth does the
+	// majority of the arithmetic in the model — forty-seven million products a
+	// block against the dense branch's eighteen.
+	//
+	// Eight units cannot accumulate into one vector, so each writes its own
+	// and the sum is a second section. The reduction is Dim adds per unit
+	// against Dim times ExpertFFN products, which is a part in seven hundred.
+	units := batch * cfg.ExpertsUsed
+	work := units * cfg.ExpertFFN * cfg.Dim * 2
+	nn.InParallel(units, work, func(first, last int) {
+		for u := first; u < last; u++ {
+			t, k := u/cfg.ExpertsUsed, u%cfg.ExpertsUsed
+			id := s.expIDs[t][k]
+			one, mid := s.ExpertIn(t), s.expertMid[u]
+
+			gateUp := s.expGateUp[u]
 			gate, up := gateUp[:cfg.ExpertFFN], gateUp[cfg.ExpertFFN:]
+
+			// One product for both halves. MatVecRows rather than
+			// MatVecBatch: this is already inside a section, and MatVecBatch
+			// would open another.
+			gu := bw.GateUpExps.At(int(id))
+			gu.MatVecRows(one, s.expGateUpRow[u], 0, gu.Rows)
+
+			nn.GELUTable(gate)
+			for i := range gate {
+				mid.F[0][i] = gate[i] * up[i]
+			}
+			mid.QuantizeColumnRange(0, 0, cfg.ExpertFFN)
+
+			d := bw.DownExps.At(int(id))
+			d.MatVecRows(mid, s.expPartialRow[u], 0, d.Rows)
+		}
+	})
+
+	nn.InParallel(batch, batch*cfg.ExpertsUsed*cfg.Dim, func(first, last int) {
+		for t := first; t < last; t++ {
 			for i := range out[t] {
 				out[t][i] = 0
 			}
-			for k, id := range s.expIDs[t] {
-				// One product for both halves. MatVecRows rather than
-				// MatVecBatch: this is already inside a section, and
-				// MatVecBatch would open another.
-				gu := bw.GateUpExps.At(int(id))
-				gu.MatVecRows(one, s.expGateUpRow[t], 0, gu.Rows)
-
-				nn.GELUTable(gate)
-				for i := range gate {
-					mid.F[0][i] = gate[i] * up[i]
-				}
-				mid.QuantizeColumnRange(0, 0, cfg.ExpertFFN)
-
-				d := bw.DownExps.At(int(id))
-				d.MatVecRows(mid, s.expDownRow[t], 0, d.Rows)
-
+			for k := 0; k < cfg.ExpertsUsed; k++ {
+				id := s.expIDs[t][k]
 				// The per-expert scale multiplies the whole of this expert's
 				// output, and so does the routing weight; one multiplication
 				// does both.
-				nn.Axpy(out[t], down, s.expWeights[t][k]*bw.DownScale[id])
+				nn.Axpy(out[t], s.expPartial[t*cfg.ExpertsUsed+k],
+					s.expWeights[t][k]*bw.DownScale[id])
 			}
 		}
 	})
