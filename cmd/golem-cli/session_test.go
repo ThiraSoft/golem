@@ -2,10 +2,12 @@ package main
 
 import (
 	"errors"
+	"io"
 	"strings"
 	"testing"
 
 	"github.com/ThiraSoft/golem/chat"
+	"github.com/ThiraSoft/golem/engine"
 	"github.com/ThiraSoft/golem/sample"
 )
 
@@ -255,3 +257,39 @@ func TestAConversationThatNoLongerFitsIsRefused(t *testing.T) {
 		t.Fatal("a prompt past the context should be refused rather than wrap the cache")
 	}
 }
+
+// A session with no encoder refuses a recording in a sentence naming the flag
+// that would have given it one, rather than dropping the sound silently.
+func TestASessionWithoutEarsRefusesARecording(t *testing.T) {
+	v := newWordVocab()
+	s := newSession(t, v, &scriptedEngine{vocab: v, script: []string{"ok"}}, 4, "")
+	_, err := s.AskWithMedia("what is said?", nil, [][]byte{{'R', 'I', 'F', 'F'}}, io.Discard)
+	if err == nil {
+		t.Fatal("a session with no projector accepted a recording")
+	}
+	if !strings.Contains(err.Error(), "-mmproj") {
+		t.Fatalf("the error does not name the flag: %q", err)
+	}
+}
+
+// And one whose projector can see but not hear says which of the two is
+// missing.
+func TestASessionWhoseProjectorOnlySeesRefusesARecording(t *testing.T) {
+	v := newWordVocab()
+	s := newSession(t, v, &scriptedEngine{vocab: v, script: []string{"ok"}}, 4, "")
+	s.SetVision(eyesOnly{})
+	_, err := s.AskWithMedia("what is said?", nil, [][]byte{{'R', 'I', 'F', 'F'}}, io.Discard)
+	if err == nil {
+		t.Fatal("a projector that cannot hear accepted a recording")
+	}
+	if !strings.Contains(err.Error(), "hear") {
+		t.Fatalf("the error does not say what is missing: %q", err)
+	}
+}
+
+// eyesOnly is a projector that carries a vision tower and no audio encoder,
+// which is what the 26B ships.
+type eyesOnly struct{ engine.Media }
+
+func (eyesOnly) CanSee() bool  { return true }
+func (eyesOnly) CanHear() bool { return false }

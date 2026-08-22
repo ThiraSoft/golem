@@ -60,6 +60,8 @@ func main() {
 	mmproj := flag.String("mmproj", os.Getenv("GOLEM_MMPROJ"), "projector GGUF, which is what lets a model see (or GOLEM_MMPROJ)")
 	var images stringList
 	flag.Var(&images, "image", "a picture to put in the first turn; repeat for several")
+	var recordings stringList
+	flag.Var(&recordings, "audio", "a sound file — WAV, MP3 or FLAC — to put in the first turn; repeat for several")
 	prompt := flag.String("p", "", "answer this and exit, instead of reading turns")
 	stats := flag.Bool("stats", false, "report tokens and speed after each answer")
 	flag.Usage = func() {
@@ -73,6 +75,9 @@ func main() {
 	}
 	if len(images) > 0 && *mmproj == "" {
 		fail(fmt.Errorf("-image needs -mmproj: the projector is a separate file, and this model was opened without one"))
+	}
+	if len(recordings) > 0 && *mmproj == "" {
+		fail(fmt.Errorf("-audio needs -mmproj: the projector is a separate file, and this model was opened without one"))
 	}
 
 	start := time.Now()
@@ -122,16 +127,21 @@ func main() {
 	session := newSession()
 	out := bufio.NewWriter(os.Stdout)
 
-	// The pictures go with the first turn and are not repeated after it: the
-	// conversation keeps them, and the model has already looked.
-	pending := images
+	// The pictures and the recordings go with the first turn and are not
+	// repeated after it: the conversation keeps them, and the model has
+	// already looked and listened.
+	pending, pendingAudio := images, recordings
 	answer := func(text string) {
 		raw, err := readAll(pending)
 		if err != nil {
 			fail(err)
 		}
-		pending = nil
-		turn, err := session.AskWith(text, raw, &flushing{out})
+		heard, err := readAll(pendingAudio)
+		if err != nil {
+			fail(err)
+		}
+		pending, pendingAudio = nil, nil
+		turn, err := session.AskWithMedia(text, raw, heard, &flushing{out})
 		out.Flush()
 		fmt.Println()
 		if err != nil {
