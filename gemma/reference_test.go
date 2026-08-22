@@ -6,9 +6,11 @@ package gemma
 import (
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -23,7 +25,11 @@ type logitProbe struct {
 }
 
 type fixture struct {
-	dir       string
+	dir string
+	// Model is the base name of the checkpoint the recording was made from.
+	// The recorder has always written it; a fixture predating the field names
+	// nothing and is accepted, so an old recording keeps working.
+	Model     string                   `json:"model"`
 	Tokens    []int32                  `json:"tokens"`
 	NEmbd     int                      `json:"n_embd"`
 	NLayer    int                      `json:"n_layer"`
@@ -216,5 +222,73 @@ func TestFixturesAreReadable(t *testing.T) {
 	}
 	if int(w.Tensors["l_out-0"].NE[1]) != 1 {
 		t.Fatal("the window fixture should keep only the last position")
+	}
+}
+
+// The guard the 0.6B-for-4B mix-up asked for.
+//
+// Every recording names the checkpoint it was made from, and has since the
+// recorder was written; nothing read the name back. So a variable pointing at
+// the wrong file of the right family failed somewhere in the arithmetic —
+// "activation length mismatch", from a function that knows nothing about
+// checkpoints — instead of saying which file was wanted. These two say it.
+
+// modelMismatch answers whether this fixture was recorded from a checkpoint
+// other than the one about to be read. The comparison is on the base name
+// alone: the recorder ran from a different directory than the test does.
+func (f *fixture) modelMismatch(path string) error {
+	if f.Model == "" || filepath.Base(path) == f.Model {
+		return nil
+	}
+	return fmt.Errorf("these fixtures were recorded from %s, and %s was opened instead",
+		f.Model, filepath.Base(path))
+}
+
+// requireModel fails the test rather than letting the mismatch reach the
+// arithmetic.
+func (f *fixture) requireModel(tb testing.TB, path string) {
+	tb.Helper()
+	if err := f.modelMismatch(path); err != nil {
+		tb.Fatal(err)
+	}
+}
+
+// TestFixturesNameTheirCheckpoint pairs each recording with the variable that
+// names the file it came from. It is one test rather than a check inside every
+// other, because the failure it catches is a misconfigured machine, not a
+// misbehaving function, and a machine is misconfigured once.
+func TestFixturesNameTheirCheckpoint(t *testing.T) {
+	for _, c := range []struct{ dir, env string }{
+		{"layers", "GOLEM_MODEL"},
+		{"window", "GOLEM_MODEL"},
+		{"layers12", "GOLEM_MODEL_12B"},
+	} {
+		path := os.Getenv(c.env)
+		if path == "" {
+			continue
+		}
+		f := loadFixture(t, c.dir)
+		if err := f.modelMismatch(path); err != nil {
+			t.Errorf("%s: %s names the wrong checkpoint: %v", c.dir, c.env, err)
+		}
+	}
+}
+
+// TestModelMismatchNamesTheFile pins what the message has to contain, because
+// a guard that fires without saying what it wanted is the thing being fixed.
+func TestModelMismatchNamesTheFile(t *testing.T) {
+	f := &fixture{Model: "gemma-4-26B-A4B-it-QAT-Q4_0.gguf"}
+	err := f.modelMismatch("/models/gemma-4-12B-it-QAT-Q4_0.gguf")
+	if err == nil {
+		t.Fatal("a recording from another checkpoint was accepted")
+	}
+	if !strings.Contains(err.Error(), "gemma-4-26B-A4B-it-QAT-Q4_0.gguf") {
+		t.Fatalf("the message does not name the recording's own model: %v", err)
+	}
+	if err := f.modelMismatch("/elsewhere/gemma-4-26B-A4B-it-QAT-Q4_0.gguf"); err != nil {
+		t.Fatalf("the matching checkpoint was rejected: %v", err)
+	}
+	if err := (&fixture{}).modelMismatch("/models/anything.gguf"); err != nil {
+		t.Fatalf("a recording that names no model must be accepted: %v", err)
 	}
 }
