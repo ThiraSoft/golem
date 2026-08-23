@@ -94,3 +94,44 @@ hstore:
 	VST1  [V0.S4, V1.S4, V2.S4, V3.S4], (R3)
 	FMOVS F14, 64(R3)
 	RET
+
+// func axpyHalfNEON(dst *float32, src *uint16, n int, a float32)
+//
+// The other half of the attention loop: Mix, against values kept in fp16. Same
+// widening as the product above, and the same hand-encoded FCVTL.
+TEXT ·axpyHalfNEON(SB), NOSPLIT, $0-28
+	MOVD  dst+0(FP), R0
+	MOVD  src+8(FP), R1
+	MOVD  n+16(FP), R2
+	FMOVS a+24(FP), F0
+	VDUP  V0.S[0], V1.S4
+
+	MOVD R2, R4
+	LSR  $2, R4
+	CBZ  R4, xtail1
+
+xfour:
+	VLD1.P 8(R1), [V12.D1]
+	WORD   $0x0e217988             // FCVTL V8.4S, V12.4H
+	VLD1   (R0), [V4.S4]
+	VFMLA  V1.S4, V8.S4, V4.S4
+	VST1.P [V4.S4], 16(R0)
+	SUB    $1, R4
+	CBNZ   R4, xfour
+
+xtail1:
+	AND $3, R2, R7
+	CBZ R7, xdone
+
+xone:
+	MOVHU.P 2(R1), R8
+	FMOVS   R8, F13
+	FCVTHS  F13, F13
+	FMOVS   (R0), F12
+	FMADDS  F13, F12, F0, F12
+	FMOVS.P F12, 4(R0)
+	SUB     $1, R7
+	CBNZ    R7, xone
+
+xdone:
+	RET

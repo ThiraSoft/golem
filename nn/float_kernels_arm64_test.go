@@ -152,3 +152,55 @@ func TestScoresAndMixOnNEON(t *testing.T) {
 		}
 	}
 }
+
+// AxpyHalf is the other half of the attention loop — Mix, against a cache kept
+// in fp16 — and it is called once per position per head, so it gets the same
+// scrutiny as the product: values, and the guard past the end.
+func TestAxpyHalfNEONMatchesTheGoForm(t *testing.T) {
+	rng := rand.New(rand.NewSource(61))
+
+	for _, n := range []int{1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 19, 31, 64, 129, 1024} {
+		src := make([]uint16, n)
+		dst := make([]float32, n)
+		want := make([]float32, n)
+		for i := range src {
+			src[i] = Half(float32(rng.NormFloat64()))
+			dst[i] = rng.Float32()*2 - 1
+			want[i] = dst[i]
+		}
+		a := rng.Float32()*2 - 1
+
+		for i := 0; i < n; i++ {
+			want[i] += a * Widen(src[i])
+		}
+		AxpyHalf(dst, src, a)
+
+		for i := 0; i < n; i++ {
+			if gap := math.Abs(float64(dst[i] - want[i])); gap > 1e-3*math.Abs(float64(want[i]))+1e-6 {
+				t.Fatalf("n=%d element %d: NEON %.8f, portable %.8f", n, i, dst[i], want[i])
+			}
+		}
+	}
+}
+
+func TestAxpyHalfNEONWritesNoFurtherThanItShould(t *testing.T) {
+	rng := rand.New(rand.NewSource(67))
+
+	for _, n := range []int{1, 3, 5, 7, 15, 17, 31, 33} {
+		const guard = 8
+		dst := make([]float32, n+guard)
+		src := make([]uint16, n)
+		for i := range src {
+			src[i] = Half(rng.Float32())
+		}
+		for i := range dst {
+			dst[i] = 987.25
+		}
+		AxpyHalf(dst[:n], src, 2)
+		for i := n; i < n+guard; i++ {
+			if dst[i] != 987.25 {
+				t.Fatalf("n=%d: element %d past the end was written (%v)", n, i, dst[i])
+			}
+		}
+	}
+}

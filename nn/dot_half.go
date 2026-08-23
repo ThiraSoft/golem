@@ -42,8 +42,7 @@ func AxpyHalf(dst []float32, src []uint16, a float32) {
 	if n == 0 {
 		return
 	}
-	if avx2 {
-		axpyHalfAVX2(&dst[0], &src[0], n, a)
+	if fastAxpyHalf(&dst[0], &src[0], n, a) {
 		return
 	}
 	for i := 0; i < n; i++ {

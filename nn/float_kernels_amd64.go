@@ -23,3 +23,11 @@ func fastDotF32Half(a *float32, b *uint16, n int) (float32, bool) {
 	}
 	return dotF32HalfAVX2(a, b, n), true
 }
+
+func fastAxpyHalf(dst *float32, src *uint16, n int, a float32) bool {
+	if !avx2 {
+		return false
+	}
+	axpyHalfAVX2(dst, src, n, a)
+	return true
+}

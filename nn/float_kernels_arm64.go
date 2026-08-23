@@ -44,3 +44,11 @@ func fastDotF32Half(a *float32, b *uint16, n int) (float32, bool) {
 	}
 	return (s[0] + s[1]) + (s[2] + s[3]) + lanes[16], true
 }
+
+//go:noescape
+func axpyHalfNEON(dst *float32, src *uint16, n int, a float32)
+
+func fastAxpyHalf(dst *float32, src *uint16, n int, a float32) bool {
+	axpyHalfNEON(dst, src, n, a)
+	return true
+}
