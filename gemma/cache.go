@@ -10,9 +10,13 @@ package gemma
 // from, not a copy: there is one cache and twenty-one blocks reading it, which
 // is what makes E2B small.
 //
-// The entries are held as float32 rounded through fp16, which is what
-// llama.cpp's default cache type stores: keeping more precision than the
-// reference would not be an improvement, it would be a divergence.
+// The entries are held as fp16, which is what llama.cpp's default cache type
+// stores: keeping more precision than the reference would not be an
+// improvement, it would be a divergence. They were held as float32 rounded
+// through fp16 until this was measured — four bytes carrying two bytes of
+// information, and four bytes crossing the memory bus on every read of every
+// token. Widening a half costs arithmetic, which this loop has spare; what it
+// saves is traffic, which it does not.
 
 import "github.com/ThiraSoft/golem/nn"
 
@@ -20,8 +24,8 @@ type LayerCache struct {
 	KVHeads  int
 	HeadDim  int
 	Capacity int
-	K        []float32 // Capacity * KVHeads * HeadDim
-	V        []float32
+	K        []uint16 // Capacity * KVHeads * HeadDim, fp16
+	V        []uint16
 
 	// used is one past the highest position written since the last Reset,
 	// clamped to the capacity by Reset itself. It exists so that forgetting a
@@ -37,8 +41,8 @@ func newLayerCache(kvHeads, headDim, capacity int) *LayerCache {
 		KVHeads:  kvHeads,
 		HeadDim:  headDim,
 		Capacity: capacity,
-		K:        make([]float32, n),
-		V:        make([]float32, n),
+		K:        make([]uint16, n),
+		V:        make([]uint16, n),
 	}
 }
 
@@ -54,17 +58,17 @@ func (c *LayerCache) Store(pos, head int, k, v []float32) {
 	}
 	o := c.offset(pos, head)
 	for i := 0; i < c.HeadDim; i++ {
-		c.K[o+i] = nn.RoundHalf(k[i])
-		c.V[o+i] = nn.RoundHalf(v[i])
+		c.K[o+i] = nn.Half(k[i])
+		c.V[o+i] = nn.Half(v[i])
 	}
 }
 
-func (c *LayerCache) Key(pos, head int) []float32 {
+func (c *LayerCache) Key(pos, head int) []uint16 {
 	o := c.offset(pos, head)
 	return c.K[o : o+c.HeadDim]
 }
 
-func (c *LayerCache) Value(pos, head int) []float32 {
+func (c *LayerCache) Value(pos, head int) []uint16 {
 	o := c.offset(pos, head)
 	return c.V[o : o+c.HeadDim]
 }

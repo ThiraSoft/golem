@@ -1,6 +1,10 @@
 package gemma
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/ThiraSoft/golem/nn"
+)
 
 func TestCacheAliasesSharedLayers(t *testing.T) {
 	g := openModel(t)
@@ -37,10 +41,20 @@ func TestCacheAliasesSharedLayers(t *testing.T) {
 	}
 }
 
+// widenAll is for the failure messages: a cache holds halves, and printing the
+// bit patterns says nothing to whoever has to read the test output.
+func widenAll(h []uint16) []float32 {
+	f := make([]float32, len(h))
+	for i, v := range h {
+		f[i] = nn.Widen(v)
+	}
+	return f
+}
+
 func TestCacheRingReplacesWhatTheWindowHides(t *testing.T) {
 	lc := &LayerCache{KVHeads: 1, HeadDim: 4, Capacity: 3}
-	lc.K = make([]float32, lc.Capacity*lc.KVHeads*lc.HeadDim)
-	lc.V = make([]float32, len(lc.K))
+	lc.K = make([]uint16, lc.Capacity*lc.KVHeads*lc.HeadDim)
+	lc.V = make([]uint16, len(lc.K))
 
 	for pos := 0; pos < 5; pos++ {
 		k := []float32{float32(pos), 0, 0, 0}
@@ -49,10 +63,10 @@ func TestCacheRingReplacesWhatTheWindowHides(t *testing.T) {
 	}
 	// Positions 2, 3 and 4 survive; 0 and 1 were overwritten by 3 and 4.
 	for pos := 2; pos <= 4; pos++ {
-		if got := lc.Key(pos, 0)[0]; got != float32(pos) {
+		if got := nn.Widen(lc.Key(pos, 0)[0]); got != float32(pos) {
 			t.Fatalf("position %d holds key %v", pos, got)
 		}
-		if got := lc.Value(pos, 0)[1]; got != float32(pos) {
+		if got := nn.Widen(lc.Value(pos, 0)[1]); got != float32(pos) {
 			t.Fatalf("position %d holds value %v", pos, got)
 		}
 	}
@@ -60,20 +74,20 @@ func TestCacheRingReplacesWhatTheWindowHides(t *testing.T) {
 
 func TestCacheStoresHeadsSeparately(t *testing.T) {
 	lc := &LayerCache{KVHeads: 2, HeadDim: 2, Capacity: 2}
-	lc.K = make([]float32, lc.Capacity*lc.KVHeads*lc.HeadDim)
-	lc.V = make([]float32, len(lc.K))
+	lc.K = make([]uint16, lc.Capacity*lc.KVHeads*lc.HeadDim)
+	lc.V = make([]uint16, len(lc.K))
 
 	lc.Store(0, 0, []float32{1, 2}, []float32{3, 4})
 	lc.Store(0, 1, []float32{5, 6}, []float32{7, 8})
 
-	if k := lc.Key(0, 0); k[0] != 1 || k[1] != 2 {
-		t.Fatalf("head 0 key %v", k)
+	if k := lc.Key(0, 0); nn.Widen(k[0]) != 1 || nn.Widen(k[1]) != 2 {
+		t.Fatalf("head 0 key %v", widenAll(k))
 	}
-	if k := lc.Key(0, 1); k[0] != 5 || k[1] != 6 {
-		t.Fatalf("head 1 key %v", k)
+	if k := lc.Key(0, 1); nn.Widen(k[0]) != 5 || nn.Widen(k[1]) != 6 {
+		t.Fatalf("head 1 key %v", widenAll(k))
 	}
-	if v := lc.Value(0, 1); v[0] != 7 || v[1] != 8 {
-		t.Fatalf("head 1 value %v", v)
+	if v := lc.Value(0, 1); nn.Widen(v[0]) != 7 || nn.Widen(v[1]) != 8 {
+		t.Fatalf("head 1 value %v", widenAll(v))
 	}
 }
 

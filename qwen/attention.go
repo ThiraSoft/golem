@@ -105,7 +105,7 @@ func Attention(
 			kv := h / perKV
 
 			for p := first; p <= last; p++ {
-				scores[p-first] = scale * nn.DotF32(query, lc.Key(p, kv))
+				scores[p-first] = scale * nn.DotF32Half(query, lc.Key(p, kv))
 			}
 			nn.SoftmaxInPlace(scores)
 			// And again for the value product: the probabilities reach ggml's
@@ -117,7 +117,7 @@ func Attention(
 			dst := set.F[t][h*bc.HeadDim : (h+1)*bc.HeadDim]
 			clear(dst)
 			for p := first; p <= last; p++ {
-				nn.Axpy(dst, lc.Value(p, kv), scores[p-first])
+				nn.AxpyHalf(dst, lc.Value(p, kv), scores[p-first])
 			}
 			set.QuantizeColumnRange(t, h*bc.HeadDim, (h+1)*bc.HeadDim)
 		}

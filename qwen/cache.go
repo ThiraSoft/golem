@@ -22,8 +22,8 @@ type LayerCache struct {
 	KVHeads  int
 	HeadDim  int
 	Capacity int
-	K        []float32 // Capacity * KVHeads * HeadDim
-	V        []float32
+	K        []uint16 // Capacity * KVHeads * HeadDim, fp16
+	V        []uint16
 
 	// used is one past the highest position written since the last Reset, so
 	// that Reset clears what a conversation touched rather than what the
@@ -39,8 +39,8 @@ func newLayerCache(kvHeads, headDim, capacity int) *LayerCache {
 		KVHeads:  kvHeads,
 		HeadDim:  headDim,
 		Capacity: capacity,
-		K:        make([]float32, n),
-		V:        make([]float32, n),
+		K:        make([]uint16, n),
+		V:        make([]uint16, n),
 	}
 }
 
@@ -55,17 +55,17 @@ func (c *LayerCache) Store(pos, head int, k, v []float32) {
 	}
 	o := c.offset(pos, head)
 	for i := 0; i < c.HeadDim; i++ {
-		c.K[o+i] = nn.RoundHalf(k[i])
-		c.V[o+i] = nn.RoundHalf(v[i])
+		c.K[o+i] = nn.Half(k[i])
+		c.V[o+i] = nn.Half(v[i])
 	}
 }
 
-func (c *LayerCache) Key(pos, head int) []float32 {
+func (c *LayerCache) Key(pos, head int) []uint16 {
 	o := c.offset(pos, head)
 	return c.K[o : o+c.HeadDim]
 }
 
-func (c *LayerCache) Value(pos, head int) []float32 {
+func (c *LayerCache) Value(pos, head int) []uint16 {
 	o := c.offset(pos, head)
 	return c.V[o : o+c.HeadDim]
 }

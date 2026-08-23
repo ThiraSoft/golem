@@ -142,7 +142,7 @@ func TestSharingBlockWritesNothing(t *testing.T) {
 	cache, s := NewCache(cfg), NewScratch(cfg)
 	replayBlock(t, f, cfg, w, cache, s, 13, false)
 
-	before := append([]float32(nil), cache.Layers[13].K...)
+	before := append([]uint16(nil), cache.Layers[13].K...)
 	replayBlock(t, f, cfg, w, cache, s, 15, false)
 
 	for i := range before {

@@ -1,6 +1,10 @@
 package qwen
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/ThiraSoft/golem/nn"
+)
 
 func tinyConfig() *Config {
 	return &Config{
@@ -45,6 +49,16 @@ func TestEveryBlockOwnsItsCache(t *testing.T) {
 
 // What goes in comes back, at the head and position it was written to — and
 // rounded through fp16, because that is what llama.cpp's cache stores.
+// widenAll is for the failure messages: a cache holds halves, and printing the
+// bit patterns says nothing to whoever has to read the test output.
+func widenAll(h []uint16) []float32 {
+	f := make([]float32, len(h))
+	for i, v := range h {
+		f[i] = nn.Widen(v)
+	}
+	return f
+}
+
 func TestCacheStoresAndReadsBack(t *testing.T) {
 	c := NewCache(tinyConfig())
 
@@ -52,15 +66,15 @@ func TestCacheStoresAndReadsBack(t *testing.T) {
 	v := []float32{5, 6, 7, 8}
 	c.Layers[0].Store(3, 1, k, v)
 
-	if got := c.Layers[0].Key(3, 1); got[0] != 1 || got[3] != 4 {
-		t.Errorf("key came back as %v", got)
+	if got := c.Layers[0].Key(3, 1); nn.Widen(got[0]) != 1 || nn.Widen(got[3]) != 4 {
+		t.Errorf("key came back as %v", widenAll(got))
 	}
-	if got := c.Layers[0].Value(3, 1); got[0] != 5 || got[3] != 8 {
-		t.Errorf("value came back as %v", got)
+	if got := c.Layers[0].Value(3, 1); nn.Widen(got[0]) != 5 || nn.Widen(got[3]) != 8 {
+		t.Errorf("value came back as %v", widenAll(got))
 	}
 	// A different head at the same position is untouched.
-	if got := c.Layers[0].Key(3, 0); got[0] != 0 {
-		t.Errorf("head 0 was written too: %v", got)
+	if got := c.Layers[0].Key(3, 0); nn.Widen(got[0]) != 0 {
+		t.Errorf("head 0 was written too: %v", widenAll(got))
 	}
 
 	c.Reset()
@@ -77,7 +91,7 @@ func TestCacheRoundsThroughHalf(t *testing.T) {
 	// a whole head, so a whole head is what it is given.
 	third := []float32{1.0 / 3, 1.0 / 3, 1.0 / 3, 1.0 / 3}
 	c.Layers[0].Store(0, 0, third, third)
-	got := c.Layers[0].Key(0, 0)[0]
+	got := nn.Widen(c.Layers[0].Key(0, 0)[0])
 	if got == float32(1.0/3) {
 		t.Error("the key was stored at full precision, not through fp16")
 	}

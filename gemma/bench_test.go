@@ -41,3 +41,29 @@ func BenchmarkPrefill(b *testing.B) {
 		m.ForwardBatch(tokens, 0)
 	}
 }
+
+// Generation with a deep cache, which is where the keys and values start to
+// weigh. BenchmarkForward above fills thirty-two positions and measures what
+// reading the weights costs; this fills four thousand, where the cache is a
+// fifth of the traffic on a dense model at full context and the format it is
+// held in stops being a detail.
+func BenchmarkForwardAtDepth(b *testing.B) {
+	const depth = 4000
+	m, err := Open(model12BPath(b), 4096)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer m.Close()
+	for pos := 0; pos < depth; pos += 256 {
+		n := min(256, depth-pos)
+		toks := make([]int32, n)
+		for i := range toks {
+			toks[i] = int32(100 + (pos+i)%1000)
+		}
+		m.ForwardBatch(toks, pos)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m.Forward(1000, depth+i%90)
+	}
+}
