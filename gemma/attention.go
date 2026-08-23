@@ -113,10 +113,9 @@ func Attention(
 			}
 			nn.SoftmaxInPlace(scores)
 			// And again for the value product: the probabilities reach ggml's
-			// kernel as fp16.
-			for i, value := range scores {
-				scores[i] = nn.RoundHalf(value)
-			}
+			// kernel as fp16. Eight at a time — this runs over every visible
+			// position of every head of every token.
+			nn.RoundHalfRange(scores)
 
 			dst := set.F[t][h*bc.HeadDim : (h+1)*bc.HeadDim]
 			clear(dst)

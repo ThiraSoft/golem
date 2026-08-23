@@ -125,3 +125,20 @@ func TestCacheVisibleRange(t *testing.T) {
 		t.Fatalf("an Until left behind: %d..%d", first, last)
 	}
 }
+
+// The mask and the remainder must name the same slot, or a cache that wraps
+// starts reading someone else's key.
+func TestRingMaskAgreesWithTheRemainder(t *testing.T) {
+	for _, capacity := range []int{1, 2, 3, 512, 1000, 1024, 4096} {
+		lc := &LayerCache{KVHeads: 2, HeadDim: 4, Capacity: capacity, mask: ringMask(capacity)}
+		for pos := 0; pos < capacity*3+7; pos++ {
+			for head := 0; head < lc.KVHeads; head++ {
+				want := ((pos%capacity)*lc.KVHeads + head) * lc.HeadDim
+				if got := lc.offset(pos, head); got != want {
+					t.Fatalf("capacity %d, position %d, head %d: %d against %d",
+						capacity, pos, head, got, want)
+				}
+			}
+		}
+	}
+}

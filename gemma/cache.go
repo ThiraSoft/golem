@@ -24,8 +24,15 @@ type LayerCache struct {
 	KVHeads  int
 	HeadDim  int
 	Capacity int
-	K        []uint16 // Capacity * KVHeads * HeadDim, fp16
-	V        []uint16
+
+	// mask is Capacity-1 when the capacity is a power of two, which every
+	// window and every context this engine is given happens to be, and zero
+	// otherwise. It exists because offset is called once per visible position
+	// per head per token — at four thousand positions of context the integer
+	// division it replaces was two and a half percent of a token.
+	mask int
+	K    []uint16 // Capacity * KVHeads * HeadDim, fp16
+	V    []uint16
 
 	// used is one past the highest position written since the last Reset,
 	// clamped to the capacity by Reset itself. It exists so that forgetting a
@@ -41,6 +48,7 @@ func newLayerCache(kvHeads, headDim, capacity int) *LayerCache {
 		KVHeads:  kvHeads,
 		HeadDim:  headDim,
 		Capacity: capacity,
+		mask:     ringMask(capacity),
 		K:        make([]uint16, n),
 		V:        make([]uint16, n),
 	}
@@ -49,7 +57,19 @@ func newLayerCache(kvHeads, headDim, capacity int) *LayerCache {
 // offset locates one head at one position. The ring wraps for window blocks;
 // for global ones Capacity is the whole context and it never does.
 func (c *LayerCache) offset(pos, head int) int {
+	if c.mask != 0 {
+		return ((pos&c.mask)*c.KVHeads + head) * c.HeadDim
+	}
 	return ((pos%c.Capacity)*c.KVHeads + head) * c.HeadDim
+}
+
+// ringMask is Capacity-1 when that is a mask, and zero when the capacity is not
+// a power of two and the remainder has to be taken the slow way.
+func ringMask(capacity int) int {
+	if capacity > 0 && capacity&(capacity-1) == 0 {
+		return capacity - 1
+	}
+	return 0
 }
 
 func (c *LayerCache) Store(pos, head int, k, v []float32) {
