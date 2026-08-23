@@ -223,8 +223,7 @@ func Axpy(dst, src []float32, a float32) {
 	if n == 0 {
 		return
 	}
-	if avx2 {
-		axpyAVX2(&dst[0], &src[0], n, a)
+	if fastAxpy(&dst[0], &src[0], n, a) {
 		return
 	}
 	for i := 0; i < n; i++ {
@@ -240,8 +239,7 @@ func AxpyFull(dst, src []float32, a float32) {
 	if len(src) == 0 {
 		return
 	}
-	if avx2 {
-		axpyAVX2(&dst[0], &src[0], len(src), a)
+	if fastAxpy(&dst[0], &src[0], len(src), a) {
 		return
 	}
 	dst = dst[:len(src)]
