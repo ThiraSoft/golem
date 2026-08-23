@@ -92,6 +92,18 @@ and what is left is arithmetic, where llama.cpp's kernels win. That is the
 honest shape of the trade — this engine is built for the regime where reading
 the weights is the cost, and it says so where it is not.
 
+**Every number here is x86-64 with AVX2.** There are arm64 kernels — Q4_0, Q6_K,
+the packed product, and the float32 and fp16 ones the attention loop is made of
+— and they are correct and untuned. They were written and verified under
+emulation, because the machine this was built on is not an ARM one, and no
+timing taken under QEMU means anything at all. Where a choice could be read out
+of llama.cpp's ARM kernels rather than guessed it was: the packed layout is four
+rows there, not the eight AVX2 wants. Expect llama.cpp to win on Apple Silicon
+anyway — it has i8mm, tuned tile sizes, and a scheduler that knows a
+performance core from an efficiency one, and none of that can be answered
+without a machine to measure on. Parts without ARMv8.2 `FEAT_DotProd` fall back
+to portable Go for the quantized products, which is correct and slower still.
+
 Each engine is self-contained. They do not import one another, and nothing in
 the shared layer knows they exist.
 
