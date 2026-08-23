@@ -52,3 +52,11 @@ func fastAxpyHalf(dst *float32, src *uint16, n int, a float32) bool {
 	axpyHalfNEON(dst, src, n, a)
 	return true
 }
+
+//go:noescape
+func roundHalfNEON(v *float32, n int)
+
+func fastRoundHalf(v *float32, n int) bool {
+	roundHalfNEON(v, n)
+	return true
+}

@@ -31,3 +31,11 @@ func fastAxpyHalf(dst *float32, src *uint16, n int, a float32) bool {
 	axpyHalfAVX2(dst, src, n, a)
 	return true
 }
+
+func fastRoundHalf(v *float32, n int) bool {
+	if !avx2 {
+		return false
+	}
+	roundHalfAVX2(v, n)
+	return true
+}

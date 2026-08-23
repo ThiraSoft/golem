@@ -95,15 +95,19 @@ func decodeARM64(w uint32) string {
 		}
 	}
 
-	// FCVTL (vector): 0 Q 0 01110 0 sz 10000 10111 10 Rn Rd
+	// FCVTL and FCVTN (vector): 0 Q 0 01110 0 sz 10000 1011x 10 Rn Rd, where the
+	// x is 1 for the widening and 0 for the narrowing.
 	if bits(31, 31) == 0 && bits(29, 29) == 0 && bits(28, 24) == 0b01110 &&
-		bits(23, 23) == 0 && bits(21, 17) == 0b10000 && bits(16, 12) == 0b10111 &&
+		bits(23, 23) == 0 && bits(21, 17) == 0b10000 && bits(16, 13) == 0b1011 &&
 		bits(11, 10) == 0b10 && bits(22, 22) == 0 {
-		wide, narrow := "FCVTL", "4H"
+		two, narrow := "", "4H"
 		if bits(30, 30) == 1 {
-			wide, narrow = "FCVTL2", "8H"
+			two, narrow = "2", "8H"
 		}
-		return wide + " V" + itoa(bits(4, 0)) + ".4S, V" + itoa(bits(9, 5)) + "." + narrow
+		if bits(12, 12) == 1 {
+			return "FCVTL" + two + " V" + itoa(bits(4, 0)) + ".4S, V" + itoa(bits(9, 5)) + "." + narrow
+		}
+		return "FCVTN" + two + " V" + itoa(bits(4, 0)) + "." + narrow + ", V" + itoa(bits(9, 5)) + ".4S"
 	}
 
 	return ""

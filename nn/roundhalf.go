@@ -7,8 +7,7 @@ func RoundHalfRange(v []float32) {
 	if len(v) == 0 {
 		return
 	}
-	if avx2 {
-		roundHalfAVX2(&v[0], len(v))
+	if fastRoundHalf(&v[0], len(v)) {
 		return
 	}
 	for i, x := range v {
