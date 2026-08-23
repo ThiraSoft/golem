@@ -358,11 +358,12 @@ costs a day if guessed:
 - **The attention scores are not divided by the square root of the head
   dimension.** Gemma 4 sets that scale to one, and the query norm does the work.
 - **Everything ggml holds in fewer bits, this holds in fewer bits too.** The
-  key-value cache is fp16, so the queries and the attention probabilities are
-  rounded to fp16 before their products; the per-layer projection is bf16, so
-  its input is rounded to bf16. Keeping float32 through any of them is not more
-  accurate than the reference, it is between one and three parts in a thousand
-  away from it — and at that size a real mistake is invisible.
+  key-value cache is held in fp16, so the queries and the attention
+  probabilities are rounded to fp16 before their products; the per-layer
+  projection is bf16, so its input is rounded to bf16. Keeping float32 through
+  any of them is not more accurate than the reference, it is between one and
+  three parts in a thousand away from it — and at that size a real mistake is
+  invisible.
 
 ### Where the remaining gap comes from, and why it stops there
 
@@ -391,6 +392,20 @@ On an i7-9700K, eight threads, Q4_0 weights. E2B first:
 | `Forward` — 35 blocks, a prompt already in the cache | 35 ms |
 | `Logits` — the whole vocabulary | 10 ms |
 | `ForwardBatch` — 64 positions of a prompt at once | 5.0 ms |
+
+Those are measured with thirty-two positions behind them, which is the right
+depth to see what reading the weights costs and the wrong one to see a cache at
+all. `BenchmarkForwardAtDepth` fills four thousand instead, on the 12B, where
+the keys and values are about a tenth of what a token reads:
+
+| 12B, 4000 positions of context | per token |
+|---|---|
+| `Forward` — 48 blocks, four thousand positions behind it | 213 ms |
+
+What a conversation costs in memory is the cache, and what the cache costs is
+two bytes a coordinate — eight of the forty-eight blocks holding the whole
+context and forty holding a window of it. That, and not the model's size, is
+what decides how many conversations a server holds at once.
 
 And the vision tower, per picture rather than per token:
 
