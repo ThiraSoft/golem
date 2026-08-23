@@ -36,11 +36,11 @@ func NewAudioTower(cfg *AudioConfig, w *AudioWeights) *AudioTower {
 type audioScratch struct {
 	n, frames int
 
-	grid    []float32    // MelBins by frames, the mel turned frequency-fastest
-	conv    [2][]float32 // what each subsampling convolution produces
-	pre     []float32    // n by Dim, the tower's input
-	held    []float32    // n by the input projection's width, its clamped input
-	wide    []float32    // n by the output projection's width
+	grid []float32   // MelBins by frames, the mel turned frequency-fastest
+	conv [][]float32 // what each subsampling convolution produces
+	pre  []float32   // n by Dim, the tower's input
+	held []float32   // n by the input projection's width, its clamped input
+	wide []float32   // n by the output projection's width
 
 	norm, q, k, v []float32 // n by Dim
 	ctx           []float32 // blocks*Chunk by Dim, the attention's answer
@@ -117,6 +117,7 @@ func (a *AudioTower) resizeFront(s *audioScratch, frames int) {
 	s.frames = frames
 	freq, time := a.Cfg.MelBins, frames
 	s.grid = make([]float32, freq*time)
+	s.conv = make([][]float32, len(a.W.Conv))
 	for i := range a.W.Conv {
 		freq, time = (freq-1)/2+1, (time-1)/2+1
 		s.conv[i] = make([]float32, freq*time*a.W.Conv[i].Out)

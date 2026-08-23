@@ -94,11 +94,13 @@ func (a *AudioTower) attendOneChunk(b *AudioBlock, q, k, v, rel, ctx, scores []f
 	dim, hd := cfg.Dim, cfg.HeadDim
 	C, P, S, R := cfg.Chunk, cfg.Past, cfg.Context, cfg.RPE
 	relH := rel[h*R*hd:]
-	cap := cfg.Softcap
+	softcap := cfg.Softcap
 
 	for qi := 0; qi < C; qi++ {
 		gq := blk*C + qi
 		if gq >= n {
+			// A query past the end of the signal: its chunk exists because the
+			// blocking rounded up, and nothing reads what it produces.
 			continue
 		}
 		row := scores[qi*S : (qi+1)*S]
@@ -110,10 +112,12 @@ func (a *AudioTower) attendOneChunk(b *AudioBlock, q, k, v, rel, ctx, scores []f
 				row[ki] = float32(math.Inf(-1))
 				continue
 			}
-			dist := gq - gk
+			// The content score, and on top of it the relative one: the
+			// distance between the two is the row of the relative table this
+			// pair reads, counted down from the past horizon.
 			sum := nn.DotF32(qh, k[gk*dim+h*hd:][:hd]) +
-				nn.DotF32(qh, relH[(P-dist)*hd:][:hd])
-			row[ki] = cap * float32(math.Tanh(float64(sum/cap)))
+				nn.DotF32(qh, relH[(P-(gq-gk))*hd:][:hd])
+			row[ki] = softcap * float32(math.Tanh(float64(sum/softcap)))
 		}
 
 		nn.SoftmaxGGML(row)

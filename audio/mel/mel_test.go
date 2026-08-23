@@ -74,3 +74,36 @@ func TestFilterbankCentresRise(t *testing.T) {
 		prev = at
 	}
 }
+
+// The sparse bank and the dense matrix are the same filterbank, and the whole
+// point is that the values Bank.Apply never reads are the zeros the dense walk
+// multiplies by. Any disagreement here means a span that stops short of its
+// triangle, which the reference recording would catch only as a small error in
+// a few of a hundred and twenty-eight bins.
+func TestBankAgreesWithTheDenseFilterbank(t *testing.T) {
+	const (
+		bins    = 128
+		fftSize = 512
+		rate    = 16000
+		nBins   = fftSize/2 + 1
+	)
+	dense := Filterbank(bins, fftSize, rate, true)
+	bank := NewBank(bins, fftSize, rate, true)
+
+	// A spectrum with no zeros in it, so a bin left out of a span cannot pass
+	// unnoticed.
+	magnitude := make([]float32, nBins)
+	for k := range magnitude {
+		magnitude[k] = float32(1 + math.Sin(float64(k)))
+	}
+
+	for m := 0; m < bins; m++ {
+		var want float64
+		for k, w := range dense[m*nBins : (m+1)*nBins] {
+			want += float64(magnitude[k]) * float64(w)
+		}
+		if got := bank.Apply(m, magnitude); math.Abs(got-want) > 1e-9 {
+			t.Fatalf("filter %d gives %v, the dense matrix %v", m, got, want)
+		}
+	}
+}

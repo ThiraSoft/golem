@@ -44,9 +44,13 @@ func (a *AudioTower) convModule(b *AudioBlock, x, out []float32, n int, s *audio
 		}
 	})
 
-	// Depthwise causal convolution with kernel size 5: each channel reads
-	// positions p-4 to p (with zero padding for p-j < 0).
-	// We run directly over channels without full transpose into memory.
+	// The convolution wants a channel's frames next to each other, where
+	// everything else here wants a frame's channels next to each other. The
+	// transpose that used to buy that layout is not needed: a causal filter of
+	// five taps is four values of history, and four values fit in registers.
+	// Each core walks its own channels down the column, carrying the history
+	// forward, and the zeros in front of the signal are the zeros h0..h3 start
+	// at.
 	nn.InParallel(dim, n*dim*taps, func(first, last int) {
 		for c := first; c < last; c++ {
 			k := b.ConvDW[c*taps : (c+1)*taps]
