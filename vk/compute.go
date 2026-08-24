@@ -1,33 +1,42 @@
 package vk
 
-// A compute pipeline over a fixed set of storage buffers.
+// Compute pipelines, the descriptor sets that point them at buffers, and the
+// recorder that puts several of them in one submission.
 //
-// Everything a dispatch needs is built once — the module, the layout, the
-// descriptor set, the pipeline — and only the push constants and the contents
-// of the host-visible buffers change from one call to the next. A kernel that
-// runs once per token cannot afford to build any of that per token.
+// The three are separate because they have three lifetimes. A pipeline is the
+// compiled shader and is built once for the whole model. A set is one binding
+// of that shader to a particular group of buffers, and there is one per block,
+// because thirty blocks hold thirty different sets of expert weights and share
+// the kernel that reads them. A recording lasts one token.
+//
+// The separation is what keeps the round trips down. One submission costs
+// sixty-three microseconds whatever is in it, which is nothing beside a token
+// and a great deal beside a dispatch that takes a hundred: a design that
+// crosses to the card twice per block would spend four milliseconds a token
+// asking rather than computing. So a block's two dispatches go in together,
+// with a barrier between them.
 
 import (
 	"unsafe"
 )
 
+// A Pipeline is one compiled compute shader and the layout of the buffers it
+// reads. It holds no buffers itself; a Set does that.
 type Pipeline struct {
 	d *Device
 
-	module     uint64
-	setLayout  uint64
-	layout     uint64
-	pipeline   uint64
-	pool       uint64
-	set        uint64
-	pushBytes  uint32
-	bufferInfo []descriptorBufferInfo // kept alive for the driver's write
+	module    uint64
+	setLayout uint64
+	layout    uint64
+	pipeline  uint64
+	pushBytes uint32
+	bindings  int
 }
 
-// NewPipeline compiles one SPIR-V compute shader and binds the given buffers
-// to bindings 0..n-1, in order.
-func (d *Device) NewPipeline(spirv []byte, buffers []*Buffer, pushBytes uint32) (*Pipeline, error) {
-	p := &Pipeline{d: d, pushBytes: pushBytes}
+// NewPipeline compiles one SPIR-V compute shader that reads the given number
+// of storage buffers, at bindings 0..bindings-1.
+func (d *Device) NewPipeline(spirv []byte, bindings int, pushBytes uint32) (*Pipeline, error) {
+	p := &Pipeline{d: d, pushBytes: pushBytes, bindings: bindings}
 
 	smci := shaderModuleCreateInfo{
 		sType:    structShaderModuleCreateInfo,
@@ -38,9 +47,9 @@ func (d *Device) NewPipeline(spirv []byte, buffers []*Buffer, pushBytes uint32) 
 		return nil, err
 	}
 
-	bindings := make([]descriptorSetLayoutBinding, len(buffers))
-	for i := range bindings {
-		bindings[i] = descriptorSetLayoutBinding{
+	layout := make([]descriptorSetLayoutBinding, bindings)
+	for i := range layout {
+		layout[i] = descriptorSetLayoutBinding{
 			binding:         uint32(i),
 			descriptorType:  descriptorStorageBuffer,
 			descriptorCount: 1,
@@ -49,8 +58,8 @@ func (d *Device) NewPipeline(spirv []byte, buffers []*Buffer, pushBytes uint32) 
 	}
 	dsl := descriptorSetLayoutCreateInfo{
 		sType:        structDescriptorSetLayoutInfo,
-		bindingCount: uint32(len(bindings)),
-		pBindings:    uintptr(unsafe.Pointer(&bindings[0])),
+		bindingCount: uint32(len(layout)),
+		pBindings:    uintptr(unsafe.Pointer(&layout[0])),
 	}
 	if err := check("vkCreateDescriptorSetLayout", vkCreateDescriptorSetLayout(d.dev, &dsl, 0, &p.setLayout)); err != nil {
 		p.Close()
@@ -87,85 +96,10 @@ func (d *Device) NewPipeline(spirv []byte, buffers []*Buffer, pushBytes uint32) 
 		p.Close()
 		return nil, err
 	}
-
-	size := descriptorPoolSize{kind: descriptorStorageBuffer, count: uint32(len(buffers))}
-	dpci := descriptorPoolCreateInfo{
-		sType:         structDescriptorPoolCreateInfo,
-		maxSets:       1,
-		poolSizeCount: 1,
-		pPoolSizes:    uintptr(unsafe.Pointer(&size)),
-	}
-	if err := check("vkCreateDescriptorPool", vkCreateDescriptorPool(d.dev, &dpci, 0, &p.pool)); err != nil {
-		p.Close()
-		return nil, err
-	}
-	dsai := descriptorSetAllocateInfo{
-		sType:              structDescriptorSetAllocateInfo,
-		descriptorPool:     p.pool,
-		descriptorSetCount: 1,
-		pSetLayouts:        uintptr(unsafe.Pointer(&p.setLayout)),
-	}
-	if err := check("vkAllocateDescriptorSets", vkAllocateDescriptorSets(d.dev, &dsai, &p.set)); err != nil {
-		p.Close()
-		return nil, err
-	}
-
-	p.bufferInfo = make([]descriptorBufferInfo, len(buffers))
-	writes := make([]writeDescriptorSet, len(buffers))
-	for i, b := range buffers {
-		p.bufferInfo[i] = descriptorBufferInfo{buffer: b.handle, offset: 0, rng: b.size}
-		writes[i] = writeDescriptorSet{
-			sType:           structWriteDescriptorSet,
-			dstSet:          p.set,
-			dstBinding:      uint32(i),
-			descriptorCount: 1,
-			descriptorType:  descriptorStorageBuffer,
-			pBufferInfo:     uintptr(unsafe.Pointer(&p.bufferInfo[i])),
-		}
-	}
-	vkUpdateDescriptorSets(d.dev, uint32(len(writes)), &writes[0], 0, 0)
 	return p, nil
 }
 
-// Dispatch runs the shader over groups workgroups and waits for it.
-func (p *Pipeline) Dispatch(groups uint32, push unsafe.Pointer) error {
-	return p.DispatchTimes(groups, push, 1)
-}
-
-// DispatchTimes runs the same dispatch n times inside one submission, each
-// waiting on the last through a memory barrier.
-//
-// One dispatch tells you what a token costs, round trip and all. It does not
-// tell you what the kernel costs, because a card handed five milliseconds of
-// work and then left alone does not raise its clocks: measured one at a time
-// this head runs at half the card's frequency and a fifth of its power. Both
-// numbers are worth having and they are not the same number.
-func (p *Pipeline) DispatchTimes(groups uint32, push unsafe.Pointer, n int) error {
-	return p.d.run(func(cb commandBuffer) {
-		vkCmdBindPipeline(cb, pipelineBindCompute, p.pipeline)
-		vkCmdBindDescriptorSets(cb, pipelineBindCompute, p.layout, 0, 1, &p.set, 0, 0)
-		if p.pushBytes > 0 {
-			vkCmdPushConstants(cb, p.layout, shaderStageCompute, 0, p.pushBytes, push)
-		}
-		barrier := memoryBarrier{
-			sType:         structMemoryBarrier,
-			srcAccessMask: accessShaderWrite,
-			dstAccessMask: accessShaderRead | accessShaderWrite,
-		}
-		for i := 0; i < n; i++ {
-			if i > 0 {
-				vkCmdPipelineBarrier(cb, stageComputeShader, stageComputeShader, 0, 1, &barrier, 0, 0, 0, 0)
-			}
-			vkCmdDispatch(cb, groups, 1, 1)
-		}
-	})
-}
-
 func (p *Pipeline) Close() {
-	if p.pool != 0 {
-		vkDestroyDescriptorPool(p.d.dev, p.pool, 0)
-		p.pool = 0
-	}
 	if p.pipeline != 0 {
 		vkDestroyPipeline(p.d.dev, p.pipeline, 0)
 		p.pipeline = 0
@@ -182,4 +116,119 @@ func (p *Pipeline) Close() {
 		vkDestroyShaderModule(p.d.dev, p.module, 0)
 		p.module = 0
 	}
+}
+
+// A Set points one pipeline at one group of buffers.
+type Set struct {
+	p    *Pipeline
+	pool uint64
+	set  uint64
+	info []descriptorBufferInfo // kept alive for the driver's write
+}
+
+// NewSet binds buffers to bindings 0..n-1, in order.
+func (p *Pipeline) NewSet(buffers []*Buffer) (*Set, error) {
+	if len(buffers) != p.bindings {
+		return nil, errBindings(len(buffers), p.bindings)
+	}
+	s := &Set{p: p}
+
+	size := descriptorPoolSize{kind: descriptorStorageBuffer, count: uint32(len(buffers))}
+	dpci := descriptorPoolCreateInfo{
+		sType:         structDescriptorPoolCreateInfo,
+		maxSets:       1,
+		poolSizeCount: 1,
+		pPoolSizes:    uintptr(unsafe.Pointer(&size)),
+	}
+	if err := check("vkCreateDescriptorPool", vkCreateDescriptorPool(p.d.dev, &dpci, 0, &s.pool)); err != nil {
+		return nil, err
+	}
+	dsai := descriptorSetAllocateInfo{
+		sType:              structDescriptorSetAllocateInfo,
+		descriptorPool:     s.pool,
+		descriptorSetCount: 1,
+		pSetLayouts:        uintptr(unsafe.Pointer(&p.setLayout)),
+	}
+	if err := check("vkAllocateDescriptorSets", vkAllocateDescriptorSets(p.d.dev, &dsai, &s.set)); err != nil {
+		s.Close()
+		return nil, err
+	}
+
+	s.info = make([]descriptorBufferInfo, len(buffers))
+	writes := make([]writeDescriptorSet, len(buffers))
+	for i, b := range buffers {
+		s.info[i] = descriptorBufferInfo{buffer: b.handle, offset: 0, rng: b.size}
+		writes[i] = writeDescriptorSet{
+			sType:           structWriteDescriptorSet,
+			dstSet:          s.set,
+			dstBinding:      uint32(i),
+			descriptorCount: 1,
+			descriptorType:  descriptorStorageBuffer,
+			pBufferInfo:     uintptr(unsafe.Pointer(&s.info[i])),
+		}
+	}
+	vkUpdateDescriptorSets(p.d.dev, uint32(len(writes)), &writes[0], 0, 0)
+	return s, nil
+}
+
+func (s *Set) Close() {
+	if s.pool != 0 {
+		vkDestroyDescriptorPool(s.p.d.dev, s.pool, 0)
+		s.pool = 0
+	}
+}
+
+// A Recorder is one command buffer being written. Dispatch adds a shader run;
+// Barrier makes everything after it wait for everything before.
+type Recorder struct{ cb commandBuffer }
+
+// Dispatch runs a set's pipeline over groups workgroups.
+func (r *Recorder) Dispatch(s *Set, groups uint32, push unsafe.Pointer) {
+	p := s.p
+	vkCmdBindPipeline(r.cb, pipelineBindCompute, p.pipeline)
+	vkCmdBindDescriptorSets(r.cb, pipelineBindCompute, p.layout, 0, 1, &s.set, 0, 0)
+	if p.pushBytes > 0 {
+		vkCmdPushConstants(r.cb, p.layout, shaderStageCompute, 0, p.pushBytes, push)
+	}
+	vkCmdDispatch(r.cb, groups, 1, 1)
+}
+
+// Barrier separates a dispatch that writes from one that reads what it wrote.
+func (r *Recorder) Barrier() {
+	b := memoryBarrier{
+		sType:         structMemoryBarrier,
+		srcAccessMask: accessShaderWrite,
+		dstAccessMask: accessShaderRead | accessShaderWrite,
+	}
+	vkCmdPipelineBarrier(r.cb, stageComputeShader, stageComputeShader, 0, 1, &b, 0, 0, 0, 0)
+}
+
+// Submit records one command buffer, runs it, and waits. Everything here is
+// synchronous: the caller wants the answer, not a pipeline.
+func (d *Device) Submit(record func(*Recorder)) error {
+	return d.run(func(cb commandBuffer) { record(&Recorder{cb: cb}) })
+}
+
+// Dispatch is one set, once, in a submission of its own.
+func (s *Set) Dispatch(groups uint32, push unsafe.Pointer) error {
+	return s.p.d.Submit(func(r *Recorder) { r.Dispatch(s, groups, push) })
+}
+
+// DispatchTimes runs the same dispatch n times inside one submission, each
+// waiting on the last.
+//
+// One dispatch tells you what a token costs, round trip and all. It does not
+// tell you what the kernel costs, because a card handed a few milliseconds of
+// work and then left alone does not raise its clocks: measured one at a time
+// the logit head runs the card at half its frequency and a fifth of its power.
+// Both numbers are worth having and they are not the same number.
+func (s *Set) DispatchTimes(groups uint32, push unsafe.Pointer, n int) error {
+	return s.p.d.Submit(func(r *Recorder) {
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				r.Barrier()
+			}
+			r.Dispatch(s, groups, push)
+		}
+	})
 }

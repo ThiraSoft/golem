@@ -46,6 +46,23 @@ type BlockWeights struct {
 	// output. llama.cpp applies it just before the routing weight, so this
 	// engine folds it into that weight.
 	DownScale []float32
+
+	// Experts is a device holding this block's two stacks, when one was asked
+	// for, and Index says which block it uploaded them as. The weights are
+	// where this belongs: a block that has been moved knows it, and nothing
+	// above has to carry the fact down through three signatures.
+	Experts     ExpertDevice
+	ExpertIndex int
+}
+
+// An ExpertDevice computes the expert branch of one block somewhere other than
+// this process's memory. vk.Experts implements it.
+//
+// in carries the branch's normed input in its Q8_0 form, one column. ids are
+// the chosen experts, weights their routing weights with the per-expert scale
+// already folded in, and out is written.
+type ExpertDevice interface {
+	Run(block int, in *nn.Batch, ids []int32, weights []float32, out []float32) error
 }
 
 // A stack of expert matrices, kept as the one three-dimensional tensor the

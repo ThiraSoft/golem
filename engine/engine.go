@@ -92,23 +92,35 @@ func (m *Model) Close() error { return m.closer.Close() }
 type vulkanHead interface {
 	UseVulkanHead() error
 	VulkanHead() bool
+	UseVulkanExperts() error
+	VulkanExperts() bool
 }
 
-// UseVulkanHead moves the logit head to a Vulkan device, when the engine has
-// one that can go and a device is there to take it. Everything else stays on
-// the CPU; gemma/vulkan.go says why that split is the affordable one.
-func (m *Model) UseVulkanHead() error {
+// UseVulkan moves to a Vulkan device everything of this engine that can go:
+// the logit head, and the expert stacks of a mixture. Both are read in full or
+// nearly so for every token drawn, and both are bandwidth on a CPU.
+//
+// It is all or nothing per part, and it fails rather than falling back: a
+// model half on a card the caller believed it was wholly on is a model whose
+// speed nobody can explain.
+func (m *Model) UseVulkan() error {
 	h, ok := m.Forward.(vulkanHead)
 	if !ok {
-		return fmt.Errorf("engine: %s has no logit head that can move to a device", m.Name)
+		return fmt.Errorf("engine: %s has nothing that can move to a device", m.Name)
+	}
+	if err := h.UseVulkanExperts(); err != nil {
+		return err
 	}
 	return h.UseVulkanHead()
 }
 
-// VulkanHead says whether the head is on a device.
-func (m *Model) VulkanHead() bool {
+// Vulkan says what is on a device, for the line printed at startup.
+func (m *Model) Vulkan() (head, experts bool) {
 	h, ok := m.Forward.(vulkanHead)
-	return ok && h.VulkanHead()
+	if !ok {
+		return false, false
+	}
+	return h.VulkanHead(), h.VulkanExperts()
 }
 
 // Open reads the architecture and hands the file to the engine that implements

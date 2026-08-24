@@ -34,7 +34,7 @@ func main() {
 	maxTokens := flag.Int("n", 1024, "most tokens to draw for one answer, when the request names no limit")
 	parallel := flag.Int("parallel", 1, "conversations to keep at once; the context is cut into that many slots, each holding its own")
 	ttl := flag.Duration("cache-ttl", 0, "forget a conversation's tokens after this long idle; 0 never forgets. The memory is allocated at startup and is released by neither")
-	vulkan := flag.Bool("vulkan", false, "put the logit head on a Vulkan device, which is a quarter of what a token costs")
+	vulkan := flag.Bool("vulkan", false, "put the logit head and the expert stacks on a Vulkan device")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [options]\n", filepath.Base(os.Args[0]))
 		flag.PrintDefaults()
@@ -51,7 +51,7 @@ func main() {
 	}
 	defer m.Close()
 	if *vulkan {
-		if err := m.UseVulkanHead(); err != nil {
+		if err := m.UseVulkan(); err != nil {
 			fail(err)
 		}
 	}
@@ -91,11 +91,8 @@ func main() {
 		server.SetVision(v)
 	}
 
-	head := "cpu"
-	if m.VulkanHead() {
-		head = "vulkan"
-	}
-	fmt.Fprintf(os.Stderr, "%s: %s, %d blocks, %d positions in %d slot(s) of %d, head on %s, loaded in %s on %d cores\n",
+	head := vulkanLine(m.Vulkan())
+	fmt.Fprintf(os.Stderr, "%s: %s, %d blocks, %d positions in %d slot(s) of %d, %s, loaded in %s on %d cores\n",
 		name, m.Name, m.Blocks, *context, m.Slots(), m.SlotContext(), head,
 		time.Since(start).Round(time.Millisecond), runtime.NumCPU())
 	// The port is taken before it is announced: an address already in use must
@@ -114,4 +111,17 @@ func main() {
 func fail(err error) {
 	fmt.Fprintln(os.Stderr, "golem-server:", err)
 	os.Exit(1)
+}
+
+// vulkanLine names what ended up on the card, for the startup line.
+func vulkanLine(head, experts bool) string {
+	switch {
+	case head && experts:
+		return "head and experts on vulkan"
+	case head:
+		return "head on vulkan"
+	case experts:
+		return "experts on vulkan"
+	}
+	return "all on cpu"
 }

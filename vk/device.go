@@ -199,6 +199,14 @@ func (d *Device) Host(size int, usage uint32) (*Buffer, error) {
 	return d.newBuffer(uint64(size), usage, memoryHostVisible|memoryHostCoherent)
 }
 
+// Local allocates a buffer in device memory that no one on this side reads or
+// writes. It is what an intermediate between two dispatches wants: the card
+// produces it and the card consumes it, and a host-visible allocation would
+// put both across the bus for nothing.
+func (d *Device) Local(size int, usage uint32) (*Buffer, error) {
+	return d.newBuffer(uint64(size), usage, memoryDeviceLocal)
+}
+
 // Bytes is the mapped buffer as a slice. It panics on a buffer that lives in
 // device memory, which has no address on this side.
 func (b *Buffer) Bytes() []byte {

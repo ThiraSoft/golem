@@ -48,6 +48,7 @@ type Q6KHead struct {
 	out     *Buffer // one float per row
 
 	pipe   *Pipeline
+	set    *Set
 	groups uint32
 }
 
@@ -101,7 +102,11 @@ func NewQ6KHead(d *Device, data []byte, rows, cols int) (*Q6KHead, error) {
 	}
 
 	buffers := []*Buffer{h.weights, h.act, h.scales, h.sums, h.out}
-	if h.pipe, err = d.NewPipeline(q6kSPIRV, buffers, uint32(unsafe.Sizeof(q6kPush{}))); err != nil {
+	if h.pipe, err = d.NewPipeline(q6kSPIRV, len(buffers), uint32(unsafe.Sizeof(q6kPush{}))); err != nil {
+		h.Close()
+		return nil, err
+	}
+	if h.set, err = h.pipe.NewSet(buffers); err != nil {
 		h.Close()
 		return nil, err
 	}
@@ -138,7 +143,7 @@ func (h *Q6KHead) MatVec(b *nn.Batch, column int, out []float32) error {
 	}
 
 	push := q6kPush{rows: uint32(h.rows), superblocks: uint32(h.superblocks)}
-	if err := h.pipe.Dispatch(h.groups, unsafe.Pointer(&push)); err != nil {
+	if err := h.set.Dispatch(h.groups, unsafe.Pointer(&push)); err != nil {
 		return err
 	}
 	copy(out, h.out.Floats())
@@ -146,6 +151,10 @@ func (h *Q6KHead) MatVec(b *nn.Batch, column int, out []float32) error {
 }
 
 func (h *Q6KHead) Close() {
+	if h.set != nil {
+		h.set.Close()
+		h.set = nil
+	}
 	if h.pipe != nil {
 		h.pipe.Close()
 		h.pipe = nil

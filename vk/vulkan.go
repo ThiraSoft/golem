@@ -501,3 +501,9 @@ func check(what string, r int32) error {
 	}
 	return nil
 }
+
+// errBindings is the one shape mismatch a caller can make between a pipeline
+// and the buffers handed to it.
+func errBindings(given, want int) error {
+	return fmt.Errorf("vk: the pipeline reads %d buffers, given %d", want, given)
+}

@@ -50,3 +50,12 @@ func GELUTable(x []float32) {
 		}
 	}
 }
+
+// GELUTableData is the table itself, for a backend that has to apply the same
+// function somewhere this package cannot reach — a shader, for instance, which
+// can index 65536 floats as cheaply as the CPU can and must land on the same
+// answers to be worth comparing.
+func GELUTableData() []float32 {
+	geluOnce.Do(buildGELUTable)
+	return geluTable[:]
+}

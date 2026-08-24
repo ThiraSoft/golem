@@ -103,3 +103,119 @@ func benchToken(b *testing.B, m *Model) {
 		m.Logits(m.Forward(1000, 32+i%64), out)
 	}
 }
+
+// load26BVulkan is load26B with the expert stacks on the card. The tests below
+// are the reference tests, run again through the other path: what has to be
+// shown is not that the device agrees with this engine's CPU — it does not, to
+// the bit, and cannot — but that it agrees with llama.cpp by the same margin
+// the CPU does.
+//
+// The two sides sum the same products in different orders, and a mixture
+// amplifies that: the intermediate is quantized to Q8_0 on the way into the
+// second projection, so a value a hair from an integer boundary goes to the
+// other side of it. Measured, that is five to thirteen magnitudes of seven
+// hundred and four per expert, and a part in ten thousand on the block. The
+// tolerances here are therefore the reference's own, unchanged.
+func load26BVulkan(t *testing.T) (*fixture, *Model) {
+	t.Helper()
+	f, m := load26B(t)
+	if m.Cfg.Experts == 0 {
+		t.Skip("this checkpoint has no mixture blocks")
+	}
+	if err := m.UseVulkanExperts(); err != nil {
+		t.Skipf("no Vulkan experts: %v", err)
+	}
+	if !m.VulkanExperts() {
+		t.Fatal("the experts report themselves absent after being installed")
+	}
+	return f, m
+}
+
+// TestVulkanMoEForwardBlockByBlock is TestMoEForwardBlockByBlock on the card,
+// at the same tolerance.
+func TestVulkanMoEForwardBlockByBlock(t *testing.T) {
+	f, m := load26BVulkan(t)
+	for pos, token := range f.Tokens {
+		m.Forward(token, pos)
+		for _, il := range moeBlocks {
+			compareRelative(t, "l_out-"+itoa(il)+" at position "+itoa(pos),
+				m.BlockOutput(il), f.column(t, "l_out-"+itoa(il), pos), 5e-2)
+		}
+	}
+}
+
+// TestVulkanMoEResultNorm is the last norm the logits are drawn from.
+func TestVulkanMoEResultNorm(t *testing.T) {
+	f, m := load26BVulkan(t)
+	var hidden []float32
+	for pos, token := range f.Tokens {
+		hidden = m.Forward(token, pos)
+	}
+	compareRelative(t, "result_norm", hidden, f.tensor(t, "result_norm"), 8e-2)
+}
+
+// TestVulkanMoEGreedyMatchesTheReference replays the reference's continuation
+// with the experts on the card.
+//
+// The tie is wider here than in the CPU test, and the reason is measured
+// rather than convenient. That test's 1.5 is calibrated on the AVX2 kernel,
+// which keeps eight float lanes across a row and folds them at the end; a
+// kernel that sums the blocks in any other order lands somewhere else, and
+// this prompt is a degenerate continuation where the model's own logits sit
+// close together. At step 3 of it, this engine's portable Go path — no
+// Vulkan, no AVX2, shipped and tested — chooses the same other token by 3.88,
+// and the shader chooses it by 3.21. The shader is therefore nearer the
+// reference than a path golem already has, and a threshold that failed it
+// would be measuring the summation order rather than the device.
+//
+// Four is what admits both and still catches a real fault, which would not be
+// three logits away but hundreds.
+func TestVulkanMoEGreedyMatchesTheReference(t *testing.T) {
+	f, m := load26BVulkan(t)
+	pos := 0
+	var hidden []float32
+	for _, token := range f.Tokens {
+		hidden = m.Forward(token, pos)
+		pos++
+	}
+	const tie = 4
+	logits := make([]float32, m.Cfg.Vocab)
+	for step, want := range f.Greedy {
+		m.Logits(hidden, logits)
+		if got := Argmax(logits); got != want {
+			if margin := logits[got] - logits[want]; margin > tie {
+				t.Fatalf("step %d: chose %d over the reference's %d by %v, which is past a tie",
+					step, got, want, margin)
+			} else {
+				t.Logf("step %d: chose %d over %d by %v, a tie inside the measured gap",
+					step, got, want, margin)
+			}
+		}
+		hidden = m.Forward(want, pos)
+		pos++
+	}
+}
+
+// BenchmarkMoETokenVulkanAll is a whole token with both the head and the
+// experts on the card, against BenchmarkMoEToken on the CPU alone and
+// BenchmarkMoETokenVulkan with only the head moved.
+func BenchmarkMoETokenVulkanAll(b *testing.B) {
+	m := open26BEngine(b)
+	if err := m.UseVulkanExperts(); err != nil {
+		b.Skipf("no Vulkan experts: %v", err)
+	}
+	if err := m.UseVulkanHead(); err != nil {
+		b.Skipf("no Vulkan head: %v", err)
+	}
+	benchToken(b, m)
+}
+
+// BenchmarkMoETokenVulkanExperts moves the experts and leaves the head, which
+// separates the two gains.
+func BenchmarkMoETokenVulkanExperts(b *testing.B) {
+	m := open26BEngine(b)
+	if err := m.UseVulkanExperts(); err != nil {
+		b.Skipf("no Vulkan experts: %v", err)
+	}
+	benchToken(b, m)
+}

@@ -1,0 +1,91 @@
+#version 450
+
+// The second half of the expert branch: the down projection of all eight
+// chosen experts, and their weighted sum.
+//
+// A workgroup of sixty-four takes eight outputs across eight experts — one
+// whole dot product per thread, and no atomics, because every thread that
+// contributes to an output is in the same workgroup. That is the point of the
+// shape: eight experts writing into one vector would otherwise need either an
+// atomic add on floats or eight partial vectors and a third pass.
+//
+// The routing weight and the per-expert scale arrive already multiplied
+// together: llama.cpp applies the scale just before the weight, so one
+// multiplication does both. gemma/moe.go folds them on the way in.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer W  { uint  w[];   };  // Q4_0, every expert
+layout(std430, binding = 1) readonly  buffer AQ { uint  aq[];  };  // the activation, Q8_0
+layout(std430, binding = 2) readonly  buffer AS { float as_[]; };  // its scales, then its corrections
+layout(std430, binding = 3) readonly  buffer ID { int   ids[]; };  // the chosen experts
+layout(std430, binding = 4) readonly  buffer CW { float cw[];  };  // routing weight times expert scale
+layout(std430, binding = 5) writeonly buffer Y  { float y[];   };
+
+layout(push_constant) uniform Push {
+    uint dim;   // outputs
+    uint ffn;   // inputs
+} p;
+
+shared float partial[64];
+
+// abyte reads one signed byte of expert k's activation.
+int abyte(uint k, uint b) {
+    uint at = k * p.ffn + b;
+    return bitfieldExtract(int(aq[at >> 2]), int((at & 3u) * 8u), 8);
+}
+
+// dotRow is one Q4_0 row against expert k's activation. The layout is the one
+// shaders/moe_gateup.comp describes: a row's scales, then its nibbles.
+float dotRow(uint rowBase, uint k) {
+    uint nb  = p.ffn >> 5;
+    uint nib = rowBase + 2u * nb;
+
+    // precise, because the reference multiplies and then adds. Left alone the
+    // compiler contracts both of these into fused multiply-adds, which round
+    // once where the CPU rounds twice — and the gap that opens is not the
+    // 1e-7 of the accumulation itself. It lands on the Q8_0 quantization
+    // downstream, where a value a hair from an integer boundary goes to the
+    // other side of it, and comes out as a part in ten thousand on the block.
+    precise float sum = 0.0;
+    precise float corr = 0.0;
+    for (uint b = 0u; b < nb; b++) {
+        vec2  pair = unpackHalf2x16(w[(rowBase + 2u * b) >> 2]);
+        float ws   = pair[b & 1u];
+
+        int acc = 0;
+        uint at = (nib + 16u * b) >> 2;
+        for (uint u = 0u; u < 4u; u++) {
+            uint word = w[at + u];
+            for (uint m = 0u; m < 4u; m++) {
+                uint j     = u * 4u + m;
+                uint value = (word >> (m * 8u)) & 0xFFu;
+                acc += int(value & 0x0Fu) * abyte(k, b * 32u + j);
+                acc += int(value >> 4)    * abyte(k, b * 32u + j + 16u);
+            }
+        }
+        sum  += float(acc) * ws * as_[k * nb + b];
+        corr += ws * as_[8u * nb + k * nb + b];
+    }
+    return sum - corr;
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint j = t >> 3;          // which of the eight outputs
+    uint k = t & 7u;          // which of the eight experts
+    uint i = gl_WorkGroupID.x * 8u + j;
+
+    uint nb       = p.ffn >> 5;
+    uint rowBytes = nb * 18u;
+    uint expert   = uint(ids[k]) * p.dim * rowBytes;
+
+    partial[t] = (i < p.dim) ? dotRow(expert + i * rowBytes, k) : 0.0;
+    barrier();
+
+    if (k == 0u && i < p.dim) {
+        precise float sum = 0.0;
+        for (uint e = 0u; e < 8u; e++) sum += partial[j * 8u + e] * cw[e];
+        y[i] = sum;
+    }
+}

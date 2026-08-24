@@ -1,0 +1,194 @@
+#version 450
+
+// The first half of one expert: the fused gate-and-up projection, ggml's GELU,
+// the elementwise product, and the Q8_0 quantization the second half wants.
+//
+// Gemma 4 stores gate and up as one matrix of twice the feed-forward width —
+// the gate's rows first, the up's after — so the value at position i needs row
+// i and row i+ffn. A workgroup of sixty-four takes thirty-two positions: the
+// low half computes the gate rows, the high half the up rows, and they meet in
+// shared memory. That pairing is also what makes the quantization possible
+// here rather than in a pass of its own, because a Q8_0 block is exactly those
+// thirty-two values and the workgroup is holding all of them.
+//
+// One thread computes one whole dot product. That is not the fastest shape —
+// neighbouring threads walk separate rows and coalesce badly — but it needs no
+// reduction at all, and the kernel is bound by what it reads, not by how it
+// adds. The faster shape is a later problem.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer W  { uint  w[];    };  // Q4_0, every expert
+layout(std430, binding = 1) readonly  buffer XQ { uint  xq[];   };  // the input, Q8_0
+layout(std430, binding = 2) readonly  buffer XS { float xs[];   };  // its scales, then its corrections
+layout(std430, binding = 3) readonly  buffer ID { int   ids[];  };  // the chosen experts
+layout(std430, binding = 4) readonly  buffer GT { float gelu[]; };  // ggml's table, 65536 entries
+layout(std430, binding = 5) writeonly buffer AQ { uint  aq[];   };  // the activation, Q8_0
+layout(std430, binding = 6) writeonly buffer AS { float as_[];  };  // its scales, then its corrections
+
+layout(push_constant) uniform Push {
+    uint dim;   // inputs to the projection
+    uint ffn;   // outputs of it, per half
+} p;
+
+shared float half_[64];
+shared int   q32[32];
+
+// abyte reads one signed byte of the input's magnitudes.
+int abyte(uint b) { return bitfieldExtract(int(xq[b >> 2]), int((b & 3u) * 8u), 8); }
+
+// floatToHalf is nn/half.go, bit for bit.
+//
+// GLSL has packHalf2x16 and it is not the same function: measured against the
+// engine's own conversion it puts about one value in ten in the neighbouring
+// fp16 bucket. That matters twice here — the GELU table is indexed by those
+// sixteen bits, so a bucket away is an answer an fp16 ulp away, and the Q8_0
+// scale is the fp16 the reference stored. Rounding is half to even, and the
+// carry out of the mantissa into the exponent is deliberate.
+uint floatToHalf(float f) {
+    uint bits     = floatBitsToUint(f);
+    uint sign     = (bits >> 16) & 0x8000u;
+    int  exponent = int((bits >> 23) & 0xFFu) - 127 + 15;
+    uint mantissa = bits & 0x7FFFFFu;
+
+    if ((bits & 0x7FFFFFFFu) == 0u) return sign;
+    if (exponent >= 0x1F) {
+        if ((bits & 0x7F800000u) == 0x7F800000u && mantissa != 0u) return sign | 0x7E00u;
+        return sign | 0x7C00u;
+    }
+    if (exponent <= 0) {
+        if (exponent < -10) return sign;
+        mantissa |= 0x800000u;
+        uint shift = uint(14 - exponent);
+        uint value = mantissa >> shift;
+        uint rest  = mantissa & ((1u << shift) - 1u);
+        uint half_way = 1u << (shift - 1u);
+        if (rest > half_way || (rest == half_way && (value & 1u) == 1u)) value++;
+        return sign | value;
+    }
+    uint value = (uint(exponent) << 10) | (mantissa >> 13);
+    uint rest  = mantissa & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (value & 1u) == 1u)) value++;
+    return sign | value;
+}
+
+// halfToFloat widens those sixteen bits back. The widening has nothing to
+// round, so the built-in is the built-in.
+float halfToFloat(uint h) { return unpackHalf2x16(h).x; }
+
+// nearestInt is ggml's round-half-to-even: adding 1.5 x 2^23 pushes the
+// fractional bits off the end of a float32 mantissa, and the rounding the
+// hardware applies to that addition is the rounding wanted. nn/batch.go says
+// the same thing on the other side.
+int nearestInt(float f) {
+    return (floatBitsToInt(f + 12582912.0) & 0x007fffff) - 0x00400000;
+}
+
+// dotRow is one Q4_0 row against the input.
+//
+// The weights are not in the file's layout. A Q4_0 block is eighteen bytes —
+// an fp16 scale then sixteen bytes of nibbles — and eighteen is not a multiple
+// of four, so every other block of a row would start off alignment. The upload
+// splits the row instead: all of its scales first, then all of its nibbles.
+// Same bytes, same count, and every load lands where a uint array can reach it.
+float dotRow(uint rowBase) {
+    uint nb  = p.dim >> 5;
+    uint nib = rowBase + 2u * nb;
+
+    // precise, because the reference multiplies and then adds. Left alone the
+    // compiler contracts both of these into fused multiply-adds, which round
+    // once where the CPU rounds twice — and the gap that opens is not the
+    // 1e-7 of the accumulation itself. It lands on the Q8_0 quantization
+    // downstream, where a value a hair from an integer boundary goes to the
+    // other side of it, and comes out as a part in ten thousand on the block.
+    precise float sum = 0.0;
+    precise float corr = 0.0;
+    for (uint b = 0u; b < nb; b++) {
+        vec2  pair = unpackHalf2x16(w[(rowBase + 2u * b) >> 2]);
+        float ws   = pair[b & 1u];
+
+        int acc = 0;
+        uint at = (nib + 16u * b) >> 2;
+        for (uint u = 0u; u < 4u; u++) {
+            uint word = w[at + u];
+            for (uint k = 0u; k < 4u; k++) {
+                uint j     = u * 4u + k;
+                uint value = (word >> (k * 8u)) & 0xFFu;
+                acc += int(value & 0x0Fu) * abyte(b * 32u + j);
+                acc += int(value >> 4)    * abyte(b * 32u + j + 16u);
+            }
+        }
+        // The weights are stored shifted by eight, and the correction the
+        // input carries is 8 x scale x sum(q) — the same for every row it
+        // meets, which is why it is not in this loop's arithmetic.
+        sum  += float(acc) * ws * xs[b];
+        corr += ws * xs[nb + b];
+    }
+    return sum - corr;
+}
+
+void main() {
+    uint blocks = p.ffn >> 5;              // Q8_0 blocks of output, per expert
+    uint e      = gl_WorkGroupID.x / blocks;
+    uint blk    = gl_WorkGroupID.x % blocks;
+    uint t      = gl_LocalInvocationID.x;
+    uint j      = t & 31u;
+
+    uint nb       = p.dim >> 5;
+    uint rowBytes = nb * 18u;
+    uint expert   = uint(ids[e]) * 2u * p.ffn * rowBytes;
+    uint row      = (t < 32u) ? (blk * 32u + j) : (p.ffn + blk * 32u + j);
+
+    half_[t] = dotRow(expert + row * rowBytes);
+    barrier();
+
+    if (t < 32u) {
+        float g = half_[t];
+        float a;
+        // ggml does not evaluate GELU: it rounds to fp16 and looks the answer
+        // up, with the two ends left alone. nn/gelu_table.go says why.
+        if (g <= -10.0)      a = 0.0;
+        else if (g >= 10.0)  a = g;
+        else                 a = gelu[floatToHalf(g)];
+        half_[t] = a * half_[32u + t];
+    }
+    barrier();
+
+    // The Q8_0 block, on one thread. Thirty-two values is less work than the
+    // barriers a reduction would cost.
+    if (t == 0u) {
+        float peak = 0.0;
+        for (uint i = 0u; i < 32u; i++) peak = max(peak, abs(half_[i]));
+
+        float scale = 0.0;
+        int   total = 0;
+        if (peak > 0.0) {
+            // The scale the product uses is the fp16 the reference stored.
+            scale = halfToFloat(floatToHalf(peak / 127.0));
+            float inverse = 127.0 / peak;
+            for (uint i = 0u; i < 32u; i++) {
+                // Same reason, and this is the one that mattered: the magic
+                // constant of nearestInt only rounds correctly when the
+                // product it is added to has already been rounded to float32.
+                precise float scaled = half_[i] * inverse;
+                int n = clamp(nearestInt(scaled), -128, 127);
+                q32[i] = n;
+                total += n;
+            }
+        } else {
+            for (uint i = 0u; i < 32u; i++) q32[i] = 0;
+        }
+
+        uint at = (e * p.ffn + blk * 32u) >> 2;
+        for (uint u = 0u; u < 8u; u++) {
+            uint word = 0u;
+            for (uint k = 0u; k < 4u; k++) {
+                word |= (uint(q32[u * 4u + k]) & 0xFFu) << (k * 8u);
+            }
+            aq[at + u] = word;
+        }
+        uint slot = e * blocks + blk;
+        as_[slot] = scale;
+        as_[8u * blocks + slot] = 8.0 * scale * float(total);
+    }
+}

@@ -158,7 +158,7 @@ waiting through the model in a single pass.
 | `audio/` | sound formats: reading and writing WAV |
 | `sample/` | top-k, top-p, temperature, and a seeded draw over a row of logits |
 | `chat/` | a conversation's shape — messages, tools, calls — and the interface an engine implements to write one out |
-| `vk/` | Vulkan compute, bound through `purego` rather than cgo: a device, buffers, one pipeline, and the Q6_K product the logit head is |
+| `vk/` | Vulkan compute, bound through `purego` rather than cgo: devices, buffers, pipelines, the Q6_K product the logit head is, and the two kernels a mixture's expert branch needs |
 
 Nothing is promoted into this layer on the strength of a guess. Code moves here
 once two engines are shown to want it, in the same commit that makes them both
@@ -181,19 +181,31 @@ Worth knowing before you clone it:
   hardware — correct, and tuned by nobody. The vision tower's interleaved kernel
   and the audio decoder's are portable Go there. An Apple or a Graviton runs; it
   will not see the numbers above.
-- **One tensor runs on a GPU, and only if you ask.** This is a CPU engine and
-  that is still the point of it. But the logit head is the input embedding read
-  the other way round, so it is the largest tensor in the file and it is read in
-  full for every token drawn — 577 mebibytes of Q6_K on the 26B, a quarter of
-  what a token costs, and a quarter no amount of CPU work shortens because the
-  bytes are the cost. `-vulkan` puts that one product on a Vulkan device: 13.6
-  to 15.8 tokens a second on the 26B A4B, exact against the CPU kernel to a part
-  in ten million over all 262144 rows. Nothing else moves, the activation that
-  crosses is eleven kilobytes, and a build without a Vulkan loader is a build
-  where the flag fails and everything else works. There is no cgo: `vk/` opens
-  `libvulkan.so.1` through `purego`, and `CGO_ENABLED=0 go build ./...` still
-  passes. The thirty blocks are not next; see `vk/q6k.go` for what the split
-  costs and `vk/shaders/q6k.comp` for the three optimizations that did nothing.
+- **Two things run on a GPU, and only if you ask.** This is a CPU engine and
+  that is still the point of it. But a token of the 26B A4B reads about 1.7
+  gigabytes, and two tensors are nearly all of it: the logit head, which is the
+  input embedding read the other way round and so the largest tensor in the
+  file, 0.6 gigabytes read in full every token; and the expert stacks, 0.8 more,
+  eight matrices at a time out of a hundred and twenty-eight, thirty times over.
+  Neither shortens with CPU work, because the bytes are the cost — the kernels
+  already run at 37 GB/s on a bus whose ceiling is about 43.
+
+  `-vulkan` moves both. On the 26B A4B, 13.4 tokens a second becomes 20.3, and
+  the answer written at temperature zero is the same token for token. The head
+  alone is worth 15.5 and the experts alone 16.0; together they are worth more
+  than either, because they also stop competing for the same bus. It costs
+  every expert being resident — 11.96 gibibytes, which is why a card with
+  sixteen is the smallest that can do this — and about nine seconds of upload.
+
+  The attention, the norms and the cache stay on the CPU. That is not a
+  half-finished migration but the affordable line: the activation crossing to
+  the card is eleven kilobytes, and one submission costs sixty-three
+  microseconds whatever is in it. Moving the attention would mean the key-value
+  cache on the card too, and everything after it.
+
+  There is no cgo: `vk/` opens `libvulkan.so.1` through `purego`, and
+  `CGO_ENABLED=0 go build ./...` still passes. A machine with no Vulkan loader
+  is one where the flag fails and everything else works.
 - **The server is one process around one model.** `-parallel` answers several
   conversations at once and batches them into one pass, the way llama.cpp's
   does — on E2B, 20.7 tokens a second for one client, 34.7 for two, 54.2 for

@@ -64,7 +64,7 @@ func main() {
 	flag.Var(&recordings, "audio", "a sound file — WAV, MP3 or FLAC — to put in the first turn; repeat for several")
 	prompt := flag.String("p", "", "answer this and exit, instead of reading turns")
 	stats := flag.Bool("stats", false, "report tokens and speed after each answer")
-	vulkan := flag.Bool("vulkan", false, "put the logit head on a Vulkan device, which is a quarter of what a token costs")
+	vulkan := flag.Bool("vulkan", false, "put the logit head and the expert stacks on a Vulkan device")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [options]\n", filepath.Base(os.Args[0]))
 		flag.PrintDefaults()
@@ -93,7 +93,7 @@ func main() {
 		}
 	}
 	if *vulkan {
-		if err := m.UseVulkanHead(); err != nil {
+		if err := m.UseVulkan(); err != nil {
 			fail(err)
 		}
 	}
@@ -115,11 +115,8 @@ func main() {
 	}
 
 	if *stats {
-		where := "cpu"
-		if m.VulkanHead() {
-			where = "vulkan"
-		}
-		fmt.Fprintf(os.Stderr, "%s: %s, %d blocks, %d positions, vocabulary %d, head on %s, loaded in %s on %d cores\n",
+		where := vulkanLine(m.Vulkan())
+		fmt.Fprintf(os.Stderr, "%s: %s, %d blocks, %d positions, vocabulary %d, %s, loaded in %s on %d cores\n",
 			filepath.Base(*model), m.Name, m.Blocks, *context, m.Vocabulary, where,
 			loading.Round(time.Millisecond), runtime.NumCPU())
 		fmt.Fprintf(os.Stderr, "sampling: temperature %g, top-k %d, top-p %g, seed %d\n",
@@ -223,4 +220,17 @@ func report(t Turn) {
 func fail(err error) {
 	fmt.Fprintln(os.Stderr, "golem-cli:", err)
 	os.Exit(1)
+}
+
+// vulkanLine names what ended up on the card, for the startup line.
+func vulkanLine(head, experts bool) string {
+	switch {
+	case head && experts:
+		return "head and experts on vulkan"
+	case head:
+		return "head on vulkan"
+	case experts:
+		return "experts on vulkan"
+	}
+	return "all on cpu"
 }

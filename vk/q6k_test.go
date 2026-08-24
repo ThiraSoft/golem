@@ -163,7 +163,7 @@ func BenchmarkQ6KHeadSaturated(b *testing.B) {
 	b.SetBytes(int64(m.Rows) * int64(m.Cols) / nn.SuperBlock * q6kPaddedBytes * rounds)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := h.pipe.DispatchTimes(h.groups, unsafe.Pointer(&push), rounds); err != nil {
+		if err := h.set.DispatchTimes(h.groups, unsafe.Pointer(&push), rounds); err != nil {
 			b.Fatal(err)
 		}
 	}
