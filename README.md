@@ -172,9 +172,11 @@ command names no engine, and nothing but a command imports it.
 Worth knowing before you clone it:
 
 - **x86-64 with AVX2 is the only tuned target.** `nn/*.s` is where the speed
-  comes from, and it is AVX2. Everything has a pure-Go fallback, so an ARM
-  machine runs — an Apple or a Graviton just will not see the numbers above.
-  NEON kernels are the largest single thing missing here.
+  comes from. arm64 has NEON kernels for the quantized generation path, written
+  and tested under QEMU on an x86 machine and never once timed on real ARM
+  hardware — correct, and tuned by nobody. Vision, audio, and the bf16 products
+  are portable Go there. An Apple or a Graviton runs; it will not see the
+  numbers above.
 - **No GPU, and none planned.** This is a CPU engine; that is the point of it,
   not a stage on the way somewhere.
 - **The server is one process around one model.** `-parallel` answers several
@@ -261,8 +263,10 @@ What would help most:
 - **A parity failure.** If a test that compares against llama.cpp or PyTorch
   fails on your setup, that is the most useful bug report this repository can
   get, and the fixtures are exactly what makes it legible.
-- **The kernels.** `nn/*.s` is where the time goes, and a NEON path is the one
-  thing this repository most obviously lacks.
+- **The kernels.** `nn/*.s` is where the time goes. The NEON side has never run
+  on real silicon: a timing from an actual Apple or Graviton part, or a tuning
+  that a machine confirms, is worth more here than anywhere else in the
+  repository.
 - **Judgement calls.** Where the code chose one thing and explained itself in a
   comment, the explanation is a claim; if it is wrong, say so.
 
