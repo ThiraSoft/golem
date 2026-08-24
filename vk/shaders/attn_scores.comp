@@ -24,14 +24,14 @@ layout(std430, binding = 2) readonly  buffer CV { uint  cv[];     };  // the val
 layout(std430, binding = 3) buffer          SC { float scores[];  };  // scratch, one row per head
 layout(std430, binding = 4) writeonly buffer AQ { uint  aq[];     };  // the mixed values, Q8_0
 layout(std430, binding = 5) writeonly buffer AS { float as_[];    };  // their scales, then corrections
+layout(std430, binding = 6) readonly  buffer WH { uvec4 where_[]; };  // one per block: position, first, last
 
 layout(push_constant) uniform Push {
     uint heads;
     uint kvHeads;
     uint headDim;
     uint perKV;     // query heads to a key-value head
-    uint first;     // the earliest visible position
-    uint last;      // the latest, inclusive
+    uint block;     // which entry of where_ holds the visible range
     uint capacity;
     uint mask;      // capacity - 1 when that is a mask, and zero otherwise
     uint stride;    // scores kept per head
@@ -85,14 +85,15 @@ void main() {
     uint h  = gl_WorkGroupID.x;
     uint t  = gl_LocalInvocationID.x;
     uint hd = p.headDim;
-    uint n  = p.last - p.first + 1u;
+    uint first = where_[p.block].y;
+    uint n  = where_[p.block].z - first + 1u;
     uint kv = h / p.perKV;
     uint qb = h * hd;
     uint sb = h * p.stride;
 
     // The scores.
     for (uint m = t; m < n; m += 256u) {
-        uint o = entry(p.first + m, kv) >> 1;
+        uint o = entry(first + m, kv) >> 1;
         float s = 0.0;
         for (uint pair = 0u; pair < (hd >> 1); pair++) {
             vec2 key = unpackHalf2x16(ck[o + pair]);
@@ -140,7 +141,7 @@ void main() {
     barrier();
     for (uint m = 0u; m < n; m++) {
         float weight = scores[sb + m];
-        uint o = entry(p.first + m, kv) >> 1;
+        uint o = entry(first + m, kv) >> 1;
         for (uint pair = t; pair < (hd >> 1); pair += 256u) {
             vec2 value = unpackHalf2x16(cv[o + pair]);
             uint i = pair << 1;

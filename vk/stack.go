@@ -112,6 +112,10 @@ type Stack struct {
 	blocks []*stackBlock
 	trace  bool // whether Run keeps each block's output; see traces
 	tl     *Timeline
+
+	// program is the recording, made on the first token and kept. Trace and
+	// Profile change what is recorded, so both drop it.
+	program *Program
 }
 
 // A stackBlock is one block's norms, its router, and the bindings that read
@@ -156,7 +160,7 @@ func NewStack(d *Device, dim int, eps float32, attn *Attention, mix *Mixture) (*
 		}
 	}
 
-	if s.xs, err = d.Host(dim*4, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
+	if s.xs, err = d.Readback(dim*4, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
 		s.Close()
 		return nil, err
 	}
@@ -275,7 +279,7 @@ func (s *Stack) Ready() error {
 	if s.traces != nil {
 		return nil
 	}
-	b, err := s.d.Host(len(s.blocks)*s.dim*4, bufferUsageStorage|bufferUsageTransferDst)
+	b, err := s.d.Readback(len(s.blocks)*s.dim*4, bufferUsageStorage|bufferUsageTransferDst)
 	if err != nil {
 		return err
 	}
@@ -286,14 +290,26 @@ func (s *Stack) Ready() error {
 // Trace turns the per-block copies on. They are off by default: thirty copies
 // and the thirty barriers around them are free beside a block's arithmetic and
 // are not free beside the launch latency that a token is actually made of.
-func (s *Stack) Trace(on bool) { s.trace = on }
+func (s *Stack) Trace(on bool) {
+	s.trace = on
+	s.forget()
+}
 
 // Profile makes the next tokens stamp the card's clock between the stages. See
 // profile.go for what the stamps are worth.
 func (s *Stack) Profile(t *Timeline) {
 	s.tl = t
+	s.forget()
 	s.attn.Profile(t)
 	s.mix.Profile(t)
+}
+
+// forget drops the recording, which the next Run makes again.
+func (s *Stack) forget() {
+	if s.program != nil {
+		s.program.Close()
+		s.program = nil
+	}
 }
 
 // NewTimeline is Device.NewTimeline on the device the stack was built on,
@@ -322,10 +338,32 @@ type Position struct {
 }
 
 // Run carries the stream in Stream through every block, in one submission.
+//
+// The recording is made on the first token and submitted again on every one
+// after it. What a token changes is in the buffers: the embedding in Stream,
+// the angles SetRotation wrote, and the position and cache range this writes
+// into the attention's own. vk/compute.go says what that is worth.
 func (s *Stack) Run(at Position, experts, used int) error {
 	if len(at.First) != len(s.blocks) || len(at.Last) != len(s.blocks) {
 		return fmt.Errorf("vk: %d blocks want %d ranges, given %d", len(s.blocks), len(s.blocks), len(at.First))
 	}
+	for i := range s.blocks {
+		if err := s.attn.SetWhere(i, at.Pos, at.First[i], at.Last[i]); err != nil {
+			return err
+		}
+	}
+	if s.program == nil {
+		p, err := s.d.Compile(func(r *Recorder) { s.record(r, experts, used) })
+		if err != nil {
+			return err
+		}
+		s.program = p
+	}
+	return s.program.Run()
+}
+
+// record is the whole stack, written into a command buffer once.
+func (s *Stack) record(r *Recorder, experts, used int) {
 	quant := normPush{n: uint32(s.dim), flags: normGain | normQuant, eps: s.eps, scalar: 1}
 	post := normPush{n: uint32(s.dim), flags: normGain | normFloat, eps: s.eps, scalar: 1}
 	resid := normPush{n: uint32(s.dim), flags: normAdd | normSum | normGain | normQuant, eps: s.eps, scalar: 1}
@@ -339,50 +377,48 @@ func (s *Stack) Run(at Position, experts, used int) error {
 	// routing on anything else gives: a model that answers fluently and wrongly.
 	routerIn := normPush{n: uint32(s.dim), flags: normVScale | normFloat, eps: s.eps, scalar: route.scalar}
 
-	return s.d.Submit(func(r *Recorder) {
-		tl := s.tl
-		if tl != nil {
-			tl.Reset(r)
-			tl.Stamp(r, "start")
-		}
-		for i, b := range s.blocks {
-			combine := combinePush{n: uint32(s.dim), eps: s.eps, outScale: b.outScale}
+	tl := s.tl
+	if tl != nil {
+		tl.Reset(r)
+		tl.Stamp(r, "start")
+	}
+	for i, b := range s.blocks {
+		combine := combinePush{n: uint32(s.dim), eps: s.eps, outScale: b.outScale}
 
-			r.Dispatch(b.setAttnNorm, 1, unsafe.Pointer(&quant))
+		r.Dispatch(b.setAttnNorm, 1, unsafe.Pointer(&quant))
+		r.Barrier()
+		tl.Stamp(r, "attn norm")
+		s.attn.Record(r, i)
+		r.Barrier()
+		tl.Stamp(r, "attn out")
+		r.Dispatch(b.setPostAttn, 1, unsafe.Pointer(&post))
+		r.Barrier()
+		r.Dispatch(b.setResid, 1, unsafe.Pointer(&resid))
+		r.Barrier()
+		tl.Stamp(r, "post+resid")
+		// The expert branch's norm and the routing both read the residual
+		// and neither reads the other.
+		r.Dispatch(b.setExpert, 1, unsafe.Pointer(&quant))
+		r.Dispatch(b.setRouterIn, 1, unsafe.Pointer(&routerIn))
+		r.Barrier()
+		tl.Stamp(r, "expert norm")
+		r.Dispatch(b.setRouterW, uint32(experts), unsafe.Pointer(&route))
+		r.Barrier()
+		tl.Stamp(r, "router")
+		r.Dispatch(b.setPick, 1, unsafe.Pointer(&route))
+		r.Barrier()
+		tl.Stamp(r, "pick")
+		s.mix.Record(r, i)
+		r.Barrier()
+		tl.Stamp(r, "moe down")
+		r.Dispatch(b.setCombine, 1, unsafe.Pointer(&combine))
+		r.Barrier()
+		tl.Stamp(r, "combine")
+		if s.trace {
+			r.Copy(s.traces, i*s.dim*4, s.xs, s.dim*4)
 			r.Barrier()
-			tl.Stamp(r, "attn norm")
-			s.attn.Record(r, i, at.Pos, at.First[i], at.Last[i])
-			r.Barrier()
-			tl.Stamp(r, "attn out")
-			r.Dispatch(b.setPostAttn, 1, unsafe.Pointer(&post))
-			r.Barrier()
-			r.Dispatch(b.setResid, 1, unsafe.Pointer(&resid))
-			r.Barrier()
-			tl.Stamp(r, "post+resid")
-			// The expert branch's norm and the routing both read the residual
-			// and neither reads the other.
-			r.Dispatch(b.setExpert, 1, unsafe.Pointer(&quant))
-			r.Dispatch(b.setRouterIn, 1, unsafe.Pointer(&routerIn))
-			r.Barrier()
-			tl.Stamp(r, "expert norm")
-			r.Dispatch(b.setRouterW, uint32(experts), unsafe.Pointer(&route))
-			r.Barrier()
-			tl.Stamp(r, "router")
-			r.Dispatch(b.setPick, 1, unsafe.Pointer(&route))
-			r.Barrier()
-			tl.Stamp(r, "pick")
-			s.mix.Record(r, i)
-			r.Barrier()
-			tl.Stamp(r, "moe down")
-			r.Dispatch(b.setCombine, 1, unsafe.Pointer(&combine))
-			r.Barrier()
-			tl.Stamp(r, "combine")
-			if s.trace {
-				r.Copy(s.traces, i*s.dim*4, s.xs, s.dim*4)
-				r.Barrier()
-			}
 		}
-	})
+	}
 }
 
 // sqrtOf is math.Sqrt on an int, kept here so that this file imports no more
@@ -400,6 +436,7 @@ func sqrtOf(n int) float64 {
 }
 
 func (s *Stack) Close() {
+	s.forget()
 	for _, b := range s.blocks {
 		b.close()
 	}

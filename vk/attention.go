@@ -60,6 +60,8 @@ type BlockShape struct {
 // resident, and the buffers one position passes through.
 type Attention struct {
 	tl *Timeline // set by Profile, nil everywhere else
+
+	where *Buffer // one uvec4 a block: the position and the visible range
 	d *Device
 
 	dim        int // the stream's width, which is what the output projection makes
@@ -93,6 +95,11 @@ type attentionBlock struct {
 	setScores    *Set
 }
 
+// maxBlocks is how many entries the position buffer holds, which caps the
+// blocks a stack may have. Sixty-four is twice the deepest model here and the
+// buffer is a kilobyte.
+const maxBlocks = 64
+
 // attnPush is what the two attention kernels take. The two shaders declare the
 // same block; the fields past what each reads are ignored.
 type attnPush struct {
@@ -100,7 +107,7 @@ type attnPush struct {
 	kvHeads    uint32
 	headDim    uint32
 	ropeDims   uint32
-	pos        uint32
+	block      uint32
 	capacity   uint32
 	mask       uint32
 	valueIsKey uint32
@@ -113,8 +120,7 @@ type scorePush struct {
 	kvHeads  uint32
 	headDim  uint32
 	perKV    uint32
-	first    uint32
-	last     uint32
+	block    uint32
 	capacity uint32
 	mask     uint32
 	stride   uint32
@@ -138,8 +144,8 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxContext, rotations int) (*
 		push     uintptr
 	}{
 		{&a.matvec, matvecSPIRV, 4, unsafe.Sizeof(moePush{})},
-		{&a.prepare, attnPrepareSPIRV, 10, unsafe.Sizeof(attnPush{})},
-		{&a.scores, attnScoresSPIRV, 6, unsafe.Sizeof(scorePush{})},
+		{&a.prepare, attnPrepareSPIRV, 11, unsafe.Sizeof(attnPush{})},
+		{&a.scores, attnScoresSPIRV, 7, unsafe.Sizeof(scorePush{})},
 	} {
 		if *spec.into, err = d.NewPipeline(spec.spirv, spec.bindings, uint32(spec.push)); err != nil {
 			a.Close()
@@ -162,6 +168,7 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxContext, rotations int) (*
 		{&a.scoreRows, maxHeads * maxContext, true}, // one row of scores per head, four bytes each
 		{&a.aq, maxHeads, true},                     // the mixed values, Q8_0
 		{&a.as, 2 * maxHeads / nn.QuantBlock * 4, true},
+		{&a.where, maxBlocks * 16, false}, // one uvec4 a block: position, first, last
 	} {
 		var b *Buffer
 		if spec.local {
@@ -311,12 +318,12 @@ func (a *Attention) AddBlock(shape BlockShape, q, k, v, o []byte, qnorm, knorm [
 		return fail(fmt.Errorf("vk: block %d names rotation %d of %d", len(a.blocks), shape.Rotation, len(a.rcos)))
 	}
 	if b.setPrepare, err = a.prepare.NewSet([]*Buffer{
-		a.q, a.k, a.v, b.qnorm, b.knorm, a.rcos[shape.Rotation], a.rsin[shape.Rotation], a.qh, ck, cv,
+		a.q, a.k, a.v, b.qnorm, b.knorm, a.rcos[shape.Rotation], a.rsin[shape.Rotation], a.qh, ck, cv, a.where,
 	}); err != nil {
 		return fail(err)
 	}
 	if b.setScores, err = a.scores.NewSet([]*Buffer{
-		a.qh, ck, cv, a.scoreRows, a.aq, a.as,
+		a.qh, ck, cv, a.scoreRows, a.aq, a.as, a.where,
 	}); err != nil {
 		return fail(err)
 	}
@@ -368,7 +375,10 @@ func (a *Attention) Attend(block int, in *nn.Batch, cos, sin []float32, pos, fir
 		return err
 	}
 
-	if err := a.d.Submit(func(r *Recorder) { a.Record(r, block, pos, first, last) }); err != nil {
+	if err := a.SetWhere(block, pos, first, last); err != nil {
+		return err
+	}
+	if err := a.d.Submit(func(r *Recorder) { a.Record(r, block) }); err != nil {
 		return err
 	}
 	copy(out, a.out.Floats()[:a.dim])
@@ -382,7 +392,20 @@ func (a *Attention) Attend(block int, in *nn.Batch, cos, sin []float32, pos, fir
 // the four products, the cache and the scores.
 func (a *Attention) Profile(t *Timeline) { a.tl = t }
 
-func (a *Attention) Record(r *Recorder, block, pos, first, last int) {
+// SetWhere writes one block's position and visible range, which is everything
+// about a token that a recording cannot hold. It is what lets the recording be
+// made once: the two kernels read these three numbers out of a buffer instead
+// of out of the command buffer's push constants.
+func (a *Attention) SetWhere(block, pos, first, last int) error {
+	if block < 0 || block >= maxBlocks {
+		return fmt.Errorf("vk: block %d of the %d the position buffer holds", block, maxBlocks)
+	}
+	at := unsafe.Slice((*uint32)(unsafe.Pointer(&a.where.Bytes()[0])), maxBlocks*4)[block*4:]
+	at[0], at[1], at[2] = uint32(pos), uint32(first), uint32(last)
+	return nil
+}
+
+func (a *Attention) Record(r *Recorder, block int) {
 	b := a.blocks[block]
 	s := b.shape
 	heads, kv := s.Heads*s.HeadDim, s.KVHeads*s.HeadDim
@@ -392,12 +415,12 @@ func (a *Attention) Record(r *Recorder, block, pos, first, last int) {
 	outProject := moePush{dim: uint32(a.dim), ffn: uint32(heads), used: 1}
 	prepare := attnPush{
 		heads: uint32(s.Heads), kvHeads: uint32(s.KVHeads), headDim: uint32(s.HeadDim),
-		ropeDims: uint32(s.RoPEDims), pos: uint32(pos), capacity: uint32(s.Capacity),
+		ropeDims: uint32(s.RoPEDims), block: uint32(block), capacity: uint32(s.Capacity),
 		mask: uint32(ringMask(s.Capacity)), valueIsKey: boolTo(s.ValueIsKey), eps: s.Eps,
 	}
 	score := scorePush{
 		heads: uint32(s.Heads), kvHeads: uint32(s.KVHeads), headDim: uint32(s.HeadDim),
-		perKV: uint32(s.Heads / s.KVHeads), first: uint32(first), last: uint32(last),
+		perKV: uint32(s.Heads / s.KVHeads), block: uint32(block),
 		capacity: uint32(s.Capacity), mask: uint32(ringMask(s.Capacity)),
 		stride: uint32(a.maxContext),
 	}
@@ -449,7 +472,7 @@ func (a *Attention) Close() {
 	}
 	a.blocks = nil
 	for _, b := range append(append([]**Buffer{}, pointers(a.rcos)...), append(pointers(a.rsin), []**Buffer{
-		&a.as, &a.aq, &a.scoreRows, &a.qh, &a.v, &a.k, &a.q,
+		&a.where, &a.as, &a.aq, &a.scoreRows, &a.qh, &a.v, &a.k, &a.q,
 		&a.out, &a.xs, &a.xq,
 	}...)...) {
 		if *b != nil {

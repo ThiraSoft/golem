@@ -199,6 +199,26 @@ func (d *Device) Host(size int, usage uint32) (*Buffer, error) {
 	return d.newBuffer(uint64(size), usage, memoryHostVisible|memoryHostCoherent)
 }
 
+// Readback allocates a buffer the shader writes and the CPU reads back whole.
+//
+// It asks for cached memory as well as visible, and the difference is not
+// small. An uncached host-visible allocation on a discrete card is
+// write-combined: writing it is fast and reading it comes back over the bus a
+// word at a time with nothing held on to. The logit head writes a megabyte of
+// logits a token, and copying that megabyte out of a write-combined buffer
+// cost three milliseconds against the kernel's one and a half — most of what
+// the head appeared to cost was the read, not the product.
+//
+// A card with no cached host-visible type gives the uncached one back, which
+// is what the buffer would have been anyway.
+func (d *Device) Readback(size int, usage uint32) (*Buffer, error) {
+	b, err := d.newBuffer(uint64(size), usage, memoryHostVisible|memoryHostCoherent|memoryHostCached)
+	if err == nil {
+		return b, nil
+	}
+	return d.Host(size, usage)
+}
+
 // Local allocates a buffer in device memory that no one on this side reads or
 // writes. It is what an intermediate between two dispatches wants: the card
 // produces it and the card consumes it, and a host-visible allocation would

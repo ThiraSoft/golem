@@ -26,13 +26,14 @@ layout(std430, binding = 6) readonly buffer RS { float rsin[]; };
 layout(std430, binding = 7) writeonly buffer QH { float qh[]; };  // the queries, fp16-exact
 layout(std430, binding = 8) buffer CK { uint ck[]; };    // the key cache, two halves to a uint
 layout(std430, binding = 9) buffer CV { uint cv[]; };    // the value cache
+layout(std430, binding = 10) readonly buffer WH { uvec4 where_[]; };  // one per block: position, first, last
 
 layout(push_constant) uniform Push {
     uint heads;
     uint kvHeads;
     uint headDim;
     uint ropeDims;
-    uint pos;
+    uint block;       // which entry of where_ this dispatch reads
     uint capacity;
     uint mask;        // capacity - 1 when that is a mask, and zero otherwise
     uint valueIsKey;  // the value is the key before the key was rotated
@@ -73,7 +74,8 @@ uint floatToHalf(float f) {
 
 // The ring, in units of one half.
 uint slot(uint head) {
-    uint at = (p.mask != 0u) ? (p.pos & p.mask) : (p.pos % p.capacity);
+    uint pos = where_[p.block].x;
+    uint at = (p.mask != 0u) ? (pos & p.mask) : (pos % p.capacity);
     return (at * p.kvHeads + head) * p.headDim;
 }
 

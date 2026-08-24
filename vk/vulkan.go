@@ -63,6 +63,7 @@ const (
 	memoryDeviceLocal  = 0x1
 	memoryHostVisible  = 0x2
 	memoryHostCoherent = 0x4
+	memoryHostCached   = 0x8
 
 	descriptorStorageBuffer = 7
 	shaderStageCompute      = 0x20
@@ -437,6 +438,7 @@ var (
 	vkCreateCommandPool                 func(device, *commandPoolCreateInfo, uintptr, *uint64) int32
 	vkDestroyCommandPool                func(device, uint64, uintptr)
 	vkAllocateCommandBuffers            func(device, *commandBufferAllocateInfo, *commandBuffer) int32
+	vkFreeCommandBuffers                func(device, uint64, uint32, *commandBuffer)
 	vkBeginCommandBuffer                func(commandBuffer, *commandBufferBeginInfo) int32
 	vkEndCommandBuffer                  func(commandBuffer) int32
 	vkResetCommandBuffer                func(commandBuffer, uint32) int32
@@ -501,6 +503,7 @@ func load() error {
 	bind(&vkCreateCommandPool, "vkCreateCommandPool")
 	bind(&vkDestroyCommandPool, "vkDestroyCommandPool")
 	bind(&vkAllocateCommandBuffers, "vkAllocateCommandBuffers")
+	bind(&vkFreeCommandBuffers, "vkFreeCommandBuffers")
 	bind(&vkBeginCommandBuffer, "vkBeginCommandBuffer")
 	bind(&vkEndCommandBuffer, "vkEndCommandBuffer")
 	bind(&vkResetCommandBuffer, "vkResetCommandBuffer")

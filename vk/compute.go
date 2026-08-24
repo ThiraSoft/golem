@@ -242,3 +242,62 @@ func (s *Set) DispatchTimes(groups uint32, push unsafe.Pointer, n int) error {
 		}
 	})
 }
+
+// A Program is a command buffer recorded once and submitted many times.
+//
+// It exists because recording is not free. A token's stack is four hundred
+// dispatches and as many barriers, and every one of them is four calls across
+// purego into the loader — measured, one and a quarter milliseconds a token of
+// CPU beside the card's ten. Nothing about the recording changes between two
+// tokens of the same model: the same kernels over the same buffers in the same
+// order. What changes is what those buffers hold, and the one thing that used
+// to be recorded rather than held — the position, and the range of the cache a
+// block may read — moved into a buffer of its own so that this could be true.
+// vk/attention.go's SetWhere is that buffer.
+type Program struct {
+	d  *Device
+	cb commandBuffer
+}
+
+// Compile records once. The recording is kept until Close.
+func (d *Device) Compile(record func(*Recorder)) (*Program, error) {
+	p := &Program{d: d}
+	cbai := commandBufferAllocateInfo{
+		sType:              structCommandBufferAllocateInfo,
+		commandPool:        d.cmdPool,
+		level:              0,
+		commandBufferCount: 1,
+	}
+	if err := check("vkAllocateCommandBuffers", vkAllocateCommandBuffers(d.dev, &cbai, &p.cb)); err != nil {
+		return nil, err
+	}
+	bi := commandBufferBeginInfo{sType: structCommandBufferBeginInfo}
+	if err := check("vkBeginCommandBuffer", vkBeginCommandBuffer(p.cb, &bi)); err != nil {
+		return nil, err
+	}
+	record(&Recorder{cb: p.cb})
+	if err := check("vkEndCommandBuffer", vkEndCommandBuffer(p.cb)); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// Run submits the recording and waits, as everything else here does.
+func (p *Program) Run() error {
+	si := submitInfo{
+		sType:              structSubmitInfo,
+		commandBufferCount: 1,
+		pCommandBuffers:    uintptr(unsafe.Pointer(&p.cb)),
+	}
+	if err := check("vkQueueSubmit", vkQueueSubmit(p.d.queue, 1, &si, 0)); err != nil {
+		return err
+	}
+	return check("vkQueueWaitIdle", vkQueueWaitIdle(p.d.queue))
+}
+
+func (p *Program) Close() {
+	if p.cb != 0 {
+		vkFreeCommandBuffers(p.d.dev, p.d.cmdPool, 1, &p.cb)
+		p.cb = 0
+	}
+}

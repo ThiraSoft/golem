@@ -96,7 +96,7 @@ func NewQ6KHead(d *Device, data []byte, rows, cols int) (*Q6KHead, error) {
 		h.Close()
 		return nil, err
 	}
-	if h.out, err = d.Host(rows*4, bufferUsageStorage); err != nil {
+	if h.out, err = d.Readback(rows*4, bufferUsageStorage); err != nil {
 		h.Close()
 		return nil, err
 	}
