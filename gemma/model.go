@@ -159,6 +159,29 @@ func (m *Model) ForwardMixed(tokens []int32, at []Place) [][]float32 {
 // of an embedding batch, and passing zeros there is what agrees with it.
 // Callers with no picture pass tokens for both.
 func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32, at []Place) [][]float32 {
+	// A device holding the attention keeps the keys and values itself, and its
+	// kernels score one column. A batch therefore goes through a position at a
+	// time: the answer is the same one the batch would have given, and a
+	// prompt pays per token what a token pays. What it loses is the one thing
+	// a batch was for — reading each matrix once for all of the positions that
+	// meet it — so a prompt is slower this way, and measurably.
+	if m.attn != nil && len(tokens) > 1 {
+		out := make([][]float32, len(tokens))
+		for i := range tokens {
+			var one [][]float32
+			if embeds != nil {
+				one = embeds[i : i+1]
+			}
+			var single []int32
+			if ple != nil {
+				single = ple[i : i+1]
+			}
+			hidden := m.ForwardEmbedded(tokens[i:i+1], one, single, at[i:i+1])
+			out[i] = append([]float32(nil), hidden[0]...)
+		}
+		return out
+	}
+
 	cfg, w := m.Cfg, m.W
 	batch := len(tokens)
 	m.reserve(batch)

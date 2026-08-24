@@ -1,0 +1,187 @@
+#version 450
+
+// The attention itself: one query head against everything it can see, the
+// softmax over that, and the values mixed by it.
+//
+// One workgroup to a head, and the head's whole output lives in shared memory
+// until it is quantized — two kilobytes at the widest, which is what lets the
+// mixing and the quantization happen in the same dispatch as the scores.
+//
+// Two roundings to fp16, both deliberate. The keys and values are held as
+// halves because llama.cpp holds them that way, and the probabilities reach
+// its kernel as halves too. gemma/attention.go rounds in the same two places
+// and says why: keeping more precision than the reference is not an
+// improvement, it is a divergence.
+//
+// No 1/sqrt(head_dim) anywhere. Gemma 4 scales by one, and the query norm is
+// what keeps the scores in range.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer QH { float qh[];     };  // the queries, fp16-exact
+layout(std430, binding = 1) readonly  buffer CK { uint  ck[];     };  // the key cache
+layout(std430, binding = 2) readonly  buffer CV { uint  cv[];     };  // the value cache
+layout(std430, binding = 3) buffer          SC { float scores[];  };  // scratch, one row per head
+layout(std430, binding = 4) writeonly buffer AQ { uint  aq[];     };  // the mixed values, Q8_0
+layout(std430, binding = 5) writeonly buffer AS { float as_[];    };  // their scales, then corrections
+
+layout(push_constant) uniform Push {
+    uint heads;
+    uint kvHeads;
+    uint headDim;
+    uint perKV;     // query heads to a key-value head
+    uint first;     // the earliest visible position
+    uint last;      // the latest, inclusive
+    uint capacity;
+    uint mask;      // capacity - 1 when that is a mask, and zero otherwise
+    uint stride;    // scores kept per head
+} p;
+
+shared float partial[256];
+shared float acc[512];
+shared float top;
+shared float total;
+
+uint floatToHalf(float f) {
+    uint bits     = floatBitsToUint(f);
+    uint sign     = (bits >> 16) & 0x8000u;
+    int  exponent = int((bits >> 23) & 0xFFu) - 127 + 15;
+    uint mantissa = bits & 0x7FFFFFu;
+
+    if ((bits & 0x7FFFFFFFu) == 0u) return sign;
+    if (exponent >= 0x1F) {
+        if ((bits & 0x7F800000u) == 0x7F800000u && mantissa != 0u) return sign | 0x7E00u;
+        return sign | 0x7C00u;
+    }
+    if (exponent <= 0) {
+        if (exponent < -10) return sign;
+        mantissa |= 0x800000u;
+        uint shift = uint(14 - exponent);
+        uint value = mantissa >> shift;
+        uint rest  = mantissa & ((1u << shift) - 1u);
+        uint mid   = 1u << (shift - 1u);
+        if (rest > mid || (rest == mid && (value & 1u) == 1u)) value++;
+        return sign | value;
+    }
+    uint value = (uint(exponent) << 10) | (mantissa >> 13);
+    uint rest  = mantissa & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (value & 1u) == 1u)) value++;
+    return sign | value;
+}
+
+float roundHalf(float f) { return unpackHalf2x16(floatToHalf(f)).x; }
+
+int nearestInt(float f) {
+    return (floatBitsToInt(f + 12582912.0) & 0x007fffff) - 0x00400000;
+}
+
+// entry locates one head at one position, in units of one half.
+uint entry(uint pos, uint head) {
+    uint at = (p.mask != 0u) ? (pos & p.mask) : (pos % p.capacity);
+    return (at * p.kvHeads + head) * p.headDim;
+}
+
+void main() {
+    uint h  = gl_WorkGroupID.x;
+    uint t  = gl_LocalInvocationID.x;
+    uint hd = p.headDim;
+    uint n  = p.last - p.first + 1u;
+    uint kv = h / p.perKV;
+    uint qb = h * hd;
+    uint sb = h * p.stride;
+
+    // The scores.
+    for (uint m = t; m < n; m += 256u) {
+        uint o = entry(p.first + m, kv) >> 1;
+        float s = 0.0;
+        for (uint pair = 0u; pair < (hd >> 1); pair++) {
+            vec2 key = unpackHalf2x16(ck[o + pair]);
+            uint i = pair << 1;
+            s += qh[qb + i] * key.x + qh[qb + i + 1u] * key.y;
+        }
+        scores[sb + m] = s;
+    }
+    barrier();
+
+    // The softmax, over however many positions there are.
+    float best = -1.0 / 0.0;
+    for (uint m = t; m < n; m += 256u) best = max(best, scores[sb + m]);
+    partial[t] = best;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (t < stride) partial[t] = max(partial[t], partial[t + stride]);
+        barrier();
+    }
+    if (t == 0u) top = partial[0];
+    barrier();
+
+    float sum = 0.0;
+    for (uint m = t; m < n; m += 256u) {
+        float e = exp(scores[sb + m] - top);
+        scores[sb + m] = e;
+        sum += e;
+    }
+    partial[t] = sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (t < stride) partial[t] += partial[t + stride];
+        barrier();
+    }
+    if (t == 0u) total = partial[0];
+    barrier();
+
+    // And the probabilities reach the value product as halves.
+    for (uint m = t; m < n; m += 256u) scores[sb + m] = roundHalf(scores[sb + m] / total);
+    barrier();
+
+    // The mix. A position at a time, so that the threads of a step read
+    // consecutive halves of one value.
+    for (uint i = t; i < hd; i += 256u) acc[i] = 0.0;
+    barrier();
+    for (uint m = 0u; m < n; m++) {
+        float weight = scores[sb + m];
+        uint o = entry(p.first + m, kv) >> 1;
+        for (uint pair = t; pair < (hd >> 1); pair += 256u) {
+            vec2 value = unpackHalf2x16(cv[o + pair]);
+            uint i = pair << 1;
+            acc[i]      += value.x * weight;
+            acc[i + 1u] += value.y * weight;
+        }
+    }
+    barrier();
+
+    // The Q8_0 form the output projection reads, one block of thirty-two to a
+    // thread. A head is a whole number of blocks, so no block spans two heads.
+    uint blocks = hd >> 5;
+    for (uint b = t; b < blocks; b += 256u) {
+        uint at = b << 5;
+        float peak = 0.0;
+        for (uint i = 0u; i < 32u; i++) peak = max(peak, abs(acc[at + i]));
+
+        float scale = 0.0;
+        int   count = 0;
+        uint  dest  = ((qb + at) >> 2);
+        if (peak > 0.0) {
+            scale = unpackHalf2x16(floatToHalf(peak / 127.0)).x;
+            float inverse = 127.0 / peak;
+            for (uint u = 0u; u < 8u; u++) {
+                uint word = 0u;
+                for (uint j = 0u; j < 4u; j++) {
+                    precise float scaled = acc[at + u * 4u + j] * inverse;
+                    int q = clamp(nearestInt(scaled), -128, 127);
+                    count += q;
+                    word |= (uint(q) & 0xFFu) << (j * 8u);
+                }
+                aq[dest + u] = word;
+            }
+        } else {
+            for (uint u = 0u; u < 8u; u++) aq[dest + u] = 0u;
+        }
+        // Scales first, then corrections, which is the layout every kernel
+        // here reads an activation in.
+        uint slot   = (qb >> 5) + b;
+        uint blocks = (p.heads * hd) >> 5;
+        as_[slot]          = scale;
+        as_[blocks + slot] = 8.0 * scale * float(count);
+    }
+}

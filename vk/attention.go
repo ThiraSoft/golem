@@ -1,94 +1,177 @@
 package vk
 
-// The four projections of an attention, on the card.
+// A whole block's attention on the card: the four products, the norms, the
+// rotation, the cache, the scores and the mix, in one submission.
 //
-// What is here is only the products: the queries, the keys, the values and the
-// output projection. The norms, the rotation, the cache and the scores stay
-// where they were. That is not where the bytes are — a block's four matrices
-// are nineteen megabytes and the scores are a few kilobytes — and it is where
-// all of Gemma 4's particulars live: a query norm and a key norm, two rotation
-// geometries, a value that is sometimes the key before the key was rotated,
-// and fifteen blocks at the end that compute no keys at all and read what two
-// earlier blocks left behind.
+// The four products alone were worth moving — nineteen megabytes a block
+// against a few kilobytes of everything else — but they left the block cut in
+// half, with the scores on this side and a submission either side of them. A
+// submission costs sixty-three microseconds whatever is in it, and the card
+// drops to half its clocks whenever it is handed one and then left alone. So
+// the rest follows the products, not for its own arithmetic but so that the
+// arithmetic already there stops waiting.
 //
-// So this moves 487 megabytes a token and leaves the intricacy alone. What it
-// costs is two more submissions a block, one before the attention and one
-// after, because the attention between them is on the other side.
-//
-// The kernel is shaders/matvec.comp, which is the mixture's own down
-// projection with the mixture taken out.
+// What that costs is the intricacy, which is now written twice: a query norm
+// and a key norm, two rotation geometries whose heads are not the same size, a
+// value taken from the key before the key was rotated, fifteen blocks at the
+// end that compute no keys and read what two earlier ones left behind, and
+// three roundings to fp16 that are not optional because llama.cpp holds its
+// cache that way. gemma/attention.go is the other copy, and it is the one the
+// tests are written against.
 
 import (
+	_ "embed"
 	"fmt"
 	"unsafe"
 
 	"github.com/ThiraSoft/golem/nn"
 )
 
-// An Attention is every attention matrix of a model, resident, and the buffers
-// one position passes through.
+//go:generate glslc -O -fshader-stage=compute shaders/attn_prepare.comp -o shaders/attn_prepare.spv
+//go:generate glslc -O -fshader-stage=compute shaders/attn_scores.comp -o shaders/attn_scores.spv
+
+//go:embed shaders/attn_prepare.spv
+var attnPrepareSPIRV []byte
+
+//go:embed shaders/attn_scores.spv
+var attnScoresSPIRV []byte
+
+// A BlockShape is what one block's attention is, as the kernels need to know
+// it. It is the block answering for itself rather than a branch on its number.
+type BlockShape struct {
+	Heads, KVHeads, HeadDim int
+	RoPEDims                int
+	// Capacity is the ring this block's cache holds: its window, or the whole
+	// context on a block that sees everything.
+	Capacity int
+	// ValueIsKey says the value is the key before the key was rotated, and
+	// OwnsKV that the block computes keys at all. A block that does not reads
+	// KVSource's cache, and is given the same buffers rather than a copy.
+	ValueIsKey bool
+	OwnsKV     bool
+	KVSource   int
+	Eps        float32
+}
+
+// An Attention is every attention matrix and every key-value cache of a model,
+// resident, and the buffers one position passes through.
 type Attention struct {
 	d *Device
 
-	dim             int // the stream's width, which is what the output projection makes
-	maxHeads, maxKV int // the widest block's query and key projections, for the buffers
+	dim        int // the stream's width, which is what the output projection makes
+	maxHeads   int // the widest block's query projection, for the shared buffers
+	maxKV      int
+	maxContext int
 
-	matvec *Pipeline
+	matvec, prepare, scores *Pipeline
 
-	// The input to the three projections, and their outputs.
-	xq, xs      *Buffer
-	oq, ok_, ov *Buffer
-	// The output projection's input and output.
-	aq, as, out *Buffer
+	// One position's traffic. Only the two ends of it cross the bus: the
+	// normed stream in, and the output projection's answer back.
+	xq, xs, out *Buffer
+	rcos, rsin  *Buffer
+	q, k, v, qh *Buffer
+	scoreRows   *Buffer
+	aq, as      *Buffer
 
 	blocks []*attentionBlock
 }
 
-// An attentionBlock is one block's four matrices. K and V are absent on the
-// blocks that compute neither.
+// An attentionBlock is one block's matrices, norms and cache.
 type attentionBlock struct {
-	q, k, v, o *Buffer
-	setQ, setK *Set
-	setV, setO *Set
+	shape BlockShape
 
-	// This block's own widths. Two geometries alternate through Gemma 4 and
-	// their heads are not the same size: sixteen of 256 on the blocks that see
-	// a window, sixteen of 512 on the ones that see everything.
-	heads, kv int
+	q, k, v, o   *Buffer
+	qnorm, knorm *Buffer
+	ck, cv       *Buffer // nil when the block reads another's cache
+	setQ, setK   *Set
+	setV, setO   *Set
+	setPrepare   *Set
+	setScores    *Set
 }
 
-// NewAttention builds the kernel and the shared buffers, which are sized for
-// the widest block: maxHeads is the largest query projection's output width
-// and maxKV the largest key's, both counted in floats.
-func NewAttention(d *Device, dim, maxHeads, maxKV int) (*Attention, error) {
+// attnPush is what the two attention kernels take. The two shaders declare the
+// same block; the fields past what each reads are ignored.
+type attnPush struct {
+	heads      uint32
+	kvHeads    uint32
+	headDim    uint32
+	ropeDims   uint32
+	pos        uint32
+	capacity   uint32
+	mask       uint32
+	valueIsKey uint32
+	eps        float32
+}
+
+// scorePush is the second kernel's, which needs a range rather than a position.
+type scorePush struct {
+	heads    uint32
+	kvHeads  uint32
+	headDim  uint32
+	perKV    uint32
+	first    uint32
+	last     uint32
+	capacity uint32
+	mask     uint32
+	stride   uint32
+}
+
+// NewAttention builds the kernels and the shared buffers, which are sized for
+// the widest block and the deepest context.
+func NewAttention(d *Device, dim, maxHeads, maxKV, maxContext int) (*Attention, error) {
 	for _, n := range []int{dim, maxHeads, maxKV} {
 		if n%nn.QuantBlock != 0 {
 			return nil, fmt.Errorf("vk: attention shapes must be multiples of %d, given %d", nn.QuantBlock, n)
 		}
 	}
-	a := &Attention{d: d, dim: dim, maxHeads: maxHeads, maxKV: maxKV}
+	a := &Attention{d: d, dim: dim, maxHeads: maxHeads, maxKV: maxKV, maxContext: maxContext}
 
 	var err error
-	if a.matvec, err = d.NewPipeline(matvecSPIRV, 4, uint32(unsafe.Sizeof(moePush{}))); err != nil {
-		return nil, err
-	}
 	for _, spec := range []struct {
-		into **Buffer
-		size int
+		into     **Pipeline
+		spirv    []byte
+		bindings int
+		push     uintptr
 	}{
-		{&a.xq, dim}, // the normed stream, Q8_0
-		{&a.xs, 2 * dim / nn.QuantBlock * 4},
-		{&a.oq, maxHeads * 4}, // the queries
-		{&a.ok_, maxKV * 4},   // the keys
-		{&a.ov, maxKV * 4},    // the values
-		{&a.aq, maxHeads},     // the attention's own output, Q8_0
-		{&a.as, 2 * maxHeads / nn.QuantBlock * 4},
-		{&a.out, dim * 4}, // and what the output projection makes of it
+		{&a.matvec, matvecSPIRV, 4, unsafe.Sizeof(moePush{})},
+		{&a.prepare, attnPrepareSPIRV, 10, unsafe.Sizeof(attnPush{})},
+		{&a.scores, attnScoresSPIRV, 6, unsafe.Sizeof(scorePush{})},
 	} {
-		if *spec.into, err = d.Host(spec.size, bufferUsageStorage); err != nil {
+		if *spec.into, err = d.NewPipeline(spec.spirv, spec.bindings, uint32(spec.push)); err != nil {
 			a.Close()
 			return nil, err
 		}
+	}
+
+	for _, spec := range []struct {
+		into  **Buffer
+		size  int
+		local bool
+	}{
+		{&a.xq, dim, false},                         // the normed stream, Q8_0
+		{&a.xs, 2 * dim / nn.QuantBlock * 4, false}, //
+		{&a.out, dim * 4, false},                    // what the output projection makes
+		{&a.rcos, maxHeads * 4, false},              // the rotation, one position's worth
+		{&a.rsin, maxHeads * 4, false},              //
+		{&a.q, maxHeads * 4, true},                  // the three projections, which never leave
+		{&a.k, maxKV * 4, true},                     //
+		{&a.v, maxKV * 4, true},                     //
+		{&a.qh, maxHeads * 4, true},                 // the queries, rounded through fp16
+		{&a.scoreRows, maxHeads * maxContext, true}, // one row of scores per head, four bytes each
+		{&a.aq, maxHeads, true},                     // the mixed values, Q8_0
+		{&a.as, 2 * maxHeads / nn.QuantBlock * 4, true},
+	} {
+		var b *Buffer
+		if spec.local {
+			b, err = d.Local(spec.size, bufferUsageStorage)
+		} else {
+			b, err = d.Host(spec.size, bufferUsageStorage)
+		}
+		if err != nil {
+			a.Close()
+			return nil, err
+		}
+		*spec.into = b
 	}
 	return a, nil
 }
@@ -96,39 +179,35 @@ func NewAttention(d *Device, dim, maxHeads, maxKV int) (*Attention, error) {
 // Blocks is how many have been added.
 func (a *Attention) Blocks() int { return len(a.blocks) }
 
-// AddBlock uploads one block's matrices in the file's own layout. k and v are
-// nil on a block that computes neither and reads an earlier block's cache, and
-// v alone is nil where the value is the key before the key was rotated.
-func (a *Attention) AddBlock(q, k, v, o []byte, heads, kv int) error {
-	if k == nil && v != nil {
-		return fmt.Errorf("vk: a block with values and no keys")
+// Bytes is what the caches take on the card, which is the part of this that
+// grows with the context rather than with the model.
+func (a *Attention) Bytes() int {
+	n := 0
+	for _, b := range a.blocks {
+		if b.ck != nil {
+			n += int(b.ck.size + b.cv.size)
+		}
 	}
+	return n
+}
+
+// AddBlock uploads one block's matrices and norms, and gives it a cache — or
+// the cache of the block it reads, when it computes no keys of its own. k and
+// v are nil where the block has no such matrix.
+func (a *Attention) AddBlock(shape BlockShape, q, k, v, o []byte, qnorm, knorm []float32) error {
+	heads, kv := shape.Heads*shape.HeadDim, shape.KVHeads*shape.HeadDim
 	if heads > a.maxHeads || kv > a.maxKV {
 		return fmt.Errorf("vk: block %d attends over %d and %d, past the %d and %d the buffers hold",
 			len(a.blocks), heads, kv, a.maxHeads, a.maxKV)
 	}
-	if heads%nn.QuantBlock != 0 || kv%nn.QuantBlock != 0 {
-		return fmt.Errorf("vk: attention shapes must be multiples of %d, given %d and %d", nn.QuantBlock, heads, kv)
+	if heads%nn.QuantBlock != 0 {
+		return fmt.Errorf("vk: a block's heads must come to a multiple of %d, given %d", nn.QuantBlock, heads)
 	}
-	for _, spec := range []struct {
-		what       string
-		data       []byte
-		rows, cols int
-	}{
-		{"the query projection", q, heads, a.dim},
-		{"the key projection", k, kv, a.dim},
-		{"the value projection", v, kv, a.dim},
-		{"the output projection", o, a.dim, heads},
-	} {
-		if spec.data == nil {
-			continue
-		}
-		if want := spec.rows * rowBytesQ4_0(spec.cols); len(spec.data) != want {
-			return fmt.Errorf("vk: %s should be %d bytes, given %d", spec.what, want, len(spec.data))
-		}
+	if !shape.OwnsKV && (shape.KVSource < 0 || shape.KVSource >= len(a.blocks)) {
+		return fmt.Errorf("vk: block %d reads block %d's cache, which is not there yet", len(a.blocks), shape.KVSource)
 	}
 
-	b := &attentionBlock{heads: heads, kv: kv}
+	b := &attentionBlock{shape: shape}
 	fail := func(err error) error {
 		b.close()
 		return err
@@ -141,120 +220,170 @@ func (a *Attention) AddBlock(q, k, v, o []byte, heads, kv int) error {
 		rows, cols int
 		out        *Buffer
 	}{
-		{&b.q, &b.setQ, q, heads, a.dim, a.oq},
-		{&b.k, &b.setK, k, kv, a.dim, a.ok_},
-		{&b.v, &b.setV, v, kv, a.dim, a.ov},
+		{&b.q, &b.setQ, q, heads, a.dim, a.q},
+		{&b.k, &b.setK, k, kv, a.dim, a.k},
+		{&b.v, &b.setV, v, kv, a.dim, a.v},
 		{&b.o, &b.setO, o, a.dim, heads, a.out},
 	} {
 		if spec.data == nil {
 			continue
+		}
+		if want := spec.rows * rowBytesQ4_0(spec.cols); len(spec.data) != want {
+			return fail(fmt.Errorf("vk: a projection should be %d bytes, given %d", want, len(spec.data)))
 		}
 		if *spec.into, err = a.d.Upload(splitQ4_0(spec.data, spec.rows, spec.cols)); err != nil {
 			return fail(err)
 		}
 		in, scales := a.xq, a.xs
 		if spec.out == a.out {
-			in, scales = a.aq, a.as // the output projection reads the attention, not the stream
+			in, scales = a.aq, a.as // the output projection reads the mix, not the stream
 		}
 		if *spec.set, err = a.matvec.NewSet([]*Buffer{*spec.into, in, scales, spec.out}); err != nil {
 			return fail(err)
 		}
 	}
+
+	if b.qnorm, err = a.d.Upload(asBytes(qnorm)); err != nil {
+		return fail(err)
+	}
+	if b.knorm, err = a.d.Upload(asBytes(knorm)); err != nil {
+		return fail(err)
+	}
+
+	// A block that computes no keys is given the buffers of the block it reads
+	// from, not a copy: there is one cache and many blocks on it, which is what
+	// gemma/cache.go does on the other side and for the same reason.
+	var ck, cv *Buffer
+	if shape.OwnsKV {
+		n := shape.Capacity * shape.KVHeads * shape.HeadDim * 2 // fp16
+		if b.ck, err = a.d.Local(n, bufferUsageStorage); err != nil {
+			return fail(err)
+		}
+		if b.cv, err = a.d.Local(n, bufferUsageStorage); err != nil {
+			return fail(err)
+		}
+		ck, cv = b.ck, b.cv
+	} else {
+		ck, cv = a.blocks[shape.KVSource].caches()
+		if ck == nil {
+			return fail(fmt.Errorf("vk: block %d reads block %d, which has no cache of its own",
+				len(a.blocks), shape.KVSource))
+		}
+	}
+
+	if b.setPrepare, err = a.prepare.NewSet([]*Buffer{
+		a.q, a.k, a.v, b.qnorm, b.knorm, a.rcos, a.rsin, a.qh, ck, cv,
+	}); err != nil {
+		return fail(err)
+	}
+	if b.setScores, err = a.scores.NewSet([]*Buffer{
+		a.qh, ck, cv, a.scoreRows, a.aq, a.as,
+	}); err != nil {
+		return fail(err)
+	}
 	a.blocks = append(a.blocks, b)
 	return nil
 }
 
-// QKV computes the three projections of one position in one submission. k and
-// v are written only when the block has those matrices; a caller whose block
-// has none passes nil for both and gets the queries alone.
-func (a *Attention) QKV(block int, in *nn.Batch, q, k, v []float32) error {
-	b, err := a.at(block)
-	if err != nil {
-		return err
-	}
-	if err := a.load(in, a.xq, a.xs, a.dim); err != nil {
-		return err
-	}
-	for _, spec := range []struct {
-		want []float32
-		set  *Set
-		what string
-	}{{k, b.setK, "keys"}, {v, b.setV, "values"}} {
-		if spec.want != nil && spec.set == nil {
-			return fmt.Errorf("vk: block %d has no %s to compute", block, spec.what)
-		}
-	}
-	push := moePush{dim: uint32(b.heads), ffn: uint32(a.dim), used: 1}
-	kvPush := moePush{dim: uint32(b.kv), ffn: uint32(a.dim), used: 1}
-	err = a.d.Submit(func(r *Recorder) {
-		// The three read the same input and none of them reads another, so
-		// they go in together and the card runs them at once.
-		r.Dispatch(b.setQ, groups(b.heads), unsafe.Pointer(&push))
-		if k != nil {
-			r.Dispatch(b.setK, groups(b.kv), unsafe.Pointer(&kvPush))
-		}
-		if v != nil {
-			r.Dispatch(b.setV, groups(b.kv), unsafe.Pointer(&kvPush))
-		}
-	})
-	if err != nil {
-		return err
-	}
-	copy(q, a.oq.Floats()[:b.heads])
-	if k != nil {
-		copy(k, a.ok_.Floats()[:b.kv])
-	}
-	if v != nil {
-		copy(v, a.ov.Floats()[:b.kv])
-	}
-	return nil
-}
+// caches is the pair this block reads, which is its own or an earlier one's.
+func (b *attentionBlock) caches() (*Buffer, *Buffer) { return b.ck, b.cv }
 
-// Out is the output projection, which reads what the attention made and not
-// the stream.
-func (a *Attention) Out(block int, in *nn.Batch, out []float32) error {
-	b, err := a.at(block)
-	if err != nil {
-		return err
+// Attend is one block's whole attention for one position, in one submission.
+//
+// in is the stream under the block's attention norm, in its Q8_0 form. cos and
+// sin are the rotation for this position, half the rotated width each. pos is
+// where the keys and values go; first and last are the inclusive range the
+// query may read, which the caller works out because the window rule and the
+// ring agree and neither of them is this kernel's business.
+func (a *Attention) Attend(block int, in *nn.Batch, cos, sin []float32, pos, first, last int, out []float32) error {
+	if block < 0 || block >= len(a.blocks) {
+		return fmt.Errorf("vk: block %d of %d", block, len(a.blocks))
 	}
-	if err := a.load(in, a.aq, a.as, b.heads); err != nil {
-		return err
+	b := a.blocks[block]
+	s := b.shape
+	if in.Width != a.dim || in.Size != 1 {
+		return fmt.Errorf("vk: the attention reads one column of %d, given %d of %d", a.dim, in.Size, in.Width)
+	}
+	if in.Q == nil {
+		return fmt.Errorf("vk: the attention needs its input in the Q8_0 form")
 	}
 	if len(out) != a.dim {
 		return fmt.Errorf("vk: the output projection writes %d, given %d", a.dim, len(out))
 	}
-	push := moePush{dim: uint32(a.dim), ffn: uint32(b.heads), used: 1}
-	if err := b.setO.Dispatch(groups(a.dim), unsafe.Pointer(&push)); err != nil {
+	if want := s.RoPEDims / 2; len(cos) != want || len(sin) != want {
+		return fmt.Errorf("vk: block %d rotates %d dimensions and wants %d angles, given %d", block, s.RoPEDims, want, len(cos))
+	}
+	if last >= a.maxContext || first > last {
+		return fmt.Errorf("vk: block %d was given positions %d to %d of a context of %d", block, first, last, a.maxContext)
+	}
+
+	dst := a.xq.Bytes()
+	for i, value := range in.Q[:a.dim] {
+		dst[i] = byte(value)
+	}
+	blocks := a.dim / nn.QuantBlock
+	scales := a.xs.Floats()
+	copy(scales[:blocks], in.Scales[:blocks])
+	copy(scales[blocks:2*blocks], in.Corr[:blocks])
+	copy(a.rcos.Floats(), cos)
+	copy(a.rsin.Floats(), sin)
+
+	heads, kv := s.Heads*s.HeadDim, s.KVHeads*s.HeadDim
+	project := moePush{dim: uint32(heads), ffn: uint32(a.dim), used: 1}
+	kvProject := moePush{dim: uint32(kv), ffn: uint32(a.dim), used: 1}
+	outProject := moePush{dim: uint32(a.dim), ffn: uint32(heads), used: 1}
+	prepare := attnPush{
+		heads: uint32(s.Heads), kvHeads: uint32(s.KVHeads), headDim: uint32(s.HeadDim),
+		ropeDims: uint32(s.RoPEDims), pos: uint32(pos), capacity: uint32(s.Capacity),
+		mask: uint32(ringMask(s.Capacity)), valueIsKey: boolTo(s.ValueIsKey), eps: s.Eps,
+	}
+	score := scorePush{
+		heads: uint32(s.Heads), kvHeads: uint32(s.KVHeads), headDim: uint32(s.HeadDim),
+		perKV: uint32(s.Heads / s.KVHeads), first: uint32(first), last: uint32(last),
+		capacity: uint32(s.Capacity), mask: uint32(ringMask(s.Capacity)),
+		stride: uint32(a.maxContext),
+	}
+	units := uint32(s.Heads)
+	if s.OwnsKV {
+		units += uint32(s.KVHeads)
+	}
+
+	err := a.d.Submit(func(r *Recorder) {
+		r.Dispatch(b.setQ, groups(heads), unsafe.Pointer(&project))
+		if b.setK != nil {
+			r.Dispatch(b.setK, groups(kv), unsafe.Pointer(&kvProject))
+		}
+		if b.setV != nil {
+			r.Dispatch(b.setV, groups(kv), unsafe.Pointer(&kvProject))
+		}
+		r.Barrier()
+		r.Dispatch(b.setPrepare, units, unsafe.Pointer(&prepare))
+		r.Barrier()
+		r.Dispatch(b.setScores, uint32(s.Heads), unsafe.Pointer(&score))
+		r.Barrier()
+		r.Dispatch(b.setO, groups(a.dim), unsafe.Pointer(&outProject))
+	})
+	if err != nil {
 		return err
 	}
 	copy(out, a.out.Floats()[:a.dim])
 	return nil
 }
 
-// load copies one column's Q8_0 form into the buffers a kernel reads.
-func (a *Attention) load(in *nn.Batch, q, s *Buffer, width int) error {
-	if in.Width != width || in.Size != 1 {
-		return fmt.Errorf("vk: a projection reads one column of %d, given %d of %d", width, in.Size, in.Width)
+// ringMask is nn's rule, and gemma/cache.go's: the capacity less one when that
+// is a mask, and zero when the remainder has to be taken the slow way.
+func ringMask(capacity int) int {
+	if capacity > 0 && capacity&(capacity-1) == 0 {
+		return capacity - 1
 	}
-	if in.Q == nil {
-		return fmt.Errorf("vk: a projection needs its input in the Q8_0 form")
-	}
-	dst := q.Bytes()
-	for i, value := range in.Q[:width] {
-		dst[i] = byte(value)
-	}
-	blocks := width / nn.QuantBlock
-	scales := s.Floats()
-	copy(scales[:blocks], in.Scales[:blocks])
-	copy(scales[blocks:2*blocks], in.Corr[:blocks])
-	return nil
+	return 0
 }
 
-func (a *Attention) at(block int) (*attentionBlock, error) {
-	if block < 0 || block >= len(a.blocks) {
-		return nil, fmt.Errorf("vk: block %d of %d", block, len(a.blocks))
+func boolTo(b bool) uint32 {
+	if b {
+		return 1
 	}
-	return a.blocks[block], nil
+	return 0
 }
 
 // groups is how many workgroups the matvec kernel needs for that many outputs.
@@ -265,26 +394,31 @@ func (a *Attention) Close() {
 		b.close()
 	}
 	a.blocks = nil
-	for _, b := range []**Buffer{&a.out, &a.as, &a.aq, &a.ov, &a.ok_, &a.oq, &a.xs, &a.xq} {
+	for _, b := range []**Buffer{
+		&a.as, &a.aq, &a.scoreRows, &a.qh, &a.v, &a.k, &a.q,
+		&a.rsin, &a.rcos, &a.out, &a.xs, &a.xq,
+	} {
 		if *b != nil {
 			(*b).Close()
 			*b = nil
 		}
 	}
-	if a.matvec != nil {
-		a.matvec.Close()
-		a.matvec = nil
+	for _, p := range []**Pipeline{&a.scores, &a.prepare, &a.matvec} {
+		if *p != nil {
+			(*p).Close()
+			*p = nil
+		}
 	}
 }
 
 func (b *attentionBlock) close() {
-	for _, s := range []**Set{&b.setO, &b.setV, &b.setK, &b.setQ} {
+	for _, s := range []**Set{&b.setScores, &b.setPrepare, &b.setO, &b.setV, &b.setK, &b.setQ} {
 		if *s != nil {
 			(*s).Close()
 			*s = nil
 		}
 	}
-	for _, x := range []**Buffer{&b.o, &b.v, &b.k, &b.q} {
+	for _, x := range []**Buffer{&b.cv, &b.ck, &b.knorm, &b.qnorm, &b.o, &b.v, &b.k, &b.q} {
 		if *x != nil {
 			(*x).Close()
 			*x = nil

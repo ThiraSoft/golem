@@ -1,0 +1,173 @@
+#version 450
+
+// What happens to the queries, keys and values between their projection and
+// the scores: a norm each, a rotation for two of them, and the fp16 the cache
+// and the reference both keep.
+//
+// One workgroup to a head. The query heads come first and the key-value heads
+// after them, in the same dispatch, because they read the same three buffers
+// and differ only in which norm they take and whether they are rotated.
+//
+// Three roundings are not optional. llama.cpp holds its cache in fp16 and its
+// matrix-vector kernel converts the other operand to fp16 to multiply it, so a
+// query that stayed float32 here would not be more accurate than the reference
+// — it would be a different model, by about one part in a thousand, which is
+// the size a real mistake would have. gemma/attention.go says the same.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Q  { float q[];  };   // the query projection, rewritten
+layout(std430, binding = 1) buffer K  { float k[];  };   // the key projection, rewritten
+layout(std430, binding = 2) buffer V  { float v[];  };   // the value projection, rewritten
+layout(std430, binding = 3) readonly buffer QN { float qnorm[]; };
+layout(std430, binding = 4) readonly buffer KN { float knorm[]; };
+layout(std430, binding = 5) readonly buffer RC { float rcos[]; };
+layout(std430, binding = 6) readonly buffer RS { float rsin[]; };
+layout(std430, binding = 7) writeonly buffer QH { float qh[]; };  // the queries, fp16-exact
+layout(std430, binding = 8) buffer CK { uint ck[]; };    // the key cache, two halves to a uint
+layout(std430, binding = 9) buffer CV { uint cv[]; };    // the value cache
+
+layout(push_constant) uniform Push {
+    uint heads;
+    uint kvHeads;
+    uint headDim;
+    uint ropeDims;
+    uint pos;
+    uint capacity;
+    uint mask;        // capacity - 1 when that is a mask, and zero otherwise
+    uint valueIsKey;  // the value is the key before the key was rotated
+    float eps;
+} p;
+
+shared float partial[256];
+
+// floatToHalf is nn/half.go, bit for bit. GLSL's packHalf2x16 is not the same
+// function — it puts about one value in ten in the neighbouring bucket — and
+// the cache is what the reference reads back.
+uint floatToHalf(float f) {
+    uint bits     = floatBitsToUint(f);
+    uint sign     = (bits >> 16) & 0x8000u;
+    int  exponent = int((bits >> 23) & 0xFFu) - 127 + 15;
+    uint mantissa = bits & 0x7FFFFFu;
+
+    if ((bits & 0x7FFFFFFFu) == 0u) return sign;
+    if (exponent >= 0x1F) {
+        if ((bits & 0x7F800000u) == 0x7F800000u && mantissa != 0u) return sign | 0x7E00u;
+        return sign | 0x7C00u;
+    }
+    if (exponent <= 0) {
+        if (exponent < -10) return sign;
+        mantissa |= 0x800000u;
+        uint shift = uint(14 - exponent);
+        uint value = mantissa >> shift;
+        uint rest  = mantissa & ((1u << shift) - 1u);
+        uint mid   = 1u << (shift - 1u);
+        if (rest > mid || (rest == mid && (value & 1u) == 1u)) value++;
+        return sign | value;
+    }
+    uint value = (uint(exponent) << 10) | (mantissa >> 13);
+    uint rest  = mantissa & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (value & 1u) == 1u)) value++;
+    return sign | value;
+}
+
+// The ring, in units of one half.
+uint slot(uint head) {
+    uint at = (p.mask != 0u) ? (p.pos & p.mask) : (p.pos % p.capacity);
+    return (at * p.kvHeads + head) * p.headDim;
+}
+
+// reduce sums one value per thread into partial[0].
+//
+// The reference sums a head's squares in float64 and this sums them in
+// float32, through a tree rather than in a line — which is nearer float64 than
+// a straight float32 loop would be, and is the one place in this kernel where
+// the two arithmetics are not the same arithmetic.
+float reduce(float value) {
+    uint t = gl_LocalInvocationID.x;
+    partial[t] = value;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (t < stride) partial[t] += partial[t + stride];
+        barrier();
+    }
+    return partial[0];
+}
+
+void main() {
+    uint u  = gl_WorkGroupID.x;
+    uint t  = gl_LocalInvocationID.x;
+    uint hd = p.headDim;
+
+    if (u < p.heads) {
+        uint base = u * hd;
+
+        float s = 0.0;
+        for (uint i = t; i < hd; i += 256u) { float x = q[base + i]; s += x * x; }
+        float scale = 1.0 / sqrt(reduce(s) / float(hd) + p.eps);
+        barrier();
+
+        for (uint i = t; i < hd; i += 256u) q[base + i] = q[base + i] * scale * qnorm[i];
+        barrier();
+
+        uint half_ = p.ropeDims >> 1;
+        for (uint i = t; i < half_; i += 256u) {
+            float re = q[base + i], im = q[base + i + half_];
+            q[base + i]          = re * rcos[i] - im * rsin[i];
+            q[base + i + half_]  = re * rsin[i] + im * rcos[i];
+        }
+        barrier();
+
+        // The query meets an fp16 cache, so it is rounded to fp16 and widened
+        // back. It stays a float: what matters is the value, not the width.
+        for (uint i = t; i < hd; i += 256u) {
+            qh[base + i] = unpackHalf2x16(floatToHalf(q[base + i])).x;
+        }
+        return;
+    }
+
+    uint h    = u - p.heads;
+    uint base = h * hd;
+    uint o    = slot(h) >> 1;   // in uints, two halves to each
+
+    // The value is taken before the key is normed or rotated, where a block
+    // has no value matrix of its own.
+    if (p.valueIsKey != 0u) {
+        for (uint i = t; i < hd; i += 256u) v[base + i] = k[base + i];
+        barrier();
+    }
+
+    float s = 0.0;
+    for (uint i = t; i < hd; i += 256u) { float x = k[base + i]; s += x * x; }
+    float kscale = 1.0 / sqrt(reduce(s) / float(hd) + p.eps);
+    barrier();
+
+    s = 0.0;
+    for (uint i = t; i < hd; i += 256u) { float x = v[base + i]; s += x * x; }
+    float vscale = 1.0 / sqrt(reduce(s) / float(hd) + p.eps);
+    barrier();
+
+    for (uint i = t; i < hd; i += 256u) {
+        k[base + i] = k[base + i] * kscale * knorm[i];
+        // The value is normalized with no gain of its own, and is not rotated:
+        // position enters through the key alone.
+        v[base + i] = v[base + i] * vscale;
+    }
+    barrier();
+
+    uint half_ = p.ropeDims >> 1;
+    for (uint i = t; i < half_; i += 256u) {
+        float re = k[base + i], im = k[base + i + half_];
+        k[base + i]         = re * rcos[i] - im * rsin[i];
+        k[base + i + half_] = re * rsin[i] + im * rcos[i];
+    }
+    barrier();
+
+    // Two halves to a uint, so a thread takes a pair and no two threads write
+    // the same word.
+    for (uint pair = t; pair < (hd >> 1); pair += 256u) {
+        uint i = pair << 1;
+        ck[o + pair] = floatToHalf(k[base + i]) | (floatToHalf(k[base + i + 1u]) << 16);
+        cv[o + pair] = floatToHalf(v[base + i]) | (floatToHalf(v[base + i + 1u]) << 16);
+    }
+}

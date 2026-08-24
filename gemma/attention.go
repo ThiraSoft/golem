@@ -48,14 +48,22 @@ func Attention(
 	// kernel converts the other operand to fp16 to do it. The same rounding has
 	// to happen here, or the scores differ in the fourth digit — which is the
 	// size of a real mistake.
-	// A device holding the block's matrices does the three products first, for
-	// a single position, and the per-head work below then finds them already
-	// written. It is only the products that move: the norms, the rotation and
-	// the cache are where all of this model's particulars are, and none of
-	// them reads a matrix.
-	onDevice := bw.Attn != nil && batch == 1
-	if onDevice {
-		projectOnDevice(bc, bw, normed, q[0], k[0], v[0])
+	// A device holding the block takes the whole attention, cache and all, and
+	// there is nothing left here to do. It is all or none: the keys and values
+	// it writes are its own, and a batch that went through the path below
+	// would leave the two caches disagreeing.
+	if bw.Attn != nil {
+		if batch != 1 {
+			panic("gemma: the attention device takes one position at a time")
+		}
+		table := ropes[0]
+		first, last := at[0].Cache.Visible(bc, at[0].Pos, at[0].Until)
+		err := bw.Attn.Attend(bw.AttnIndex, normed, table.Cos, table.Sin,
+			at[0].Pos, first, last, out[0])
+		if err != nil {
+			panic(fmt.Sprintf("gemma: the attention device failed: %v", err))
+		}
+		return
 	}
 
 	units := bc.Heads
@@ -66,9 +74,7 @@ func Attention(
 		for u := start; u < end; u++ {
 			if u < bc.Heads {
 				from, to := u*bc.HeadDim, (u+1)*bc.HeadDim
-				if !onDevice {
-					bw.Q.MatVecRows(normed, q, from, to)
-				}
+				bw.Q.MatVecRows(normed, q, from, to)
 				for t := 0; t < batch; t++ {
 					head := q[t][from:to]
 					nn.RMSNormPlain(head, bw.QNorm, cfg.Eps)
@@ -81,11 +87,9 @@ func Attention(
 			}
 			h := u - bc.Heads
 			from, to := h*bc.HeadDim, (h+1)*bc.HeadDim
-			if !onDevice {
-				bw.K.MatVecRows(normed, k, from, to)
-				if !bc.ValueIsKey {
-					bw.V.MatVecRows(normed, v, from, to)
-				}
+			bw.K.MatVecRows(normed, k, from, to)
+			if !bc.ValueIsKey {
+				bw.V.MatVecRows(normed, v, from, to)
 			}
 			for t := 0; t < batch; t++ {
 				lc := at[t].Cache.Layers[bc.Index]
@@ -142,35 +146,7 @@ func Attention(
 		}
 	})
 
-	if onDevice {
-		if err := bw.Attn.Out(bw.AttnIndex, set, out[0]); err != nil {
-			panic(fmt.Sprintf("gemma: the attention device failed: %v", err))
-		}
-	} else {
-		bw.O.MatVecBatch(set, out)
-	}
-}
-
-// projectOnDevice computes the queries, and the keys and values where the
-// block has them, in one submission.
-//
-// Which of the three exist is the block's own answer and not a branch on its
-// number: fifteen blocks at the end of this model project nothing but queries
-// and read what two earlier ones left in the cache, and some blocks take their
-// value from the key before the key was rotated rather than from a matrix.
-func projectOnDevice(bc BlockConfig, bw *BlockWeights, normed *nn.Batch, q, k, v []float32) {
-	heads := bc.Heads * bc.HeadDim
-	width := bc.KVHeads * bc.HeadDim
-	var keys, values []float32
-	if bc.OwnsKV {
-		keys = k[:width]
-		if !bc.ValueIsKey {
-			values = v[:width]
-		}
-	}
-	if err := bw.Attn.QKV(bw.AttnIndex, normed, q[:heads], keys, values); err != nil {
-		panic(fmt.Sprintf("gemma: the attention device failed: %v", err))
-	}
+	bw.O.MatVecBatch(set, out)
 }
 
 // deepest is the furthest into a conversation this batch reaches, which is

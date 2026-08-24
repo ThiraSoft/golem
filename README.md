@@ -192,16 +192,34 @@ Worth knowing before you clone it:
   ceiling is about 43.
 
   `-vulkan` moves all four. On the 26B A4B, **13.4 tokens a second becomes
-  30.1**. It costs those matrices being resident — 12.8 gibibytes, which is why
+  33.8**, and the prompt goes from 40 a second to 45. It costs those matrices being resident — 12.8 gibibytes, which is why
   a card with sixteen is the smallest that can do this — and about nine seconds
   of upload.
 
-  What stays here is everything that is not a matrix product: the norms, the
-  rotation, the routing, the key-value cache and the scores. That is where all
-  of Gemma 4's particulars live — a query norm and a key norm, two rotation
-  geometries, a value that is sometimes the key before the key was rotated,
-  fifteen blocks at the end that compute no keys at all — and it is a few
-  kilobytes a block against nineteen megabytes of weights.
+  The whole attention goes with them, cache included: the norms, the rotation,
+  the keys and values in fp16, the scores, the softmax and the mix, in one
+  submission a block. That was not for its own arithmetic — a block's scores
+  are a few kilobytes against nineteen megabytes of weights — but so that the
+  arithmetic already there stops waiting. A submission costs sixty-three
+  microseconds whatever is in it, and a card handed one and then left alone
+  drops to half its clocks.
+
+  What that costs is Gemma 4's particulars written twice: a query norm and a
+  key norm, two rotation geometries whose heads are not even the same size, a
+  value taken from the key before the key was rotated, fifteen blocks at the
+  end that compute no keys at all and read what two earlier ones left behind,
+  and three roundings to fp16 that are not optional because llama.cpp holds its
+  cache that way. `gemma/attention.go` is the other copy and it is the one the
+  tests are written against.
+
+  What stays here is the norms between the two halves of a block, the residual
+  adds and the routing — one vector's worth of arithmetic each, and the routing
+  reads the residual this side already has.
+
+  A model whose attention is on the card also reads its prompt a position at a
+  time, because the kernels score one column and the two caches must not part.
+  That turned out to cost nothing: the prompt is faster this way than the
+  batched CPU path it replaces.
 
   It is not bit-identical to the CPU path and cannot be: the two sum the same
   products in different orders, and a mixture amplifies that because its

@@ -122,7 +122,7 @@ func (m *Model) UseVulkanAttention() error {
 	if err != nil {
 		return err
 	}
-	a, err := vk.NewAttention(d, cfg.Dim, maxHeads, maxKV)
+	a, err := vk.NewAttention(d, cfg.Dim, maxHeads, maxKV, cfg.MaxContext)
 	if err != nil {
 		return err
 	}
@@ -144,7 +144,17 @@ func (m *Model) UseVulkanAttention() error {
 				return fmt.Errorf("gemma: the attention kernel reads Q4_0, block %d has a %s", i, q)
 			}
 		}
-		if err := a.AddBlock(bw.Q.Data, k, v, bw.O.Data, bc.Heads*bc.HeadDim, bc.KVHeads*bc.HeadDim); err != nil {
+		capacity := cfg.MaxContext
+		if bc.Window && bc.WindowSize < capacity {
+			capacity = bc.WindowSize
+		}
+		shape := vk.BlockShape{
+			Heads: bc.Heads, KVHeads: bc.KVHeads, HeadDim: bc.HeadDim,
+			RoPEDims: bc.RoPEDims, Capacity: capacity,
+			ValueIsKey: bc.ValueIsKey, OwnsKV: bc.OwnsKV, KVSource: bc.KVSource,
+			Eps: cfg.Eps,
+		}
+		if err := a.AddBlock(shape, bw.Q.Data, k, v, bw.O.Data, bw.QNorm, bw.KNorm); err != nil {
 			a.Close()
 			return err
 		}
@@ -152,6 +162,15 @@ func (m *Model) UseVulkanAttention() error {
 	}
 	m.attn = a
 	return nil
+}
+
+// VulkanCacheBytes is what the keys and values take on the card, which is the
+// part of this that grows with the context rather than with the model.
+func (m *Model) VulkanCacheBytes() int {
+	if m.attn == nil {
+		return 0
+	}
+	return m.attn.Bytes()
 }
 
 // VulkanAttention says whether the attention matrices are on a device.

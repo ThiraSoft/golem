@@ -60,16 +60,19 @@ type BlockWeights struct {
 	AttnIndex int
 }
 
-// An AttentionDevice computes the four products of one block's attention
-// somewhere other than this process's memory. vk.Attention implements it.
+// An AttentionDevice computes one block's whole attention somewhere other than
+// this process's memory, cache included. vk.Attention implements it.
 //
-// QKV writes the queries, and the keys and values when the caller asks for
-// them by passing slices to write into; nil means the block has none to
-// compute. Out is the output projection, which reads what the attention made
-// rather than the stream.
+// in is the stream under the block's attention norm, in its Q8_0 form. cos and
+// sin are this position's rotation. pos is where the keys and values go, and
+// first and last the inclusive range the query may read — worked out here,
+// because the window rule and the ring agree and neither is the device's
+// business. out receives the output projection's answer.
+//
+// The device keeps its own keys and values. A model whose attention is on one
+// must not also run batches through the CPU path, or the two caches part.
 type AttentionDevice interface {
-	QKV(block int, in *nn.Batch, q, k, v []float32) error
-	Out(block int, in *nn.Batch, out []float32) error
+	Attend(block int, in *nn.Batch, cos, sin []float32, pos, first, last int, out []float32) error
 }
 
 // A MixtureDevice computes the feed-forward half of one block somewhere other
