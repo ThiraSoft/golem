@@ -158,7 +158,7 @@ waiting through the model in a single pass.
 | `audio/` | sound formats: reading and writing WAV |
 | `sample/` | top-k, top-p, temperature, and a seeded draw over a row of logits |
 | `chat/` | a conversation's shape — messages, tools, calls — and the interface an engine implements to write one out |
-| `vk/` | Vulkan compute, bound through `purego` rather than cgo: devices, buffers, pipelines, and four kernels — the Q6_K product the logit head is, the two a mixture's expert branch needs, and the plain Q4_0 product that turned out to be most of the rest of the model |
+| `vk/` | Vulkan compute, bound through `purego` rather than cgo: devices, buffers, pipelines, and the ten kernels a whole block is made of — the Q6_K product the logit head is, the plain Q4_0 product that turned out to be most of the rest of the model, the two a mixture's expert branch needs, the attention's cache and scores, the norms, the router, and the three post-norms that close a mixture block |
 
 Nothing is promoted into this layer on the strength of a guess. Code moves here
 once two engines are shown to want it, in the same commit that makes them both
@@ -191,18 +191,24 @@ Worth knowing before you clone it:
   the bytes are the cost — the kernels already run at 37 GB/s on a bus whose
   ceiling is about 43.
 
-  `-vulkan` moves all four. On the 26B A4B, **13.4 tokens a second becomes
-  33.8**, and the prompt goes from 40 a second to 45. It costs those matrices being resident — 12.8 gibibytes, which is why
-  a card with sixteen is the smallest that can do this — and about nine seconds
-  of upload.
+  `-vulkan` moves all four, and then everything between them. On the 26B A4B,
+  **13.4 tokens a second becomes 96.8** — llama.cpp's ROCm build is at 99.8 on
+  the same card — and the prompt goes from 40 a second to 135. It costs those
+  matrices being resident — 12.8 gibibytes, which is why a card with sixteen is
+  the smallest that can do this — and about nine seconds of upload.
 
-  The whole attention goes with them, cache included: the norms, the rotation,
-  the keys and values in fp16, the scores, the softmax and the mix, in one
-  submission a block. That was not for its own arithmetic — a block's scores
-  are a few kilobytes against nineteen megabytes of weights — but so that the
-  arithmetic already there stops waiting. A submission costs sixty-three
-  microseconds whatever is in it, and a card handed one and then left alone
-  drops to half its clocks.
+  The whole of a block goes: the norms, the rotation, the keys and values in
+  fp16, the scores, the softmax and the mix, the router, the experts and the
+  three post-norms that make a mixture block. Thirty blocks and the logit head
+  are two submissions a token, and the first of those is a recording made once
+  and submitted again — a token's four hundred dispatches cost more to write
+  down than the card takes to run some of them. What crosses the bus is the
+  embedding in, the position, and the logits back.
+
+  Not because a norm is expensive. A submission costs sixty-three microseconds
+  whatever is in it, and a card handed one and then left alone drops to half
+  its clocks; as long as one norm stayed here the block had to come back to
+  have it done.
 
   What that costs is Gemma 4's particulars written twice: a query norm and a
   key norm, two rotation geometries whose heads are not even the same size, a
@@ -212,9 +218,15 @@ Worth knowing before you clone it:
   cache that way. `gemma/attention.go` is the other copy and it is the one the
   tests are written against.
 
-  What stays here is the norms between the two halves of a block, the residual
-  adds and the routing — one vector's worth of arithmetic each, and the routing
-  reads the residual this side already has.
+  The kernels are written against the card's four-byte integer dot product,
+  which is one instruction for what the unpacked loop spends eight on. A Q4_0
+  word holds eight weights as nibbles and a single mask puts four of them in
+  the four bytes the instruction reads; the accumulator is integer, so the
+  answer does not move. It is what took the product kernels from about 250
+  gigabytes a second to between 360 and 530, and the logit head to 609. A card
+  without `VK_KHR_shader_integer_dot_product` gets an error where it would get
+  a device, and the engine falls back to the CPU as it does when there is no
+  Vulkan at all.
 
   A model whose attention is on the card also reads its prompt a position at a
   time, because the kernels score one column and the two caches must not part.

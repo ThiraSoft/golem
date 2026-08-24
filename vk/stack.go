@@ -27,10 +27,10 @@ import (
 	"unsafe"
 )
 
-//go:generate glslc -O -fshader-stage=compute shaders/norm.comp -o shaders/norm.spv
-//go:generate glslc -O -fshader-stage=compute shaders/router_logits.comp -o shaders/router_logits.spv
-//go:generate glslc -O -fshader-stage=compute shaders/router_pick.comp -o shaders/router_pick.spv
-//go:generate glslc -O -fshader-stage=compute shaders/combine.comp -o shaders/combine.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/norm.comp -o shaders/norm.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/router_logits.comp -o shaders/router_logits.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/router_pick.comp -o shaders/router_pick.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/combine.comp -o shaders/combine.spv
 
 //go:embed shaders/norm.spv
 var normSPIRV []byte

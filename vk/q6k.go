@@ -18,7 +18,7 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 )
 
-//go:generate glslc -O -fshader-stage=compute shaders/q6k.comp -o shaders/q6k.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/q6k.comp -o shaders/q6k.spv
 
 //go:embed shaders/q6k.spv
 var q6kSPIRV []byte

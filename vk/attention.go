@@ -27,8 +27,8 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 )
 
-//go:generate glslc -O -fshader-stage=compute shaders/attn_prepare.comp -o shaders/attn_prepare.spv
-//go:generate glslc -O -fshader-stage=compute shaders/attn_scores.comp -o shaders/attn_scores.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/attn_prepare.comp -o shaders/attn_prepare.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/attn_scores.comp -o shaders/attn_scores.spv
 
 //go:embed shaders/attn_prepare.spv
 var attnPrepareSPIRV []byte

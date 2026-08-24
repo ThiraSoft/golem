@@ -29,9 +29,9 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 )
 
-//go:generate glslc -O -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup.spv
-//go:generate glslc -O -fshader-stage=compute shaders/moe_down.comp -o shaders/moe_down.spv
-//go:generate glslc -O -fshader-stage=compute shaders/matvec.comp -o shaders/matvec.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_down.comp -o shaders/moe_down.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec.spv
 
 //go:embed shaders/moe_gateup.spv
 var moeGateUpSPIRV []byte
