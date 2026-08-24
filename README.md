@@ -158,7 +158,7 @@ waiting through the model in a single pass.
 | `audio/` | sound formats: reading and writing WAV |
 | `sample/` | top-k, top-p, temperature, and a seeded draw over a row of logits |
 | `chat/` | a conversation's shape — messages, tools, calls — and the interface an engine implements to write one out |
-| `vk/` | Vulkan compute, bound through `purego` rather than cgo: devices, buffers, pipelines, the Q6_K product the logit head is, and the two kernels a mixture's expert branch needs |
+| `vk/` | Vulkan compute, bound through `purego` rather than cgo: devices, buffers, pipelines, and four kernels — the Q6_K product the logit head is, the two a mixture's expert branch needs, and the plain Q4_0 product that turned out to be most of the rest of the model |
 
 Nothing is promoted into this layer on the strength of a guess. Code moves here
 once two engines are shown to want it, in the same commit that makes them both
@@ -181,26 +181,35 @@ Worth knowing before you clone it:
   hardware — correct, and tuned by nobody. The vision tower's interleaved kernel
   and the audio decoder's are portable Go there. An Apple or a Graviton runs; it
   will not see the numbers above.
-- **Two things run on a GPU, and only if you ask.** This is a CPU engine and
-  that is still the point of it. But a token of the 26B A4B reads about 1.7
-  gigabytes, and two tensors are nearly all of it: the logit head, which is the
-  input embedding read the other way round and so the largest tensor in the
-  file, 0.6 gigabytes read in full every token; and the expert stacks, 0.8 more,
-  eight matrices at a time out of a hundred and twenty-eight, thirty times over.
-  Neither shortens with CPU work, because the bytes are the cost — the kernels
-  already run at 37 GB/s on a bus whose ceiling is about 43.
+- **Most of a token runs on a GPU, if you ask.** This began as a CPU engine and
+  the CPU path is still the one every test is written against. But a token of
+  the 26B A4B reads about 2.3 gigabytes and almost all of it is four kinds of
+  matrix: the logit head, 0.6 gigabytes, which is the input embedding read the
+  other way round; the expert stacks, 0.8, eight matrices at a time out of a
+  hundred and twenty-eight; the shared branch beside them, 0.3; and the
+  attention's four projections, 0.5. None of it shortens with CPU work, because
+  the bytes are the cost — the kernels already run at 37 GB/s on a bus whose
+  ceiling is about 43.
 
-  `-vulkan` moves both, and the shared branch of every mixture block beside
-  them. On the 26B A4B, 13.4 tokens a second becomes 24.6, and the answer
-  written at temperature zero is the same token for token. It costs every one
-  of those matrices being resident — 12.3 gibibytes, which is why a card with
-  sixteen is the smallest that can do this — and about nine seconds of upload.
+  `-vulkan` moves all four. On the 26B A4B, **13.4 tokens a second becomes
+  30.1**. It costs those matrices being resident — 12.8 gibibytes, which is why
+  a card with sixteen is the smallest that can do this — and about nine seconds
+  of upload.
 
-  The attention, the norms and the cache stay on the CPU for now. What that
-  costs is measurable and is no longer the kernels: a block's feed-forward half
-  takes 306 microseconds submitted on its own and 117 when the card is not
-  allowed to rest between blocks. The card spends most of a token at low clocks
-  waiting for the CPU to hand it the next one.
+  What stays here is everything that is not a matrix product: the norms, the
+  rotation, the routing, the key-value cache and the scores. That is where all
+  of Gemma 4's particulars live — a query norm and a key norm, two rotation
+  geometries, a value that is sometimes the key before the key was rotated,
+  fifteen blocks at the end that compute no keys at all — and it is a few
+  kilobytes a block against nineteen megabytes of weights.
+
+  It is not bit-identical to the CPU path and cannot be: the two sum the same
+  products in different orders, and a mixture amplifies that because its
+  intermediate is quantized on the way into the second projection. The Vulkan
+  path is held to the reference tests the CPU path is held to, at the same
+  tolerances, and `gemma/vulkan_test.go` measures where it sits — nearer
+  llama.cpp than this engine's own portable Go path, which is also not the AVX2
+  one.
 
   There is no cgo: `vk/` opens `libvulkan.so.1` through `purego`, and
   `CGO_ENABLED=0 go build ./...` still passes. A machine with no Vulkan loader

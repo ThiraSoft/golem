@@ -40,6 +40,7 @@ type Model struct {
 	// gemma/vulkan.go says what that buys and what it leaves alone.
 	head    *vk.Q6KHead
 	experts *vk.Mixture
+	attn    *vk.Attention
 	headDev *vk.Device
 }
 

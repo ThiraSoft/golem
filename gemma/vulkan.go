@@ -99,6 +99,64 @@ func (m *Model) UseVulkanExperts() error {
 	return nil
 }
 
+// UseVulkanAttention uploads every block's four attention matrices and makes
+// the four products run there.
+//
+// Only the products move. The norms, the rotation, the cache and the scores
+// stay here, which is where every particular of this model's attention lives
+// and where almost none of its bytes are: a block's matrices are nineteen
+// megabytes and its scores are a few kilobytes.
+func (m *Model) UseVulkanAttention() error {
+	if m.attn != nil {
+		return nil
+	}
+	cfg := m.Cfg
+	// Two geometries alternate through this model and their heads are not the
+	// same size, so the shared buffers are cut for the widest.
+	var maxHeads, maxKV int
+	for _, bc := range cfg.Blocks {
+		maxHeads = max(maxHeads, bc.Heads*bc.HeadDim)
+		maxKV = max(maxKV, bc.KVHeads*bc.HeadDim)
+	}
+	d, err := m.device()
+	if err != nil {
+		return err
+	}
+	a, err := vk.NewAttention(d, cfg.Dim, maxHeads, maxKV)
+	if err != nil {
+		return err
+	}
+	for i := range cfg.Blocks {
+		bc, bw := cfg.Blocks[i], &m.W.Blocks[i]
+		// A block answers for itself which matrices it has: fifteen at the end
+		// of this model have neither keys nor values, and some take the value
+		// from the key rather than from a matrix.
+		var k, v []byte
+		if bc.OwnsKV {
+			k = bw.K.Data
+			if !bc.ValueIsKey {
+				v = bw.V.Data
+			}
+		}
+		for _, q := range []nn.Quant{bw.Q.Quant, bw.O.Quant} {
+			if q != nn.Q4_0 {
+				a.Close()
+				return fmt.Errorf("gemma: the attention kernel reads Q4_0, block %d has a %s", i, q)
+			}
+		}
+		if err := a.AddBlock(bw.Q.Data, k, v, bw.O.Data, bc.Heads*bc.HeadDim, bc.KVHeads*bc.HeadDim); err != nil {
+			a.Close()
+			return err
+		}
+		bw.Attn, bw.AttnIndex = a, a.Blocks()-1
+	}
+	m.attn = a
+	return nil
+}
+
+// VulkanAttention says whether the attention matrices are on a device.
+func (m *Model) VulkanAttention() bool { return m.attn != nil }
+
 // VulkanExperts says whether the expert stacks are on a device.
 func (m *Model) VulkanExperts() bool { return m.experts != nil }
 
@@ -123,6 +181,13 @@ func (m *Model) VulkanHead() bool { return m.head != nil }
 // closeVulkanHead releases the device. Close calls it; a caller that wants the
 // memory back sooner has no reason to.
 func (m *Model) closeVulkanHead() {
+	if m.attn != nil {
+		m.attn.Close()
+		m.attn = nil
+		for i := range m.W.Blocks {
+			m.W.Blocks[i].Attn = nil
+		}
+	}
 	if m.experts != nil {
 		m.experts.Close()
 		m.experts = nil

@@ -31,7 +31,7 @@ import (
 
 //go:generate glslc -O -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup.spv
 //go:generate glslc -O -fshader-stage=compute shaders/moe_down.comp -o shaders/moe_down.spv
-//go:generate glslc -O -fshader-stage=compute shaders/dense_down.comp -o shaders/dense_down.spv
+//go:generate glslc -O -fshader-stage=compute shaders/matvec.comp -o shaders/matvec.spv
 
 //go:embed shaders/moe_gateup.spv
 var moeGateUpSPIRV []byte
@@ -39,8 +39,11 @@ var moeGateUpSPIRV []byte
 //go:embed shaders/moe_down.spv
 var moeDownSPIRV []byte
 
-//go:embed shaders/dense_down.spv
-var denseDownSPIRV []byte
+// matvecSPIRV is the plain Q4_0 product, which the shared branch's down
+// projection and the attention's four projections both want.
+//
+//go:embed shaders/matvec.spv
+var matvecSPIRV []byte
 
 // expertsUsed is what the mixture's down kernel is written for: its workgroup
 // is eight outputs by eight experts. A checkpoint that chose a different
@@ -113,7 +116,7 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int) (*Mixture, error)
 	}{
 		{&m.gateUp, moeGateUpSPIRV, 7},
 		{&m.down, moeDownSPIRV, 6},
-		{&m.denseDown, denseDownSPIRV, 4},
+		{&m.denseDown, matvecSPIRV, 4},
 	} {
 		if *spec.into, err = d.NewPipeline(spec.spirv, spec.bindings, push); err != nil {
 			m.Close()

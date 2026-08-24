@@ -1,12 +1,16 @@
 #version 450
 
-// The down projection of a shared branch: one matrix, one activation, no
-// combination.
+// y = W * x for one Q4_0 matrix against one Q8_0 activation.
 //
-// It is shaders/moe_down.comp with the mixture taken out. A workgroup takes
-// sixty-four outputs with eight threads to each, which is the same shape for
-// the same reason: a lane walks the blocks of its row eight at a time, so the
-// eight of them read a hundred and twenty-eight contiguous bytes at once.
+// It is shaders/moe_down.comp with the mixture taken out, and it turned out to
+// be the kernel most of the model wants: the down projection of a shared
+// branch, and the four projections of an attention. Nothing about it knows
+// which.
+//
+// A workgroup takes sixty-four outputs with eight threads to each, which is
+// the same shape for the same reason the mixture uses it: a lane walks the
+// blocks of its row eight at a time, so the eight of them read a hundred and
+// twenty-eight contiguous bytes at once.
 
 layout(local_size_x = 512) in;   // sixty-four outputs, eight lanes each
 
@@ -18,7 +22,7 @@ layout(std430, binding = 3) writeonly buffer Y  { float y[];   };
 layout(push_constant) uniform Push {
     uint dim;   // outputs
     uint ffn;   // inputs
-    uint used;  // one, and only here so that all three kernels take the same block
+    uint used;  // one, and only here so that every kernel takes the same block
 } p;
 
 const uint LANES = 8u;

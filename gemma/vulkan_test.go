@@ -219,3 +219,88 @@ func BenchmarkMoETokenVulkanExperts(b *testing.B) {
 	}
 	benchToken(b, m)
 }
+
+// load26BFull is load26B with everything that can go on the card: the four
+// attention products, both feed-forward branches, and the logit head.
+func load26BFull(t *testing.T) (*fixture, *Model) {
+	t.Helper()
+	f, m := load26BVulkan(t)
+	if err := m.UseVulkanAttention(); err != nil {
+		t.Skipf("no Vulkan attention: %v", err)
+	}
+	if !m.VulkanAttention() {
+		t.Fatal("the attention reports itself absent after being installed")
+	}
+	return f, m
+}
+
+// TestVulkanFullForwardBlockByBlock is TestMoEForwardBlockByBlock with the
+// attention products moved too, at the same tolerance.
+func TestVulkanFullForwardBlockByBlock(t *testing.T) {
+	f, m := load26BFull(t)
+	for pos, token := range f.Tokens {
+		m.Forward(token, pos)
+		for _, il := range moeBlocks {
+			compareRelative(t, "l_out-"+itoa(il)+" at position "+itoa(pos),
+				m.BlockOutput(il), f.column(t, "l_out-"+itoa(il), pos), 5e-2)
+		}
+	}
+}
+
+// TestVulkanFullResultNorm is the last norm the logits are drawn from.
+func TestVulkanFullResultNorm(t *testing.T) {
+	f, m := load26BFull(t)
+	var hidden []float32
+	for pos, token := range f.Tokens {
+		hidden = m.Forward(token, pos)
+	}
+	compareRelative(t, "result_norm", hidden, f.tensor(t, "result_norm"), 8e-2)
+}
+
+// TestVulkanFullGreedyMatchesTheReference replays the reference's
+// continuation with everything on the card. The tie is the one
+// TestVulkanMoEGreedyMatchesTheReference explains and measures.
+func TestVulkanFullGreedyMatchesTheReference(t *testing.T) {
+	f, m := load26BFull(t)
+	pos := 0
+	var hidden []float32
+	for _, token := range f.Tokens {
+		hidden = m.Forward(token, pos)
+		pos++
+	}
+	const tie = 4
+	logits := make([]float32, m.Cfg.Vocab)
+	for step, want := range f.Greedy {
+		m.Logits(hidden, logits)
+		if got := Argmax(logits); got != want {
+			if margin := logits[got] - logits[want]; margin > tie {
+				t.Fatalf("step %d: chose %d over the reference's %d by %v, which is past a tie",
+					step, got, want, margin)
+			} else {
+				t.Logf("step %d: chose %d over %d by %v, a tie inside the measured gap",
+					step, got, want, margin)
+			}
+		}
+		hidden = m.Forward(want, pos)
+		pos++
+	}
+}
+
+// BenchmarkMoETokenVulkanFull is a whole token with everything that can move
+// moved.
+func BenchmarkMoETokenVulkanFull(b *testing.B) {
+	m := open26BEngine(b)
+	for _, step := range []struct {
+		what string
+		do   func() error
+	}{
+		{"experts", m.UseVulkanExperts},
+		{"attention", m.UseVulkanAttention},
+		{"head", m.UseVulkanHead},
+	} {
+		if err := step.do(); err != nil {
+			b.Skipf("no Vulkan %s: %v", step.what, err)
+		}
+	}
+	benchToken(b, m)
+}

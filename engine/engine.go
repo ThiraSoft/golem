@@ -94,6 +94,8 @@ type vulkanHead interface {
 	VulkanHead() bool
 	UseVulkanExperts() error
 	VulkanExperts() bool
+	UseVulkanAttention() error
+	VulkanAttention() bool
 }
 
 // UseVulkan moves to a Vulkan device everything of this engine that can go:
@@ -111,16 +113,19 @@ func (m *Model) UseVulkan() error {
 	if err := h.UseVulkanExperts(); err != nil {
 		return err
 	}
+	if err := h.UseVulkanAttention(); err != nil {
+		return err
+	}
 	return h.UseVulkanHead()
 }
 
 // Vulkan says what is on a device, for the line printed at startup.
-func (m *Model) Vulkan() (head, experts bool) {
+func (m *Model) Vulkan() (head, experts, attention bool) {
 	h, ok := m.Forward.(vulkanHead)
 	if !ok {
-		return false, false
+		return false, false, false
 	}
-	return h.VulkanHead(), h.VulkanExperts()
+	return h.VulkanHead(), h.VulkanExperts(), h.VulkanAttention()
 }
 
 // Open reads the architecture and hands the file to the engine that implements

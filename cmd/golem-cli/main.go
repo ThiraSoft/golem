@@ -223,14 +223,18 @@ func fail(err error) {
 }
 
 // vulkanLine names what ended up on the card, for the startup line.
-func vulkanLine(head, experts bool) string {
-	switch {
-	case head && experts:
-		return "head and experts on vulkan"
-	case head:
-		return "head on vulkan"
-	case experts:
-		return "experts on vulkan"
+func vulkanLine(head, experts, attention bool) string {
+	parts := []string{}
+	for _, part := range []struct {
+		on   bool
+		name string
+	}{{attention, "attention"}, {experts, "feed forward"}, {head, "head"}} {
+		if part.on {
+			parts = append(parts, part.name)
+		}
 	}
-	return "all on cpu"
+	if len(parts) == 0 {
+		return "all on cpu"
+	}
+	return strings.Join(parts, ", ") + " on vulkan"
 }

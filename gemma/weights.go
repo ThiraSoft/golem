@@ -53,6 +53,23 @@ type BlockWeights struct {
 	// and nothing above has to carry the fact down through three signatures.
 	Mixture      MixtureDevice
 	MixtureIndex int
+
+	// Attn is a device holding this block's four attention matrices, on the
+	// same terms.
+	Attn      AttentionDevice
+	AttnIndex int
+}
+
+// An AttentionDevice computes the four products of one block's attention
+// somewhere other than this process's memory. vk.Attention implements it.
+//
+// QKV writes the queries, and the keys and values when the caller asks for
+// them by passing slices to write into; nil means the block has none to
+// compute. Out is the output projection, which reads what the attention made
+// rather than the stream.
+type AttentionDevice interface {
+	QKV(block int, in *nn.Batch, q, k, v []float32) error
+	Out(block int, in *nn.Batch, out []float32) error
 }
 
 // A MixtureDevice computes the feed-forward half of one block somewhere other
