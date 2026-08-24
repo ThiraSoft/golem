@@ -15,8 +15,8 @@ func DotF32(a, b []float32) float32 {
 	if n == 0 {
 		return 0
 	}
-	if avx2 {
-		return dotF32AVX2(&a[0], &b[0], n)
+	if v, ok := fastDotF32(&a[0], &b[0], n); ok {
+		return v
 	}
 	var s0, s1, s2, s3 float32
 	i := 0

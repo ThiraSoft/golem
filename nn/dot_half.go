@@ -19,8 +19,8 @@ func DotF32Half(a []float32, b []uint16) float32 {
 	if n == 0 {
 		return 0
 	}
-	if avx2 {
-		return dotF32HalfAVX2(&a[0], &b[0], n)
+	if v, ok := fastDotF32Half(&a[0], &b[0], n); ok {
+		return v
 	}
 	var s0, s1, s2, s3 float32
 	i := 0
@@ -42,8 +42,7 @@ func AxpyHalf(dst []float32, src []uint16, a float32) {
 	if n == 0 {
 		return
 	}
-	if avx2 {
-		axpyHalfAVX2(&dst[0], &src[0], n, a)
+	if fastAxpyHalf(&dst[0], &src[0], n, a) {
 		return
 	}
 	for i := 0; i < n; i++ {

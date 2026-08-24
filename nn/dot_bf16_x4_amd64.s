@@ -103,23 +103,36 @@ b8cond:
 	CMPQ AX, DX
 	JLT  b8
 
+	// The one-at-a-time tail keeps four accumulators of its own, and they are
+	// registers no vector loop above touched.
+	//
+	// It cannot borrow Y1, Y3, Y5 and Y7. A scalar instruction in the VEX
+	// encoding zeroes bits 255:128 of what it writes, so a single
+	// VFMADD231SS into X1 throws away the upper half of the accumulator the
+	// sixteen-at-a-time loop just filled. That is why this kernel was correct
+	// for a row shorter than sixteen and for a row that is a whole number of
+	// eights, and wrong for every other length: those are exactly the cases
+	// where this loop and that one do not both run.
+	VXORPS X9, X9, X9
+	VXORPS X11, X11, X11
+	VXORPS X13, X13, X13
+	VXORPS X15, X15, X15
 	JMP b1cond
 
 b1:
 	MOVWLZX (SI)(AX*2), BX
 	SHLL    $16, BX
 	VMOVD   BX, X8
-	VBROADCASTSS X8, X8
 
-	VMOVSS (R12)(AX*4), X10
-	VFMADD231SS X10, X8, X1
-	VMOVSS (R13)(AX*4), X11
-	VFMADD231SS X11, X8, X3
-	VMOVSS (R14)(AX*4), X12
-	VFMADD231SS X12, X8, X5
-	VMOVSS (R15)(AX*4), X13
-	VFMADD231SS X13, X8, X7
-	INCQ    AX
+	VMOVSS      (R12)(AX*4), X10
+	VFMADD231SS X10, X8, X9
+	VMOVSS      (R13)(AX*4), X10
+	VFMADD231SS X10, X8, X11
+	VMOVSS      (R14)(AX*4), X10
+	VFMADD231SS X10, X8, X13
+	VMOVSS      (R15)(AX*4), X10
+	VFMADD231SS X10, X8, X15
+	INCQ        AX
 
 b1cond:
 	CMPQ AX, CX
@@ -135,24 +148,28 @@ b1cond:
 	VADDPS       X1, X0, X0
 	VHADDPS      X0, X0, X0
 	VHADDPS      X0, X0, X0
+	VADDSS       X9, X0, X0
 	VMOVSS       X0, (R9)
 
 	VEXTRACTF128 $1, Y2, X3
 	VADDPS       X3, X2, X2
 	VHADDPS      X2, X2, X2
 	VHADDPS      X2, X2, X2
+	VADDSS       X11, X2, X2
 	VMOVSS       X2, 4(R9)
 
 	VEXTRACTF128 $1, Y4, X5
 	VADDPS       X5, X4, X4
 	VHADDPS      X4, X4, X4
 	VHADDPS      X4, X4, X4
+	VADDSS       X13, X4, X4
 	VMOVSS       X4, 8(R9)
 
 	VEXTRACTF128 $1, Y6, X7
 	VADDPS       X7, X6, X6
 	VHADDPS      X6, X6, X6
 	VHADDPS      X6, X6, X6
+	VADDSS       X15, X6, X6
 	VMOVSS       X6, 12(R9)
 
 	VZEROUPPER

@@ -46,8 +46,8 @@ func dotBF16(row []uint16, x []float32) float32 {
 	if len(row) == 0 {
 		return 0
 	}
-	if avx2 {
-		return dotBF16AVX2(&row[0], &x[0], len(row))
+	if v, ok := fastDotBF16(&row[0], &x[0], len(row)); ok {
+		return v
 	}
 	var s0, s1, s2, s3 float32
 	i := 0
@@ -190,6 +190,10 @@ func MatMatBF16Rows(w []byte, x []float32, outputs, inputs, batch int, y []float
 		}
 		return
 	}
+	if hasBF16x4 {
+		blockedBF16Rows(weights, x, outputs, inputs, batch, y, start, end)
+		return
+	}
 	row := make([]float32, inputs)
 	for o := start; o < end; o++ {
 		raw := weights[o*inputs : (o+1)*inputs]
@@ -214,6 +218,38 @@ func MatMatBF16Rows(w []byte, x []float32, outputs, inputs, batch int, y []float
 	}
 }
 
+// blockedBF16Rows is the panelled product for a machine that has the
+// four-column kernel but not the pair-of-rows one AVX2 uses.
+//
+// It is the AVX2 branch above with the pairs pass taken out: the same panels of
+// the batch, the same four columns against one row of weights, the same
+// one-column kernel for what does not fill a group of four. Keeping the two
+// apart rather than folding them into one loop is deliberate — the order the
+// sums are taken in is what the parity tests measure, and a shared loop that
+// took a different order on one architecture than the other would make those
+// tests mean two different things depending on where they ran.
+func blockedBF16Rows(weights []uint16, x []float32, outputs, inputs, batch int, y []float32, start, end int) {
+	var four [4]float32
+	panel := panelOf(inputs)
+	for at := 0; at < batch; at += panel {
+		to := min(at+panel, batch)
+		for o := start; o < end; o++ {
+			raw := weights[o*inputs : (o+1)*inputs]
+			l := at
+			for ; l+3 < to; l += 4 {
+				dotBF16x4(raw, x[l*inputs:], inputs, inputs, &four)
+				y[l*outputs+o] = four[0]
+				y[(l+1)*outputs+o] = four[1]
+				y[(l+2)*outputs+o] = four[2]
+				y[(l+3)*outputs+o] = four[3]
+			}
+			for ; l < to; l++ {
+				y[l*outputs+o] = dotBF16(raw, x[l*inputs:(l+1)*inputs])
+			}
+		}
+	}
+}
+
 // Axpy computes dst += a*src over the first n elements common to both.
 //
 // This is the inner loop of the convolutions; it deserves its own kernel just
@@ -223,8 +259,7 @@ func Axpy(dst, src []float32, a float32) {
 	if n == 0 {
 		return
 	}
-	if avx2 {
-		axpyAVX2(&dst[0], &src[0], n, a)
+	if fastAxpy(&dst[0], &src[0], n, a) {
 		return
 	}
 	for i := 0; i < n; i++ {
@@ -240,8 +275,7 @@ func AxpyFull(dst, src []float32, a float32) {
 	if len(src) == 0 {
 		return
 	}
-	if avx2 {
-		axpyAVX2(&dst[0], &src[0], len(src), a)
+	if fastAxpy(&dst[0], &src[0], len(src), a) {
 		return
 	}
 	dst = dst[:len(src)]

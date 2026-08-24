@@ -102,6 +102,13 @@ func testFullSynthesis(t *testing.T, set string) {
 	// nn.MatMatBF16Rows learned to block its rows and columns, which changed
 	// the order of its sums and therefore what this engine emits. Two engines
 	// share that kernel and this is the narrower of them.
+	//
+	// The figure is per-architecture, because the order of the sums is. On
+	// arm64 the same fixtures come out at 0.048%: its kernels take four
+	// columns at a time but not two rows, so the blocking there is the
+	// shallower of the two. Both are measured and both are fine; a machine
+	// that reports something far from either has changed the arithmetic, not
+	// merely the instruction set.
 	for i := 0; i < f.Frames; i++ {
 		start, end := i*mimi.SamplesPerFrame, (i+1)*mimi.SamplesPerFrame
 		reference.Compare(t, "audio", sound[start:end], wantAudio[start:end], 5e-3)

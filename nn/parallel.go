@@ -42,7 +42,8 @@ type workers struct {
 	// sees a new sequence sees the fields written before it.
 	work      func(start, end int)
 	n         int
-	grain     int
+	chunks    int
+	floor     int
 	cursor    atomic.Int64
 	sequence  atomic.Uint64
 	remaining atomic.Int64
@@ -110,14 +111,42 @@ func (w *workers) serve(index int) {
 // are not all equally expensive — some are already in cache, some are not — and
 // a core that finished early is worth more taking the next range than waiting
 // at the barrier for one that did not.
+//
+// They also shrink as the work runs out. A fixed range makes the barrier wait
+// for one whole range past the moment the fastest core ran dry, which on a chip
+// whose cores are not the same speed — an Apple part has performance cores and
+// efficiency cores differing by two or three times — is a range taken by the
+// slowest core in the room. So each take is a share of what is left rather than
+// a constant: large while there is plenty, down to `floor` at the end, where a
+// straggler holds up only a few rows. The cost is a compare-and-swap instead of
+// a fetch-and-add, paid a few dozen times per section.
 func (w *workers) consume() {
 	for {
-		start := int(w.cursor.Add(int64(w.grain))) - w.grain
-		if start >= w.n {
+		start := w.cursor.Load()
+		if int(start) >= w.n {
 			return
 		}
-		w.work(start, min(start+w.grain, w.n))
+		size := int64(w.take(w.n - int(start)))
+		if !w.cursor.CompareAndSwap(start, start+size) {
+			continue
+		}
+		w.work(int(start), min(int(start)+int(size), w.n))
 	}
+}
+
+// take is how many tasks to claim with `left` of them remaining: a share of
+// what is left, never below the floor. Dividing by the number of chunks — the
+// number of cores the section is meant to fill — leaves each core roughly one
+// range per round and ends in a tail of floor-sized ones.
+func (w *workers) take(left int) int {
+	size := left / w.chunks
+	if size < w.floor {
+		size = w.floor
+	}
+	if size > left {
+		size = left
+	}
+	return size
 }
 
 // run spreads n tasks over `chunks` chunks and returns when all are done. The
@@ -128,13 +157,14 @@ func (w *workers) run(n, chunks int, work func(start, end int)) {
 		work(0, n)
 		return
 	}
-	// Four ranges per core: enough for a late core to catch up, few enough that
-	// the counter they share is not what they queue on.
-	grain := (n + chunks*4 - 1) / (chunks * 4)
-	if grain < 1 {
-		grain = 1
+	// The floor bounds how many times the shared counter is touched: a share of
+	// what is left is taken each time, so a floor of a sixteenth of a core's even
+	// portion gives a few dozen takes for the whole section.
+	floor := n / (chunks * 16)
+	if floor < 1 {
+		floor = 1
 	}
-	w.work, w.n, w.grain = work, n, grain
+	w.work, w.n, w.chunks, w.floor = work, n, chunks, floor
 	w.cursor.Store(0)
 	w.spin.Store(chunks >= w.count)
 	w.remaining.Store(int64(w.count - 1))
