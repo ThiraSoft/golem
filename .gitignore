@@ -43,3 +43,4 @@ __pycache__/
 /testdata/audio/
 /testdata/gemma/audio/
 /testdata/gemma/audio12/
+/golem-arm.txt

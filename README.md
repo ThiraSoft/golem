@@ -104,6 +104,8 @@ anyway — it has i8mm, tuned tile sizes, and a scheduler that knows a
 performance core from an efficiency one, and none of that can be answered
 without a machine to measure on. Parts without ARMv8.2 `FEAT_DotProd` fall back
 to portable Go for the quantized products, which is correct and slower still.
+If you have an arm64 machine, [`benchmark-arm.sh`](benchmark-arm.sh) is how this
+paragraph stops being a disclaimer and becomes a number.
 
 Each engine is self-contained. They do not import one another, and nothing in
 the shared layer knows they exist.
@@ -267,7 +269,9 @@ What would help most:
 - **The kernels.** `nn/*.s` is where the time goes. The NEON side has never run
   on real silicon: a timing from an actual Apple or Graviton part, or a tuning
   that a machine confirms, is worth more here than anywhere else in the
-  repository.
+  repository. [`benchmark-arm.sh`](benchmark-arm.sh) takes that measurement —
+  run it on any arm64 machine and post the `golem-arm.txt` it writes. Most of it
+  needs no model files.
 - **Judgement calls.** Where the code chose one thing and explained itself in a
   comment, the explanation is a claim; if it is wrong, say so.
 
