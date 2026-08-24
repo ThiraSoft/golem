@@ -93,8 +93,9 @@ honest shape of the trade — this engine is built for the regime where reading
 the weights is the cost, and it says so where it is not.
 
 **Every number here is x86-64 with AVX2.** There are arm64 kernels — Q4_0, Q6_K,
-the packed product, and the float32 and fp16 ones the attention loop is made of
-— and they are correct and untuned. They were written and verified under
+the packed product, the float32 and fp16 ones the attention loop is made of, and
+the bfloat16 products the speech engine runs on — and they are correct and
+untuned. They were written and verified under
 emulation, because the machine this was built on is not an ARM one, and no
 timing taken under QEMU means anything at all. Where a choice could be read out
 of llama.cpp's ARM kernels rather than guessed it was: the packed layout is four
@@ -174,9 +175,9 @@ Worth knowing before you clone it:
 - **x86-64 with AVX2 is the only tuned target.** `nn/*.s` is where the speed
   comes from. arm64 has NEON kernels for the quantized generation path, written
   and tested under QEMU on an x86 machine and never once timed on real ARM
-  hardware — correct, and tuned by nobody. Vision, audio, and the bf16 products
-  are portable Go there. An Apple or a Graviton runs; it will not see the
-  numbers above.
+  hardware — correct, and tuned by nobody. The vision tower's interleaved kernel
+  and the audio decoder's are portable Go there. An Apple or a Graviton runs; it
+  will not see the numbers above.
 - **No GPU, and none planned.** This is a CPU engine; that is the point of it,
   not a stage on the way somewhere.
 - **The server is one process around one model.** `-parallel` answers several
