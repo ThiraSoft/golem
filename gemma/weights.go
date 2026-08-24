@@ -47,22 +47,25 @@ type BlockWeights struct {
 	// engine folds it into that weight.
 	DownScale []float32
 
-	// Experts is a device holding this block's two stacks, when one was asked
-	// for, and Index says which block it uploaded them as. The weights are
-	// where this belongs: a block that has been moved knows it, and nothing
-	// above has to carry the fact down through three signatures.
-	Experts     ExpertDevice
-	ExpertIndex int
+	// Mixture is a device holding this block's feed-forward matrices, when one
+	// was asked for, and Index says which block it uploaded them as. The
+	// weights are where this belongs: a block that has been moved knows it,
+	// and nothing above has to carry the fact down through three signatures.
+	Mixture      MixtureDevice
+	MixtureIndex int
 }
 
-// An ExpertDevice computes the expert branch of one block somewhere other than
-// this process's memory. vk.Experts implements it.
+// A MixtureDevice computes the feed-forward half of one block somewhere other
+// than this process's memory. vk.Mixture implements it.
 //
-// in carries the branch's normed input in its Q8_0 form, one column. ids are
-// the chosen experts, weights their routing weights with the per-expert scale
-// already folded in, and out is written.
-type ExpertDevice interface {
-	Run(block int, in *nn.Batch, ids []int32, weights []float32, out []float32) error
+// shared and expert carry the two branches' normed inputs in their Q8_0 form,
+// one column each — different vectors, because the branches read the residual
+// under different norms. ids are the chosen experts, weights their routing
+// weights with the per-expert scale already folded in. The two outputs come
+// back unnormed and unadded: what happens between them and the stream is the
+// block's business and stays here.
+type MixtureDevice interface {
+	Run(block int, shared, expert *nn.Batch, ids []int32, weights []float32, sharedOut, expertOut []float32) error
 }
 
 // A stack of expert matrices, kept as the one three-dimensional tensor the

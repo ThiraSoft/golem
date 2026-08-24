@@ -1,0 +1,72 @@
+#version 450
+
+// The down projection of a shared branch: one matrix, one activation, no
+// combination.
+//
+// It is shaders/moe_down.comp with the mixture taken out. A workgroup takes
+// sixty-four outputs with eight threads to each, which is the same shape for
+// the same reason: a lane walks the blocks of its row eight at a time, so the
+// eight of them read a hundred and twenty-eight contiguous bytes at once.
+
+layout(local_size_x = 512) in;   // sixty-four outputs, eight lanes each
+
+layout(std430, binding = 0) readonly  buffer W  { uint  w[];   };
+layout(std430, binding = 1) readonly  buffer AQ { uint  aq[];  };  // the activation, Q8_0
+layout(std430, binding = 2) readonly  buffer AS { float as_[]; };  // its scales, then its corrections
+layout(std430, binding = 3) writeonly buffer Y  { float y[];   };
+
+layout(push_constant) uniform Push {
+    uint dim;   // outputs
+    uint ffn;   // inputs
+    uint used;  // one, and only here so that all three kernels take the same block
+} p;
+
+const uint LANES = 8u;
+
+shared float partial[512];
+
+// abyte reads one signed byte of the activation.
+int abyte(uint b) { return bitfieldExtract(int(aq[b >> 2]), int((b & 3u) * 8u), 8); }
+
+// lanePart is one lane's share of a Q4_0 row against it.
+float lanePart(uint rowBase, uint lane) {
+    uint nb  = p.ffn >> 5;
+    uint nib = rowBase + 2u * nb;
+
+    precise float sum = 0.0;
+    precise float corr = 0.0;
+    for (uint b = lane; b < nb; b += LANES) {
+        vec2  pair = unpackHalf2x16(w[(rowBase + 2u * b) >> 2]);
+        float ws   = pair[b & 1u];
+
+        int acc = 0;
+        uint at = (nib + 16u * b) >> 2;
+        for (uint u = 0u; u < 4u; u++) {
+            uint word = w[at + u];
+            for (uint m = 0u; m < 4u; m++) {
+                uint j     = u * 4u + m;
+                uint value = (word >> (m * 8u)) & 0xFFu;
+                acc += int(value & 0x0Fu) * abyte(b * 32u + j);
+                acc += int(value >> 4)    * abyte(b * 32u + j + 16u);
+            }
+        }
+        sum  += float(acc) * ws * as_[b];
+        corr += ws * as_[p.used * nb + b];
+    }
+    return sum - corr;
+}
+
+void main() {
+    uint t    = gl_LocalInvocationID.x;
+    uint lane = t & 7u;
+    uint i    = gl_WorkGroupID.x * 64u + (t >> 3);
+
+    uint rowBytes = (p.ffn >> 5) * 18u;
+    partial[t] = (i < p.dim) ? lanePart(i * rowBytes, lane) : 0.0;
+    barrier();
+    for (uint stride = LANES >> 1; stride > 0u; stride >>= 1) {
+        if (lane < stride) partial[t] += partial[t + stride];
+        barrier();
+    }
+    if (lane == 0u && i < p.dim) y[i] = partial[t];
+}

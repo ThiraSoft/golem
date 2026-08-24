@@ -5,18 +5,26 @@
 //
 // Gemma 4 stores gate and up as one matrix of twice the feed-forward width —
 // the gate's rows first, the up's after — so the value at position i needs row
-// i and row i+ffn. A workgroup of sixty-four takes thirty-two positions: the
-// low half computes the gate rows, the high half the up rows, and they meet in
-// shared memory. That pairing is also what makes the quantization possible
-// here rather than in a pass of its own, because a Q8_0 block is exactly those
-// thirty-two values and the workgroup is holding all of them.
+// i and row i+ffn. A workgroup takes thirty-two positions: half its teams
+// compute the gate rows, half the up rows, and they meet in shared memory.
+// That pairing is also what makes the quantization possible here rather than
+// in a pass of its own, because a Q8_0 block is exactly those thirty-two
+// values and the workgroup is holding all of them.
 //
-// One thread computes one whole dot product. That is not the fastest shape —
-// neighbouring threads walk separate rows and coalesce badly — but it needs no
-// reduction at all, and the kernel is bound by what it reads, not by how it
-// adds. The faster shape is a later problem.
+// The same kernel serves the shared branch of a mixture block, which is an
+// ordinary gated feed forward: one expert, chosen by an identifier that is
+// always zero, with the gate matrix and the up matrix concatenated on upload
+// into the one matrix of twice the width this reads.
+//
+// Eight threads to a row, striding the blocks. The first version of this gave
+// a whole row to one thread, which needed no reduction at all and ran at 113
+// gigabytes a second — a fifth of what the same card does on the logit head.
+// Neighbouring threads were walking rows fifteen hundred bytes apart, so every
+// load in a wave touched thirty-two separate lines. Eight lanes stepping
+// through the blocks together read a hundred and twenty-eight contiguous bytes
+// per iteration instead, and pay three barriers for it.
 
-layout(local_size_x = 64) in;
+layout(local_size_x = 512) in;   // sixty-four rows, eight lanes each
 
 layout(std430, binding = 0) readonly  buffer W  { uint  w[];    };  // Q4_0, every expert
 layout(std430, binding = 1) readonly  buffer XQ { uint  xq[];   };  // the input, Q8_0
@@ -29,8 +37,12 @@ layout(std430, binding = 6) writeonly buffer AS { float as_[];  };  // its scale
 layout(push_constant) uniform Push {
     uint dim;   // inputs to the projection
     uint ffn;   // outputs of it, per half
+    uint used;  // how many experts this dispatch is for; one, for a shared branch
 } p;
 
+const uint LANES = 8u;
+
+shared float partial[512];
 shared float half_[64];
 shared int   q32[32];
 
@@ -62,8 +74,8 @@ uint floatToHalf(float f) {
         uint shift = uint(14 - exponent);
         uint value = mantissa >> shift;
         uint rest  = mantissa & ((1u << shift) - 1u);
-        uint half_way = 1u << (shift - 1u);
-        if (rest > half_way || (rest == half_way && (value & 1u) == 1u)) value++;
+        uint mid   = 1u << (shift - 1u);
+        if (rest > mid || (rest == mid && (value & 1u) == 1u)) value++;
         return sign | value;
     }
     uint value = (uint(exponent) << 10) | (mantissa >> 13);
@@ -84,26 +96,21 @@ int nearestInt(float f) {
     return (floatBitsToInt(f + 12582912.0) & 0x007fffff) - 0x00400000;
 }
 
-// dotRow is one Q4_0 row against the input.
+// lanePart is one lane's share of a Q4_0 row against the input: the blocks
+// congruent to it, modulo the width of a team.
 //
 // The weights are not in the file's layout. A Q4_0 block is eighteen bytes —
 // an fp16 scale then sixteen bytes of nibbles — and eighteen is not a multiple
 // of four, so every other block of a row would start off alignment. The upload
 // splits the row instead: all of its scales first, then all of its nibbles.
 // Same bytes, same count, and every load lands where a uint array can reach it.
-float dotRow(uint rowBase) {
+void lanePart(uint rowBase, uint lane, out float sum, out float corr) {
     uint nb  = p.dim >> 5;
     uint nib = rowBase + 2u * nb;
 
-    // precise, because the reference multiplies and then adds. Left alone the
-    // compiler contracts both of these into fused multiply-adds, which round
-    // once where the CPU rounds twice — and the gap that opens is not the
-    // 1e-7 of the accumulation itself. It lands on the Q8_0 quantization
-    // downstream, where a value a hair from an integer boundary goes to the
-    // other side of it, and comes out as a part in ten thousand on the block.
-    precise float sum = 0.0;
-    precise float corr = 0.0;
-    for (uint b = 0u; b < nb; b++) {
+    precise float s = 0.0;
+    precise float c = 0.0;
+    for (uint b = lane; b < nb; b += LANES) {
         vec2  pair = unpackHalf2x16(w[(rowBase + 2u * b) >> 2]);
         float ws   = pair[b & 1u];
 
@@ -121,25 +128,37 @@ float dotRow(uint rowBase) {
         // The weights are stored shifted by eight, and the correction the
         // input carries is 8 x scale x sum(q) — the same for every row it
         // meets, which is why it is not in this loop's arithmetic.
-        sum  += float(acc) * ws * xs[b];
-        corr += ws * xs[nb + b];
+        s += float(acc) * ws * xs[b];
+        c += ws * xs[nb + b];
     }
-    return sum - corr;
+    sum = s;
+    corr = c;
 }
 
 void main() {
     uint blocks = p.ffn >> 5;              // Q8_0 blocks of output, per expert
     uint e      = gl_WorkGroupID.x / blocks;
     uint blk    = gl_WorkGroupID.x % blocks;
-    uint t      = gl_LocalInvocationID.x;
-    uint j      = t & 31u;
+
+    uint t    = gl_LocalInvocationID.x;
+    uint r    = t / LANES;                 // which of the sixty-four rows
+    uint lane = t % LANES;
+    uint j    = r & 31u;
 
     uint nb       = p.dim >> 5;
     uint rowBytes = nb * 18u;
     uint expert   = uint(ids[e]) * 2u * p.ffn * rowBytes;
-    uint row      = (t < 32u) ? (blk * 32u + j) : (p.ffn + blk * 32u + j);
+    uint row      = (r < 32u) ? (blk * 32u + j) : (p.ffn + blk * 32u + j);
 
-    half_[t] = dotRow(expert + row * rowBytes);
+    float sum, corr;
+    lanePart(expert + row * rowBytes, lane, sum, corr);
+    partial[t] = sum - corr;
+    barrier();
+    for (uint stride = LANES >> 1; stride > 0u; stride >>= 1) {
+        if (lane < stride) partial[t] += partial[t + stride];
+        barrier();
+    }
+    if (lane == 0u) half_[r] = partial[t];
     barrier();
 
     if (t < 32u) {
@@ -167,9 +186,10 @@ void main() {
             scale = halfToFloat(floatToHalf(peak / 127.0));
             float inverse = 127.0 / peak;
             for (uint i = 0u; i < 32u; i++) {
-                // Same reason, and this is the one that mattered: the magic
-                // constant of nearestInt only rounds correctly when the
-                // product it is added to has already been rounded to float32.
+                // precise, because the magic constant of nearestInt only
+                // rounds correctly when the product it is added to has already
+                // been rounded to float32. Left alone the compiler contracts
+                // the two into a fused multiply-add.
                 precise float scaled = half_[i] * inverse;
                 int n = clamp(nearestInt(scaled), -128, 127);
                 q32[i] = n;
@@ -189,6 +209,6 @@ void main() {
         }
         uint slot = e * blocks + blk;
         as_[slot] = scale;
-        as_[8u * blocks + slot] = 8.0 * scale * float(total);
+        as_[p.used * blocks + slot] = 8.0 * scale * float(total);
     }
 }

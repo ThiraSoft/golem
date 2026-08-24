@@ -190,18 +190,17 @@ Worth knowing before you clone it:
   Neither shortens with CPU work, because the bytes are the cost — the kernels
   already run at 37 GB/s on a bus whose ceiling is about 43.
 
-  `-vulkan` moves both. On the 26B A4B, 13.4 tokens a second becomes 20.3, and
-  the answer written at temperature zero is the same token for token. The head
-  alone is worth 15.5 and the experts alone 16.0; together they are worth more
-  than either, because they also stop competing for the same bus. It costs
-  every expert being resident — 11.96 gibibytes, which is why a card with
+  `-vulkan` moves both, and the shared branch of every mixture block beside
+  them. On the 26B A4B, 13.4 tokens a second becomes 24.6, and the answer
+  written at temperature zero is the same token for token. It costs every one
+  of those matrices being resident — 12.3 gibibytes, which is why a card with
   sixteen is the smallest that can do this — and about nine seconds of upload.
 
-  The attention, the norms and the cache stay on the CPU. That is not a
-  half-finished migration but the affordable line: the activation crossing to
-  the card is eleven kilobytes, and one submission costs sixty-three
-  microseconds whatever is in it. Moving the attention would mean the key-value
-  cache on the card too, and everything after it.
+  The attention, the norms and the cache stay on the CPU for now. What that
+  costs is measurable and is no longer the kernels: a block's feed-forward half
+  takes 306 microseconds submitted on its own and 117 when the card is not
+  allowed to rest between blocks. The card spends most of a token at low clocks
+  waiting for the CPU to hand it the next one.
 
   There is no cgo: `vk/` opens `libvulkan.so.1` through `purego`, and
   `CGO_ENABLED=0 go build ./...` still passes. A machine with no Vulkan loader

@@ -39,7 +39,7 @@ type Model struct {
 	// The logit head on a Vulkan device, when UseVulkanHead put it there.
 	// gemma/vulkan.go says what that buys and what it leaves alone.
 	head    *vk.Q6KHead
-	experts *vk.Experts
+	experts *vk.Mixture
 	headDev *vk.Device
 }
 

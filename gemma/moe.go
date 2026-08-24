@@ -17,7 +17,6 @@ package gemma
 // gives a model that answers fluently and wrongly, which nothing announces.
 
 import (
-	"fmt"
 	"math"
 
 	"github.com/ThiraSoft/golem/nn"
@@ -124,24 +123,6 @@ func ExpertFFN(cfg *Config, bw *BlockWeights, s *Scratch, in *nn.Batch, out [][]
 			one.QuantizeColumnRange(0, 0, cfg.Dim)
 		}
 	})
-
-	// A device holding the stacks takes the branch from here, for a single
-	// position. A batch keeps the CPU path: the kernel scores one column, and
-	// a prompt already reads each expert once for all of the positions that
-	// chose it, which is the thing the device was buying.
-	if bw.Experts != nil && batch == 1 {
-		var cw [8]float32
-		for k := 0; k < cfg.ExpertsUsed; k++ {
-			cw[k] = s.expWeights[0][k] * bw.DownScale[s.expIDs[0][k]]
-		}
-		err := bw.Experts.Run(bw.ExpertIndex, s.ExpertIn(0), s.expIDs[0], cw[:cfg.ExpertsUsed], out[0])
-		if err != nil {
-			// The stacks are on the device and there is nothing to fall back
-			// to that would still be the same model.
-			panic(fmt.Sprintf("gemma: the expert device failed: %v", err))
-		}
-		return
-	}
 
 	// One unit of work is one expert of one position, and there are eight of
 	// them per position rather than one. That is the whole of why this is

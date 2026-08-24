@@ -70,7 +70,7 @@ func (m *Model) UseVulkanExperts() error {
 	if err != nil {
 		return err
 	}
-	e, err := vk.NewExperts(d, cfg.Dim, cfg.ExpertFFN, cfg.Experts, cfg.ExpertsUsed)
+	e, err := vk.NewMixture(d, cfg.Dim, cfg.ExpertFFN, cfg.Blocks[0].FFN, cfg.Experts, cfg.ExpertsUsed)
 	if err != nil {
 		return err
 	}
@@ -79,15 +79,21 @@ func (m *Model) UseVulkanExperts() error {
 			continue
 		}
 		bw := &m.W.Blocks[i]
-		if bw.GateUpExps.Quant != nn.Q4_0 || bw.DownExps.Quant != nn.Q4_0 {
-			e.Close()
-			return fmt.Errorf("gemma: the expert kernels read Q4_0, block %d is %s", i, bw.GateUpExps.Quant)
+		for _, q := range []nn.Quant{bw.GateUpExps.Quant, bw.DownExps.Quant, bw.Gate.Quant, bw.Up.Quant, bw.Down.Quant} {
+			if q != nn.Q4_0 {
+				e.Close()
+				return fmt.Errorf("gemma: the feed-forward kernels read Q4_0, block %d has a %s", i, q)
+			}
 		}
-		if err := e.AddBlock(bw.GateUpExps.Data, bw.DownExps.Data); err != nil {
+		if cfg.Blocks[i].FFN != cfg.Blocks[0].FFN {
+			e.Close()
+			return fmt.Errorf("gemma: block %d has a shared branch of %d where block 0 has %d", i, cfg.Blocks[i].FFN, cfg.Blocks[0].FFN)
+		}
+		if err := e.AddBlock(bw.GateUpExps.Data, bw.DownExps.Data, bw.Gate.Data, bw.Up.Data, bw.Down.Data); err != nil {
 			e.Close()
 			return err
 		}
-		bw.Experts, bw.ExpertIndex = e, e.Blocks()-1
+		bw.Mixture, bw.MixtureIndex = e, e.Blocks()-1
 	}
 	m.experts = e
 	return nil
@@ -121,7 +127,7 @@ func (m *Model) closeVulkanHead() {
 		m.experts.Close()
 		m.experts = nil
 		for i := range m.W.Blocks {
-			m.W.Blocks[i].Experts = nil
+			m.W.Blocks[i].Mixture = nil
 		}
 	}
 	if m.head != nil {
