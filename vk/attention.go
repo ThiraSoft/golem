@@ -44,6 +44,9 @@ type BlockShape struct {
 	// Capacity is the ring this block's cache holds: its window, or the whole
 	// context on a block that sees everything.
 	Capacity int
+	// Rotation says which of the model's rotation geometries this block uses.
+	// Gemma 4 has two, and a block is asked once rather than branched on.
+	Rotation int
 	// ValueIsKey says the value is the key before the key was rotated, and
 	// OwnsKV that the block computes keys at all. A block that does not reads
 	// KVSource's cache, and is given the same buffers rather than a copy.
@@ -68,7 +71,7 @@ type Attention struct {
 	// One position's traffic. Only the two ends of it cross the bus: the
 	// normed stream in, and the output projection's answer back.
 	xq, xs, out *Buffer
-	rcos, rsin  *Buffer
+	rcos, rsin  []*Buffer // one pair per rotation geometry
 	q, k, v, qh *Buffer
 	scoreRows   *Buffer
 	aq, as      *Buffer
@@ -118,7 +121,7 @@ type scorePush struct {
 
 // NewAttention builds the kernels and the shared buffers, which are sized for
 // the widest block and the deepest context.
-func NewAttention(d *Device, dim, maxHeads, maxKV, maxContext int) (*Attention, error) {
+func NewAttention(d *Device, dim, maxHeads, maxKV, maxContext, rotations int) (*Attention, error) {
 	for _, n := range []int{dim, maxHeads, maxKV} {
 		if n%nn.QuantBlock != 0 {
 			return nil, fmt.Errorf("vk: attention shapes must be multiples of %d, given %d", nn.QuantBlock, n)
@@ -151,8 +154,6 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxContext int) (*Attention, 
 		{&a.xq, dim, false},                         // the normed stream, Q8_0
 		{&a.xs, 2 * dim / nn.QuantBlock * 4, false}, //
 		{&a.out, dim * 4, false},                    // what the output projection makes
-		{&a.rcos, maxHeads * 4, false},              // the rotation, one position's worth
-		{&a.rsin, maxHeads * 4, false},              //
 		{&a.q, maxHeads * 4, true},                  // the three projections, which never leave
 		{&a.k, maxKV * 4, true},                     //
 		{&a.v, maxKV * 4, true},                     //
@@ -173,8 +174,42 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxContext int) (*Attention, 
 		}
 		*spec.into = b
 	}
+	// One pair of tables per geometry, written once a token rather than once a
+	// block: the angles depend on the position and the geometry and on nothing
+	// else, which is what nn/rope.go tabulates them for.
+	for i := 0; i < rotations; i++ {
+		cos, err := d.Host(maxHeads*4, bufferUsageStorage)
+		if err != nil {
+			a.Close()
+			return nil, err
+		}
+		sin, err := d.Host(maxHeads*4, bufferUsageStorage)
+		if err != nil {
+			a.Close()
+			return nil, err
+		}
+		a.rcos = append(a.rcos, cos)
+		a.rsin = append(a.rsin, sin)
+	}
 	return a, nil
 }
+
+// SetRotation writes one geometry's angles for the position about to be read.
+func (a *Attention) SetRotation(i int, cos, sin []float32) error {
+	if i < 0 || i >= len(a.rcos) {
+		return fmt.Errorf("vk: rotation %d of %d", i, len(a.rcos))
+	}
+	copy(a.rcos[i].Floats(), cos)
+	copy(a.rsin[i].Floats(), sin)
+	return nil
+}
+
+// Input is the buffer pair a block's attention reads its normed stream from,
+// so that a kernel upstream can write it instead of the caller.
+func (a *Attention) Input() (*Buffer, *Buffer) { return a.xq, a.xs }
+
+// Output is where the output projection leaves its answer.
+func (a *Attention) Output() *Buffer { return a.out }
 
 // Blocks is how many have been added.
 func (a *Attention) Blocks() int { return len(a.blocks) }
@@ -271,8 +306,11 @@ func (a *Attention) AddBlock(shape BlockShape, q, k, v, o []byte, qnorm, knorm [
 		}
 	}
 
+	if shape.Rotation < 0 || shape.Rotation >= len(a.rcos) {
+		return fail(fmt.Errorf("vk: block %d names rotation %d of %d", len(a.blocks), shape.Rotation, len(a.rcos)))
+	}
 	if b.setPrepare, err = a.prepare.NewSet([]*Buffer{
-		a.q, a.k, a.v, b.qnorm, b.knorm, a.rcos, a.rsin, a.qh, ck, cv,
+		a.q, a.k, a.v, b.qnorm, b.knorm, a.rcos[shape.Rotation], a.rsin[shape.Rotation], a.qh, ck, cv,
 	}); err != nil {
 		return fail(err)
 	}
@@ -325,10 +363,25 @@ func (a *Attention) Attend(block int, in *nn.Batch, cos, sin []float32, pos, fir
 	scales := a.xs.Floats()
 	copy(scales[:blocks], in.Scales[:blocks])
 	copy(scales[blocks:2*blocks], in.Corr[:blocks])
-	copy(a.rcos.Floats(), cos)
-	copy(a.rsin.Floats(), sin)
+	if err := a.SetRotation(s.Rotation, cos, sin); err != nil {
+		return err
+	}
 
+	if err := a.d.Submit(func(r *Recorder) { a.Record(r, block, pos, first, last) }); err != nil {
+		return err
+	}
+	copy(out, a.out.Floats()[:a.dim])
+	return nil
+}
+
+// Record puts one block's attention into a recording without submitting it,
+// which is what running a whole token in one submission needs. The input must
+// already be in the buffers Input names.
+func (a *Attention) Record(r *Recorder, block, pos, first, last int) {
+	b := a.blocks[block]
+	s := b.shape
 	heads, kv := s.Heads*s.HeadDim, s.KVHeads*s.HeadDim
+
 	project := moePush{dim: uint32(heads), ffn: uint32(a.dim), used: 1}
 	kvProject := moePush{dim: uint32(kv), ffn: uint32(a.dim), used: 1}
 	outProject := moePush{dim: uint32(a.dim), ffn: uint32(heads), used: 1}
@@ -348,26 +401,19 @@ func (a *Attention) Attend(block int, in *nn.Batch, cos, sin []float32, pos, fir
 		units += uint32(s.KVHeads)
 	}
 
-	err := a.d.Submit(func(r *Recorder) {
-		r.Dispatch(b.setQ, groups(heads), unsafe.Pointer(&project))
-		if b.setK != nil {
-			r.Dispatch(b.setK, groups(kv), unsafe.Pointer(&kvProject))
-		}
-		if b.setV != nil {
-			r.Dispatch(b.setV, groups(kv), unsafe.Pointer(&kvProject))
-		}
-		r.Barrier()
-		r.Dispatch(b.setPrepare, units, unsafe.Pointer(&prepare))
-		r.Barrier()
-		r.Dispatch(b.setScores, uint32(s.Heads), unsafe.Pointer(&score))
-		r.Barrier()
-		r.Dispatch(b.setO, groups(a.dim), unsafe.Pointer(&outProject))
-	})
-	if err != nil {
-		return err
+	r.Dispatch(b.setQ, groups(heads), unsafe.Pointer(&project))
+	if b.setK != nil {
+		r.Dispatch(b.setK, groups(kv), unsafe.Pointer(&kvProject))
 	}
-	copy(out, a.out.Floats()[:a.dim])
-	return nil
+	if b.setV != nil {
+		r.Dispatch(b.setV, groups(kv), unsafe.Pointer(&kvProject))
+	}
+	r.Barrier()
+	r.Dispatch(b.setPrepare, units, unsafe.Pointer(&prepare))
+	r.Barrier()
+	r.Dispatch(b.setScores, uint32(s.Heads), unsafe.Pointer(&score))
+	r.Barrier()
+	r.Dispatch(b.setO, groups(a.dim), unsafe.Pointer(&outProject))
 }
 
 // ringMask is nn's rule, and gemma/cache.go's: the capacity less one when that
@@ -394,10 +440,10 @@ func (a *Attention) Close() {
 		b.close()
 	}
 	a.blocks = nil
-	for _, b := range []**Buffer{
+	for _, b := range append(append([]**Buffer{}, pointers(a.rcos)...), append(pointers(a.rsin), []**Buffer{
 		&a.as, &a.aq, &a.scoreRows, &a.qh, &a.v, &a.k, &a.q,
-		&a.rsin, &a.rcos, &a.out, &a.xs, &a.xq,
-	} {
+		&a.out, &a.xs, &a.xq,
+	}...)...) {
 		if *b != nil {
 			(*b).Close()
 			*b = nil
@@ -409,6 +455,15 @@ func (a *Attention) Close() {
 			*p = nil
 		}
 	}
+}
+
+// pointers is the addresses of a slice's elements, for the close loop.
+func pointers(bs []*Buffer) []**Buffer {
+	out := make([]**Buffer, len(bs))
+	for i := range bs {
+		out[i] = &bs[i]
+	}
+	return out
 }
 
 func (b *attentionBlock) close() {

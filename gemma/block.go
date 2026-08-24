@@ -13,11 +13,7 @@ package gemma
 // same for the feed forward; and post_norm, which sounds like the block's last
 // word, is the norm on the per-layer branch alone.
 
-import (
-	"fmt"
-
-	"github.com/ThiraSoft/golem/nn"
-)
+import "github.com/ThiraSoft/golem/nn"
 
 func Block(
 	cfg *Config, bc BlockConfig, bw *BlockWeights,
@@ -102,49 +98,6 @@ func Block(
 	}
 }
 
-// moeHalfDevice is moeHalf for one position with the matrices on a device.
-//
-// What crosses is two normed vectors in and two unnormed ones back, eleven
-// kilobytes each way, in one submission. Everything either side of that — the
-// second branch's norm, the routing, and the three post-norms that make a
-// mixture block a mixture block — stays here, because none of it reads a
-// matrix and all of it is arithmetic on one vector.
-func moeHalfDevice(cfg *Config, bw *BlockWeights, s *Scratch, xs [][]float32, normed *nn.Batch) {
-	// The expert branch leaves the same residual under its own norm.
-	expIn := s.ExpertBranch(1)
-	copy(expIn.F[0], s.resid[0])
-	nn.RMSNormPlain(expIn.F[0], bw.PreFFWNorm2, cfg.Eps)
-	expIn.QuantizeColumnRange(0, 0, cfg.Dim)
-
-	Route(cfg, bw, s, s.resid[:1], s.expIDs[:1], s.expWeights[:1])
-	var cw [8]float32
-	for k := 0; k < cfg.ExpertsUsed; k++ {
-		// The per-expert scale multiplies the whole of that expert's output,
-		// and so does the routing weight; one multiplication does both.
-		cw[k] = s.expWeights[0][k] * bw.DownScale[s.expIDs[0][k]]
-	}
-
-	shared, experts := s.moeShared[0], s.moeExperts[0]
-	err := bw.Mixture.Run(bw.MixtureIndex, normed, expIn,
-		s.expIDs[0], cw[:cfg.ExpertsUsed], shared, experts)
-	if err != nil {
-		// The matrices are on the device and there is nothing to fall back to
-		// that would still be the same model.
-		panic(fmt.Sprintf("gemma: the mixture device failed: %v", err))
-	}
-
-	combined := s.ffn[0]
-	nn.RMSNormPlain(shared, bw.PostFFWNorm1, cfg.Eps)
-	nn.RMSNormPlain(experts, bw.PostFFWNorm2, cfg.Eps)
-	for i := range combined {
-		combined[i] = shared[i] + experts[i]
-	}
-	nn.RMSNormPlain(combined, bw.PostFFWNorm, cfg.Eps)
-	for i := range xs[0] {
-		xs[0][i] = s.resid[0][i] + combined[i]
-	}
-}
-
 // perPosition is what a pass over one position costs, in the units InParallel
 // counts: a norm, a residual add and a quantization come to a few dozen
 // operations for every element of the stream.
@@ -206,15 +159,6 @@ func denseHalf(cfg *Config, bc BlockConfig, bw *BlockWeights, s *Scratch, xs [][
 // reads, under the same norm, which is why the shared expert needs no code of
 // its own: it is the ordinary feed forward, and only its post-norm differs.
 func moeHalf(cfg *Config, bc BlockConfig, bw *BlockWeights, s *Scratch, xs [][]float32, normed *nn.Batch, batch int) {
-	// A device holding the block's matrices takes both branches at once, for a
-	// single position. A batch keeps the CPU path: the kernels score one
-	// column, and a prompt already reads each matrix once for every position
-	// that meets it, which is the thing the device was buying.
-	if bw.Mixture != nil && batch == 1 {
-		moeHalfDevice(cfg, bw, s, xs, normed)
-		return
-	}
-
 	gate := s.Batch(bc.FFN, batch)
 	up := s.up[:batch]
 	blocks := bc.FFN / nn.QuantBlock

@@ -16,6 +16,7 @@ package gemma
 
 import (
 	"fmt"
+	"unsafe"
 
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/vk"
@@ -47,101 +48,103 @@ func (m *Model) UseVulkanHead() error {
 	return nil
 }
 
-// UseVulkanExperts uploads every mixture block's expert stacks to a Vulkan
-// device and makes the expert branch run there.
+// UseVulkanStack puts every block of the model on a Vulkan device: the
+// attention with its cache, both branches of the feed forward, the norms
+// between them and the routing. A token then crosses the bus twice — the
+// embedding in and the last hidden state out — instead of sixty times.
 //
-// This is the large one. The stacks are 11.96 gibibytes on the 26B A4B, all of
-// them resident, which is why a card with sixteen is the smallest that can
-// take them — and why it fails rather than falls back when they do not fit.
-// What it buys is the other end of the same fact: the experts are 0.8 of the
-// 1.7 gigabytes a token reads, and on the CPU that is all bandwidth.
+// It is the last of four moves and the one the other three were for. A
+// submission costs sixty-three microseconds whatever is in it, and a card
+// handed a hundred microseconds of work and then left alone runs at half its
+// clocks. vk/stack.go has the measurements.
 //
-// A model with no mixture blocks is not an error; it simply has nothing to
-// upload, and VulkanExperts then answers false.
-func (m *Model) UseVulkanExperts() error {
-	if m.experts != nil {
+// It fails rather than falling back: a model half on a card the caller
+// believed it was wholly on is a model whose speed nobody can explain.
+func (m *Model) UseVulkanStack() error {
+	if m.stack != nil {
 		return nil
 	}
 	cfg := m.Cfg
 	if cfg.Experts == 0 {
-		return nil
+		return fmt.Errorf("gemma: the Vulkan stack is written for a mixture, and this checkpoint has none")
+	}
+	if len(m.caches) > 1 {
+		return fmt.Errorf("gemma: the device holds one cache, and this model was opened with %d slots", len(m.caches))
 	}
 	d, err := m.device()
 	if err != nil {
 		return err
 	}
-	e, err := vk.NewMixture(d, cfg.Dim, cfg.ExpertFFN, cfg.Blocks[0].FFN, cfg.Experts, cfg.ExpertsUsed)
-	if err != nil {
-		return err
-	}
-	for i := range cfg.Blocks {
-		if !cfg.Blocks[i].MoE {
+
+	// One rotation geometry per base. A block is asked which it uses rather
+	// than branched on, the way nn/rope.go keys its tables.
+	m.rotations = nil
+	index := map[float64]int{}
+	for i, bc := range cfg.Blocks {
+		if _, ok := index[bc.RoPEBase]; ok {
 			continue
 		}
-		bw := &m.W.Blocks[i]
-		for _, q := range []nn.Quant{bw.GateUpExps.Quant, bw.DownExps.Quant, bw.Gate.Quant, bw.Up.Quant, bw.Down.Quant} {
-			if q != nn.Q4_0 {
-				e.Close()
-				return fmt.Errorf("gemma: the feed-forward kernels read Q4_0, block %d has a %s", i, q)
-			}
+		freqs := m.W.RoPEFreqs
+		if bc.Window {
+			freqs = nil // the frequency factors belong to the global blocks
 		}
-		if cfg.Blocks[i].FFN != cfg.Blocks[0].FFN {
-			e.Close()
-			return fmt.Errorf("gemma: block %d has a shared branch of %d where block 0 has %d", i, cfg.Blocks[i].FFN, cfg.Blocks[0].FFN)
-		}
-		if err := e.AddBlock(bw.GateUpExps.Data, bw.DownExps.Data, bw.Gate.Data, bw.Up.Data, bw.Down.Data); err != nil {
-			e.Close()
-			return err
-		}
-		bw.Mixture, bw.MixtureIndex = e, e.Blocks()-1
+		index[bc.RoPEBase] = len(m.rotations)
+		m.rotations = append(m.rotations, rotation{base: bc.RoPEBase, dims: cfg.Blocks[i].RoPEDims, freqs: freqs})
 	}
-	m.experts = e
-	return nil
-}
 
-// UseVulkanAttention uploads every block's four attention matrices and makes
-// the four products run there.
-//
-// Only the products move. The norms, the rotation, the cache and the scores
-// stay here, which is where every particular of this model's attention lives
-// and where almost none of its bytes are: a block's matrices are nineteen
-// megabytes and its scores are a few kilobytes.
-func (m *Model) UseVulkanAttention() error {
-	if m.attn != nil {
-		return nil
-	}
-	cfg := m.Cfg
-	// Two geometries alternate through this model and their heads are not the
-	// same size, so the shared buffers are cut for the widest.
 	var maxHeads, maxKV int
 	for _, bc := range cfg.Blocks {
 		maxHeads = max(maxHeads, bc.Heads*bc.HeadDim)
 		maxKV = max(maxKV, bc.KVHeads*bc.HeadDim)
 	}
-	d, err := m.device()
+	attn, err := vk.NewAttention(d, cfg.Dim, maxHeads, maxKV, cfg.MaxContext, len(m.rotations))
 	if err != nil {
 		return err
 	}
-	a, err := vk.NewAttention(d, cfg.Dim, maxHeads, maxKV, cfg.MaxContext)
+	mix, err := vk.NewMixture(d, cfg.Dim, cfg.ExpertFFN, cfg.Blocks[0].FFN, cfg.Experts, cfg.ExpertsUsed)
 	if err != nil {
+		attn.Close()
 		return err
 	}
+	stack, err := vk.NewStack(d, cfg.Dim, cfg.Eps, attn, mix)
+	if err != nil {
+		attn.Close()
+		mix.Close()
+		return err
+	}
+
+	// The router's logits are bound into every block's sets, so their buffer
+	// has to exist before the first block is added.
+	if err := stack.Experts(cfg.Experts); err != nil {
+		stack.Close()
+		return err
+	}
+
 	for i := range cfg.Blocks {
 		bc, bw := cfg.Blocks[i], &m.W.Blocks[i]
-		// A block answers for itself which matrices it has: fifteen at the end
-		// of this model have neither keys nor values, and some take the value
-		// from the key rather than from a matrix.
+		for _, q := range []nn.Quant{
+			bw.Q.Quant, bw.O.Quant, bw.Gate.Quant, bw.Up.Quant, bw.Down.Quant,
+			bw.GateUpExps.Quant, bw.DownExps.Quant,
+		} {
+			if q != nn.Q4_0 {
+				stack.Close()
+				return fmt.Errorf("gemma: the kernels read Q4_0, block %d has a %s", i, q)
+			}
+		}
+		if bw.Router.Quant != nn.F32 {
+			stack.Close()
+			return fmt.Errorf("gemma: the router kernel reads float32, block %d has a %s", i, bw.Router.Quant)
+		}
+		if !bc.MoE {
+			stack.Close()
+			return fmt.Errorf("gemma: block %d is dense, and the stack is written for a mixture", i)
+		}
+
 		var k, v []byte
 		if bc.OwnsKV {
 			k = bw.K.Data
 			if !bc.ValueIsKey {
 				v = bw.V.Data
-			}
-		}
-		for _, q := range []nn.Quant{bw.Q.Quant, bw.O.Quant} {
-			if q != nn.Q4_0 {
-				a.Close()
-				return fmt.Errorf("gemma: the attention kernel reads Q4_0, block %d has a %s", i, q)
 			}
 		}
 		capacity := cfg.MaxContext
@@ -150,34 +153,52 @@ func (m *Model) UseVulkanAttention() error {
 		}
 		shape := vk.BlockShape{
 			Heads: bc.Heads, KVHeads: bc.KVHeads, HeadDim: bc.HeadDim,
-			RoPEDims: bc.RoPEDims, Capacity: capacity,
+			RoPEDims: bc.RoPEDims, Capacity: capacity, Rotation: index[bc.RoPEBase],
 			ValueIsKey: bc.ValueIsKey, OwnsKV: bc.OwnsKV, KVSource: bc.KVSource,
 			Eps: cfg.Eps,
 		}
-		if err := a.AddBlock(shape, bw.Q.Data, k, v, bw.O.Data, bw.QNorm, bw.KNorm); err != nil {
-			a.Close()
+		if err := attn.AddBlock(shape, bw.Q.Data, k, v, bw.O.Data, bw.QNorm, bw.KNorm); err != nil {
+			stack.Close()
 			return err
 		}
-		bw.Attn, bw.AttnIndex = a, a.Blocks()-1
+		if err := mix.AddBlock(bw.GateUpExps.Data, bw.DownExps.Data, bw.Gate.Data, bw.Up.Data, bw.Down.Data); err != nil {
+			stack.Close()
+			return err
+		}
+		if err := stack.AddBlock(vk.BlockNorms{
+			Attn: bw.AttnNorm, PostAttn: bw.PostAttnNorm, FFN: bw.FFNNorm,
+			PreFFW2: bw.PreFFWNorm2, PostFFW1: bw.PostFFWNorm1, PostFFW2: bw.PostFFWNorm2,
+			PostFFW: bw.PostFFWNorm, RouterScale: bw.RouterScale, DownScale: bw.DownScale,
+			Router: routerRows(bw.Router), OutScale: bw.OutScale,
+		}); err != nil {
+			stack.Close()
+			return err
+		}
 	}
-	m.attn = a
+	if err := stack.Ready(); err != nil {
+		stack.Close()
+		return err
+	}
+	m.stack = stack
 	return nil
 }
 
-// VulkanCacheBytes is what the keys and values take on the card, which is the
-// part of this that grows with the context rather than with the model.
-func (m *Model) VulkanCacheBytes() int {
-	if m.attn == nil {
-		return 0
-	}
-	return m.attn.Bytes()
+// routerRows reads a float32 matrix out of the mapping, which is where the
+// router alone among this model's matrices is kept.
+func routerRows(m nn.Matrix) []float32 {
+	return unsafe.Slice((*float32)(unsafe.Pointer(&m.Data[0])), m.Rows*m.Cols)
 }
 
-// VulkanAttention says whether the attention matrices are on a device.
-func (m *Model) VulkanAttention() bool { return m.attn != nil }
+// VulkanStack says whether the blocks are on a device.
+func (m *Model) VulkanStack() bool { return m.stack != nil }
 
-// VulkanExperts says whether the expert stacks are on a device.
-func (m *Model) VulkanExperts() bool { return m.experts != nil }
+// A rotation is one geometry of the model's rotation, tabulated once a token
+// rather than once a block.
+type rotation struct {
+	base  float64
+	dims  int
+	freqs []float32
+}
 
 // device opens the Vulkan device the model shares between its parts, or
 // returns the one it already has. The head and the experts sit on the same
@@ -200,19 +221,9 @@ func (m *Model) VulkanHead() bool { return m.head != nil }
 // closeVulkanHead releases the device. Close calls it; a caller that wants the
 // memory back sooner has no reason to.
 func (m *Model) closeVulkanHead() {
-	if m.attn != nil {
-		m.attn.Close()
-		m.attn = nil
-		for i := range m.W.Blocks {
-			m.W.Blocks[i].Attn = nil
-		}
-	}
-	if m.experts != nil {
-		m.experts.Close()
-		m.experts = nil
-		for i := range m.W.Blocks {
-			m.W.Blocks[i].Mixture = nil
-		}
+	if m.stack != nil {
+		m.stack.Close()
+		m.stack = nil
 	}
 	if m.head != nil {
 		m.head.Close()

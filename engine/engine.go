@@ -92,10 +92,8 @@ func (m *Model) Close() error { return m.closer.Close() }
 type vulkanHead interface {
 	UseVulkanHead() error
 	VulkanHead() bool
-	UseVulkanExperts() error
-	VulkanExperts() bool
-	UseVulkanAttention() error
-	VulkanAttention() bool
+	UseVulkanStack() error
+	VulkanStack() bool
 }
 
 // UseVulkan moves to a Vulkan device everything of this engine that can go:
@@ -110,22 +108,19 @@ func (m *Model) UseVulkan() error {
 	if !ok {
 		return fmt.Errorf("engine: %s has nothing that can move to a device", m.Name)
 	}
-	if err := h.UseVulkanExperts(); err != nil {
-		return err
-	}
-	if err := h.UseVulkanAttention(); err != nil {
+	if err := h.UseVulkanStack(); err != nil {
 		return err
 	}
 	return h.UseVulkanHead()
 }
 
 // Vulkan says what is on a device, for the line printed at startup.
-func (m *Model) Vulkan() (head, experts, attention bool) {
+func (m *Model) Vulkan() (head, blocks bool) {
 	h, ok := m.Forward.(vulkanHead)
 	if !ok {
-		return false, false, false
+		return false, false
 	}
-	return h.VulkanHead(), h.VulkanExperts(), h.VulkanAttention()
+	return h.VulkanHead(), h.VulkanStack()
 }
 
 // Open reads the architecture and hands the file to the engine that implements

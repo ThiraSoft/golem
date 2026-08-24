@@ -1,0 +1,41 @@
+#version 450
+
+// One expert's routing logit to a workgroup.
+//
+// The router matrix is float32 — the only one in this model that is — and a
+// hundred and twenty-eight rows of it is 1.4 megabytes a block, 43 a token.
+// The first version of this read all of that in a single workgroup, on one
+// compute unit of sixty-four, and it cost more than the submissions the whole
+// design was written to save. A row to a workgroup instead.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer X { float x[];      };  // the router's normed input
+layout(std430, binding = 1) readonly  buffer W { float w[];      };  // experts by dim, float32
+layout(std430, binding = 2) writeonly buffer L { float logits[]; };
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint experts;
+    uint used;
+    float eps;
+    float scalar;
+} p;
+
+shared float partial[256];
+
+void main() {
+    uint e = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint at = e * p.n;
+
+    precise float sum = 0.0;
+    for (uint i = t; i < p.n; i += 256u) sum += w[at + i] * x[i];
+    partial[t] = sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (t < stride) partial[t] += partial[t + stride];
+        barrier();
+    }
+    if (t == 0u) logits[e] = partial[0];
+}

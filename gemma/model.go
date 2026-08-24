@@ -38,10 +38,11 @@ type Model struct {
 
 	// The logit head on a Vulkan device, when UseVulkanHead put it there.
 	// gemma/vulkan.go says what that buys and what it leaves alone.
-	head    *vk.Q6KHead
-	experts *vk.Mixture
-	attn    *vk.Attention
-	headDev *vk.Device
+	head      *vk.Q6KHead
+	stack     *vk.Stack
+	rotations []rotation
+	ropeTable []nn.RoPETable
+	headDev   *vk.Device
 }
 
 // Open maps a GGUF file and binds it. maxContext caps the cache; the file
@@ -165,7 +166,7 @@ func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32,
 	// prompt pays per token what a token pays. What it loses is the one thing
 	// a batch was for — reading each matrix once for all of the positions that
 	// meet it — so a prompt is slower this way, and measurably.
-	if m.attn != nil && len(tokens) > 1 {
+	if m.stack != nil && len(tokens) > 1 {
 		out := make([][]float32, len(tokens))
 		for i := range tokens {
 			var one [][]float32
@@ -211,6 +212,13 @@ func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32,
 	for t := range tokens {
 		copy(xs[t], embedded.F[t])
 	}
+	if m.stack != nil {
+		m.runStack(xs[0], at[0])
+		copy(m.hidden[0], xs[0])
+		nn.RMSNormPlain(m.hidden[0], w.OutputNorm, cfg.Eps)
+		return m.hidden[:1]
+	}
+
 	blockPLE := make([][]float32, batch)
 	for i := range cfg.Blocks {
 		bc := cfg.Blocks[i]
@@ -238,7 +246,45 @@ func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32,
 
 // BlockOutput is what the given block last produced. For the tests that have to
 // say which block a divergence began in.
-func (m *Model) BlockOutput(block int) []float32 { return m.outputs[block] }
+func (m *Model) BlockOutput(block int) []float32 {
+	if m.stack != nil {
+		return m.stack.BlockOutput(block)
+	}
+	return m.outputs[block]
+}
+
+// runStack carries one position through every block on the device, in one
+// submission. What crosses is this vector in and the same vector back.
+func (m *Model) runStack(xs []float32, at Place) {
+	cfg := m.Cfg
+	copy(m.stack.Stream().Floats(), xs)
+
+	// The angles for this position, one geometry at a time. They depend on the
+	// position and the geometry and on nothing else, so a token computes them
+	// twice rather than sixty times.
+	if m.ropeTable == nil {
+		m.ropeTable = make([]nn.RoPETable, len(m.rotations))
+	}
+	for i, r := range m.rotations {
+		m.ropeTable[i].Prepare(r.dims, at.Pos, r.base, r.freqs)
+		if err := m.stack.SetRotation(i, m.ropeTable[i].Cos, m.ropeTable[i].Sin); err != nil {
+			panic(fmt.Sprintf("gemma: the device refused a rotation: %v", err))
+		}
+	}
+
+	// The window rule and the ring agree, so the range is worked out here and
+	// neither kernel has to check the other.
+	pos := vk.Position{Pos: at.Pos}
+	for _, bc := range cfg.Blocks {
+		first, last := at.Cache.Visible(bc, at.Pos, at.Until)
+		pos.First = append(pos.First, first)
+		pos.Last = append(pos.Last, last)
+	}
+	if err := m.stack.Run(pos, cfg.Experts, cfg.ExpertsUsed); err != nil {
+		panic(fmt.Sprintf("gemma: the device failed: %v", err))
+	}
+	copy(xs, m.stack.Stream().Floats())
+}
 
 // Logits scores the whole vocabulary. The head is the input embedding read the
 // other way round — Gemma ties them — so this reads the largest tensor in the

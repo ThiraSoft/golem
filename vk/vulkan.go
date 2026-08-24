@@ -67,9 +67,12 @@ const (
 	commandBufferOneTime = 0x1
 	pipelineBindCompute  = 1
 
-	stageComputeShader = 0x800
-	accessShaderRead   = 0x20
-	accessShaderWrite  = 0x40
+	stageComputeShader  = 0x800
+	stageTransfer       = 0x1000
+	accessShaderRead    = 0x20
+	accessShaderWrite   = 0x40
+	accessTransferRead  = 0x800
+	accessTransferWrite = 0x1000
 )
 
 // vkApplicationInfo is skipped everywhere: it is optional and an instance

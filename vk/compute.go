@@ -193,14 +193,24 @@ func (r *Recorder) Dispatch(s *Set, groups uint32, push unsafe.Pointer) {
 	vkCmdDispatch(r.cb, groups, 1, 1)
 }
 
-// Barrier separates a dispatch that writes from one that reads what it wrote.
+// Barrier separates a dispatch that writes from one that reads what it wrote,
+// and covers the copies too: a recording that traces its own intermediates has
+// a transfer between two dispatches.
 func (r *Recorder) Barrier() {
 	b := memoryBarrier{
 		sType:         structMemoryBarrier,
-		srcAccessMask: accessShaderWrite,
-		dstAccessMask: accessShaderRead | accessShaderWrite,
+		srcAccessMask: accessShaderWrite | accessTransferWrite,
+		dstAccessMask: accessShaderRead | accessShaderWrite | accessTransferRead,
 	}
-	vkCmdPipelineBarrier(r.cb, stageComputeShader, stageComputeShader, 0, 1, &b, 0, 0, 0, 0)
+	const stages = stageComputeShader | stageTransfer
+	vkCmdPipelineBarrier(r.cb, stages, stages, 0, 1, &b, 0, 0, 0, 0)
+}
+
+// Copy takes size bytes from the start of src into dst at an offset. It is how
+// a recording keeps a waypoint it would otherwise overwrite.
+func (r *Recorder) Copy(dst *Buffer, offset int, src *Buffer, size int) {
+	region := bufferCopy{srcOffset: 0, dstOffset: uint64(offset), size: uint64(size)}
+	vkCmdCopyBuffer(r.cb, src.handle, dst.handle, 1, &region)
 }
 
 // Submit records one command buffer, runs it, and waits. Everything here is

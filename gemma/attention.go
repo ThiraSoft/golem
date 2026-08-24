@@ -14,8 +14,6 @@ package gemma
 // itself. That is why the two halves below are two sections and not one.
 
 import (
-	"fmt"
-
 	"github.com/ThiraSoft/golem/nn"
 )
 
@@ -48,24 +46,6 @@ func Attention(
 	// kernel converts the other operand to fp16 to do it. The same rounding has
 	// to happen here, or the scores differ in the fourth digit — which is the
 	// size of a real mistake.
-	// A device holding the block takes the whole attention, cache and all, and
-	// there is nothing left here to do. It is all or none: the keys and values
-	// it writes are its own, and a batch that went through the path below
-	// would leave the two caches disagreeing.
-	if bw.Attn != nil {
-		if batch != 1 {
-			panic("gemma: the attention device takes one position at a time")
-		}
-		table := ropes[0]
-		first, last := at[0].Cache.Visible(bc, at[0].Pos, at[0].Until)
-		err := bw.Attn.Attend(bw.AttnIndex, normed, table.Cos, table.Sin,
-			at[0].Pos, first, last, out[0])
-		if err != nil {
-			panic(fmt.Sprintf("gemma: the attention device failed: %v", err))
-		}
-		return
-	}
-
 	units := bc.Heads
 	if bc.OwnsKV {
 		units += bc.KVHeads

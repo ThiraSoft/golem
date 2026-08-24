@@ -1,0 +1,72 @@
+#version 450
+
+// The end of a mixture block: three post-norms, the sum of the two branches,
+// and the residual that puts it back in the stream.
+//
+// The three norms are why a mixture block is not a dense one with more
+// matrices. Each branch is normed on its own, their sum is normed again, and
+// only then does it rejoin. gemma/moe.go says what happens when the outer one
+// is missing: every waypoint inside the block agrees to a millionth and only
+// the block's output is wrong.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer SH { float shared_[]; };  // the dense branch
+layout(std430, binding = 1) readonly  buffer EX { float experts[]; };  // the expert branch
+layout(std430, binding = 2) readonly  buffer RS { float resid[];   };
+layout(std430, binding = 3) readonly  buffer G1 { float g1[];      };  // post_ffw_norm_1
+layout(std430, binding = 4) readonly  buffer G2 { float g2[];      };  // post_ffw_norm_2
+layout(std430, binding = 5) readonly  buffer G3 { float g3[];      };  // post_ffw_norm
+layout(std430, binding = 6) writeonly buffer XS { float xs[];      };
+
+layout(push_constant) uniform Push {
+    uint  n;
+    float eps;
+    float outScale;   // the one scalar the file carries per block
+} p;
+
+const uint MAXN = 4096u;
+
+shared float u[MAXN];
+shared float w[MAXN];
+shared float partial[256];
+
+float reduce(float value) {
+    uint t = gl_LocalInvocationID.x;
+    partial[t] = value;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (t < stride) partial[t] += partial[t + stride];
+        barrier();
+    }
+    return partial[0];
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+
+    for (uint i = t; i < p.n; i += 256u) { u[i] = shared_[i]; w[i] = experts[i]; }
+    barrier();
+
+    float s = 0.0;
+    for (uint i = t; i < p.n; i += 256u) s += u[i] * u[i];
+    float su = 1.0 / sqrt(reduce(s) / float(p.n) + p.eps);
+    barrier();
+
+    s = 0.0;
+    for (uint i = t; i < p.n; i += 256u) s += w[i] * w[i];
+    float sw = 1.0 / sqrt(reduce(s) / float(p.n) + p.eps);
+    barrier();
+
+    for (uint i = t; i < p.n; i += 256u) u[i] = u[i] * su * g1[i] + w[i] * sw * g2[i];
+    barrier();
+
+    s = 0.0;
+    for (uint i = t; i < p.n; i += 256u) s += u[i] * u[i];
+    float sc = 1.0 / sqrt(reduce(s) / float(p.n) + p.eps);
+    barrier();
+
+    for (uint i = t; i < p.n; i += 256u) {
+        xs[i] = (resid[i] + u[i] * sc * g3[i]) * p.outScale;
+    }
+}

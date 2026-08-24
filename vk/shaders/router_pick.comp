@@ -1,0 +1,57 @@
+#version 450
+
+// Eight experts of a hundred and twenty-eight, and what they weigh.
+//
+// By selection rather than by sorting: eight passes over a hundred and
+// twenty-eight logits, once per block per token, and a sort would allocate. A
+// tie goes to the lower index, so that two runs of the same model choose the
+// same experts and a comparison against a recording means something.
+// gemma/moe.go is the other copy.
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly  buffer L  { float logits[]; };
+layout(std430, binding = 1) readonly  buffer DS { float dscale[]; };  // one scalar per expert
+layout(std430, binding = 2) writeonly buffer ID { int   ids[];    };
+layout(std430, binding = 3) writeonly buffer CW { float cw[];     };  // weight times that scalar
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint experts;
+    uint used;
+    float eps;
+    float scalar;
+} p;
+
+void main() {
+    int   chosen[32];
+    float weight[32];
+
+    for (uint k = 0u; k < p.used; k++) {
+        int best = -1;
+        for (uint e = 0u; e < p.experts; e++) {
+            bool taken = false;
+            for (uint j = 0u; j < k; j++) taken = taken || (chosen[j] == int(e));
+            if (taken) continue;
+            if (best < 0 || logits[e] > logits[best]) best = int(e);
+        }
+        chosen[k] = best;
+        ids[k] = best;
+    }
+
+    // The softmax is over the chosen few alone, renormalized. The largest is
+    // subtracted first so that a large logit does not become an infinity on
+    // its way through the exponential.
+    float top = logits[chosen[0]];
+    float total = 0.0;
+    for (uint k = 0u; k < p.used; k++) {
+        float e = exp(logits[chosen[k]] - top);
+        weight[k] = e;
+        total += e;
+    }
+    for (uint k = 0u; k < p.used; k++) {
+        // llama.cpp applies the per-expert scale just before the routing
+        // weight, so one multiplication does both.
+        cw[k] = (weight[k] / total) * dscale[chosen[k]];
+    }
+}

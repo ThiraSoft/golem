@@ -46,46 +46,6 @@ type BlockWeights struct {
 	// output. llama.cpp applies it just before the routing weight, so this
 	// engine folds it into that weight.
 	DownScale []float32
-
-	// Mixture is a device holding this block's feed-forward matrices, when one
-	// was asked for, and Index says which block it uploaded them as. The
-	// weights are where this belongs: a block that has been moved knows it,
-	// and nothing above has to carry the fact down through three signatures.
-	Mixture      MixtureDevice
-	MixtureIndex int
-
-	// Attn is a device holding this block's four attention matrices, on the
-	// same terms.
-	Attn      AttentionDevice
-	AttnIndex int
-}
-
-// An AttentionDevice computes one block's whole attention somewhere other than
-// this process's memory, cache included. vk.Attention implements it.
-//
-// in is the stream under the block's attention norm, in its Q8_0 form. cos and
-// sin are this position's rotation. pos is where the keys and values go, and
-// first and last the inclusive range the query may read — worked out here,
-// because the window rule and the ring agree and neither is the device's
-// business. out receives the output projection's answer.
-//
-// The device keeps its own keys and values. A model whose attention is on one
-// must not also run batches through the CPU path, or the two caches part.
-type AttentionDevice interface {
-	Attend(block int, in *nn.Batch, cos, sin []float32, pos, first, last int, out []float32) error
-}
-
-// A MixtureDevice computes the feed-forward half of one block somewhere other
-// than this process's memory. vk.Mixture implements it.
-//
-// shared and expert carry the two branches' normed inputs in their Q8_0 form,
-// one column each — different vectors, because the branches read the residual
-// under different norms. ids are the chosen experts, weights their routing
-// weights with the per-expert scale already folded in. The two outputs come
-// back unnormed and unadded: what happens between them and the stream is the
-// block's business and stays here.
-type MixtureDevice interface {
-	Run(block int, shared, expert *nn.Batch, ids []int32, weights []float32, sharedOut, expertOut []float32) error
 }
 
 // A stack of expert matrices, kept as the one three-dimensional tensor the

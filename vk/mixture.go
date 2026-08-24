@@ -333,6 +333,38 @@ func (m *Mixture) RunTimes(block, n int) error {
 	})
 }
 
+// Record puts one block's two branches into a recording without submitting
+// it, which is what running a whole token in one submission needs. The inputs
+// and the routing must already be in the buffers the accessors below name.
+func (m *Mixture) Record(r *Recorder, block int) {
+	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed}
+	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1}
+	b := m.blocks[block]
+	// Nothing in either branch waits on the other, so they go in without a
+	// barrier between them and the card runs them together.
+	r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
+	r.Dispatch(b.setDenseUp, uint32(m.dense/nn.QuantBlock), unsafe.Pointer(&shared))
+	r.Barrier()
+	r.Dispatch(b.setDown, uint32(m.dim/expertsUsed), unsafe.Pointer(&experts))
+	r.Dispatch(b.setDenseDn, uint32((m.dim+63)/64), unsafe.Pointer(&shared))
+}
+
+// The buffers a kernel upstream writes and one downstream reads, so that a
+// whole token can be recorded without anything crossing the bus.
+
+// ExpertInput is where the expert branch reads its normed input, Q8_0.
+func (m *Mixture) ExpertInput() (*Buffer, *Buffer) { return m.xq, m.xs }
+
+// SharedInput is the same for the branch beside it, which reads the residual
+// under a different norm.
+func (m *Mixture) SharedInput() (*Buffer, *Buffer) { return m.dxq, m.dxs }
+
+// Routing is the chosen experts and their weights, which the router writes.
+func (m *Mixture) Routing() (*Buffer, *Buffer) { return m.ids, m.cw }
+
+// Outputs are the two branches' answers, unnormed and unadded.
+func (m *Mixture) Outputs() (shared, experts *Buffer) { return m.dout, m.out }
+
 func (m *Mixture) Close() {
 	for _, b := range m.blocks {
 		b.close()
