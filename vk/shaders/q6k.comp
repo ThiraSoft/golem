@@ -1,0 +1,128 @@
+#version 450
+
+// y = W * x for a Q6_K matrix against a Q8_K activation.
+//
+// This is nn/dot_q6_k.go: the six-bit magnitudes stay packed, multiply the
+// activation as small integers, and the recentring by thirty-two comes out
+// once per group of sixteen as a scale times the group's sum. The arithmetic
+// is integer and the reduction order is fixed, so a row lands on the same
+// float32 the CPU produced.
+//
+// The weights are not read in the layout the file stores. A Q6_K superblock is
+// 210 bytes, which is not a multiple of four, and a shader indexing a uint
+// array cannot afford a row stride that walks off alignment on every
+// superblock. Q6KHead pads the superblock to 212 bytes on upload: the same 210
+// bytes, then two that are never read. It costs one percent of the tensor and
+// buys every load its alignment.
+//
+// The shape of the work follows from that alignment. A team of sixteen threads
+// takes one row, and each thread takes four consecutive positions of a half —
+// four positions being exactly one uint of low nibbles, one uint of high pairs
+// and one uint of activation.
+//
+// Four things were tried and only one moved the number. Reading uints instead
+// of single bytes: nothing. Cutting the barriers down to one reduction a row,
+// at the cost of the integer exactness: nothing, so the exact form stays.
+// Staging the activation in shared memory, since it is the same few kilobytes
+// for every one of a quarter of a million rows: eight percent worse, the
+// caches were already holding it. What did move it was giving each of the
+// sixteen lanes its own group of the recentring instead of leaving lane zero
+// to walk all sixteen while the others waited — 5.6 ms to 4.8 ms. The lesson
+// is the usual one: the serial tail, not the parallel body.
+
+layout(local_size_x = 64) in;   // four teams of sixteen
+
+layout(std430, binding = 0) readonly  buffer W  { uint  w[];   };
+layout(std430, binding = 1) readonly  buffer A  { uint  a[];   };
+layout(std430, binding = 2) readonly  buffer AS { float asc[]; };
+layout(std430, binding = 3) readonly  buffer BS { int   bsum[]; };
+layout(std430, binding = 4) writeonly buffer Y  { float y[];   };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint superblocks;
+} p;
+
+const uint BYTES = 212u;   // one padded superblock
+const uint TEAMS = 4u;     // teams to a workgroup
+
+shared int partial[64];
+
+// wsbyte reads one signed byte of the weights, which is what a group scale is.
+int wsbyte(uint b) { return bitfieldExtract(int(w[b >> 2]), int((b & 3u) * 8u), 8); }
+
+void main() {
+    uint t    = gl_LocalInvocationID.x;
+    uint team = t >> 4;
+    uint lane = t & 15u;
+
+    uint upper = lane >> 3;          // which half of the superblock
+    uint i0    = (lane & 7u) * 4u;   // the first of four positions in it
+    uint group = i0 >> 4;            // which group of sixteen scales it
+
+    for (uint row = gl_WorkGroupID.x * TEAMS + team; row < p.rows;
+         row += gl_NumWorkGroups.x * TEAMS) {
+
+        float total = 0.0;
+
+        for (uint sb = 0u; sb < p.superblocks; sb++) {
+            uint base = (row * p.superblocks + sb) * BYTES;
+
+            uint wl0 = w[(base + upper * 64u + i0) >> 2];
+            uint wl1 = w[(base + upper * 64u + 32u + i0) >> 2];
+            uint wh  = w[(base + 128u + upper * 32u + i0) >> 2];
+
+            uint sbase = base + 192u + upper * 8u + group;
+            int s0 = wsbyte(sbase);
+            int s1 = wsbyte(sbase + 2u);
+            int s2 = wsbyte(sbase + 4u);
+            int s3 = wsbyte(sbase + 6u);
+
+            uint ab = sb * 64u + upper * 32u + (i0 >> 2);
+            uint a0 = a[ab];
+            uint a1 = a[ab + 8u];
+            uint a2 = a[ab + 16u];
+            uint a3 = a[ab + 24u];
+
+            int sum = 0;
+            for (uint k = 0u; k < 4u; k++) {
+                uint sh = k * 8u;
+                uint l0 = (wl0 >> sh) & 0xFFu;
+                uint l1 = (wl1 >> sh) & 0xFFu;
+                uint h  = (wh  >> sh) & 0xFFu;
+
+                sum += s0 * int((l0 & 0x0Fu) | ((h        & 3u) << 4))
+                          * bitfieldExtract(int(a0), int(sh), 8);
+                sum += s1 * int((l1 & 0x0Fu) | (((h >> 2) & 3u) << 4))
+                          * bitfieldExtract(int(a1), int(sh), 8);
+                sum += s2 * int((l0 >> 4)    | (((h >> 4) & 3u) << 4))
+                          * bitfieldExtract(int(a2), int(sh), 8);
+                sum += s3 * int((l1 >> 4)    | (((h >> 6) & 3u) << 4))
+                          * bitfieldExtract(int(a3), int(sh), 8);
+            }
+
+            // The recentring, which the CPU kernel folds group by group after
+            // the fact: the weights were read shifted by thirty-two, so the
+            // product owes 32 x scale x sum(q) for each group of sixteen.
+            // There are sixteen groups and sixteen lanes, so each lane carries
+            // its own into the reduction instead of one lane walking all of
+            // them while the other fifteen wait.
+            sum -= 32 * wsbyte(base + 192u + lane) * bsum[sb * 16u + lane];
+
+            partial[t] = sum;
+            barrier();
+            for (uint stride = 8u; stride > 0u; stride >>= 1) {
+                if (lane < stride) partial[t] += partial[t + stride];
+                barrier();
+            }
+
+            if (lane == 0u) {
+                float d = unpackHalf2x16(w[(base >> 2) + 52u]).x;
+                total += float(partial[t]) * d * asc[sb];
+            }
+            barrier();
+        }
+
+        if (lane == 0u) y[row] = total;
+    }
+}

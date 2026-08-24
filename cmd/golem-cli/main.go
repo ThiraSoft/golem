@@ -64,6 +64,7 @@ func main() {
 	flag.Var(&recordings, "audio", "a sound file — WAV, MP3 or FLAC — to put in the first turn; repeat for several")
 	prompt := flag.String("p", "", "answer this and exit, instead of reading turns")
 	stats := flag.Bool("stats", false, "report tokens and speed after each answer")
+	vulkan := flag.Bool("vulkan", false, "put the logit head on a Vulkan device, which is a quarter of what a token costs")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [options]\n", filepath.Base(os.Args[0]))
 		flag.PrintDefaults()
@@ -91,6 +92,11 @@ func main() {
 			fail(err)
 		}
 	}
+	if *vulkan {
+		if err := m.UseVulkanHead(); err != nil {
+			fail(err)
+		}
+	}
 	loading := time.Since(start)
 
 	params := m.Sampling
@@ -109,8 +115,12 @@ func main() {
 	}
 
 	if *stats {
-		fmt.Fprintf(os.Stderr, "%s: %s, %d blocks, %d positions, vocabulary %d, loaded in %s on %d cores\n",
-			filepath.Base(*model), m.Name, m.Blocks, *context, m.Vocabulary,
+		where := "cpu"
+		if m.VulkanHead() {
+			where = "vulkan"
+		}
+		fmt.Fprintf(os.Stderr, "%s: %s, %d blocks, %d positions, vocabulary %d, head on %s, loaded in %s on %d cores\n",
+			filepath.Base(*model), m.Name, m.Blocks, *context, m.Vocabulary, where,
 			loading.Round(time.Millisecond), runtime.NumCPU())
 		fmt.Fprintf(os.Stderr, "sampling: temperature %g, top-k %d, top-p %g, seed %d\n",
 			params.Temperature, params.TopK, params.TopP, params.Seed)

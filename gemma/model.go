@@ -13,6 +13,7 @@ import (
 
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/tensors"
+	"github.com/ThiraSoft/golem/vk"
 )
 
 type Model struct {
@@ -34,6 +35,11 @@ type Model struct {
 	vision      *VisionTower // nil until OpenProjector, or when the file has no eyes
 	audio       *AudioTower  // nil until OpenProjector, or when the file has no ears
 	projFile    *tensors.GGUF
+
+	// The logit head on a Vulkan device, when UseVulkanHead put it there.
+	// gemma/vulkan.go says what that buys and what it leaves alone.
+	head    *vk.Q6KHead
+	headDev *vk.Device
 }
 
 // Open maps a GGUF file and binds it. maxContext caps the cache; the file
@@ -96,6 +102,7 @@ func (m *Model) reserve(batch int) {
 }
 
 func (m *Model) Close() error {
+	m.closeVulkanHead()
 	if m.projFile != nil {
 		m.projFile.Close()
 		m.projFile = nil
@@ -220,7 +227,16 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 	// The head is the only K-quantized product in the engine, and it wants the
 	// activation cut in superblocks rather than in blocks of 32.
 	v.QuantizeK()
-	m.W.TokenEmbd.MatVec(v, out)
+	if m.head != nil {
+		// A device that fails here has failed for good — the weights are on it
+		// and there is nothing to fall back to that would still be the same
+		// model. The engine's other impossible states panic; so does this one.
+		if err := m.head.MatVec(v, 0, out); err != nil {
+			panic(fmt.Sprintf("gemma: the Vulkan head failed: %v", err))
+		}
+	} else {
+		m.W.TokenEmbd.MatVec(v, out)
+	}
 	nn.Softcap(out, m.Cfg.LogitSoftcap)
 	m.suppress(out, nil)
 }

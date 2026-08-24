@@ -158,6 +158,7 @@ waiting through the model in a single pass.
 | `audio/` | sound formats: reading and writing WAV |
 | `sample/` | top-k, top-p, temperature, and a seeded draw over a row of logits |
 | `chat/` | a conversation's shape — messages, tools, calls — and the interface an engine implements to write one out |
+| `vk/` | Vulkan compute, bound through `purego` rather than cgo: a device, buffers, one pipeline, and the Q6_K product the logit head is |
 
 Nothing is promoted into this layer on the strength of a guess. Code moves here
 once two engines are shown to want it, in the same commit that makes them both
@@ -180,8 +181,19 @@ Worth knowing before you clone it:
   hardware — correct, and tuned by nobody. The vision tower's interleaved kernel
   and the audio decoder's are portable Go there. An Apple or a Graviton runs; it
   will not see the numbers above.
-- **No GPU, and none planned.** This is a CPU engine; that is the point of it,
-  not a stage on the way somewhere.
+- **One tensor runs on a GPU, and only if you ask.** This is a CPU engine and
+  that is still the point of it. But the logit head is the input embedding read
+  the other way round, so it is the largest tensor in the file and it is read in
+  full for every token drawn — 577 mebibytes of Q6_K on the 26B, a quarter of
+  what a token costs, and a quarter no amount of CPU work shortens because the
+  bytes are the cost. `-vulkan` puts that one product on a Vulkan device: 13.6
+  to 15.8 tokens a second on the 26B A4B, exact against the CPU kernel to a part
+  in ten million over all 262144 rows. Nothing else moves, the activation that
+  crosses is eleven kilobytes, and a build without a Vulkan loader is a build
+  where the flag fails and everything else works. There is no cgo: `vk/` opens
+  `libvulkan.so.1` through `purego`, and `CGO_ENABLED=0 go build ./...` still
+  passes. The thirty blocks are not next; see `vk/q6k.go` for what the split
+  costs and `vk/shaders/q6k.comp` for the three optimizations that did nothing.
 - **The server is one process around one model.** `-parallel` answers several
   conversations at once and batches them into one pass, the way llama.cpp's
   does — on E2B, 20.7 tokens a second for one client, 34.7 for two, 54.2 for

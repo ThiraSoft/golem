@@ -85,6 +85,32 @@ func (m *Model) SlotContext() int { return m.Forward.SlotContext() }
 // Close releases the model and the file behind it.
 func (m *Model) Close() error { return m.closer.Close() }
 
+// vulkanHead is implemented by the engines whose logit head can move to a
+// device. It is not part of Forward: an engine that cannot do it is not
+// broken, and a caller that never asks should not have to know the method
+// exists.
+type vulkanHead interface {
+	UseVulkanHead() error
+	VulkanHead() bool
+}
+
+// UseVulkanHead moves the logit head to a Vulkan device, when the engine has
+// one that can go and a device is there to take it. Everything else stays on
+// the CPU; gemma/vulkan.go says why that split is the affordable one.
+func (m *Model) UseVulkanHead() error {
+	h, ok := m.Forward.(vulkanHead)
+	if !ok {
+		return fmt.Errorf("engine: %s has no logit head that can move to a device", m.Name)
+	}
+	return h.UseVulkanHead()
+}
+
+// VulkanHead says whether the head is on a device.
+func (m *Model) VulkanHead() bool {
+	h, ok := m.Forward.(vulkanHead)
+	return ok && h.VulkanHead()
+}
+
 // Open reads the architecture and hands the file to the engine that implements
 // it. maxContext caps the cache; the files declare far more than a machine here
 // would survive.
