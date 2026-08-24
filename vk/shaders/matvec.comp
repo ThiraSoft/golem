@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_integer_dot_product : require
 
 // y = W * x for one Q4_0 matrix against one Q8_0 activation.
 //
@@ -50,14 +51,18 @@ float lanePart(uint rowBase, uint lane) {
 
         int acc = 0;
         uint at = (nib + 16u * b) >> 2;
+        uint ab = b * 8u;
+        // Four products to an instruction. A Q4_0 word holds eight weights
+        // as nibbles, and the two halves of it come out as two packed
+        // quadruples with one mask each — which is the layout's gift: a mask
+        // and a shift give four weights already sitting in the four bytes the
+        // dot product wants. The accumulator is integer and exact, so this is
+        // the same number the unpacked loop produced, in a quarter of the
+        // instructions. vk/device.go says what the card is asked for.
         for (uint u = 0u; u < 4u; u++) {
             uint word = w[at + u];
-            for (uint m = 0u; m < 4u; m++) {
-                uint j     = u * 4u + m;
-                uint value = (word >> (m * 8u)) & 0xFFu;
-                acc += int(value & 0x0Fu) * abyte(b * 32u + j);
-                acc += int(value >> 4)    * abyte(b * 32u + j + 16u);
-            }
+            acc = dotPacked4x8AccSatEXT(word & 0x0F0F0F0Fu,        int(aq[ab + u]),      acc);
+            acc = dotPacked4x8AccSatEXT((word >> 4) & 0x0F0F0F0Fu, int(aq[ab + u + 4u]), acc);
         }
         sum  += float(acc) * ws * as_[b];
         corr += ws * as_[p.used * nb + b];

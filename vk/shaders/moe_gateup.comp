@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_integer_dot_product : require
 
 // The first half of one expert: the fused gate-and-up projection, ggml's GELU,
 // the elementwise product, and the Q8_0 quantization the second half wants.
@@ -116,14 +117,18 @@ void lanePart(uint rowBase, uint lane, out float sum, out float corr) {
 
         int acc = 0;
         uint at = (nib + 16u * b) >> 2;
+        uint ab = b * 8u;
+        // Four products to an instruction. A Q4_0 word holds eight weights
+        // as nibbles, and the two halves of it come out as two packed
+        // quadruples with one mask each — which is the layout's gift: a mask
+        // and a shift give four weights already sitting in the four bytes the
+        // dot product wants. The accumulator is integer and exact, so this is
+        // the same number the unpacked loop produced, in a quarter of the
+        // instructions. vk/device.go says what the card is asked for.
         for (uint u = 0u; u < 4u; u++) {
             uint word = w[at + u];
-            for (uint k = 0u; k < 4u; k++) {
-                uint j     = u * 4u + k;
-                uint value = (word >> (k * 8u)) & 0xFFu;
-                acc += int(value & 0x0Fu) * abyte(b * 32u + j);
-                acc += int(value >> 4)    * abyte(b * 32u + j + 16u);
-            }
+            acc = dotPacked4x8AccSatEXT(word & 0x0F0F0F0Fu,        int(xq[ab + u]),      acc);
+            acc = dotPacked4x8AccSatEXT((word >> 4) & 0x0F0F0F0Fu, int(xq[ab + u + 4u]), acc);
         }
         // The weights are stored shifted by eight, and the correction the
         // input carries is 8 x scale x sum(q) — the same for every row it
