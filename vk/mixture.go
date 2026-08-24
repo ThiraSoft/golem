@@ -50,9 +50,17 @@ var matvecSPIRV []byte
 // number would need the shape changed, not a constant.
 const expertsUsed = 8
 
+// downOuts is how many outputs shaders/moe_down.comp writes per workgroup.
+const downOuts = 8
+
+// matvecOuts is shaders/matvec.comp's, which serves the shared branch's down
+// projection and every projection of an attention.
+const matvecOuts = 16
+
 // A Mixture is every feed-forward matrix of a model, resident, plus the
 // kernels that read them and the small buffers a token passes through.
 type Mixture struct {
+	tl *Timeline // set by Profile, nil everywhere else
 	d *Device
 
 	dim, ffn, dense, experts int
@@ -102,8 +110,8 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int) (*Mixture, error)
 			return nil, fmt.Errorf("vk: feed-forward shapes must be multiples of %d, given %d", nn.QuantBlock, n)
 		}
 	}
-	if dim%expertsUsed != 0 {
-		return nil, fmt.Errorf("vk: the down kernel writes %d outputs at a time, and %d is not a multiple of it", expertsUsed, dim)
+	if dim%downOuts != 0 {
+		return nil, fmt.Errorf("vk: the down kernel writes %d outputs at a time, and %d is not a multiple of it", downOuts, dim)
 	}
 	m := &Mixture{d: d, dim: dim, ffn: ffn, dense: dense, experts: experts}
 
@@ -292,8 +300,8 @@ func (m *Mixture) Run(block int, shared, expert *nn.Batch, ids []int32, weights 
 		r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
 		r.Dispatch(b.setDenseUp, uint32(m.dense/nn.QuantBlock), unsafe.Pointer(&sharedPush))
 		r.Barrier()
-		r.Dispatch(b.setDown, uint32(m.dim/expertsUsed), unsafe.Pointer(&experts))
-		r.Dispatch(b.setDenseDn, uint32((m.dim+63)/64), unsafe.Pointer(&sharedPush))
+		r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
+		r.Dispatch(b.setDenseDn, uint32((m.dim+matvecOuts-1)/matvecOuts), unsafe.Pointer(&sharedPush))
 	})
 	if err != nil {
 		return err
@@ -327,8 +335,8 @@ func (m *Mixture) RunTimes(block, n int) error {
 			r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
 			r.Dispatch(b.setDenseUp, uint32(m.dense/nn.QuantBlock), unsafe.Pointer(&shared))
 			r.Barrier()
-			r.Dispatch(b.setDown, uint32(m.dim/expertsUsed), unsafe.Pointer(&experts))
-			r.Dispatch(b.setDenseDn, uint32((m.dim+63)/64), unsafe.Pointer(&shared))
+			r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
+			r.Dispatch(b.setDenseDn, uint32((m.dim+matvecOuts-1)/matvecOuts), unsafe.Pointer(&shared))
 		}
 	})
 }
@@ -336,6 +344,9 @@ func (m *Mixture) RunTimes(block, n int) error {
 // Record puts one block's two branches into a recording without submitting
 // it, which is what running a whole token in one submission needs. The inputs
 // and the routing must already be in the buffers the accessors below name.
+// Profile is Stack.Profile, forwarded: one stamp between the two halves.
+func (m *Mixture) Profile(t *Timeline) { m.tl = t }
+
 func (m *Mixture) Record(r *Recorder, block int) {
 	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed}
 	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1}
@@ -345,8 +356,9 @@ func (m *Mixture) Record(r *Recorder, block int) {
 	r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
 	r.Dispatch(b.setDenseUp, uint32(m.dense/nn.QuantBlock), unsafe.Pointer(&shared))
 	r.Barrier()
-	r.Dispatch(b.setDown, uint32(m.dim/expertsUsed), unsafe.Pointer(&experts))
-	r.Dispatch(b.setDenseDn, uint32((m.dim+63)/64), unsafe.Pointer(&shared))
+	m.tl.Stamp(r, "moe gate/up")
+	r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
+	r.Dispatch(b.setDenseDn, uint32((m.dim+matvecOuts-1)/matvecOuts), unsafe.Pointer(&shared))
 }
 
 // The buffers a kernel upstream writes and one downstream reads, so that a

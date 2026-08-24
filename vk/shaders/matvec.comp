@@ -7,12 +7,16 @@
 // branch, and the four projections of an attention. Nothing about it knows
 // which.
 //
-// A workgroup takes sixty-four outputs with eight threads to each, which is
-// the same shape for the same reason the mixture uses it: a lane walks the
-// blocks of its row eight at a time, so the eight of them read a hundred and
-// twenty-eight contiguous bytes at once.
+// A workgroup takes sixteen outputs with eight threads to each, which keeps
+// the reason the mixture's shape has — a lane walks the blocks of its row
+// eight at a time, so the eight of them read a hundred and twenty-eight
+// contiguous bytes at once — and gives up the wide workgroup that came with
+// it. Sixty-four outputs to a workgroup left the attention's output
+// projection with forty-four workgroups for sixty-four compute units, and a
+// fifth of the card idle for the length of the kernel. Sixteen gives it a
+// hundred and seventy-six.
 
-layout(local_size_x = 512) in;   // sixty-four outputs, eight lanes each
+layout(local_size_x = 128) in;   // sixteen outputs, eight lanes each
 
 layout(std430, binding = 0) readonly  buffer W  { uint  w[];   };
 layout(std430, binding = 1) readonly  buffer AQ { uint  aq[];  };  // the activation, Q8_0
@@ -26,8 +30,9 @@ layout(push_constant) uniform Push {
 } p;
 
 const uint LANES = 8u;
+const uint OUTS  = 16u;   // outputs to a workgroup, which is 128 / LANES
 
-shared float partial[512];
+shared float partial[128];
 
 // abyte reads one signed byte of the activation.
 int abyte(uint b) { return bitfieldExtract(int(aq[b >> 2]), int((b & 3u) * 8u), 8); }
@@ -63,7 +68,7 @@ float lanePart(uint rowBase, uint lane) {
 void main() {
     uint t    = gl_LocalInvocationID.x;
     uint lane = t & 7u;
-    uint i    = gl_WorkGroupID.x * 64u + (t >> 3);
+    uint i    = gl_WorkGroupID.x * OUTS + (t >> 3);
 
     uint rowBytes = (p.ffn >> 5) * 18u;
     partial[t] = (i < p.dim) ? lanePart(i * rowBytes, lane) : 0.0;

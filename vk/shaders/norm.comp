@@ -14,7 +14,7 @@
 // branch's own norm. What differs between them is which of the optional parts
 // they want, and each is one bit.
 
-layout(local_size_x = 256) in;
+layout(local_size_x = 1024) in;
 
 layout(std430, binding = 0) readonly  buffer A  { float a[];      };
 layout(std430, binding = 1) readonly  buffer B  { float b[];      };
@@ -42,7 +42,7 @@ const uint QUANT  = 32u;  // write its Q8_0 form
 const uint MAXN = 4096u;
 
 shared float v[MAXN];
-shared float partial[256];
+shared float partial[1024];
 
 int nearestInt(float f) {
     return (floatBitsToInt(f + 12582912.0) & 0x007fffff) - 0x00400000;
@@ -80,27 +80,28 @@ uint floatToHalf(float f) {
 void main() {
     uint t = gl_LocalInvocationID.x;
 
-    for (uint i = t; i < p.n; i += 256u) {
+    // The squares are summed in the same walk that loads the vector: a pass
+    // over this vector is a memory latency an iteration on the one compute
+    // unit a single workgroup gets, and the count of passes is what the kernel
+    // costs. The reference sums them in float64 and this sums them in float32
+    // through a tree, which is nearer float64 than a straight loop would be.
+    float s = 0.0;
+    for (uint i = t; i < p.n; i += 1024u) {
         float x = ((p.flags & ADD) != 0u) ? (a[i] + b[i]) : a[i];
         v[i] = x;
         if ((p.flags & SUM) != 0u) sum[i] = x;
+        s += x * x;
     }
-    barrier();
-
-    // The reference sums the squares in float64 and this sums them in float32
-    // through a tree, which is nearer float64 than a straight loop would be.
-    float s = 0.0;
-    for (uint i = t; i < p.n; i += 256u) s += v[i] * v[i];
     partial[t] = s;
     barrier();
-    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+    for (uint stride = 512u; stride > 0u; stride >>= 1) {
         if (t < stride) partial[t] += partial[t + stride];
         barrier();
     }
     float scale = 1.0 / sqrt(partial[0] / float(p.n) + p.eps);
     barrier();
 
-    for (uint i = t; i < p.n; i += 256u) {
+    for (uint i = t; i < p.n; i += 1024u) {
         float x = v[i] * scale;
         if ((p.flags & GAIN) != 0u)   x *= gain[i];
         if ((p.flags & VSCALE) != 0u) x *= vscale[i];
@@ -117,7 +118,7 @@ void main() {
     // inverting itself, halves round to even, and the scale the product uses
     // is the fp16 the reference would have stored.
     uint blocks = p.n >> 5;
-    for (uint blk = t; blk < blocks; blk += 256u) {
+    for (uint blk = t; blk < blocks; blk += 1024u) {
         uint at = blk << 5;
         float peak = 0.0;
         for (uint i = 0u; i < 32u; i++) peak = max(peak, abs(v[at + i]));

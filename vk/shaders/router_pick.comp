@@ -2,13 +2,20 @@
 
 // Eight experts of a hundred and twenty-eight, and what they weigh.
 //
-// By selection rather than by sorting: eight passes over a hundred and
-// twenty-eight logits, once per block per token, and a sort would allocate. A
-// tie goes to the lower index, so that two runs of the same model choose the
-// same experts and a comparison against a recording means something.
-// gemma/moe.go is the other copy.
+// By selection rather than by sorting: eight rounds of an argmax over the
+// logits, the winner of each struck out of the next. A tie goes to the lower
+// index, so that two runs of the same model choose the same experts and a
+// comparison against a recording means something. gemma/moe.go is the other
+// copy.
+//
+// The first version of this ran the whole selection on one lane, with the
+// chosen kept in a local array. A local array that is indexed by a variable
+// does not live in registers; it lives in scratch, which is card memory, and
+// the eight passes cost a hundred and ninety microseconds a block — a third of
+// the whole token, spent on a hundred and twenty-eight numbers. One lane per
+// expert and the tournament in shared memory costs a few.
 
-layout(local_size_x = 1) in;
+layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly  buffer L  { float logits[]; };
 layout(std430, binding = 1) readonly  buffer DS { float dscale[]; };  // one scalar per expert
@@ -23,35 +30,49 @@ layout(push_constant) uniform Push {
     float scalar;
 } p;
 
+const float minusInf = -3.4e38;
+
+shared float sv[256];
+shared int   si[256];
+shared int   chosen[32];
+
 void main() {
-    int   chosen[32];
-    float weight[32];
+    uint t = gl_LocalInvocationID.x;
+    float mine = t < p.experts ? logits[t] : minusInf;
 
     for (uint k = 0u; k < p.used; k++) {
-        int best = -1;
-        for (uint e = 0u; e < p.experts; e++) {
-            bool taken = false;
-            for (uint j = 0u; j < k; j++) taken = taken || (chosen[j] == int(e));
-            if (taken) continue;
-            if (best < 0 || logits[e] > logits[best]) best = int(e);
+        sv[t] = mine;
+        si[t] = int(t);
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (t < s && (sv[t + s] > sv[t] || (sv[t + s] == sv[t] && si[t + s] < si[t]))) {
+                sv[t] = sv[t + s];
+                si[t] = si[t + s];
+            }
+            barrier();
         }
-        chosen[k] = best;
-        ids[k] = best;
+        int best = si[0];
+        if (t == uint(best)) mine = minusInf;
+        if (t == 0u) {
+            chosen[k] = best;
+            ids[k] = best;
+        }
+        barrier();
     }
 
     // The softmax is over the chosen few alone, renormalized. The largest is
     // subtracted first so that a large logit does not become an infinity on
-    // its way through the exponential.
-    float top = logits[chosen[0]];
-    float total = 0.0;
-    for (uint k = 0u; k < p.used; k++) {
-        float e = exp(logits[chosen[k]] - top);
-        weight[k] = e;
-        total += e;
-    }
-    for (uint k = 0u; k < p.used; k++) {
-        // llama.cpp applies the per-expert scale just before the routing
-        // weight, so one multiplication does both.
-        cw[k] = (weight[k] / total) * dscale[chosen[k]];
+    // its way through the exponential. It is summed and then recomputed rather
+    // than kept, because keeping it is the local array this shader is built to
+    // avoid.
+    if (t == 0u) {
+        float top = logits[chosen[0]];
+        float total = 0.0;
+        for (uint k = 0u; k < p.used; k++) total += exp(logits[chosen[k]] - top);
+        for (uint k = 0u; k < p.used; k++) {
+            // llama.cpp applies the per-expert scale just before the routing
+            // weight, so one multiplication does both.
+            cw[k] = (exp(logits[chosen[k]] - top) / total) * dscale[chosen[k]];
+        }
     }
 }

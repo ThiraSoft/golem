@@ -3,21 +3,27 @@
 // The second half of the expert branch: the down projection of all eight
 // chosen experts, and their weighted sum.
 //
-// A workgroup takes eight outputs across eight experts, with eight threads to
-// each of those sixty-four dot products. No atomics, because every thread that
-// contributes to an output is in the same workgroup — that is the point of the
-// shape: eight experts writing into one vector would otherwise need either an
-// atomic add on floats or eight partial vectors and a third pass.
+// A workgroup takes thirty-two outputs across eight experts, with two threads
+// to each of those two hundred and fifty-six dot products. No atomics, because
+// every thread that contributes to an output is in the same workgroup — that
+// is the point of the shape: eight experts writing into one vector would
+// otherwise need either an atomic add on floats or eight partial vectors and a
+// third pass.
 //
-// Eight lanes to a row for the same reason shaders/moe_gateup.comp gives: one
-// thread to a whole row needs no reduction but reads rows hundreds of bytes
-// apart, and a wave then touches a separate line per thread.
+// Two lanes to a row, where shaders/moe_gateup.comp gives eight, because the
+// rows are not the same length. This projection's rows are the feed-forward
+// width, seven hundred and four, which is twenty-two Q4_0 blocks; eight lanes
+// left each of them with under three blocks to walk, and a loop that short is
+// a reduction and a launch with a little arithmetic between them. It ran at a
+// hundred and fifty gigabytes a second against the other kernel's two hundred
+// and fifty. Two lanes walk eleven blocks each, which is the same loop the
+// wider kernel got its number with.
 //
 // The routing weight and the per-expert scale arrive already multiplied
 // together: llama.cpp applies the scale just before the weight, so one
 // multiplication does both. gemma/block.go folds them on the way in.
 
-layout(local_size_x = 512) in;   // eight outputs, eight experts, eight lanes
+layout(local_size_x = 512) in;   // thirty-two outputs, eight experts, two lanes
 
 layout(std430, binding = 0) readonly  buffer W  { uint  w[];   };  // Q4_0, every expert
 layout(std430, binding = 1) readonly  buffer AQ { uint  aq[];  };  // the activation, Q8_0
@@ -33,6 +39,7 @@ layout(push_constant) uniform Push {
 } p;
 
 const uint LANES = 8u;
+const uint OUTS  = 8u;    // outputs to a workgroup, which is 512 / (8 x LANES)
 
 shared float partial[512];
 
@@ -74,10 +81,10 @@ float lanePart(uint rowBase, uint k, uint lane) {
 
 void main() {
     uint t    = gl_LocalInvocationID.x;
-    uint j    = t >> 6;            // which of the eight outputs
-    uint k    = (t >> 3) & 7u;     // which of the eight experts
-    uint lane = t & 7u;
-    uint i    = gl_WorkGroupID.x * 8u + j;
+    uint j    = t / (8u * LANES);  // which of the outputs
+    uint k    = (t / LANES) & 7u;  // which of the eight experts
+    uint lane = t % LANES;
+    uint i    = gl_WorkGroupID.x * OUTS + j;
 
     uint nb       = p.ffn >> 5;
     uint rowBytes = nb * 18u;
@@ -90,9 +97,9 @@ void main() {
         barrier();
     }
 
-    if (t == j * 64u && i < p.dim) {
+    if (lane == 0u && k == 0u && i < p.dim) {
         precise float sum = 0.0;
-        for (uint e = 0u; e < 8u; e++) sum += partial[j * 64u + e * 8u] * cw[e];
+        for (uint e = 0u; e < 8u; e++) sum += partial[t + e * LANES] * cw[e];
         y[i] = sum;
     }
 }

@@ -50,6 +50,9 @@ const (
 	structCommandBufferAllocateInfo = 40
 	structCommandBufferBeginInfo    = 42
 	structMemoryBarrier             = 46
+	structQueryPoolCreateInfo       = 11
+
+	queryTypeTimestamp = 2
 
 	queueCompute = 0x2
 
@@ -67,6 +70,7 @@ const (
 	commandBufferOneTime = 0x1
 	pipelineBindCompute  = 1
 
+	stageBottomOfPipe   = 0x2000
 	stageComputeShader  = 0x800
 	stageTransfer       = 0x1000
 	accessShaderRead    = 0x20
@@ -384,6 +388,16 @@ type memoryBarrier struct {
 	dstAccessMask uint32
 }
 
+type queryPoolCreateInfo struct {
+	sType              uint32
+	_                  uint32
+	pNext              uintptr
+	flags              uint32
+	queryType          uint32
+	queryCount         uint32
+	pipelineStatistics uint32
+}
+
 type bufferCopy struct {
 	srcOffset uint64
 	dstOffset uint64
@@ -432,6 +446,11 @@ var (
 	vkCmdDispatch                       func(commandBuffer, uint32, uint32, uint32)
 	vkCmdCopyBuffer                     func(commandBuffer, uint64, uint64, uint32, *bufferCopy)
 	vkCmdPipelineBarrier                func(commandBuffer, uint32, uint32, uint32, uint32, *memoryBarrier, uint32, uintptr, uint32, uintptr)
+	vkCreateQueryPool                   func(device, *queryPoolCreateInfo, uintptr, *uint64) int32
+	vkDestroyQueryPool                  func(device, uint64, uintptr)
+	vkCmdResetQueryPool                 func(commandBuffer, uint64, uint32, uint32)
+	vkCmdWriteTimestamp                 func(commandBuffer, uint32, uint64, uint32)
+	vkGetQueryPoolResults               func(device, uint64, uint32, uint32, uint64, unsafe.Pointer, uint64, uint32) int32
 	vkQueueSubmit                       func(queue, uint32, *submitInfo, uint64) int32
 	vkQueueWaitIdle                     func(queue) int32
 )
@@ -491,6 +510,11 @@ func load() error {
 	bind(&vkCmdDispatch, "vkCmdDispatch")
 	bind(&vkCmdCopyBuffer, "vkCmdCopyBuffer")
 	bind(&vkCmdPipelineBarrier, "vkCmdPipelineBarrier")
+	bind(&vkCreateQueryPool, "vkCreateQueryPool")
+	bind(&vkDestroyQueryPool, "vkDestroyQueryPool")
+	bind(&vkCmdResetQueryPool, "vkCmdResetQueryPool")
+	bind(&vkCmdWriteTimestamp, "vkCmdWriteTimestamp")
+	bind(&vkGetQueryPoolResults, "vkGetQueryPoolResults")
 	bind(&vkQueueSubmit, "vkQueueSubmit")
 	bind(&vkQueueWaitIdle, "vkQueueWaitIdle")
 	loaded = true

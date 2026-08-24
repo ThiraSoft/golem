@@ -8,8 +8,15 @@
 // only then does it rejoin. gemma/moe.go says what happens when the outer one
 // is missing: every waypoint inside the block agrees to a millionth and only
 // the block's output is wrong.
+//
+// Three norms read as three passes and there are only two here, because the
+// first two do not depend on each other: one walk over both branches sums both
+// their squares. A pass over this vector is not arithmetic, it is a wait —
+// eleven kilobytes at a memory latency an iteration, on the one compute unit a
+// single workgroup gets — so the passes are what this kernel costs and the
+// count of them is the only thing worth tuning.
 
-layout(local_size_x = 256) in;
+layout(local_size_x = 1024) in;
 
 layout(std430, binding = 0) readonly  buffer SH { float shared_[]; };  // the dense branch
 layout(std430, binding = 1) readonly  buffer EX { float experts[]; };  // the expert branch
@@ -25,48 +32,63 @@ layout(push_constant) uniform Push {
     float outScale;   // the one scalar the file carries per block
 } p;
 
-const uint MAXN = 4096u;
+const uint MAXN  = 4096u;
+const uint LANES = 1024u;
 
 shared float u[MAXN];
 shared float w[MAXN];
-shared float partial[256];
+shared float pa[LANES];
+shared float pb[LANES];
 
-float reduce(float value) {
+// reduce2 sums two values across the workgroup at once, which is what the two
+// independent norms want and costs one tree rather than two.
+void reduce2(float a, float b, out float sa, out float sb) {
     uint t = gl_LocalInvocationID.x;
-    partial[t] = value;
+    pa[t] = a;
+    pb[t] = b;
     barrier();
-    for (uint stride = 128u; stride > 0u; stride >>= 1) {
-        if (t < stride) partial[t] += partial[t + stride];
+    for (uint stride = LANES >> 1; stride > 0u; stride >>= 1) {
+        if (t < stride) {
+            pa[t] += pa[t + stride];
+            pb[t] += pb[t + stride];
+        }
         barrier();
     }
-    return partial[0];
+    sa = pa[0];
+    sb = pb[0];
 }
 
 void main() {
     uint t = gl_LocalInvocationID.x;
 
-    for (uint i = t; i < p.n; i += 256u) { u[i] = shared_[i]; w[i] = experts[i]; }
+    float qu = 0.0, qw = 0.0;
+    for (uint i = t; i < p.n; i += LANES) {
+        float a = shared_[i], b = experts[i];
+        u[i] = a;
+        w[i] = b;
+        qu += a * a;
+        qw += b * b;
+    }
+    barrier();
+    float tu, tw;
+    reduce2(qu, qw, tu, tw);
+    float su = 1.0 / sqrt(tu / float(p.n) + p.eps);
+    float sw = 1.0 / sqrt(tw / float(p.n) + p.eps);
     barrier();
 
-    float s = 0.0;
-    for (uint i = t; i < p.n; i += 256u) s += u[i] * u[i];
-    float su = 1.0 / sqrt(reduce(s) / float(p.n) + p.eps);
+    float qc = 0.0;
+    for (uint i = t; i < p.n; i += LANES) {
+        float x = u[i] * su * g1[i] + w[i] * sw * g2[i];
+        u[i] = x;
+        qc += x * x;
+    }
+    barrier();
+    float tc, unused;
+    reduce2(qc, 0.0, tc, unused);
+    float sc = 1.0 / sqrt(tc / float(p.n) + p.eps);
     barrier();
 
-    s = 0.0;
-    for (uint i = t; i < p.n; i += 256u) s += w[i] * w[i];
-    float sw = 1.0 / sqrt(reduce(s) / float(p.n) + p.eps);
-    barrier();
-
-    for (uint i = t; i < p.n; i += 256u) u[i] = u[i] * su * g1[i] + w[i] * sw * g2[i];
-    barrier();
-
-    s = 0.0;
-    for (uint i = t; i < p.n; i += 256u) s += u[i] * u[i];
-    float sc = 1.0 / sqrt(reduce(s) / float(p.n) + p.eps);
-    barrier();
-
-    for (uint i = t; i < p.n; i += 256u) {
+    for (uint i = t; i < p.n; i += LANES) {
         xs[i] = (resid[i] + u[i] * sc * g3[i]) * p.outScale;
     }
 }

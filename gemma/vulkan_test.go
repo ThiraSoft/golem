@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"testing"
+	"time"
 )
 
 // open26B is open26BEngine for a test rather than a benchmark.
@@ -134,6 +135,7 @@ func load26BStack(t *testing.T) (*fixture, *Model) {
 // began.
 func TestVulkanForwardBlockByBlock(t *testing.T) {
 	f, m := load26BStack(t)
+	m.TraceBlocks()
 	for pos, token := range f.Tokens {
 		m.Forward(token, pos)
 		for _, il := range moeBlocks {
@@ -212,4 +214,28 @@ func BenchmarkMoETokenVulkanBlocks(b *testing.B) {
 		b.Skipf("no Vulkan stack: %v", err)
 	}
 	benchToken(b, m)
+}
+
+// TestVulkanStackProfile is not a test of anything; it is the instrument that
+// says which stage of a block a token is spent in. Run it with -v.
+func TestVulkanStackProfile(t *testing.T) {
+	_, m := load26BStack(t)
+	tl, err := m.NewStackTimeline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tl.Close()
+
+	m.Forward(2, 0) // warm the clocks
+	m.ProfileStack(tl)
+	start := time.Now()
+	m.Forward(2, 1)
+	took := time.Since(start)
+	m.ProfileStack(nil)
+
+	report, err := tl.Report(took)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log("\n" + report)
 }

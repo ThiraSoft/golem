@@ -62,6 +62,10 @@ type normPush struct {
 	scalar float32
 }
 
+// pickLanes is shaders/router_pick.comp's workgroup, which is one lane per
+// expert and so also the most experts it can choose among.
+const pickLanes = 256
+
 // routerPush is shaders/router.comp's.
 type routerPush struct {
 	n       uint32
@@ -106,6 +110,8 @@ type Stack struct {
 	traces *Buffer
 
 	blocks []*stackBlock
+	trace  bool // whether Run keeps each block's output; see traces
+	tl     *Timeline
 }
 
 // A stackBlock is one block's norms, its router, and the bindings that read
@@ -252,6 +258,10 @@ func (s *Stack) Experts(n int) error {
 	if s.routerOut != nil {
 		return nil
 	}
+	// shaders/router_pick.comp gives one lane to each expert.
+	if n > pickLanes {
+		return fmt.Errorf("vk: the router picks among at most %d experts, this model has %d", pickLanes, n)
+	}
 	b, err := s.d.Local(n*4, bufferUsageStorage)
 	if err != nil {
 		return err
@@ -273,8 +283,31 @@ func (s *Stack) Ready() error {
 	return nil
 }
 
-// BlockOutput is what the given block last left in the stream.
+// Trace turns the per-block copies on. They are off by default: thirty copies
+// and the thirty barriers around them are free beside a block's arithmetic and
+// are not free beside the launch latency that a token is actually made of.
+func (s *Stack) Trace(on bool) { s.trace = on }
+
+// Profile makes the next tokens stamp the card's clock between the stages. See
+// profile.go for what the stamps are worth.
+func (s *Stack) Profile(t *Timeline) {
+	s.tl = t
+	s.attn.Profile(t)
+	s.mix.Profile(t)
+}
+
+// NewTimeline is Device.NewTimeline on the device the stack was built on,
+// sized for the stamps Run writes: eight a block, and a few over.
+func (s *Stack) NewTimeline() (*Timeline, error) { return s.d.NewTimeline(16*len(s.blocks) + 8) }
+
+// BlockOutput is what the given block last left in the stream. It is nil
+// unless Trace was turned on before the token ran, rather than stale, so that
+// a caller that forgot fails where it reads instead of comparing against the
+// last thing in the buffer.
 func (s *Stack) BlockOutput(block int) []float32 {
+	if !s.trace {
+		return nil
+	}
 	at := block * s.dim
 	return s.traces.Floats()[at : at+s.dim]
 }
@@ -307,32 +340,47 @@ func (s *Stack) Run(at Position, experts, used int) error {
 	routerIn := normPush{n: uint32(s.dim), flags: normVScale | normFloat, eps: s.eps, scalar: route.scalar}
 
 	return s.d.Submit(func(r *Recorder) {
+		tl := s.tl
+		if tl != nil {
+			tl.Reset(r)
+			tl.Stamp(r, "start")
+		}
 		for i, b := range s.blocks {
 			combine := combinePush{n: uint32(s.dim), eps: s.eps, outScale: b.outScale}
 
 			r.Dispatch(b.setAttnNorm, 1, unsafe.Pointer(&quant))
 			r.Barrier()
+			tl.Stamp(r, "attn norm")
 			s.attn.Record(r, i, at.Pos, at.First[i], at.Last[i])
 			r.Barrier()
+			tl.Stamp(r, "attn out")
 			r.Dispatch(b.setPostAttn, 1, unsafe.Pointer(&post))
 			r.Barrier()
 			r.Dispatch(b.setResid, 1, unsafe.Pointer(&resid))
 			r.Barrier()
+			tl.Stamp(r, "post+resid")
 			// The expert branch's norm and the routing both read the residual
 			// and neither reads the other.
 			r.Dispatch(b.setExpert, 1, unsafe.Pointer(&quant))
 			r.Dispatch(b.setRouterIn, 1, unsafe.Pointer(&routerIn))
 			r.Barrier()
+			tl.Stamp(r, "expert norm")
 			r.Dispatch(b.setRouterW, uint32(experts), unsafe.Pointer(&route))
 			r.Barrier()
+			tl.Stamp(r, "router")
 			r.Dispatch(b.setPick, 1, unsafe.Pointer(&route))
 			r.Barrier()
+			tl.Stamp(r, "pick")
 			s.mix.Record(r, i)
 			r.Barrier()
+			tl.Stamp(r, "moe down")
 			r.Dispatch(b.setCombine, 1, unsafe.Pointer(&combine))
 			r.Barrier()
-			r.Copy(s.traces, i*s.dim*4, s.xs, s.dim*4)
-			r.Barrier()
+			tl.Stamp(r, "combine")
+			if s.trace {
+				r.Copy(s.traces, i*s.dim*4, s.xs, s.dim*4)
+				r.Barrier()
+			}
 		}
 	})
 }

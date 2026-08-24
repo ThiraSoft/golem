@@ -59,6 +59,7 @@ type BlockShape struct {
 // An Attention is every attention matrix and every key-value cache of a model,
 // resident, and the buffers one position passes through.
 type Attention struct {
+	tl *Timeline // set by Profile, nil everywhere else
 	d *Device
 
 	dim        int // the stream's width, which is what the output projection makes
@@ -377,6 +378,10 @@ func (a *Attention) Attend(block int, in *nn.Batch, cos, sin []float32, pos, fir
 // Record puts one block's attention into a recording without submitting it,
 // which is what running a whole token in one submission needs. The input must
 // already be in the buffers Input names.
+// Profile is Stack.Profile, forwarded: the stamps the attention writes are
+// the four products, the cache and the scores.
+func (a *Attention) Profile(t *Timeline) { a.tl = t }
+
 func (a *Attention) Record(r *Recorder, block, pos, first, last int) {
 	b := a.blocks[block]
 	s := b.shape
@@ -409,10 +414,13 @@ func (a *Attention) Record(r *Recorder, block, pos, first, last int) {
 		r.Dispatch(b.setV, groups(kv), unsafe.Pointer(&kvProject))
 	}
 	r.Barrier()
+	a.tl.Stamp(r, "attn qkv")
 	r.Dispatch(b.setPrepare, units, unsafe.Pointer(&prepare))
 	r.Barrier()
+	a.tl.Stamp(r, "attn cache")
 	r.Dispatch(b.setScores, uint32(s.Heads), unsafe.Pointer(&score))
 	r.Barrier()
+	a.tl.Stamp(r, "attn scores")
 	r.Dispatch(b.setO, groups(a.dim), unsafe.Pointer(&outProject))
 }
 
@@ -433,7 +441,7 @@ func boolTo(b bool) uint32 {
 }
 
 // groups is how many workgroups the matvec kernel needs for that many outputs.
-func groups(outputs int) uint32 { return uint32((outputs + 63) / 64) }
+func groups(outputs int) uint32 { return uint32((outputs + matvecOuts - 1) / matvecOuts) }
 
 func (a *Attention) Close() {
 	for _, b := range a.blocks {

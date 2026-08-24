@@ -244,6 +244,31 @@ func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32,
 	return hidden
 }
 
+// TraceBlocks asks the device path to keep every block's output, which it does
+// not do by default. It costs a copy a block and must be set before the token
+// that is going to be read back.
+func (m *Model) TraceBlocks() {
+	if m.stack != nil {
+		m.stack.Trace(true)
+	}
+}
+
+// ProfileStack points the device path at a timeline, which stamps the card's
+// clock between the stages of every block. It is nil-safe and off by default.
+func (m *Model) ProfileStack(t *vk.Timeline) {
+	if m.stack != nil {
+		m.stack.Profile(t)
+	}
+}
+
+// NewStackTimeline is a timeline sized for one token of this model's stack.
+func (m *Model) NewStackTimeline() (*vk.Timeline, error) {
+	if m.stack == nil {
+		return nil, fmt.Errorf("gemma: there is no device stack to profile")
+	}
+	return m.stack.NewTimeline()
+}
+
 // BlockOutput is what the given block last produced. For the tests that have to
 // say which block a divergence began in.
 func (m *Model) BlockOutput(block int) []float32 {
