@@ -93,3 +93,42 @@ func BenchmarkMixtureSaturated(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkAttentionBlock is one block's whole attention on the card,
+// submission and all: the four products, the norms, the rotation, the cache,
+// the scores and the mix.
+func BenchmarkAttentionBlock(b *testing.B) {
+	path := os.Getenv("GOLEM_MODEL_26B")
+	if path == "" {
+		b.Skip("no model")
+	}
+	m, err := Open(path, 512)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.UseVulkanAttention(); err != nil {
+		b.Skip(err)
+	}
+	cfg := m.Cfg
+	bw, bc := &m.W.Blocks[0], cfg.Blocks[0]
+	m.Forward(100, 0)
+
+	in := nn.NewBatch(cfg.Dim, 1)
+	for i := range in.F[0] {
+		in.F[0][i] = float32(i%64) * 0.01
+	}
+	in.QuantizeColumnRange(0, 0, cfg.Dim)
+	cos := make([]float32, bc.RoPEDims/2)
+	sin := make([]float32, bc.RoPEDims/2)
+	for i := range cos {
+		cos[i], sin[i] = 1, 0
+	}
+	out := make([]float32, cfg.Dim)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := bw.Attn.Attend(bw.AttnIndex, in, cos, sin, 1, 0, 1, out); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
