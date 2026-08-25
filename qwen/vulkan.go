@@ -149,6 +149,13 @@ func (m *Model) UseVulkanStack() error {
 			return err
 		}
 	}
+	// The final norm too, so that what comes back off the card is the hidden
+	// state a caller can compare against llama.cpp's at the same point rather
+	// than one norm short of it.
+	if err := stack.SetOutputNorm(m.W.OutputNorm); err != nil {
+		stack.Close()
+		return err
+	}
 	if err := stack.Ready(); err != nil {
 		stack.Close()
 		return err

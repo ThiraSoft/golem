@@ -16,6 +16,7 @@ package gemma
 
 import (
 	"fmt"
+	"math"
 	"unsafe"
 
 	"github.com/ThiraSoft/golem/nn"
@@ -45,7 +46,31 @@ func (m *Model) UseVulkanHead() error {
 		return err
 	}
 	m.head = h
+	// The head is the embedding read the other way round, so a stack built
+	// before it can now read its rows too rather than being handed them.
+	if m.stack != nil {
+		if err := m.useVulkanEmbedding(); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// useVulkanEmbedding points the stack at the head's table. It is one tensor
+// serving both directions: nothing more is uploaded, and what it saves is not
+// the microseconds but the last step of a pass that was still this side of the
+// bus. vk/shaders/embed_q6k.comp says the rest.
+func (m *Model) useVulkanEmbedding() error {
+	if m.head == nil || m.stack == nil || m.stack.Embedding() {
+		return nil
+	}
+	if m.Cfg.PLEDim > 0 {
+		// The per-layer inputs are built from the embedding on this side, so
+		// it has to exist here.
+		return nil
+	}
+	table, cols := m.head.Table()
+	return m.stack.SetEmbedding(table, cols, float32(math.Sqrt(float64(m.Cfg.Dim))))
 }
 
 // UseVulkanStack puts every block of the model on a Vulkan device: the
@@ -199,11 +224,21 @@ func (m *Model) UseVulkanStack() error {
 			return err
 		}
 	}
+	// The final norm too, so that what comes back off the card is the hidden
+	// state a caller can compare against llama.cpp's at the same point rather
+	// than one norm short of it.
+	if err := stack.SetOutputNorm(m.W.OutputNorm); err != nil {
+		stack.Close()
+		return err
+	}
 	if err := stack.Ready(); err != nil {
 		stack.Close()
 		return err
 	}
 	m.stack = stack
+	if err := m.useVulkanEmbedding(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -238,6 +273,10 @@ func (m *Model) device() (*vk.Device, error) {
 	m.headDev = d
 	return d, nil
 }
+
+// VulkanEmbedding says whether the card looks the token embedding up itself,
+// which it does when both the stack and the head are on it.
+func (m *Model) VulkanEmbedding() bool { return m.stack != nil && m.stack.Embedding() }
 
 // VulkanHead says whether the head is on a device.
 func (m *Model) VulkanHead() bool { return m.head != nil }

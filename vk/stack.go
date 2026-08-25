@@ -31,6 +31,7 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/router_logits.comp -o shaders/router_logits.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/router_pick.comp -o shaders/router_pick.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/combine.comp -o shaders/combine.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_q6k.comp -o shaders/embed_q6k.spv
 
 //go:embed shaders/norm.spv
 var normSPIRV []byte
@@ -43,6 +44,9 @@ var routerPickSPIRV []byte
 
 //go:embed shaders/combine.spv
 var combineSPIRV []byte
+
+//go:embed shaders/embed_q6k.spv
+var embedQ6KSPIRV []byte
 
 // The flags shaders/norm.comp reads.
 const (
@@ -73,6 +77,13 @@ type routerPush struct {
 	used    uint32
 	eps     float32
 	scalar  float32
+}
+
+// embedPush is shaders/embed_q6k.comp's.
+type embedPush struct {
+	cols        uint32
+	superblocks uint32
+	scale       float32
 }
 
 // combinePush is shaders/combine.comp's.
@@ -109,9 +120,23 @@ type Stack struct {
 	mix  *Mixture
 
 	norm, routerW, routerPick, combine *Pipeline
+	// embed reads one row of the token embedding into the stream, when the
+	// caller gave the stack a table to read it from.
+	embed    *Pipeline
+	embedSet *Set
+	ids      *Buffer // one identifier a column, negative where the caller wrote its own
+	embedOf  embedPush
 
 	routerIn  *Buffer // the residual under the router's own norm and scale
 	routerOut *Buffer // one logit per expert
+
+	// outGain is the model's final norm, when the caller gave it one. The
+	// last thing a pass does is then the same kernel as every other norm,
+	// reading the stream and writing it back in place — which is what lets a
+	// caller read the hidden state out already normed and lets a step of this
+	// engine be compared against llama.cpp's at the same point.
+	outGain  *Buffer
+	setFinal *Set
 
 	xs     *Buffer // the stream, seeded by the caller and read back at the end
 	resid  *Buffer // between the two halves of a block
@@ -172,6 +197,7 @@ func NewStack(d *Device, dim int, eps float32, attn *Attention, mix *Mixture) (*
 		{&s.routerW, routerLogitsSPIRV, 3, unsafe.Sizeof(routerPush{})},
 		{&s.routerPick, routerPickSPIRV, 4, unsafe.Sizeof(routerPush{})},
 		{&s.combine, combineSPIRV, 7, unsafe.Sizeof(combinePush{})},
+		{&s.embed, embedQ6KSPIRV, 3, unsafe.Sizeof(embedPush{})},
 	} {
 		if *spec.into, err = d.NewPipeline(spec.spirv, spec.bindings, uint32(spec.push)); err != nil {
 			s.Close()
@@ -191,6 +217,81 @@ func NewStack(d *Device, dim int, eps float32, attn *Attention, mix *Mixture) (*
 	}
 	return s, nil
 }
+
+// SetEmbedding gives the stack the token embedding to read, which is the
+// tensor the logit head already holds: pass its Table. A pass then looks its
+// own row up rather than being handed one, and SetTokens says which.
+//
+// It may be called at any time; the recordings are dropped and made again.
+func (s *Stack) SetEmbedding(table *Buffer, cols int, scale float32) error {
+	if cols != s.dim {
+		return fmt.Errorf("vk: the embedding is %d wide and the stream is %d", cols, s.dim)
+	}
+	if cols%256 != 0 {
+		return fmt.Errorf("vk: a Q6_K row needs a multiple of 256 columns, given %d", cols)
+	}
+	if s.embedSet != nil {
+		return fmt.Errorf("vk: the embedding is already set")
+	}
+	var err error
+	if s.ids, err = s.d.Host(maxColumns*4, bufferUsageStorage); err != nil {
+		return err
+	}
+	if s.embedSet, err = s.embed.NewSet([]*Buffer{table, s.ids, s.xs}); err != nil {
+		return err
+	}
+	s.embedOf = embedPush{cols: uint32(cols), superblocks: uint32(cols / 256), scale: scale}
+	s.programs = nil
+	return nil
+}
+
+// Embedding says whether the stack looks its own embedding up.
+func (s *Stack) Embedding() bool { return s.embedSet != nil }
+
+// SetTokens says which row of the embedding each column of the pass reads. A
+// negative identifier leaves that column of the stream alone, which is how a
+// picture reaches the model: the vision tower's rows are written there by the
+// caller and nothing must overwrite them.
+func (s *Stack) SetTokens(ids []int32) error {
+	if s.embedSet == nil {
+		return fmt.Errorf("vk: this stack has no embedding to look up")
+	}
+	if len(ids) > maxColumns {
+		return fmt.Errorf("vk: a pass carries %d columns, given %d identifiers", maxColumns, len(ids))
+	}
+	copy(unsafe.Slice((*int32)(unsafe.Pointer(&s.ids.Bytes()[0])), maxColumns), ids)
+	return nil
+}
+
+// SetOutputNorm puts the model's final norm on the card. Without it a pass
+// leaves the last block's residual in the stream and the caller norms it
+// itself; with it the stream comes back normed.
+//
+// It is called once, before Ready, and the gain is uploaded rather than kept.
+func (s *Stack) SetOutputNorm(gain []float32) error {
+	if len(gain) != s.dim {
+		return fmt.Errorf("vk: the final norm should be %d wide, given %d", s.dim, len(gain))
+	}
+	if s.outGain != nil {
+		return fmt.Errorf("vk: the final norm is already set")
+	}
+	buf, err := s.d.Upload(asBytes(gain))
+	if err != nil {
+		return err
+	}
+	s.outGain = buf
+	// a, b, gain, vscale, sum, y, yq, ys — in place, and nothing quantized.
+	set, err := s.norm.NewSet([]*Buffer{s.xs, s.none, s.outGain, s.none, s.none, s.xs, s.none, s.none})
+	if err != nil {
+		return err
+	}
+	s.setFinal = set
+	s.programs = nil
+	return nil
+}
+
+// OutputNorm says whether the final norm is on the card.
+func (s *Stack) OutputNorm() bool { return s.setFinal != nil }
 
 // SetGeometry writes one rotation geometry's inverse frequencies. It is called
 // once, when the stack is built: the angles themselves are made by the card at
@@ -460,6 +561,13 @@ func (s *Stack) record(r *Recorder, experts, used, columns int) {
 		tl.Reset(r)
 		tl.Stamp(r, "start")
 	}
+	if s.embedSet != nil {
+		// The embedding before anything, since the stream is what the first
+		// block norms.
+		r.Dispatch(s.embedSet, cols, unsafe.Pointer(&s.embedOf))
+		r.Barrier()
+		tl.Stamp(r, "embed")
+	}
 	// The angles first: every block reads them and nothing writes them but
 	// this, so one dispatch a geometry at the head of the pass serves the
 	// whole of it.
@@ -510,6 +618,15 @@ func (s *Stack) record(r *Recorder, experts, used, columns int) {
 			r.Barrier()
 		}
 	}
+	if s.setFinal != nil {
+		// In place: the kernel loads its column into shared memory before it
+		// writes anything, so the stream is both what it reads and where it
+		// leaves the answer.
+		final := normPush{n: uint32(s.dim), flags: normGain | normFloat, eps: s.eps, scalar: 1}
+		r.DispatchColumns(s.setFinal, 1, cols, unsafe.Pointer(&final))
+		r.Barrier()
+		tl.Stamp(r, "final norm")
+	}
 }
 
 // sqrtOf is math.Sqrt on an int, kept here so that this file imports no more
@@ -527,6 +644,22 @@ func sqrtOf(n int) float64 {
 }
 
 func (s *Stack) Close() {
+	if s.embedSet != nil {
+		s.embedSet.Close()
+		s.embedSet = nil
+	}
+	if s.ids != nil {
+		s.ids.Close()
+		s.ids = nil
+	}
+	if s.setFinal != nil {
+		s.setFinal.Close()
+		s.setFinal = nil
+	}
+	if s.outGain != nil {
+		s.outGain.Close()
+		s.outGain = nil
+	}
 	s.forget()
 	for _, b := range s.blocks {
 		b.close()
@@ -538,7 +671,7 @@ func (s *Stack) Close() {
 			*b = nil
 		}
 	}
-	for _, p := range []**Pipeline{&s.combine, &s.routerPick, &s.routerW, &s.norm} {
+	for _, p := range []**Pipeline{&s.embed, &s.combine, &s.routerPick, &s.routerW, &s.norm} {
 		if *p != nil {
 			(*p).Close()
 			*p = nil

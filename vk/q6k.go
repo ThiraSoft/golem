@@ -119,6 +119,11 @@ func NewQ6KHead(d *Device, data []byte, rows, cols int) (*Q6KHead, error) {
 
 // MatVec computes y = W*x for one column of a batch that already carries its
 // Q8_K form, and leaves the result in out.
+// Table is the matrix itself, so that a caller holding both this and a Stack
+// can read a row of it there too: Gemma's head and its input embedding are the
+// same tensor, and uploading it twice would be 577 mebibytes for nothing.
+func (h *Q6KHead) Table() (*Buffer, int) { return h.weights, h.cols }
+
 func (h *Q6KHead) MatVec(b *nn.Batch, column int, out []float32) error {
 	if b.QK == nil {
 		return fmt.Errorf("vk: a Q6_K product needs the activation in its Q8_K form")

@@ -189,9 +189,10 @@ func (m *Model) ForwardMixed(tokens []int32, at []Place) [][]float32 {
 	// same.
 	if m.stack != nil {
 		m.runStack(xs, at)
+		// The card normed it: the last thing the recording does is the
+		// model's final norm, in place in the stream.
 		for t := range tokens {
 			copy(m.hidden[t], xs[t])
-			nn.RMSNormPlain(m.hidden[t], w.OutputNorm, cfg.Eps)
 		}
 		return m.hidden[:batch]
 	}

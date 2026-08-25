@@ -1,0 +1,75 @@
+#version 450
+
+// The token embedding, read on the card.
+//
+// Gemma ties its head to its input embedding, so the table is already there
+// whenever the head is: a quarter of a million rows of Q6_K that the logit
+// product reads in full every token. Reading one row of it was the last thing
+// the CPU did before a pass — a dequantization of a few thousand values, a
+// scale by the square root of the width, and a copy of the result across the
+// bus into the stream.
+//
+// It was under a percent of a wide prompt, so this is not here for the
+// milliseconds. It is here so that what a pass is can be said in one place: a
+// token goes in and a hidden state comes out, and every step between them is
+// the card's. That is also what makes a step of this engine comparable with
+// the same step of llama.cpp, which has never done any of it anywhere else.
+//
+// A column whose identifier is negative is left alone. That is how a picture
+// reaches the model: the vision tower's rows are written into the stream by
+// the caller and this must not overwrite them.
+//
+// The unpacking is ggml's, and vk/shaders/q6k.comp is the other copy of it in
+// this engine — that one folds the weights into a product, this one writes
+// them out.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer W  { uint w[];   };
+layout(std430, binding = 1) readonly  buffer ID { int  ids[]; };
+layout(std430, binding = 2) writeonly buffer Y  { float y[];  };
+
+layout(push_constant) uniform Push {
+    uint  cols;        // the width of a row
+    uint  superblocks; // cols / 256
+    float scale;       // sqrt(dim), which Gemma multiplies the embedding by
+} p;
+
+const uint BYTES = 212u;   // one padded superblock, as vk/q6k.go packs it
+
+uint ubyte(uint b) { return bitfieldExtract(w[b >> 2], int((b & 3u) * 8u), 8); }
+int  sbyte(uint b) { return bitfieldExtract(int(w[b >> 2]), int((b & 3u) * 8u), 8); }
+
+void main() {
+    uint col = gl_WorkGroupID.x;
+    int  id  = ids[col];
+    if (id < 0) return;   // the caller wrote this column itself
+
+    uint t     = gl_LocalInvocationID.x;
+    uint upper = t >> 5;        // which half of the superblock
+    uint l     = t & 31u;       // and which of its thirty-two quads
+    uint is    = l >> 4;
+
+    uint row  = uint(id) * p.superblocks;
+    uint ybase = col * p.cols;
+
+    for (uint sb = 0u; sb < p.superblocks; sb++) {
+        uint base = (row + sb) * BYTES;
+
+        uint lo0 = ubyte(base + upper * 64u + l);
+        uint lo1 = ubyte(base + upper * 64u + 32u + l);
+        uint hi  = ubyte(base + 128u + upper * 32u + l);
+
+        uint sc = base + 192u + upper * 8u + is;
+        float d = unpackHalf2x16(w[(base >> 2) + 52u]).x;
+
+        uint at = ybase + sb * 256u + upper * 128u + l;
+        // The scale comes last, after the dequantization, because that is the
+        // order gemma/ple.go multiplies in and a hidden state that differs
+        // from the CPU path's by an ULP is a fixture that stops matching.
+        y[at]       = (d * float(sbyte(sc))      * float(int((lo0 & 15u) | (((hi >> 0) & 3u) << 4)) - 32)) * p.scale;
+        y[at + 32u] = (d * float(sbyte(sc + 2u)) * float(int((lo1 & 15u) | (((hi >> 2) & 3u) << 4)) - 32)) * p.scale;
+        y[at + 64u] = (d * float(sbyte(sc + 4u)) * float(int((lo0 >> 4)  | (((hi >> 4) & 3u) << 4)) - 32)) * p.scale;
+        y[at + 96u] = (d * float(sbyte(sc + 6u)) * float(int((lo1 >> 4)  | (((hi >> 6) & 3u) << 4)) - 32)) * p.scale;
+    }
+}

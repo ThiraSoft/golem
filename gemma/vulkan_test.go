@@ -125,6 +125,16 @@ func load26BStack(t *testing.T) (*fixture, *Model) {
 	if !m.VulkanStack() {
 		t.Fatal("the stack reports itself absent after being installed")
 	}
+	// The head too, and not only for the logits: it is the input embedding
+	// read the other way round, so it is also what the stack looks its own
+	// rows up in. Every test below then covers the embedding on the card,
+	// which is otherwise a step nothing exercises.
+	if err := m.UseVulkanHead(); err != nil {
+		t.Fatalf("the head would not go on the card: %v", err)
+	}
+	if !m.VulkanEmbedding() {
+		t.Fatal("the head is on the card and the stack is still being handed its embedding")
+	}
 	return f, m
 }
 

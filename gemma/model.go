@@ -27,6 +27,7 @@ type Model struct {
 	slotContext int
 	scratch     *Scratch
 	embedded    map[int]*nn.Batch
+	ids         []int32 // one embedding row a column, for the device path
 	xs          [][]float32
 	hidden      [][]float32
 	ple         [][]float32
@@ -98,6 +99,7 @@ func (m *Model) reserve(batch int) {
 	m.batch = batch
 	m.scratch.Reserve(batch)
 
+	m.ids = make([]int32, batch)
 	m.xs = rows(batch, m.Cfg.Dim)
 	m.hidden = rows(batch, m.Cfg.Dim)
 	m.ple = rows(batch, len(m.Cfg.Blocks)*m.Cfg.PLEDim)
@@ -188,6 +190,31 @@ func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32,
 	batch := len(tokens)
 	m.reserve(batch)
 
+	if m.stack != nil && m.stack.Embedding() {
+		// The card reads its own row of the table, so the only thing this
+		// side writes is which row — and, where a picture stands in for a
+		// token, the row itself.
+		ids := m.ids[:batch]
+		stream := m.stack.Stream().Floats()
+		for t := range tokens {
+			if embeds != nil && embeds[t] != nil {
+				ids[t] = -1
+				copy(stream[t*cfg.Dim:], embeds[t])
+				continue
+			}
+			ids[t] = tokens[t]
+		}
+		if err := m.stack.SetTokens(ids); err != nil {
+			panic(fmt.Sprintf("gemma: the device refused the identifiers: %v", err))
+		}
+		m.runStack(nil, at)
+		xs := m.stack.Stream().Floats()
+		for t := range tokens {
+			copy(m.hidden[t], xs[t*cfg.Dim:])
+		}
+		return m.hidden[:batch]
+	}
+
 	embedded, ok := m.embedded[batch]
 	if !ok {
 		// Its own batch rather than one from the scratch space: the blocks reuse
@@ -215,9 +242,10 @@ func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32,
 	}
 	if m.stack != nil {
 		m.runStack(xs, at)
+		// The card normed it: the last thing the recording does is the
+		// model's final norm, in place in the stream.
 		for t := range tokens {
 			copy(m.hidden[t], xs[t])
-			nn.RMSNormPlain(m.hidden[t], w.OutputNorm, cfg.Eps)
 		}
 		return m.hidden[:batch]
 	}
@@ -294,13 +322,15 @@ func (m *Model) stackColumns() int {
 }
 
 // runStack carries a stretch of positions through every block on the device,
-// in one submission. What crosses is those vectors in and the same vectors
-// back.
+// in one submission. xs is the embeddings to seed the stream with, or nil
+// where the card looks them up itself.
 func (m *Model) runStack(xs [][]float32, at []Place) {
 	cfg := m.Cfg
-	stream := m.stack.Stream().Floats()
-	for t := range xs {
-		copy(stream[t*cfg.Dim:], xs[t])
+	if xs != nil {
+		stream := m.stack.Stream().Floats()
+		for t := range xs {
+			copy(stream[t*cfg.Dim:], xs[t])
+		}
 	}
 
 	// The window rule and the ring agree, so the range is worked out here and
@@ -317,9 +347,11 @@ func (m *Model) runStack(xs [][]float32, at []Place) {
 	if err := m.stack.Run(positions, cfg.Experts, cfg.ExpertsUsed); err != nil {
 		panic(fmt.Sprintf("gemma: the device failed: %v", err))
 	}
-	stream = m.stack.Stream().Floats()
-	for t := range xs {
-		copy(xs[t], stream[t*cfg.Dim:])
+	if xs != nil {
+		stream := m.stack.Stream().Floats()
+		for t := range xs {
+			copy(xs[t], stream[t*cfg.Dim:])
+		}
 	}
 }
 
