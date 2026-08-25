@@ -44,21 +44,32 @@ var attnScoresSPIRV []byte
 // passWidth says which binary a pass of a given length actually runs.
 const maxColumns = wideColumns
 
+// scoreColumns is how many columns of a pass the scores kernel answers at
+// once. Its scratch is one float per head per column per visible position,
+// and the deepest context makes that the largest buffer in the stack by a
+// wide margin: sizing it for the whole width of a pass would be hundreds of
+// megabytes on a card that is already holding the weights. So a wide pass
+// runs shaders/attn_scores.comp once per stretch of this many, at an offset
+// it pushes. Four dispatches a block rather than one, which measured under a
+// percent of a pass — see the header of that shader.
+const scoreColumns = 32
+
 // passWidth is the widest binary that answers a pass of that many columns.
-// There are three: the tiled product at thirty-two, the mat-vec at eight, and
-// the mat-vec at one, which is a token. A pass shorter than the binary it runs
-// computes the columns above it too, out of buffers that are allocated for
-// them and out of positions the per-column kernels never dispatch — so the
-// answer is right and the cost is the binary's, which is why the callers cut a
-// prompt into stretches of maxColumns and not into whatever is left.
+// There are four: the tiled product at a hundred and twenty-eight and at
+// thirty-two, the mat-vec at eight, and the mat-vec at one, which is a token.
+// A pass shorter than the binary it runs computes the columns above it too,
+// out of buffers that are allocated for them and out of positions the
+// per-column kernels never dispatch — so the answer is right and the cost is
+// the binary's. Hence the ladder rather than one width: a prompt of sixty-four
+// read by the widest binary pays for a hundred and twenty-eight, and measured
+// that is a third of the rate the thirty-two-column binary gives it.
 func passWidth(columns int) int {
-	switch {
-	case columns > smallColumns:
-		return wideColumns
-	case columns > 1:
-		return smallColumns
+	for _, w := range matmulWidths {
+		if columns <= w {
+			return w
+		}
 	}
-	return 1
+	return wideColumns
 }
 
 // A BlockShape is what one block's attention is, as the kernels need to know
@@ -172,6 +183,7 @@ type scorePush struct {
 	mask     uint32
 	stride   uint32
 	scale    float32
+	col0     uint32
 }
 
 // NewAttention builds the kernels and the shared buffers, which are sized for
@@ -217,7 +229,9 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 		spirv   []byte
 	}{
 		{smallColumns, matvecWideSPIRV},
-		{wideColumns, matmulWideSPIRV},
+		{tiledColumns, matmulWide32SPIRV},
+		{64, matmulWide64SPIRV},
+		{wideColumns, matmulWide()},
 	} {
 		if err := a.matvec.Wide(spec.columns, spec.spirv); err != nil {
 			a.Close()
@@ -233,16 +247,16 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 		// Everything here is device memory: the CPU writes none of it, and a
 		// shader reading system memory reaches across the bus. vk/device.go's
 		// Host says what that was worth.
-		{&a.xq, dim * maxColumns, true},                                   // the normed stream, Q8_0
-		{&a.xs, 2 * dim / nn.QuantBlock * 4 * maxColumns, true},           //
-		{&a.out, dim * 4 * maxColumns, true},                              // what the output projection makes
-		{&a.q, maxHeads * 4 * maxColumns, true},                           // the three projections, which never leave
-		{&a.k, maxKV * 4 * maxColumns, true},                              //
-		{&a.v, maxKV * 4 * maxColumns, true},                              //
-		{&a.qh, maxHeads * 4 * maxColumns, true},                          // the queries, rounded through fp16
-		{&a.outParts, dim * 4 * maxColumns * matmulSplit(dim), true},      // its slices, when it is split
-		{&a.scoreRows, maxQueryHeads * maxContext * 4 * maxColumns, true}, // one row of scores per head per column
-		{&a.aq, maxHeads * maxColumns, true},                              // the mixed values, Q8_0
+		{&a.xq, dim * maxColumns, true},                                     // the normed stream, Q8_0
+		{&a.xs, 2 * dim / nn.QuantBlock * 4 * maxColumns, true},             //
+		{&a.out, dim * 4 * maxColumns, true},                                // what the output projection makes
+		{&a.q, maxHeads * 4 * maxColumns, true},                             // the three projections, which never leave
+		{&a.k, maxKV * 4 * maxColumns, true},                                //
+		{&a.v, maxKV * 4 * maxColumns, true},                                //
+		{&a.qh, maxHeads * 4 * maxColumns, true},                            // the queries, rounded through fp16
+		{&a.outParts, dim * 4 * maxColumns * matmulSplit(dim), true},        // its slices, when it is split
+		{&a.scoreRows, maxQueryHeads * maxContext * 4 * scoreColumns, true}, // one row of scores per head per column of a stretch
+		{&a.aq, maxHeads * maxColumns, true},                                // the mixed values, Q8_0
 		{&a.as, 2 * maxHeads / nn.QuantBlock * 4 * maxColumns, true},
 		{&a.where, maxBlocks * maxColumns * 16, false}, // per block and column: position, first, last
 	} {
@@ -512,18 +526,33 @@ func (a *Attention) Record(r *Recorder, block, columns int) {
 	r.DispatchColumns(b.setPrepare, units, uint32(columns), unsafe.Pointer(&prepare))
 	r.Barrier()
 	a.tl.Stamp(r, "attn cache")
-	r.DispatchColumns(b.setScores, uint32(s.Heads), uint32(columns), unsafe.Pointer(&score))
+	for c := 0; c < columns; c += scoreColumns {
+		n := columns - c
+		if n > scoreColumns {
+			n = scoreColumns
+		}
+		if c > 0 {
+			// One stretch at a time through the same scratch, so the next
+			// may not start before the last has read its own rows back.
+			r.Barrier()
+		}
+		score.col0 = uint32(c)
+		r.DispatchColumns(b.setScores, uint32(s.Heads), uint32(n), unsafe.Pointer(&score))
+	}
 	r.Barrier()
 	a.tl.Stamp(r, "attn scores")
-	if b.setOParts != nil && width == wideColumns {
+	if b.setOParts != nil && width >= tiledColumns {
 		// The split product, and the pass that adds its slices. See
 		// matmulSplit: this matrix is the stack's row-poorest, and eighty
 		// workgroups do not fill the card.
 		outProject.split = uint32(a.splitOut)
 		r.DispatchWide(b.setOParts, width, productGroups(width, a.dim)*uint32(a.splitOut), unsafe.Pointer(&outProject))
 		r.Barrier()
-		fold := moePush{dim: uint32(a.dim), ffn: uint32(columns), used: uint32(a.splitOut)}
-		r.Dispatch(a.reduceSet, uint32((a.dim*columns+255)/256), unsafe.Pointer(&fold))
+		// The slices are as wide as the binary, not as the pass: a stretch
+		// shorter than the width still writes its unasked-for columns, and
+		// the fold has to walk the same stride the product wrote at.
+		fold := moePush{dim: uint32(a.dim), ffn: uint32(width), used: uint32(a.splitOut)}
+		r.Dispatch(a.reduceSet, uint32((a.dim*width+255)/256), unsafe.Pointer(&fold))
 		return
 	}
 	product(b.setO, a.dim, unsafe.Pointer(&outProject))
@@ -549,10 +578,13 @@ func boolTo(b bool) uint32 {
 func groups(outputs int) uint32 { return uint32((outputs + matvecOuts - 1) / matvecOuts) }
 
 // productGroups is the same for whichever product a pass of that width runs.
+// A tiled product is cut across its columns as well as its rows above BN of
+// them, so the grid is rows over BM by columns over BN.
 func productGroups(width, outputs int) uint32 {
 	rows := matvecOuts
-	if width == wideColumns {
+	if width >= tiledColumns {
 		rows = matmulRows
+		return uint32((outputs+rows-1)/rows) * uint32(matmulColGroups(width))
 	}
 	return uint32((outputs + rows - 1) / rows)
 }

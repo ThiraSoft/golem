@@ -164,23 +164,32 @@ func BenchmarkQuantizedTokenVulkan(b *testing.B) {
 	benchToken(b, m)
 }
 
-// A prompt of sixty-four positions, which the device path reads one column at
-// a time.
+// A prompt at several lengths, which is what llama-bench's -p sweeps and the
+// only fair way to read the number: a pass answers a fixed width of columns
+// whether or not the prompt fills it, so a prompt shorter than one pass pays
+// for the columns it did not ask for.
 func BenchmarkQuantizedPrefillVulkan(b *testing.B) {
-	m := openQuantizedBench(b)
-	if err := m.UseVulkanStack(); err != nil {
-		b.Skipf("no Vulkan stack: %v", err)
-	}
-	tokens := make([]int32, 64)
-	for i := range tokens {
-		tokens[i] = int32(100 + i)
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		m.Reset()
-		m.ForwardBatch(tokens, 0)
+	for _, n := range []int{64, 128, 256, 512} {
+		b.Run(itoa(n), func(b *testing.B) {
+			m := openQuantizedBench(b)
+			if err := m.UseVulkanStack(); err != nil {
+				b.Skipf("no Vulkan stack: %v", err)
+			}
+			tokens := make([]int32, n)
+			for i := range tokens {
+				tokens[i] = int32(100 + i)
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				m.Reset()
+				m.ForwardBatch(tokens, 0)
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(n)*float64(b.N)/b.Elapsed().Seconds(), "tok/s")
+		})
 	}
 }
+
 
 // TestVulkanPromptProfile is not a test of anything; it is the instrument that
 // says which stage of a block a stretch of prompt is spent in. Run it with -v.

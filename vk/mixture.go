@@ -79,7 +79,13 @@ const gateColumns = 8
 // the shape a token wants. shaders/matmul.comp says why.
 //
 //go:embed shaders/matmul32.spv
-var matmulWideSPIRV []byte
+var matmulWide32SPIRV []byte
+
+//go:embed shaders/matmul64.spv
+var matmulWide64SPIRV []byte
+
+//go:embed shaders/matmul128.spv
+var matmulWidest128SPIRV []byte
 
 //go:embed shaders/matmul_reduce.spv
 var matmulReduceSPIRV []byte
@@ -255,9 +261,11 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 	}{
 		{&m.gateUp, smallColumns, moeGateUpWideSPIRV},
 		{&m.gateUp, 16, moeGateUpMidSPIRV},
-		{&m.gateUp, wideColumns, moeGateUpWidestSPIRV},
+		{&m.gateUp, 32, moeGateUpWidestSPIRV},
 		{&m.denseDown, smallColumns, matvecWideSPIRV},
-		{&m.denseDown, wideColumns, matmulWideSPIRV},
+		{&m.denseDown, tiledColumns, matmulWide32SPIRV},
+		{&m.denseDown, 64, matmulWide64SPIRV},
+		{&m.denseDown, wideColumns, matmulWide()},
 	} {
 		if err := (*spec.pipe).Wide(spec.columns, spec.spirv); err != nil {
 			m.Close()
@@ -456,13 +464,13 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 	if m.experts > 0 {
 		r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
 	}
-	if b.setDenseDnParts != nil && width == wideColumns {
+	if b.setDenseDnParts != nil && width >= tiledColumns {
 		split := shared
 		split.split = uint32(m.splitDown)
 		r.DispatchWide(b.setDenseDnParts, width, down*uint32(m.splitDown), unsafe.Pointer(&split))
 		r.Barrier()
-		fold := moePush{dim: uint32(m.dim), ffn: uint32(columns), used: uint32(m.splitDown)}
-		r.Dispatch(m.reduceSet, uint32((m.dim*columns+255)/256), unsafe.Pointer(&fold))
+		fold := moePush{dim: uint32(m.dim), ffn: uint32(width), used: uint32(m.splitDown)}
+		r.Dispatch(m.reduceSet, uint32((m.dim*width+255)/256), unsafe.Pointer(&fold))
 	} else if width > 1 {
 		r.DispatchWide(b.setDenseDn, width, down, unsafe.Pointer(&shared))
 	} else {

@@ -19,6 +19,8 @@ import (
 //go:generate glslc -O -DCOLUMNS=128 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop128.spv
 //go:generate glslc -O -DCOLUMNS=256 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop256.spv
 //go:generate glslc -O -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul32.spv
+//go:generate glslc -O -DCOLUMNS=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul64.spv
+//go:generate glslc -O -DCOLUMNS=128 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul128.spv
 //go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul8.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_reduce.comp -o shaders/matmul_reduce.spv
 
@@ -30,12 +32,34 @@ import (
 // four rows by four columns, so a pass narrower than four columns has nothing
 // to tile and the mat-vec kernel is the right shape for it.
 const (
-	wideColumns  = 32
+	wideColumns  = 128
+	tiledColumns = 32
 	smallColumns = 8
 )
 
+// matmulWidths are every width a pass may run at, smallest first. A stretch
+// takes the narrowest that holds it: a prompt of sixty-four read by the
+// hundred-and-twenty-eight column binary computes sixty-four columns nobody
+// asked for, and measured that is a third of the rate the right binary gives
+// it.
+var matmulWidths = []int{1, smallColumns, tiledColumns, 64, wideColumns}
+
 // matmulRows is shaders/matmul.comp's BM: how many rows one workgroup writes.
 const matmulRows = 32
+
+// matmulColBlock is shaders/matmul.comp's BN: how many columns of the batch
+// one workgroup answers. Above it a pass is cut across its columns too — the
+// activation staged for a step is BN*(KSTEP*8+1) uints, and at sixty-four
+// columns that is already more shared memory than a workgroup may have.
+const matmulColBlock = 32
+
+// matmulColGroups is how many of those a pass of that width makes.
+func matmulColGroups(width int) int {
+	if width <= matmulColBlock {
+		return 1
+	}
+	return width / matmulColBlock
+}
 
 // matmulSplit is how many slices of the shared dimension the tiled product
 // cuts a matrix of that many rows into.
@@ -182,6 +206,17 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int, coop bool) (*Mat
 	return m, nil
 }
 
+// matmulWide is the tiled product built at the width of a pass, which is a
+// constant: a width the generate lines do not build is a build failure here
+// rather than a run-time one.
+func matmulWide() []byte {
+	spirv, err := matmulSPIRV(wideColumns)
+	if err != nil {
+		panic(err)
+	}
+	return spirv
+}
+
 // matmulCoopSPIRV is the cooperative product built for that many columns.
 func matmulCoopSPIRV(columns int) ([]byte, error) {
 	switch columns {
@@ -200,13 +235,17 @@ func matmulCoopSPIRV(columns int) ([]byte, error) {
 // matmulSPIRV is the binary built for that many columns.
 func matmulSPIRV(columns int) ([]byte, error) {
 	switch columns {
-	case wideColumns:
-		return matmulWideSPIRV, nil
+	case 128:
+		return matmulWidest128SPIRV, nil
+	case 64:
+		return matmulWide64SPIRV, nil
+	case 32:
+		return matmulWide32SPIRV, nil
 	case smallColumns:
 		return matmulSmallSPIRV, nil
 	}
-	return nil, fmt.Errorf("vk: the tiled product is built at %d and %d columns, not %d",
-		smallColumns, wideColumns, columns)
+	return nil, fmt.Errorf("vk: the tiled product is built at %d, 32, 64 and 128 columns, not %d",
+		smallColumns, columns)
 }
 
 // SetColumn writes one column of the batch, which must already carry its Q8_0
@@ -278,7 +317,11 @@ func (m *MatMul) RunTimes(n int) error {
 // was split.
 func (m *MatMul) pass(r *Recorder) {
 	push := moePush{dim: uint32(m.rows), ffn: uint32(m.cols), used: 1, split: uint32(m.split)}
-	groups := uint32((m.rows+m.perGroup-1)/m.perGroup) * uint32(m.split)
+	cols := matmulColGroups(m.columns)
+	if m.coop {
+		cols = 1 // the cooperative product's own BN is its whole width
+	}
+	groups := uint32((m.rows+m.perGroup-1)/m.perGroup) * uint32(cols) * uint32(m.split)
 	r.Dispatch(m.set, groups, unsafe.Pointer(&push))
 	if m.split > 1 {
 		r.Barrier()

@@ -72,22 +72,22 @@ func oneColumn(b *nn.Batch, c int) *nn.Batch {
 }
 
 func TestMatMulMatchesCPU(t *testing.T) {
-	for _, coop := range []bool{false, true} {
-		name := "tiled"
-		if coop {
-			name = "coopmat"
-		}
-		t.Run(name, func(t *testing.T) { matMulMatchesCPU(t, coop) })
+	// Every width the tiled product is built at, because above BN columns a
+	// workgroup answers a slice of the batch rather than all of it, and a
+	// dispatch that forgot to count those slices answers a fraction of the
+	// columns and leaves the rest zero.
+	for _, columns := range []int{32, 64, 128} {
+		t.Run("tiled"+itoa(columns), func(t *testing.T) { matMulMatchesCPU(t, columns, false) })
 	}
+	t.Run("coopmat", func(t *testing.T) { matMulMatchesCPU(t, 32, true) })
 }
 
-func matMulMatchesCPU(t *testing.T, coop bool) {
+func matMulMatchesCPU(t *testing.T, cols int, coop bool) {
 	g, m := aQ4_0(t)
 	defer g.Close()
 	d := open(t)
 	defer d.Close()
 
-	const cols = 32
 	batch := columnsOf(m.Cols, cols)
 
 	// What the CPU makes of it, one product per column.
@@ -155,7 +155,7 @@ func BenchmarkMatMul(b *testing.B) {
 			name    string
 			columns int
 			coop    bool
-		}{{"8", 8, false}, {"32", 32, false}, {"coop32", 32, true}, {"coop64", 64, true}, {"coop128", 128, true}, {"coop256", 256, true}} {
+		}{{"8", 8, false}, {"32", 32, false}, {"64", 64, false}, {"128", 128, false}, {"coop32", 32, true}, {"coop64", 64, true}, {"coop128", 128, true}, {"coop256", 256, true}} {
 			columns, coop := spec.columns, spec.coop
 			b.Run(shape.name+"/"+spec.name, func(b *testing.B) {
 				g, m := namedQ4_0(b, shape.tensor)

@@ -38,10 +38,11 @@ layout(push_constant) uniform Push {
     uint mask;      // capacity - 1 when that is a mask, and zero otherwise
     uint stride;   // scores kept per head
     float scale;   // 1/sqrt(head_dim), or one where a query norm holds the range
+    uint col0;     // the first column of the pass this dispatch answers
 } p;
 
 // WHERE_COLUMNS is vk/attention.go's maxColumns, and the two have to agree.
-const uint WHERE_COLUMNS = 32u;
+const uint WHERE_COLUMNS = 128u;
 
 // The column this workgroup carries. A prompt dispatches one per position, and
 // each of them sees its own stretch of the cache: shaders/attn_prepare.comp has
@@ -49,7 +50,20 @@ const uint WHERE_COLUMNS = 32u;
 // the positions before it in the same batch as well as those before the batch.
 // That is the whole of what makes a batched prompt equal to the same tokens
 // read one at a time.
-#define COL (gl_WorkGroupID.y)
+#define COL (gl_WorkGroupID.y + p.col0)
+
+// The scratch is not sized for the width of a pass.
+//
+// A row of scores is one float per head per column per position it can see,
+// and the stride is the deepest context the model has: at a hundred and
+// twenty-eight columns of a thirty-two head model over forty thousand
+// positions that is six hundred and seventy megabytes, on a card that is
+// already holding the weights. So the scratch is sized for
+// vk/attention.go's scoreColumns and a wide pass dispatches this kernel once
+// per stretch of that many, with p.col0 saying which. Everything else the
+// kernel touches — the queries in, the mixed values out — is indexed by the
+// column of the whole pass and needs no chunking.
+#define SCRATCH_COL (gl_WorkGroupID.y)
 
 shared float partial[256];
 shared float acc[512];
@@ -105,7 +119,7 @@ void main() {
     uint n  = where.z - first + 1u;
     uint kv = h / p.perKV;
     uint qb = COL * p.heads * hd + h * hd;
-    uint sb = (COL * p.heads + h) * p.stride;
+    uint sb = (SCRATCH_COL * p.heads + h) * p.stride;
 
     // The scores.
     for (uint m = t; m < n; m += 256u) {
