@@ -248,15 +248,23 @@ Worth knowing before you clone it:
   Vulkan at all.
 
   A model whose attention is on the card reads its prompt in stretches of
-  eight positions, because the keys and values are the card's and the two
-  caches must not part. Eight of them in one pass is what a batch was always
-  for: every matrix of the model read once for all eight instead of once for
-  each, which is the whole of the difference between a prompt at the memory
-  ceiling and a prompt eight times over it. On the 12B that took the prompt
-  from 71 tokens a second to 245, on the Qwen3 4B from 179 to 568, and on the
-  0.6B from 420 to 1793. Generation is untouched, and reads the same binaries
-  it always did: the column count is compiled into the kernel rather than
-  pushed, so there are two of each and a token draws the narrow one.
+  thirty-two positions, because the keys and values are the card's and the two
+  caches must not part. Thirty-two of them in one pass is what a batch was
+  always for: every matrix of the model read once for all thirty-two instead of
+  once for each, which is the whole of the difference between a prompt at the
+  memory ceiling and a prompt thirty-two times over it. On the 12B that took
+  the prompt from 71 tokens a second to 382, on the Qwen3 4B from 179 to 893,
+  and on the 0.6B from 420 to 3628. Generation is untouched, and reads the same
+  binaries it always did: the column count is compiled into the kernel rather
+  than pushed, so there are several of each and a token draws the narrowest.
+
+  Which kernel a pass runs is the width's business. A token and a short
+  stretch draw the mat-vec, one row of the answer to a team of eight lanes; a
+  stretch above eight draws a tiled product instead, which stages both operands
+  in shared memory and keeps a tile of the answer in registers, and which is
+  two and a half times the mat-vec at the widths a prompt reaches. Both read
+  their operands sixteen bytes at a time — that alone was worth a quarter of
+  the tiled product's time, and it moved where the tile wants to be.
 
   It is not bit-identical to the CPU path and cannot be: the two sum the same
   products in different orders, and a mixture amplifies that because its
