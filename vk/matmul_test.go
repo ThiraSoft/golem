@@ -217,3 +217,79 @@ func itoa(n int) string {
 	}
 	return string(d)
 }
+
+// BenchmarkMatMulCold is the same product against a working set the card
+// cannot keep. One Q4_0 matrix of this shape is fourteen megabytes and the
+// 9070 XT carries sixty-four of last level cache, so BenchmarkMatMul above
+// reads its matrix out of cache from the second pass onwards and reports a
+// bandwidth no engine will ever see: a real pass walks half a gigabyte of
+// weights and every byte of it is cold. Here the same matrix is uploaded
+// copies times over and the passes walk the copies in turn, so that by the
+// time one comes round again the cache has long since dropped it.
+func BenchmarkMatMulCold(b *testing.B) {
+	const copies = 24 // 24 x 14 MiB = 340 MiB, five times the cache
+	for _, shape := range []struct{ name, tensor string }{
+		{"down", "blk.0.ffn_down.weight"},
+		{"gate", "blk.0.ffn_gate.weight"},
+	} {
+		for _, spec := range []struct {
+			name    string
+			columns int
+			coop    bool
+		}{{"32", 32, false}, {"64", 64, false}, {"128", 128, false}, {"256", 256, false}, {"coop64", 64, true}, {"coop256", 256, true}} {
+			columns, coop := spec.columns, spec.coop
+			b.Run(shape.name+"/"+spec.name, func(b *testing.B) {
+				g, m := namedQ4_0(b, shape.tensor)
+				defer g.Close()
+				d := open(b)
+				defer d.Close()
+
+				batch := columnsOf(m.Cols, columns)
+				mms := make([]*MatMul, copies)
+				for k := range mms {
+					mm, err := NewMatMul(d, m.Data, m.Rows, m.Cols, columns, coop)
+					if err != nil {
+						b.Fatal(err)
+					}
+					defer mm.Close()
+					for c := 0; c < columns; c++ {
+						if err := mm.SetColumn(c, oneColumn(batch, c)); err != nil {
+							b.Fatal(err)
+						}
+					}
+					mms[k] = mm
+				}
+				out := make([][]float32, columns)
+				for c := range out {
+					out[c] = make([]float32, m.Rows)
+				}
+				if err := mms[0].Run(out); err != nil {
+					b.Fatal(err)
+				}
+				for _, mm := range mms[1:] {
+					if err := d.Submit(func(r *Recorder) { mm.upload(r) }); err != nil {
+						b.Fatal(err)
+					}
+				}
+				bytes := m.Rows * rowBytesQ4_0(m.Cols)
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if err := d.Submit(func(r *Recorder) {
+						for k, mm := range mms {
+							if k > 0 {
+								r.Barrier()
+							}
+							mm.pass(r)
+						}
+					}); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.StopTimer()
+				seconds := b.Elapsed().Seconds() / float64(b.N) / copies
+				b.ReportMetric(float64(bytes)/seconds/1e9, "GB/s")
+				b.ReportMetric(seconds*1e6/float64(columns), "us/column")
+			})
+		}
+	}
+}
