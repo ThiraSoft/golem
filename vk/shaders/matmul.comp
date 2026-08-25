@@ -223,6 +223,61 @@
 // to its traffic is not short of bandwidth — this file said that once already,
 // of the shape it replaced. What it is short of, at BN thirty-two, is the same
 // eighty per cent shaders/matmul_coop.comp measured and named: the staging.
+//
+// **The driver's own assembly then said what the staging is**, which is the
+// first thing here that was read rather than swept. RADV_DEBUG=asm over
+// BenchmarkMatMulCold, the hot block of the two-hundred-and-fifty-six column
+// build:
+//
+//   12288  v_dot4_i32_iu8      the multiply
+//    6144  v_and_b32           the nibble mask
+//    5640  ds_load_b64         the staged operands
+//    3072  v_lshrrev_b32       the high nibble
+//    3864  s_delay_alu
+//    2712  s_wait_dscnt        waiting on shared memory
+//    1536  v_cvt_f32_i32 + 1536 v_fma_f32 + 1536 v_fmac_f32
+//
+// Two numbers out of that. **Under half the vector issue is the product** —
+// 2.125 vector instructions to a dot4, of which 0.75 is unpacking. And **0.75
+// shared-memory dwords to a dot4**: TN*8 for the activation and TM*4 for the
+// weights against TM*TN*8 products, which is 1/TM + 1/(2*TN) and at two by two
+// is three quarters. Three bytes of LDS for every four multiply-accumulates,
+// against an LDS that gives 128 bytes a clock where the dot units eat 64
+// products a clock. The shared memory is the wall, by a factor of about two.
+//
+// Both halves were then attacked and both are closed:
+//
+//   - **The nibbles pre-split in shared memory**, eight uints a block instead
+//     of four, so the column loop is nothing but dot products. It is a wash:
+//     the vector count falls by a third and the shared traffic rises by the
+//     same, and at its best geometry (KSTEP four) it is 6.59 on ffn_down
+//     against 6.93 and 9.35 on ffn_gate against 9.19. Which is the proof that
+//     this kernel is bound by the shared memory and not by the arithmetic —
+//     trading one for the other at par.
+//   - **The weights read straight from memory into registers**, no shared stop
+//     at all, which is what the fused gate kernel does at 319 gigabytes a
+//     second. Compiled behind WDIRECT and swept over ten geometries, now that
+//     dropping the weight tile leaves the LDS free for a much larger one: the
+//     best is 7.44 on ffn_down and 14.69 on ffn_gate, against 6.93 and 9.19.
+//     Every one of them loses. The BN/TN threads that share a row each issue
+//     the same load, and the L1 that answers them is not cheaper than the LDS
+//     that was answering them before.
+//   - **A larger register tile at a constant thread count**, which is the one
+//     direction that cuts the 0.75 — four by four takes it to 0.375 — and
+//     which every earlier sweep had confounded with the thread count. 128x32
+//     over four by four at KSTEP eight, four and sixteen: 7.46, 7.47, 8.93 on
+//     ffn_down. It loses too, and 64x64 does not survive the parity test.
+//
+// **And BN was never measured fairly until now.** matmulColBlock is BN in Go,
+// a third copy of a shader constant after BM/matmulRows, and left behind at
+// thirty-two a BN of sixty-four dispatches twice the column groups that exist:
+// half the workgroups return at once and the wasted launches were being read
+// as the geometry losing. Moved in step, BN sixty-four at KSTEP eight is 7.12
+// on ffn_down against thirty-two's 6.95. It still loses, by a fortieth rather
+// than by a quarter.
+//
+// So the tile is a hard local optimum, the wall has a name and a number, and
+// neither half of the trade moves it. What is left is not a geometry.
 
 #ifndef COLUMNS
 #define COLUMNS 32
