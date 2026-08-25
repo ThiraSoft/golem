@@ -1,0 +1,34 @@
+#version 450
+
+// The second half of a split product.
+//
+// shaders/matmul.comp cuts the shared dimension into p.used slices when the
+// matrix has too few rows to fill the card — ffn_down gives eighty workgroups
+// against sixty-four compute units that hold two each — and each slice writes
+// a whole answer of its own. This adds them, in place, into the first: what
+// the kernels downstream read is where they always read it, and nothing but
+// the size of the buffer changes for them.
+//
+// The traffic is the answer times the slice count, which for a 2560 by 32
+// product at four slices is a megabyte and a quarter against the twelve
+// megabytes of weights the product itself reads. That is the trade.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer P { float part[]; };
+layout(std430, binding = 1) writeonly buffer Y { float y[];    };
+
+layout(push_constant) uniform Push {
+    uint dim;   // rows of the answer
+    uint ffn;   // columns of it
+    uint used;  // slices
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint n = p.dim * p.ffn;
+    if (i >= n) return;
+    float sum = 0.0;
+    for (uint s = 0u; s < p.used; s++) sum += part[s * n + i];
+    y[i] = sum;
+}

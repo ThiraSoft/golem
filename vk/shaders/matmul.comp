@@ -51,6 +51,18 @@
 //     a workgroup, so twice as many workgroups, and a walk twice as long
 //     between the barriers. That is another 7.0 to 5.9.
 //
+// **The shared dimension is then split.** A workgroup writes BM rows, so a
+// matrix with few rows gives few workgroups: ffn_down gives eighty against
+// sixty-four compute units that hold two of these each, and the card runs out
+// of anything to schedule. Cutting the shared dimension into p.split slices,
+// one workgroup each, multiplies them, and shaders/matmul_reduce.comp adds the
+// slices afterwards. On ffn_down at thirty-two columns that is 4.24
+// microseconds a column against 3.59, and in the engine the down projection of
+// a block goes from 6.36 milliseconds to 4.40 over thirty-six blocks. On
+// ffn_gate, which has three hundred and four workgroups already, the same
+// split is a fifth *slower* — the reduction is not free and there was nothing
+// to gain. vk/matmul.go's matmulSplit is where the row count decides.
+//
 // What was ruled out on the way, so that it is not ruled out again:
 //
 //   - **Bank conflicts were real and are fixed.** A column of the activation
@@ -70,6 +82,21 @@
 //   - **BM and vk/matmul.go's matmulRows are one number in two places.** Left
 //     disagreeing, the dispatch covers a fraction of the rows, the answer is
 //     zero below it, and the benchmark reports the fraction as a speed-up.
+//   - **Reading the staged operands sixteen bytes at a time**, one
+//     ds_read_b128 where there are four and eight scalar reads, which is the
+//     obvious way to cut a third of the inner loop's instructions. It is 1.4
+//     times slower, at every tile and both widths, and it stays 1.4 times
+//     slower with the activation's block index XOR-swizzled so that sixteen
+//     lanes on sixteen columns land on sixteen different bank quads. Wide
+//     shared reads are not what this card wants; the scalar loop at an odd
+//     stride is.
+//   - **A wider pass.** The cost of a pass is a straight line: fifty-five
+//     microseconds fixed, which is the twelve megabytes of ffn_down at two
+//     hundred and twenty-five gigabytes a second, plus 3.6 microseconds a
+//     column. The weights are already near the card's ceiling and doubling the
+//     width only halves what is already small — sixty-four columns measured
+//     3.90 against thirty-two's 4.24, which does not pay for what a wider pass
+//     costs everywhere else.
 
 #ifndef COLUMNS
 #define COLUMNS 32
@@ -140,6 +167,8 @@ layout(push_constant) uniform Push {
     uint ffn;   // inputs
     uint used;  // one, and only here so that every kernel takes the same block
     uint act;   // the activation, which is spent before this kernel runs
+    uint col;   // the gate kernel's, and not read here
+    uint split; // slices of the shared dimension, one for the whole of it
 } p;
 
 // The staged operands. Ten kilobytes, which leaves a compute unit several
@@ -154,9 +183,23 @@ void main() {
     uint t   = gl_LocalInvocationID.x;
     uint tr  = t / uint(COLTH);            // which TM rows this thread owns
     uint tc  = t % uint(COLTH);            // which TN columns
-    uint row0 = gl_WorkGroupID.x * uint(BM);
 
     uint nb  = p.ffn >> 5;           // blocks of the shared dimension
+
+    // The slice of the shared dimension this workgroup answers.
+    //
+    // A product over few rows gives few workgroups — ffn_down at BM rows to a
+    // group gives eighty, against sixty-four compute units that hold two each,
+    // so the card is three fifths idle for the whole pass. Cutting the shared
+    // dimension into slices multiplies the workgroups by the slice count and
+    // costs one pass of shaders/matmul_reduce.comp over the answer.
+    uint groups = (p.dim + uint(BM) - 1u) / uint(BM);
+    uint ir  = gl_WorkGroupID.x % groups;
+    uint ik  = gl_WorkGroupID.x / groups;
+    uint per = ((nb + p.split - 1u) / p.split + uint(KSTEP) - 1u) & ~(uint(KSTEP) - 1u);
+    uint kb0 = ik * per;
+    uint kbn = min(nb, kb0 + per);
+    uint row0 = ir * uint(BM);
     uint aw  = p.ffn >> 2;           // one column of the activation, in uints
     uint aw4 = aw >> 2;              // the same, in uvec4
     uint rowBytes = nb * 18u;
@@ -238,12 +281,12 @@ void main() {
         sbc[c * uint(SD_STRIDE) + k] = ac[i]; \
     }
 
-    FETCH(0u)
-    for (uint kb = 0u; kb < nb; kb += uint(KSTEP)) {
+    FETCH(kb0)
+    for (uint kb = kb0; kb < kbn; kb += uint(KSTEP)) {
         barrier();
         STAGE()
         barrier();
-        if (kb + uint(KSTEP) < nb) { FETCH(kb + uint(KSTEP)) }
+        if (kb + uint(KSTEP) < kbn) { FETCH(kb + uint(KSTEP)) }
 
         [[unroll]] for (uint k = 0u; k < KSTEP; k++) {
             // This thread's TM weight blocks, held while every column meets
@@ -292,7 +335,7 @@ void main() {
         uint row = row0 + tr * TM + r;
         if (row >= p.dim) continue;
         [[unroll]] for (uint c = 0u; c < TN; c++) {
-            y[(tc * TN + c) * p.dim + row] = acc[r][c];
+            y[(ik * COLUMNS + tc * TN + c) * p.dim + row] = acc[r][c];
         }
     }
 }

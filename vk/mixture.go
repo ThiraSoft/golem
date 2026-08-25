@@ -81,6 +81,9 @@ const gateColumns = 8
 //go:embed shaders/matmul32.spv
 var matmulWideSPIRV []byte
 
+//go:embed shaders/matmul_reduce.spv
+var matmulReduceSPIRV []byte
+
 //go:embed shaders/matmul8.spv
 var matmulSmallSPIRV []byte
 
@@ -125,8 +128,15 @@ type Mixture struct {
 	act                      Activation
 
 	gateUp, down, denseDown *Pipeline
-	gelu                    *Buffer // ggml's GELU table, uploaded once
-	zero                    *Buffer // one identifier, always zero, for the shared branch
+	// reduce folds the slices of a split shared-branch down projection, and
+	// splitDown is how many there are. matmulSplit says which matrices want
+	// it: this one has the stack's fewest rows and the most weight behind
+	// them.
+	reduce    *Pipeline
+	splitDown int
+	reduceSet *Set
+	gelu      *Buffer // ggml's GELU table, uploaded once
+	zero      *Buffer // one identifier, always zero, for the shared branch
 
 	// The expert branch's traffic, reused by every block.
 	xq, xs, ids, cw, out *Buffer
@@ -134,6 +144,7 @@ type Mixture struct {
 
 	// The shared branch's, which is the same shape with one expert.
 	dxq, dxs, dout *Buffer
+	doutParts      *Buffer // the slices of a split down projection
 	daq, das       *Buffer
 
 	blocks []*mixtureBlock
@@ -145,6 +156,7 @@ type mixtureBlock struct {
 	denseGateUp, denseDown *Buffer
 	setGateUp, setDown     *Set
 	setDenseUp, setDenseDn *Set
+	setDenseDnParts        *Set // the same, writing the slices of a split product
 }
 
 // moePush is what all three kernels take. matvec.comp reads the first three
@@ -159,6 +171,12 @@ type moePush struct {
 	// width of a pass, so a wide pass runs it more than once at an offset.
 	// Every other kernel declares four uints and ignores this one.
 	col uint32
+	// split is how many slices of the shared dimension a tiled product is cut
+	// into, and only shaders/matmul.comp reads it. One means the whole of it in
+	// one workgroup and the answer written where the caller wants it; more
+	// means each slice writes its own copy and shaders/matmul_reduce.comp adds
+	// them. Every other kernel declares fewer uints and ignores this one.
+	split uint32
 }
 
 // An Activation is what a gated feed forward puts on its gate. Gemma 4 looks
@@ -203,6 +221,7 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 	}{
 		{&m.gateUp, moeGateUpSPIRV, 7},
 		{&m.denseDown, matvecSPIRV, 4},
+		{&m.reduce, matmulReduceSPIRV, 2},
 	}
 	if experts > 0 {
 		pipes = append(pipes, struct {
@@ -246,6 +265,7 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		}
 	}
 
+	m.splitDown = matmulSplit(dim)
 	if m.gelu, err = d.Upload(asBytes(nn.GELUTableData())); err != nil {
 		m.Close()
 		return nil, err
@@ -263,9 +283,10 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		local bool
 	}
 	bufs := []bufSpec{
-		{&m.dxq, dim * maxColumns, true},          // the shared branch's input
-		{&m.dxs, 2 * in * 4 * maxColumns, true},   //
-		{&m.dout, dim * 4 * maxColumns, true},     // its output
+		{&m.dxq, dim * maxColumns, true},        // the shared branch's input
+		{&m.dxs, 2 * in * 4 * maxColumns, true}, //
+		{&m.dout, dim * 4 * maxColumns, true},   // its output
+		{&m.doutParts, dim * 4 * maxColumns * matmulSplit(dim), true},
 		{&m.daq, dense * maxColumns, true},        // its intermediate
 		{&m.das, 2 * dmid * 4 * maxColumns, true}, //
 	}
@@ -293,6 +314,12 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 			return nil, err
 		}
 		*spec.into = b
+	}
+	if m.splitDown > 1 {
+		if m.reduceSet, err = m.reduce.NewSet([]*Buffer{m.doutParts, m.dout}); err != nil {
+			m.Close()
+			return nil, err
+		}
 	}
 	return m, nil
 }
@@ -372,6 +399,10 @@ func (m *Mixture) AddBlock(gateUpExps, downExps, gate, up, down []byte) error {
 		{&b.setDenseUp, m.gateUp, []*Buffer{b.denseGateUp, m.dxq, m.dxs, m.zero, m.gelu, m.daq, m.das}},
 		{&b.setDenseDn, m.denseDown, []*Buffer{b.denseDown, m.daq, m.das, m.dout}},
 	}
+	if m.splitDown > 1 {
+		sets = append(sets, setSpec{&b.setDenseDnParts, m.denseDown,
+			[]*Buffer{b.denseDown, m.daq, m.das, m.doutParts}})
+	}
 	if m.experts > 0 {
 		sets = append(sets,
 			setSpec{&b.setGateUp, m.gateUp, []*Buffer{b.gateUp, m.xq, m.xs, m.ids, m.gelu, m.aq, m.as}},
@@ -425,7 +456,14 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 	if m.experts > 0 {
 		r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
 	}
-	if width > 1 {
+	if b.setDenseDnParts != nil && width == wideColumns {
+		split := shared
+		split.split = uint32(m.splitDown)
+		r.DispatchWide(b.setDenseDnParts, width, down*uint32(m.splitDown), unsafe.Pointer(&split))
+		r.Barrier()
+		fold := moePush{dim: uint32(m.dim), ffn: uint32(columns), used: uint32(m.splitDown)}
+		r.Dispatch(m.reduceSet, uint32((m.dim*columns+255)/256), unsafe.Pointer(&fold))
+	} else if width > 1 {
 		r.DispatchWide(b.setDenseDn, width, down, unsafe.Pointer(&shared))
 	} else {
 		r.Dispatch(b.setDenseDn, down, unsafe.Pointer(&shared))
@@ -454,7 +492,7 @@ func (m *Mixture) Close() {
 	}
 	m.blocks = nil
 	for _, b := range []**Buffer{
-		&m.das, &m.daq, &m.dout, &m.dxs, &m.dxq,
+		&m.das, &m.daq, &m.doutParts, &m.dout, &m.dxs, &m.dxq,
 		&m.as, &m.aq, &m.out, &m.cw, &m.ids, &m.xs, &m.xq,
 		&m.zero, &m.gelu,
 	} {
@@ -463,7 +501,11 @@ func (m *Mixture) Close() {
 			*b = nil
 		}
 	}
-	for _, p := range []**Pipeline{&m.denseDown, &m.down, &m.gateUp} {
+	if m.reduceSet != nil {
+		m.reduceSet.Close()
+		m.reduceSet = nil
+	}
+	for _, p := range []**Pipeline{&m.denseDown, &m.down, &m.gateUp, &m.reduce} {
 		if *p != nil {
 			(*p).Close()
 			*p = nil

@@ -107,12 +107,19 @@ type Attention struct {
 	maxContext int
 
 	matvec, prepare, scores *Pipeline
+	// reduce folds the slices of a split output projection. See matmulSplit:
+	// that projection is the stack's row-poorest tiled product, and the one
+	// dispatched with nothing beside it, so it is the one that can be cut.
+	reduce   *Pipeline
+	splitOut int
 
 	// One position's traffic. Only the two ends of it cross the bus: the
 	// normed stream in, and the output projection's answer back.
 	xq, xs, out *Buffer
 	rcos, rsin  []*Buffer // one pair per rotation geometry
 	q, k, v, qh *Buffer
+	outParts    *Buffer // the slices of a split output projection
+	reduceSet   *Set
 	scoreRows   *Buffer
 	aq, as      *Buffer
 
@@ -130,6 +137,7 @@ type attentionBlock struct {
 	setV, setO   *Set
 	setPrepare   *Set
 	setScores    *Set
+	setOParts    *Set // the output projection when its shared dimension is split
 }
 
 // maxBlocks is how many entries the position buffer holds, which caps the
@@ -179,7 +187,7 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 			return nil, fmt.Errorf("vk: attention shapes must be multiples of %d, given %d", nn.QuantBlock, n)
 		}
 	}
-	a := &Attention{d: d, dim: dim, maxHeads: maxHeads, maxKV: maxKV, maxContext: maxContext}
+	a := &Attention{d: d, dim: dim, maxHeads: maxHeads, maxKV: maxKV, maxContext: maxContext, splitOut: matmulSplit(dim)}
 
 	var err error
 	for _, spec := range []struct {
@@ -189,6 +197,7 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 		push     uintptr
 	}{
 		{&a.matvec, matvecSPIRV, 4, unsafe.Sizeof(moePush{})},
+		{&a.reduce, matmulReduceSPIRV, 2, unsafe.Sizeof(moePush{})},
 		{&a.prepare, attnPrepareSPIRV, 11, unsafe.Sizeof(attnPush{})},
 		{&a.scores, attnScoresSPIRV, 7, unsafe.Sizeof(scorePush{})},
 	} {
@@ -231,6 +240,7 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 		{&a.k, maxKV * 4 * maxColumns, true},                              //
 		{&a.v, maxKV * 4 * maxColumns, true},                              //
 		{&a.qh, maxHeads * 4 * maxColumns, true},                          // the queries, rounded through fp16
+		{&a.outParts, dim * 4 * maxColumns * matmulSplit(dim), true},      // its slices, when it is split
 		{&a.scoreRows, maxQueryHeads * maxContext * 4 * maxColumns, true}, // one row of scores per head per column
 		{&a.aq, maxHeads * maxColumns, true},                              // the mixed values, Q8_0
 		{&a.as, 2 * maxHeads / nn.QuantBlock * 4 * maxColumns, true},
@@ -247,6 +257,12 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 			return nil, err
 		}
 		*spec.into = b
+	}
+	if a.splitOut > 1 {
+		if a.reduceSet, err = a.reduce.NewSet([]*Buffer{a.outParts, a.out}); err != nil {
+			a.Close()
+			return nil, err
+		}
 	}
 	// One pair of tables per geometry, written once a token rather than once a
 	// block: the angles depend on the position and the geometry and on nothing
@@ -360,6 +376,14 @@ func (a *Attention) AddBlock(shape BlockShape, q, k, v, o []byte, qnorm, knorm [
 		}
 		if *spec.set, err = a.matvec.NewSet([]*Buffer{*spec.into, in, scales, spec.out}); err != nil {
 			return fail(err)
+		}
+		// The output projection twice: once writing the answer where the
+		// kernels after it read, and once writing the slices a split product
+		// makes. Which of the two a pass dispatches is its width's business.
+		if spec.out == a.out && a.splitOut > 1 {
+			if b.setOParts, err = a.matvec.NewSet([]*Buffer{*spec.into, in, scales, a.outParts}); err != nil {
+				return fail(err)
+			}
 		}
 	}
 
@@ -491,6 +515,17 @@ func (a *Attention) Record(r *Recorder, block, columns int) {
 	r.DispatchColumns(b.setScores, uint32(s.Heads), uint32(columns), unsafe.Pointer(&score))
 	r.Barrier()
 	a.tl.Stamp(r, "attn scores")
+	if b.setOParts != nil && width == wideColumns {
+		// The split product, and the pass that adds its slices. See
+		// matmulSplit: this matrix is the stack's row-poorest, and eighty
+		// workgroups do not fill the card.
+		outProject.split = uint32(a.splitOut)
+		r.DispatchWide(b.setOParts, width, productGroups(width, a.dim)*uint32(a.splitOut), unsafe.Pointer(&outProject))
+		r.Barrier()
+		fold := moePush{dim: uint32(a.dim), ffn: uint32(columns), used: uint32(a.splitOut)}
+		r.Dispatch(a.reduceSet, uint32((a.dim*columns+255)/256), unsafe.Pointer(&fold))
+		return
+	}
 	product(b.setO, a.dim, unsafe.Pointer(&outProject))
 }
 
@@ -528,7 +563,7 @@ func (a *Attention) Close() {
 	}
 	a.blocks = nil
 	for _, b := range append(append([]**Buffer{}, pointers(a.rcos)...), append(pointers(a.rsin), []**Buffer{
-		&a.where, &a.as, &a.aq, &a.scoreRows, &a.qh, &a.v, &a.k, &a.q,
+		&a.where, &a.as, &a.aq, &a.scoreRows, &a.outParts, &a.qh, &a.v, &a.k, &a.q,
 		&a.out, &a.xs, &a.xq,
 	}...)...) {
 		if *b != nil {
@@ -536,7 +571,11 @@ func (a *Attention) Close() {
 			*b = nil
 		}
 	}
-	for _, p := range []**Pipeline{&a.scores, &a.prepare, &a.matvec} {
+	if a.reduceSet != nil {
+		a.reduceSet.Close()
+		a.reduceSet = nil
+	}
+	for _, p := range []**Pipeline{&a.scores, &a.prepare, &a.matvec, &a.reduce} {
 		if *p != nil {
 			(*p).Close()
 			*p = nil
@@ -554,7 +593,7 @@ func pointers(bs []*Buffer) []**Buffer {
 }
 
 func (b *attentionBlock) close() {
-	for _, s := range []**Set{&b.setScores, &b.setPrepare, &b.setO, &b.setV, &b.setK, &b.setQ} {
+	for _, s := range []**Set{&b.setScores, &b.setPrepare, &b.setOParts, &b.setO, &b.setV, &b.setK, &b.setQ} {
 		if *s != nil {
 			(*s).Close()
 			*s = nil

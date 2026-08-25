@@ -264,11 +264,22 @@ Worth knowing before you clone it:
   registers before the step they are computing, so that the card waits for
   memory with a step of arithmetic in hand rather than at a barrier.
 
-  On the 12B that took the prompt from 71 tokens a second to 608, on the Qwen3
-  4B from 179 to 1446, and on the 0.6B from 420 to 5301. llama.cpp's own
-  Vulkan build, same card and same files, reads them at 984, 2958 and 8135:
-  the gap that is left is the matrix cores, which it uses and golem does not —
-  vk/shaders/matmul_coop.comp is the attempt at them and says what it measured.
+  A matrix with few rows gives the tiled product few workgroups — the Qwen3
+  4B's down projection gives eighty, against sixty-four compute units that hold
+  two of these each — so for those the shared dimension is cut into four
+  slices, one workgroup apiece, and a pass over the answer adds them back. The
+  row count decides: a matrix wide enough to fill the card is left alone, and
+  measured on one that already is, the same split is a fifth slower. It takes
+  the down projection of a Qwen3 4B block from 6.36 milliseconds over
+  thirty-six blocks to 4.40, and the output projection from 2.78 to 2.07.
+
+  On the 12B that took the prompt from 71 tokens a second to 615, on the Qwen3
+  4B from 179 to 1527, and on the 0.6B from 420 to 5475. llama.cpp's own
+  Vulkan build, same card and same files, reads them at 984, 2855 and 8135.
+  What is left of the gap is one shape — many rows over a short shared
+  dimension, which every gate, up and qkv projection has — and
+  vk/shaders/matmul_coop.comp says what the matrix cores did and did not fix
+  about it.
 
   The largest single thing was not a kernel. Six buffers carrying the stream
   from one kernel to the next were allocated host-visible, left over from a
@@ -307,25 +318,33 @@ Worth knowing before you clone it:
 - **The prompt path on Gemma is a factor of one and two thirds behind ggml's
   best**, even where it beats the default build; `gemma/README.md` says where
   the remainder sits.
-- **On a card, the prompt is a factor of four to six behind, and generation a
-  tenth.** Measured against llama.cpp's own Vulkan build on the same card,
-  which is the fair comparison for a Vulkan engine and is faster than its ROCm
-  build at everything here:
+- **On a card, the prompt is a factor of one and a half to two behind, and
+  generation a tenth.** Measured against llama.cpp's own Vulkan build on the
+  same card, which is the fair comparison for a Vulkan engine and is faster
+  than its ROCm build at everything here:
 
   | tokens a second | golem gen | llama gen | golem prompt | llama prompt |
   | --------------- | --------: | --------: | -----------: | -----------: |
   | Gemma 4 26B A4B |      96.8 |     116.5 |          135 |          822 |
-  | Gemma 4 12B     |      58.1 |      63.1 |          245 |          984 |
-  | Qwen3 4B        |     154.8 |     162.6 |          568 |         2855 |
-  | Qwen3 0.6B      |     312.5 |     352.3 |         1793 |         8135 |
+  | Gemma 4 12B     |      59.3 |      63.1 |          615 |          984 |
+  | Qwen3 4B        |     158.0 |     162.6 |         1527 |         2855 |
+  | Qwen3 0.6B      |     343.0 |     352.3 |         5475 |         8135 |
 
-  Generation is within a tenth. The prompt is not, and the gap is reachable —
-  the same API on the same card does it. What is left is the shape of the
-  product: a prompt here reads its weights once for eight positions through a
-  mat-vec kernel, and llama.cpp caps that same kernel at eight columns and
-  hands anything wider to a tiled product. `vk/shaders/matmul.comp` is a first
-  attempt at one and is not bound in; its header says what it measures and
-  what has been ruled out.
+  The 26B's row is the one that has not moved: a mixture prompt still goes one
+  position at a time, because each position routes to its own eight matrices
+  and two positions share no read.
+
+  Generation is within a tenth. The prompt is not, and what is left of the gap
+  has been measured rather than guessed. The cost of a tiled product is a
+  straight line — the weights, which are already read at two hundred and
+  twenty-five gigabytes a second, plus a term per column that is instructions
+  and not memory. Cutting the shared dimension gave the row-poor matrices their
+  workgroups back and is bound in. What has not moved is the other shape: many
+  rows over a short shared dimension, which is what every gate, up and qkv
+  projection is and what two fifths of a pass is spent in. It sits at half the
+  rate of its own transpose under every tile, width, split and kernel measured,
+  cooperative or integer, on the same weights and the same multiply count.
+  `vk/shaders/matmul_coop.comp` says what the matrix cores do and do not fix.
 
 ## What is here, and what is not
 

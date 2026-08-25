@@ -20,9 +20,11 @@ import (
 //go:generate glslc -O -DCOLUMNS=256 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop256.spv
 //go:generate glslc -O -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul32.spv
 //go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul8.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_reduce.comp -o shaders/matmul_reduce.spv
 
-// Nothing in the engine binds this yet. BenchmarkMatMul is why, and the header
-// of shaders/matmul.comp says the rest.
+// The engine binds the tiled product itself; this wrapper is the bench's and
+// the parity test's. The cooperative product is what nothing binds yet, and
+// the header of shaders/matmul_coop.comp says why.
 
 // The widths the tiled product is built at. shaders/matmul.comp gives a thread
 // four rows by four columns, so a pass narrower than four columns has nothing
@@ -34,6 +36,28 @@ const (
 
 // matmulRows is shaders/matmul.comp's BM: how many rows one workgroup writes.
 const matmulRows = 32
+
+// matmulSplit is how many slices of the shared dimension the tiled product
+// cuts a matrix of that many rows into.
+//
+// A product writes matmulRows rows to a workgroup, so a matrix with few rows
+// gives few workgroups: the Qwen3 4B's ffn_down gives eighty against
+// sixty-four compute units, and the card is idle for want of anything to run.
+// Cutting the shared dimension multiplies them and costs one pass of
+// shaders/matmul_reduce.comp over the answer. Measured on that matrix at
+// thirty-two columns, 4.24 microseconds a column against 3.65 — and on
+// ffn_gate, which has three hundred and four workgroups and needs none of it,
+// the same split is a fifth slower. So it is the row count that decides.
+func matmulSplit(rows int) int {
+	if groups := (rows + matmulRows - 1) / matmulRows; groups <= 96 {
+		return matmulSlices
+	}
+	return 1
+}
+
+// matmulSlices is the split a row-poor product gets. Three and four measure
+// the same and five is worse.
+const matmulSlices = 4
 
 // matmulCoopRows is shaders/matmul_coop.comp's BM, which is its own number:
 // the cooperative product works in sixteen-row blocks and takes four of them.
@@ -49,6 +73,12 @@ type MatMul struct {
 	perGroup int
 
 	weights, aq, as, out *Buffer
+	// split is how many slices of the shared dimension the product is cut
+	// into, parts is where the slices land, and reduce adds them into out.
+	split      int
+	parts      *Buffer
+	reducePipe *Pipeline
+	reduceSet  *Set
 	// The activation is staged: written here and copied into device memory
 	// before a pass. It used to be read straight out of system memory, and a
 	// benchmark built that way measures the bus rather than the kernel —
@@ -84,7 +114,11 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int, coop bool) (*Mat
 		perGroup = matmulCoopRows
 	}
 
-	m := &MatMul{d: d, rows: rows, cols: cols, columns: columns, perGroup: perGroup, coop: coop && d.Coopmat()}
+	split := matmulSplit(rows)
+	if coop {
+		split = 1 // the cooperative product is not bound in and not split
+	}
+	m := &MatMul{d: d, rows: rows, cols: cols, columns: columns, perGroup: perGroup, split: split, coop: coop && d.Coopmat()}
 	layout := splitQ4_0(data, rows, cols)
 	if coop && d.Coopmat() {
 		layout = tileQ4_0(data, rows, cols, perGroup)
@@ -120,7 +154,23 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int, coop bool) (*Mat
 		*spec.into = b
 	}
 
-	buffers := []*Buffer{m.weights, m.aq, m.as, m.out}
+	target := m.out
+	if m.split > 1 {
+		if m.parts, err = d.Local(rows*4*columns*m.split, bufferUsageStorage); err != nil {
+			m.Close()
+			return nil, err
+		}
+		target = m.parts
+		if m.reducePipe, err = d.newPipeline(matmulReduceSPIRV, 2, uint32(unsafe.Sizeof(moePush{})), 0); err != nil {
+			m.Close()
+			return nil, err
+		}
+		if m.reduceSet, err = m.reducePipe.NewSet([]*Buffer{m.parts, m.out}); err != nil {
+			m.Close()
+			return nil, err
+		}
+	}
+	buffers := []*Buffer{m.weights, m.aq, m.as, target}
 	if m.pipe, err = d.newPipeline(spirv, len(buffers), uint32(unsafe.Sizeof(moePush{})), wave); err != nil {
 		m.Close()
 		return nil, err
@@ -194,11 +244,9 @@ func (m *MatMul) Run(out [][]float32) error {
 			return fmt.Errorf("vk: a column writes %d outputs, given %d", m.rows, len(o))
 		}
 	}
-	push := moePush{dim: uint32(m.rows), ffn: uint32(m.cols), used: 1}
-	groups := uint32((m.rows + m.perGroup - 1) / m.perGroup)
 	if err := m.d.Submit(func(r *Recorder) {
 		m.upload(r)
-		r.Dispatch(m.set, groups, unsafe.Pointer(&push))
+		m.pass(r)
 	}); err != nil {
 		return err
 	}
@@ -215,17 +263,28 @@ func (m *MatMul) Run(out [][]float32) error {
 // handed one pass and then left alone runs at half its clocks. Mixture.RunTimes
 // says the same about the feed forward.
 func (m *MatMul) RunTimes(n int) error {
-	push := moePush{dim: uint32(m.rows), ffn: uint32(m.cols), used: 1}
-	groups := uint32((m.rows + m.perGroup - 1) / m.perGroup)
 	return m.d.Submit(func(r *Recorder) {
 		m.upload(r)
 		for i := 0; i < n; i++ {
 			if i > 0 {
 				r.Barrier()
 			}
-			r.Dispatch(m.set, groups, unsafe.Pointer(&push))
+			m.pass(r)
 		}
 	})
+}
+
+// pass is the product, and the reduction after it when the shared dimension
+// was split.
+func (m *MatMul) pass(r *Recorder) {
+	push := moePush{dim: uint32(m.rows), ffn: uint32(m.cols), used: 1, split: uint32(m.split)}
+	groups := uint32((m.rows+m.perGroup-1)/m.perGroup) * uint32(m.split)
+	r.Dispatch(m.set, groups, unsafe.Pointer(&push))
+	if m.split > 1 {
+		r.Barrier()
+		sum := moePush{dim: uint32(m.rows), ffn: uint32(m.columns), used: uint32(m.split)}
+		r.Dispatch(m.reduceSet, uint32((m.rows*m.columns+255)/256), unsafe.Pointer(&sum))
+	}
 }
 
 // upload puts the staged activation into device memory. It is one copy of a
@@ -246,7 +305,15 @@ func (m *MatMul) Close() {
 		m.pipe.Close()
 		m.pipe = nil
 	}
-	for _, b := range []**Buffer{&m.out, &m.as, &m.aq, &m.stageS, &m.stageQ, &m.weights} {
+	if m.reduceSet != nil {
+		m.reduceSet.Close()
+		m.reduceSet = nil
+	}
+	if m.reducePipe != nil {
+		m.reducePipe.Close()
+		m.reducePipe = nil
+	}
+	for _, b := range []**Buffer{&m.parts, &m.out, &m.as, &m.aq, &m.stageS, &m.stageQ, &m.weights} {
 		if *b != nil {
 			(*b).Close()
 			*b = nil

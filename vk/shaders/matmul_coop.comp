@@ -59,10 +59,23 @@
 //     million values into forty copies. Thirty-two columns got worse (11.1
 //     against 9.1) and only a hundred and twenty-eight got better.
 //
-// The one thing the plan calls for and that has not been tried is splitting
-// the shared dimension across workgroups with a reduce pass. Every sweep in
-// this file says the card wants more work in flight and less of it per thread,
-// and that is the only lever left that gives it any.
+// **Splitting the shared dimension, and blocking the columns, were then tried,
+// and they are what the sweeps above were missing.** With p.split slices of
+// the shared dimension and BN columns to a workgroup rather than all of them —
+// which is llama.cpp's own shape, and neither of golem's two products had it —
+// this kernel reaches 2.66 microseconds a column on ffn_down at a hundred and
+// twenty-eight columns, against the integer product's 4.24 at thirty-two. That
+// is the first time the cores have been ahead of the dot products.
+//
+// It is still not bound in, for two reasons. It wants a pass of at least a
+// hundred and twenty-eight columns to get there, which is four times what the
+// stack carries; and **ffn_gate does not move**. That shape — many rows, a
+// short shared dimension, which is what every gate, up and qkv projection is —
+// sits at six microseconds a column under every combination of BM, BN, BK,
+// split and width measured, integer or cooperative, while ffn_down's shape
+// goes to 2.66. Nothing in the arithmetic of the two is different: the same
+// weights, the same activations, the same multiply count, the same staging.
+// Naming that asymmetry is what the next pass at this is for.
 
 #ifndef COLUMNS
 #define COLUMNS 32
@@ -79,6 +92,17 @@
 #endif
 #ifndef THREADS
 #define THREADS 256
+#endif
+
+// BN is how many of the pass's columns one workgroup answers. Giving a
+// workgroup every column is the shape both kernels started with, and it is the
+// wrong one for a matrix with many rows and a short shared dimension: there is
+// nothing left to divide but the rows, and the tile wants those. Cutting the
+// columns as well multiplies the workgroups without the reduction a split of
+// the shared dimension needs — each one writes outputs nobody else writes. It
+// costs reading the weights COLUMNS/BN times.
+#ifndef BN
+#define BN COLUMNS
 #endif
 
 // WAVE is the width vk/device.go asks the driver for, and the reason it has to
@@ -116,10 +140,12 @@ layout(push_constant) uniform Push {
     uint ffn;   // inputs
     uint used;  // one, and only here so that every kernel takes the same block
     uint act;   // the activation, which is spent before this kernel runs
+    uint col;   // the gate kernel's, and not read here
+    uint split; // slices of the shared dimension, one for the whole of it
 } p;
 
 shared float16_t sa[BM * SA_STRIDE];
-shared float16_t sb[COLUMNS * SB_STRIDE];
+shared float16_t sb[BN * SB_STRIDE];
 
 // The answer goes straight out. A cooperative matrix is stored to a stride the
 // whole sixteen-row tile has to exist for, which is why vk/matmul.go refuses a
@@ -129,16 +155,28 @@ shared float16_t sb[COLUMNS * SB_STRIDE];
 
 void main() {
     uint t    = gl_LocalInvocationID.x;
-    uint row0 = gl_WorkGroupID.x * uint(BM);
     uint nb   = p.ffn >> 5;          // blocks of the shared dimension
+    // The slice of the shared dimension this workgroup answers. A tile this
+    // wide leaves ffn_down twenty workgroups, which is a third of the compute
+    // units; the split is what puts them back.
+    uint wgs  = (p.dim + uint(BM) - 1u) / uint(BM);
+    const uint CGROUPS = uint(COLUMNS) / uint(BN);
+    uint ir   = gl_WorkGroupID.x % wgs;
+    uint ic   = (gl_WorkGroupID.x / wgs) % CGROUPS;
+    uint ik   = gl_WorkGroupID.x / (wgs * CGROUPS);
+    uint row0 = ir * uint(BM);
+    uint col0 = ic * uint(BN);
     uint aw   = p.ffn >> 2;          // one column of the activation, in uints
     uint rowBytes = nb * 18u;
     const uint KB = uint(BK) >> 5;   // Q4_0 blocks in one step
+    uint per  = ((nb + p.split - 1u) / p.split + KB - 1u) & ~(KB - 1u);
+    uint kb0  = ik * per;
+    uint kbn  = min(nb, kb0 + per);
 
     // The tile this wave owns: RSUB row blocks by every column block, which
     // are static counts, so the accumulators stay in registers.
     const uint RB = uint(BM) / uint(TILE);
-    const uint CB = uint(COLUMNS) / uint(TILE);
+    const uint CB = uint(BN) / uint(TILE);
     const uint RSUB = RB / uint(WAVES);
     uint rbase = gl_SubgroupID * RSUB;
 
@@ -149,7 +187,7 @@ void main() {
         }
     }
 
-    for (uint kb = 0u; kb < nb; kb += KB) {
+    for (uint kb = kb0; kb < kbn; kb += KB) {
         barrier();
 
         // The weights, dequantised.
@@ -172,7 +210,7 @@ void main() {
             uint word = 0u;
             float ws = 0.0;
             if (row0 + r < p.dim && b < nb) {
-                uint base = (gl_WorkGroupID.x * nb + b) * uint(BM) * 18u;
+                uint base = (ir * nb + b) * uint(BM) * 18u;
                 word = w[((base + uint(BM) * 2u + r * 16u) >> 2) + u];
                 ws   = unpackHalf2x16(w[(base + 2u * r) >> 2])[r & 1u];
             }
@@ -189,7 +227,7 @@ void main() {
         // straight from a buffer instead, as fp16 written once by the kernel
         // upstream, a thirty-two column pass measured worse and only a
         // hundred-and-twenty-eight column pass measured better.
-        for (uint idx = t; idx < COLUMNS * KB * 8u; idx += uint(THREADS)) {
+        for (uint idx = t; idx < BN * KB * 8u; idx += uint(THREADS)) {
             uint u    = idx & 7u;
             uint rest = idx >> 3;
             uint k    = rest % KB;
@@ -198,8 +236,8 @@ void main() {
             uint word = 0u;
             float as = 0.0;
             if (b < nb) {
-                word = aq[c * aw + b * 8u + u];
-                as   = as_[c * 2u * nb + b];
+                word = aq[(col0 + c) * aw + b * 8u + u];
+                as   = as_[(col0 + c) * 2u * nb + b];
             }
             uint base = c * uint(SB_STRIDE) + k * 32u + u * 4u;
             [[unroll]] for (uint m = 0u; m < 4u; m++) {
@@ -243,7 +281,7 @@ void main() {
         uint row = row0 + (rbase + r) * uint(TILE);
         if (row >= p.dim) continue;
         [[unroll]] for (uint c = 0u; c < CB; c++) {
-            coopMatStore(acc[r][c], y, c * uint(TILE) * p.dim + row,
+            coopMatStore(acc[r][c], y, (ik * uint(COLUMNS) + col0 + c * uint(TILE)) * p.dim + row,
                          p.dim, gl_CooperativeMatrixLayoutColumnMajor);
         }
     }
