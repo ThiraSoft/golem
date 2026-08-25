@@ -80,7 +80,7 @@
 // Swept rather than reasoned to, twice — see the header. BM must equal
 // vk/matmul.go's matmulRows.
 #ifndef TM
-#define TM     1
+#define TM     2
 #endif
 #ifndef TN
 #define TN     2
@@ -93,6 +93,12 @@
 #endif
 #define COLTH  (COLUMNS / TN)
 #define THREADS ((BM / TM) * COLTH)
+
+// How many of each operand one thread fetches per step. The staging is issued
+// a whole step ahead into these, so they have to be a fixed count.
+#define WLOADS (BM * KSTEP / THREADS)
+#define ALOADS (COLUMNS * KSTEP * 2 / THREADS)
+#define ADLOADS (COLUMNS * KSTEP / THREADS)
 
 const uint BN = COLUMNS;
 
@@ -163,64 +169,81 @@ void main() {
         [[unroll]] for (uint c = 0u; c < TN; c++) acc[r][c] = 0.0;
     }
 
+    // The staging, a step ahead of where it is used.
+    //
+    // Read and used in the same breath, the walk stalls on memory once a step:
+    // there is nothing between issuing the loads and needing them but a
+    // barrier. Measured against the fused gate kernel — which has no shared
+    // memory and no barriers and streams its weights at three hundred and
+    // nineteen gigabytes a second — this one was reaching ninety.
+    //
+    // So a step's loads are issued into registers, the compute of the previous
+    // step runs, and only then are they written to shared memory. The card
+    // waits for the loads at the write rather than at the barrier, with a
+    // whole step of arithmetic in between to cover them.
+    uvec4 wq[WLOADS];
+    float wd[WLOADS];
+    uvec4 av[ALOADS];
+    float ad[ADLOADS];
+    float ac[ADLOADS];
+
+#define FETCH(kb) \
+    [[unroll]] for (uint i = 0u; i < uint(WLOADS); i++) { \
+        uint idx = t + i * uint(THREADS); \
+        uint r = idx / KSTEP, k = idx & (KSTEP - 1u); \
+        uint row = row0 + r, b = (kb) + k; \
+        if (row < p.dim && b < nb) { \
+            uint at = row * rowBytes + 2u * nb + 16u * b; \
+            wq[i] = wide ? w4[at >> 4] \
+                         : uvec4(w[(at >> 2)], w[(at >> 2) + 1u], w[(at >> 2) + 2u], w[(at >> 2) + 3u]); \
+            wd[i] = unpackHalf2x16(w[(row * rowBytes + 2u * b) >> 2])[b & 1u]; \
+        } else { \
+            wq[i] = uvec4(0u); wd[i] = 0.0; \
+        } \
+    } \
+    [[unroll]] for (uint i = 0u; i < uint(ALOADS); i++) { \
+        uint idx = t + i * uint(THREADS); \
+        uint rest = idx & (KSTEP * 2u - 1u); \
+        uint c = idx / (KSTEP * 2u), k = rest >> 1, h = rest & 1u; \
+        uint b = (kb) + k; \
+        av[i] = (b < nb) ? aq4[c * aw4 + b * 2u + h] : uvec4(0u); \
+    } \
+    [[unroll]] for (uint i = 0u; i < uint(ADLOADS); i++) { \
+        uint idx = t + i * uint(THREADS); \
+        uint c = idx / KSTEP, k = idx & (KSTEP - 1u); \
+        uint b = (kb) + k; \
+        ad[i] = (b < nb) ? as_[c * 2u * nb + b] : 0.0; \
+        ac[i] = (b < nb) ? as_[c * 2u * nb + nb + b] : 0.0; \
+    }
+
+#define STAGE() \
+    [[unroll]] for (uint i = 0u; i < uint(WLOADS); i++) { \
+        uint idx = t + i * uint(THREADS); \
+        uint r = idx / KSTEP, k = idx & (KSTEP - 1u); \
+        uint o = r * uint(SA_STRIDE) + k * 4u; \
+        sa[o] = wq[i].x; sa[o + 1u] = wq[i].y; sa[o + 2u] = wq[i].z; sa[o + 3u] = wq[i].w; \
+        sad[r * uint(SD_STRIDE) + k] = wd[i]; \
+    } \
+    [[unroll]] for (uint i = 0u; i < uint(ALOADS); i++) { \
+        uint idx = t + i * uint(THREADS); \
+        uint rest = idx & (KSTEP * 2u - 1u); \
+        uint c = idx / (KSTEP * 2u), k = rest >> 1, h = rest & 1u; \
+        uint o = c * uint(SB_STRIDE) + k * 8u + h * 4u; \
+        sb[o] = av[i].x; sb[o + 1u] = av[i].y; sb[o + 2u] = av[i].z; sb[o + 3u] = av[i].w; \
+    } \
+    [[unroll]] for (uint i = 0u; i < uint(ADLOADS); i++) { \
+        uint idx = t + i * uint(THREADS); \
+        uint c = idx / KSTEP, k = idx & (KSTEP - 1u); \
+        sbd[c * uint(SD_STRIDE) + k] = ad[i]; \
+        sbc[c * uint(SD_STRIDE) + k] = ac[i]; \
+    }
+
+    FETCH(0u)
     for (uint kb = 0u; kb < nb; kb += uint(KSTEP)) {
         barrier();
-
-        // The weights: BM rows by KSTEP blocks, nibbles then scale.
-        if (wide) {
-            // One load a block: the four uints of nibbles are one uvec4.
-            for (uint idx = t; idx < BM * KSTEP; idx += uint(THREADS)) {
-                uint r   = idx / KSTEP, k = idx & (KSTEP - 1u);
-                uint row = row0 + r, b = kb + k;
-                uvec4 q  = (row < p.dim && b < nb)
-                        ? w4[(row * rowBytes + 2u * nb + 16u * b) >> 4]
-                        : uvec4(0u);
-                uint o = r * uint(SA_STRIDE) + k * 4u;
-                sa[o] = q.x; sa[o + 1u] = q.y; sa[o + 2u] = q.z; sa[o + 3u] = q.w;
-            }
-        } else {
-            for (uint idx = t; idx < BM * KSTEP * 4u; idx += uint(THREADS)) {
-                uint rest = idx & (KSTEP * 4u - 1u);
-                uint r    = idx / (KSTEP * 4u);
-                uint k    = rest >> 2, u = rest & 3u;
-                uint row  = row0 + r;
-                uint b    = kb + k;
-                sa[r * uint(SA_STRIDE) + k * 4u + u] = (row < p.dim && b < nb)
-                        ? w[((row * rowBytes + 2u * nb + 16u * b) >> 2) + u]
-                        : 0u;
-            }
-        }
-        for (uint idx = t; idx < BM * KSTEP; idx += uint(THREADS)) {
-            uint r   = idx / KSTEP, k = idx & (KSTEP - 1u);
-            uint row = row0 + r, b = kb + k;
-            if (row < p.dim && b < nb) {
-                vec2 pair = unpackHalf2x16(w[(row * rowBytes + 2u * b) >> 2]);
-                sad[r * uint(SD_STRIDE) + k] = pair[b & 1u];
-            } else {
-                sad[r * uint(SD_STRIDE) + k] = 0.0;
-            }
-        }
-
-        // The activation: COLUMNS columns by KSTEP blocks.
-        // Two loads a block: a Q8_0 block is thirty-two bytes and the columns
-        // are contiguous, so every block is aligned whatever the shape.
-        for (uint idx = t; idx < BN * KSTEP * 2u; idx += uint(THREADS)) {
-            uint rest = idx & (KSTEP * 2u - 1u);
-            uint c    = idx / (KSTEP * 2u);
-            uint k    = rest >> 1, h = rest & 1u;
-            uint b    = kb + k;
-            uvec4 q   = (b < nb) ? aq4[c * aw4 + b * 2u + h] : uvec4(0u);
-            uint o    = c * uint(SB_STRIDE) + k * 8u + h * 4u;
-            sb[o] = q.x; sb[o + 1u] = q.y; sb[o + 2u] = q.z; sb[o + 3u] = q.w;
-        }
-        for (uint idx = t; idx < BN * KSTEP; idx += uint(THREADS)) {
-            uint c = idx / KSTEP, k = idx & (KSTEP - 1u);
-            uint b = kb + k;
-            sbd[c * uint(SD_STRIDE) + k] = (b < nb) ? as_[c * 2u * nb + b] : 0.0;
-            sbc[c * uint(SD_STRIDE) + k] = (b < nb) ? as_[c * 2u * nb + nb + b] : 0.0;
-        }
-
+        STAGE()
         barrier();
+        if (kb + uint(KSTEP) < nb) { FETCH(kb + uint(KSTEP)) }
 
         [[unroll]] for (uint k = 0u; k < KSTEP; k++) {
             // This thread's TM weight blocks, held while every column meets

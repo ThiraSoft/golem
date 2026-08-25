@@ -49,9 +49,14 @@ type MatMul struct {
 	perGroup int
 
 	weights, aq, as, out *Buffer
-	coop                 bool
-	pipe                 *Pipeline
-	set                  *Set
+	// The activation is staged: written here and copied into device memory
+	// before a pass. It used to be read straight out of system memory, and a
+	// benchmark built that way measures the bus rather than the kernel —
+	// vk/device.go's Host says what that was worth in the engine.
+	stageQ, stageS *Buffer
+	coop           bool
+	pipe           *Pipeline
+	set            *Set
 }
 
 // NewMatMul uploads a Q4_0 matrix in the file's own layout and binds the tiled
@@ -93,15 +98,20 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int, coop bool) (*Mat
 		size int
 		back bool
 	}{
+		{&m.stageQ, cols * columns, false},
+		{&m.stageS, 2 * nb * 4 * columns, false},
 		{&m.aq, cols * columns, false},
 		{&m.as, 2 * nb * 4 * columns, false},
 		{&m.out, rows * 4 * columns, true},
 	} {
 		var b *Buffer
-		if spec.back {
+		switch {
+		case spec.back:
 			b, err = d.Readback(spec.size, bufferUsageStorage)
-		} else {
-			b, err = d.Host(spec.size, bufferUsageStorage)
+		case spec.into == &m.stageQ || spec.into == &m.stageS:
+			b, err = d.Host(spec.size, bufferUsageTransferSrc)
+		default:
+			b, err = d.Local(spec.size, bufferUsageStorage|bufferUsageTransferDst)
 		}
 		if err != nil {
 			m.Close()
@@ -164,11 +174,11 @@ func (m *MatMul) SetColumn(column int, b *nn.Batch) error {
 		return fmt.Errorf("vk: column %d of %d", column, m.columns)
 	}
 	nb := m.cols / nn.QuantBlock
-	dst := m.aq.Bytes()[column*m.cols:]
+	dst := m.stageQ.Bytes()[column*m.cols:]
 	for i, v := range b.Q[:m.cols] {
 		dst[i] = byte(v)
 	}
-	scales := m.as.Floats()[column*2*nb:]
+	scales := m.stageS.Floats()[column*2*nb:]
 	copy(scales[:nb], b.Scales[:nb])
 	copy(scales[nb:2*nb], b.Corr[:nb])
 	return nil
@@ -186,7 +196,10 @@ func (m *MatMul) Run(out [][]float32) error {
 	}
 	push := moePush{dim: uint32(m.rows), ffn: uint32(m.cols), used: 1}
 	groups := uint32((m.rows + m.perGroup - 1) / m.perGroup)
-	if err := m.set.Dispatch(groups, unsafe.Pointer(&push)); err != nil {
+	if err := m.d.Submit(func(r *Recorder) {
+		m.upload(r)
+		r.Dispatch(m.set, groups, unsafe.Pointer(&push))
+	}); err != nil {
 		return err
 	}
 	answer := m.out.Floats()
@@ -205,6 +218,7 @@ func (m *MatMul) RunTimes(n int) error {
 	push := moePush{dim: uint32(m.rows), ffn: uint32(m.cols), used: 1}
 	groups := uint32((m.rows + m.perGroup - 1) / m.perGroup)
 	return m.d.Submit(func(r *Recorder) {
+		m.upload(r)
 		for i := 0; i < n; i++ {
 			if i > 0 {
 				r.Barrier()
@@ -212,6 +226,15 @@ func (m *MatMul) RunTimes(n int) error {
 			r.Dispatch(m.set, groups, unsafe.Pointer(&push))
 		}
 	})
+}
+
+// upload puts the staged activation into device memory. It is one copy of a
+// few hundred kilobytes at the head of a submission, and the sixty-four passes
+// after it read it from where the engine's own kernels would have left it.
+func (m *MatMul) upload(r *Recorder) {
+	r.CopyFrom(m.aq, 0, m.stageQ, 0, len(m.stageQ.Bytes()))
+	r.CopyFrom(m.as, 0, m.stageS, 0, len(m.stageS.Bytes()))
+	r.Barrier()
 }
 
 func (m *MatMul) Close() {
@@ -223,7 +246,7 @@ func (m *MatMul) Close() {
 		m.pipe.Close()
 		m.pipe = nil
 	}
-	for _, b := range []**Buffer{&m.out, &m.as, &m.aq, &m.weights} {
+	for _, b := range []**Buffer{&m.out, &m.as, &m.aq, &m.stageS, &m.stageQ, &m.weights} {
 		if *b != nil {
 			(*b).Close()
 			*b = nil
