@@ -1,0 +1,42 @@
+#version 450
+
+// The eight slots of a column, weighted and added.
+//
+// The one-column expert branch does this inside its down projection: eight
+// experts and one output live in the same workgroup, so the sum needs neither
+// atomics nor a second pass. Read by expert rather than by column that shape
+// is gone — the eight matrices a column wants are in eight different
+// workgroups, and there is no ordering between them — so the down projection
+// writes one row per pair and this adds them.
+//
+// In slot order, which is what makes two runs of the same prompt give the same
+// floats: the pairs reached their expert in whatever order the atomics of
+// shaders/moe_scatter.comp decided, but a pair's slot is fixed by the router
+// and the sum here walks the slots and not the lists.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer P  { float part[]; };  // one row per pair
+layout(std430, binding = 1) readonly  buffer CW { float cw[];   };  // routing weight times expert scale
+layout(std430, binding = 2) writeonly buffer Y  { float y[];    };
+
+layout(push_constant) uniform Push {
+    uint dim;
+    uint used;
+    uint columns;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint n = p.dim * p.columns;
+    if (i >= n) return;
+    uint col = i / p.dim;
+    uint row = i % p.dim;
+
+    precise float sum = 0.0;
+    for (uint s = 0u; s < p.used; s++) {
+        uint pair = col * p.used + s;
+        sum += part[pair * p.dim + row] * cw[pair];
+    }
+    y[i] = sum;
+}

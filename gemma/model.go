@@ -283,15 +283,13 @@ func (m *Model) BlockOutput(block int) []float32 {
 }
 
 // stackColumns is how many positions one pass of the device carries, or zero
-// when there is no device. A mixture is one: an expert branch routes each
-// position to its own eight matrices, so a batch of them shares no read, and
-// vk/stack.go refuses one rather than pretending.
+// when there is no device. A mixture used to be one — an expert branch routes
+// each position to its own eight matrices, so a batch of them shares no read
+// column by column — and is now the same width as everything else: the branch
+// reads the stack by expert instead, and vk/shaders/moe_scatter.comp says how.
 func (m *Model) stackColumns() int {
-	switch {
-	case m.stack == nil:
+	if m.stack == nil {
 		return 0
-	case m.Cfg.Experts > 0:
-		return 1
 	}
 	return m.stack.Columns()
 }

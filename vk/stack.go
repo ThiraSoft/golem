@@ -330,7 +330,9 @@ func (s *Stack) Experts(n int) error {
 	if n > pickLanes {
 		return fmt.Errorf("vk: the router picks among at most %d experts, this model has %d", pickLanes, n)
 	}
-	b, err := s.d.Local(n*4, bufferUsageStorage)
+	// One row of logits per column of a pass: every position of a prompt
+	// routes for itself.
+	b, err := s.d.Local(n*4*maxColumns, bufferUsageStorage)
 	if err != nil {
 		return err
 	}
@@ -411,12 +413,6 @@ func (s *Stack) Run(at []Position, experts, used int) error {
 	if len(at) == 0 || len(at) > maxColumns {
 		return fmt.Errorf("vk: a pass carries between one and %d columns, given %d", maxColumns, len(at))
 	}
-	if experts > 0 && len(at) > 1 {
-		// An expert branch routes each position to its own eight matrices, so
-		// a batch of them shares no read. A mixture reads its prompt the way
-		// it always did, a position at a time.
-		return fmt.Errorf("vk: a mixture carries one column at a time, given %d", len(at))
-	}
 	for c, one := range at {
 		if len(one.First) != len(s.blocks) || len(one.Last) != len(s.blocks) {
 			return fmt.Errorf("vk: %d blocks want %d ranges, given %d", len(s.blocks), len(s.blocks), len(one.First))
@@ -482,14 +478,14 @@ func (s *Stack) record(r *Recorder, experts, used, columns int) {
 		if b.layout == LayoutMixture {
 			// The expert branch's norm and the routing both read the residual
 			// and neither reads the other.
-			r.Dispatch(b.setExpert, 1, unsafe.Pointer(&quant))
-			r.Dispatch(b.setRouterIn, 1, unsafe.Pointer(&routerIn))
+			r.DispatchColumns(b.setExpert, 1, cols, unsafe.Pointer(&quant))
+			r.DispatchColumns(b.setRouterIn, 1, cols, unsafe.Pointer(&routerIn))
 			r.Barrier()
 			tl.Stamp(r, "expert norm")
-			r.Dispatch(b.setRouterW, uint32(experts), unsafe.Pointer(&route))
+			r.DispatchColumns(b.setRouterW, uint32(experts), cols, unsafe.Pointer(&route))
 			r.Barrier()
 			tl.Stamp(r, "router")
-			r.Dispatch(b.setPick, 1, unsafe.Pointer(&route))
+			r.DispatchColumns(b.setPick, 1, cols, unsafe.Pointer(&route))
 			r.Barrier()
 			tl.Stamp(r, "pick")
 		}

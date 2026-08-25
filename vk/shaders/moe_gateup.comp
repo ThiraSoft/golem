@@ -48,13 +48,43 @@ layout(std430, binding = 4) readonly  buffer GT { float gelu[]; };  // ggml's ta
 layout(std430, binding = 5) writeonly buffer AQ { uint  aq[];   };  // the activation, Q8_0
 layout(std430, binding = 6) writeonly buffer AS { float as_[];  };  // its scales, then its corrections
 
+// Read by expert rather than by column.
+//
+// Built with BYID a workgroup belongs to one expert of the model and answers
+// every column of the pass that chose it, which is what makes a mixture prompt
+// read the expert stack once instead of once per column. The lists come from
+// shaders/moe_scatter.comp; this build reads no ids[] at all, because the
+// expert it answers for is its own workgroup number.
+#ifdef BYID
+layout(std430, binding = 7) readonly buffer CN { uint counts[]; };
+layout(std430, binding = 8) readonly buffer PR { uint pairs[];  };
+#endif
+
 layout(push_constant) uniform Push {
     uint dim;   // inputs to the projection
     uint ffn;   // outputs of it, per half
     uint used;  // how many experts this dispatch is for; one, for a shared branch
     uint act;   // 0: ggml's tabulated GELU; 1: SiLU, which is a swiglu's half
     uint col;   // the first column of the pass this dispatch answers
+    uint split; // the tiled product's, and not read here
+    uint cap;   // room in one expert's list of columns, where there is one
 } p;
+
+// Which column of the pass a lane of the chunk carries, and which of its eight
+// slots the answer belongs in. Consecutive without the lists; whatever the
+// router chose with them.
+#ifdef BYID
+shared uint scol[COLUMNS];
+shared uint sslot[COLUMNS];
+shared bool sactive[COLUMNS];
+#define SRCCOL(k)  scol[k]
+#define OUTSLOT(k) sslot[k]
+#define ACTIVE(k)  sactive[k]
+#else
+#define SRCCOL(k)  (p.col + (k))
+#define OUTSLOT(k) e
+#define ACTIVE(k)  true
+#endif
 
 // COLUMNS columns starting at p.col.
 //
@@ -169,13 +199,13 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
         // input carries is 8 x scale x sum(q) — the same for every row it
         // meets, which is why it is not in this loop's arithmetic.
         [[unroll]] for (uint k = 0u; k < COLUMNS; k++) {
-            uint xc = (p.col + k) * xw + ab;
+            uint xc = SRCCOL(k) * xw + ab;
             int acc = 0;
             [[unroll]] for (uint u = 0u; u < 4u; u++) {
                 acc = dotPacked4x8AccSatEXT(lo[u], int(xq[xc + u]),      acc);
                 acc = dotPacked4x8AccSatEXT(hi[u], int(xq[xc + u + 4u]), acc);
             }
-            uint sc = (p.col + k) * 2u * nb;
+            uint sc = SRCCOL(k) * 2u * nb;
             s[k] += ws * (float(acc) * xs[sc + b] - xs[sc + nb + b]);
         }
     }
@@ -194,8 +224,37 @@ void main() {
 
     uint nb       = p.dim >> 5;
     uint rowBytes = nb * 18u;
-    uint expert   = uint(ids[e]) * 2u * p.ffn * rowBytes;
     uint row      = (r < 32u) ? (blk * 32u + j) : (p.ffn + blk * 32u + j);
+#ifdef BYID
+    // The workgroup's own expert, and the columns that chose it. An expert no
+    // column chose costs a workgroup that reads one counter and stops, which
+    // is why the grid can be every expert of the model and still read only
+    // the matrices a pass wants.
+    uint n = counts[e];
+    if (n == 0u) return;
+    uint expert = e * 2u * p.ffn * rowBytes;
+#else
+    uint n = COLUMNS;
+    uint expert = uint(ids[e]) * 2u * p.ffn * rowBytes;
+#endif
+
+    // A chunk of the expert's columns at a time: the shared memory this
+    // kernel holds is what bounds COLUMNS, so a longer list is walked in
+    // stretches of it and the weights are read once per stretch.
+    for (uint base = 0u; base < n; base += COLUMNS) {
+#ifdef BYID
+    for (uint k = t; k < COLUMNS; k += 512u) {
+        bool live = base + k < n;
+        // A lane past the end of the list reads the first column of the
+        // chunk rather than nothing: the arithmetic is discarded, and a
+        // column that exists keeps every load in range.
+        uint pair = pairs[e * p.cap + (live ? base + k : base)];
+        scol[k]    = pair / p.used;
+        sslot[k]   = pair % p.used;
+        sactive[k] = live;
+    }
+    barrier();
+#endif
 
     // The eight lanes of a row fold their partial sums inside the wave.
     //
@@ -266,7 +325,8 @@ void main() {
             for (uint i = 0u; i < 32u; i++) q32[qb + i] = 0;
         }
 
-        uint at = ((p.col + k) * p.used * p.ffn + e * p.ffn + blk * 32u) >> 2;
+        if (!ACTIVE(k)) continue;
+        uint at = (SRCCOL(k) * p.used * p.ffn + OUTSLOT(k) * p.ffn + blk * 32u) >> 2;
         for (uint u = 0u; u < 8u; u++) {
             uint word = 0u;
             for (uint m = 0u; m < 4u; m++) {
@@ -274,8 +334,12 @@ void main() {
             }
             aq[at + u] = word;
         }
-        uint slot = (p.col + k) * 2u * p.used * blocks + e * blocks + blk;
+        uint slot = SRCCOL(k) * 2u * p.used * blocks + OUTSLOT(k) * blocks + blk;
         as_[slot] = scale;
         as_[p.used * blocks + slot] = 8.0 * scale * float(total);
+    }
+    // The next stretch of the list overwrites the shared arrays this one has
+    // just been read out of.
+    barrier();
     }
 }

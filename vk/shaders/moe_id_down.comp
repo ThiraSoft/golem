@@ -1,0 +1,148 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// The down projection of one expert against every column that chose it.
+//
+// shaders/moe_down.comp is the same projection for a single column, and its
+// shape is the right one there: eight experts and one output live in the same
+// workgroup, so the weighted sum over the experts needs neither atomics nor a
+// second pass. That shape cannot read an expert once for several columns —
+// the workgroup belongs to a column — and for a prompt that is the whole cost.
+//
+// So this one belongs to an expert. It reads the list
+// shaders/moe_scatter.comp built, walks it a stretch at a time, and holds each
+// weight block in registers while every column of the stretch meets it. The
+// expert stack is then read once for a pass rather than once for each of its
+// columns, which at a hundred and twenty-eight columns and eight experts to a
+// column is eight times less traffic through the twelve gigabytes this model
+// keeps on the card.
+//
+// What it gives up is the sum: the eight matrices a column wants are now in
+// eight different workgroups with no ordering between them, so each writes its
+// own row and shaders/moe_id_combine.comp adds them in slot order afterwards.
+// One row per pair is a hundred and twenty-eight columns by eight slots by the
+// width of the stream, ten megabytes, which is a tenth of what the pass saves.
+//
+// Sixty-four outputs to a workgroup and eight lanes to each of them, striding
+// the blocks: neighbouring lanes read neighbouring bytes of one row, which is
+// what shaders/moe_gateup.comp's header says the alternative cost.
+
+#ifndef CCOL
+#define CCOL 8
+#endif
+
+layout(local_size_x = 512) in; // sixty-four outputs, eight lanes each
+
+layout(std430, binding = 0) readonly  buffer W  { uint  w[];      }; // Q4_0, every expert
+layout(std430, binding = 1) readonly  buffer AQ { uint  aq[];     }; // the intermediate, Q8_0, a row per pair
+layout(std430, binding = 2) readonly  buffer AS { float as_[];    }; // its scales, then its corrections
+layout(std430, binding = 3) readonly  buffer CN { uint  counts[]; }; // columns that chose each expert
+layout(std430, binding = 4) readonly  buffer PR { uint  pairs[];  }; // and which
+layout(std430, binding = 5) writeonly buffer Y  { float y[];      }; // one row per pair
+
+// The block every kernel of the expert branch takes, so that one push serves
+// both halves. This one reads the shapes and the list's stride and ignores
+// the rest.
+layout(push_constant) uniform Push {
+    uint dim;   // outputs
+    uint ffn;   // inputs, one expert's feed-forward width
+    uint used;  // experts to a column
+    uint act;   // the gate kernel's
+    uint col;   // the gate kernel's
+    uint split; // the tiled product's
+    uint cap;   // room in one expert's list
+} p;
+
+const uint LANES = 8u;
+const uint OUTS  = 64u;
+
+shared uint spair[CCOL];
+shared bool sactive[CCOL];
+
+void main() {
+    uint nb        = p.ffn >> 5;
+    uint rowBytes  = nb * 18u;
+    uint perExpert = (p.dim + OUTS - 1u) / OUTS;
+
+    uint e   = gl_WorkGroupID.x / perExpert;
+    uint blk = gl_WorkGroupID.x % perExpert;
+
+    // An expert no column chose costs one counter and a return, which is what
+    // lets the grid be every expert of the model: the pass reads the matrices
+    // it wants and nothing else, without the dispatch having to know in
+    // advance which those were.
+    uint n = counts[e];
+    if (n == 0u) return;
+
+    uint t    = gl_LocalInvocationID.x;
+    uint r    = t / LANES;
+    uint lane = t % LANES;
+    uint i    = blk * OUTS + r;
+
+    uint rowBase = (e * p.dim + i) * rowBytes;
+    uint nib     = rowBase + 2u * nb;
+
+    for (uint base = 0u; base < n; base += CCOL) {
+        for (uint k = t; k < CCOL; k += 512u) {
+            bool live = base + k < n;
+            // Past the end of the list a lane reads the stretch's first pair
+            // rather than nothing: the answer is thrown away, and a pair that
+            // exists keeps every load in range.
+            spair[k]   = pairs[e * p.cap + (live ? base + k : base)];
+            sactive[k] = live;
+        }
+        barrier();
+
+        // Magnitude and correction apart, which is what shaders/moe_down.comp
+        // does: the two are summed in that order in the reference and in the
+        // engine's own kernel, and eight columns of two accumulators is
+        // sixteen floats, well inside what a lane holds.
+        precise float sum[CCOL];
+        precise float corr[CCOL];
+        [[unroll]] for (uint k = 0u; k < CCOL; k++) {
+            sum[k]  = 0.0;
+            corr[k] = 0.0;
+        }
+
+        if (i < p.dim) {
+            for (uint b = lane; b < nb; b += LANES) {
+                vec2  packed = unpackHalf2x16(w[(rowBase + 2u * b) >> 2]);
+                float ws     = packed[b & 1u];
+
+                uint at = (nib + 16u * b) >> 2;
+                uint lo[4], hi[4];
+                for (uint u = 0u; u < 4u; u++) {
+                    uint word = w[at + u];
+                    lo[u] = word & 0x0F0F0F0Fu;
+                    hi[u] = (word >> 4) & 0x0F0F0F0Fu;
+                }
+                [[unroll]] for (uint k = 0u; k < CCOL; k++) {
+                    uint pair = spair[k];
+                    uint ab   = ((pair * p.ffn) >> 2) + b * 8u;
+                    int acc = 0;
+                    [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                        acc = dotPacked4x8AccSatEXT(lo[u], int(aq[ab + u]),      acc);
+                        acc = dotPacked4x8AccSatEXT(hi[u], int(aq[ab + u + 4u]), acc);
+                    }
+                    // The scales of a column are laid out slot by slot, its
+                    // corrections after them — the layout
+                    // shaders/moe_gateup.comp writes and
+                    // shaders/moe_down.comp reads for one column.
+                    uint sc = (pair / p.used) * 2u * p.used * nb + (pair % p.used) * nb;
+                    sum[k]  += float(acc) * ws * as_[sc + b];
+                    corr[k] += ws * as_[sc + p.used * nb + b];
+                }
+            }
+        }
+
+        // The eight lanes of a row fold inside the wave: they are consecutive
+        // invocations by construction, t = r * LANES + lane.
+        [[unroll]] for (uint k = 0u; k < CCOL; k++) {
+            float folded = subgroupClusteredAdd(sum[k] - corr[k], LANES);
+            if (lane == 0u && i < p.dim && sactive[k]) y[spair[k] * p.dim + i] = folded;
+        }
+        barrier();
+    }
+}

@@ -37,9 +37,14 @@ shared float sl[256];
 shared int   chosen[32];
 shared float se[32];
 
+// The column of the pass this workgroup picks for. One workgroup a column:
+// the choice is a hundred and twenty-eight comparisons and the positions of a
+// prompt share nothing.
+#define COL (gl_WorkGroupID.y)
+
 void main() {
     uint t = gl_LocalInvocationID.x;
-    if (t < p.experts) sl[t] = logits[t];
+    if (t < p.experts) sl[t] = logits[COL * p.experts + t];
     barrier();
 
     if (t < p.experts) {
@@ -50,7 +55,7 @@ void main() {
         }
         if (rank < p.used) {
             chosen[rank] = int(t);
-            ids[rank] = int(t);
+            ids[COL * p.used + rank] = int(t);
         }
     }
     barrier();
@@ -71,6 +76,6 @@ void main() {
         for (uint k = 0u; k < p.used; k++) total += se[k];
         // llama.cpp applies the per-expert scale just before the routing
         // weight, so one multiplication does both.
-        cw[t] = (se[t] / total) * dscale[chosen[t]];
+        cw[COL * p.used + t] = (se[t] / total) * dscale[chosen[t]];
     }
 }

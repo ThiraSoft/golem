@@ -239,3 +239,89 @@ func TestVulkanStackProfile(t *testing.T) {
 	}
 	t.Log("\n" + report)
 }
+
+// TestVulkanBatchBlockByBlock is TestVulkanForwardBlockByBlock with the prompt
+// read as a batch rather than a position at a time.
+//
+// This is the test the by-expert branch needed and none of the others gave.
+// Every other Vulkan test here goes a position at a time, which is the path
+// through shaders/moe_gateup.comp and shaders/moe_down.comp; a batch goes
+// through shaders/moe_scatter.comp and the two kernels that read an expert's
+// list, and those had no coverage at all until this. A wrong list, a slot
+// written to the wrong row, or a count read before it was zeroed all come out
+// here and nowhere else.
+//
+// Against the reference and not against this engine's own token path, for the
+// reason load26BStack gives: the two paths fold the same products in different
+// orders — eight lanes through shared memory one way, a clustered add inside
+// the wave the other — and a mixture amplifies that, because the intermediate
+// is quantized to Q8_0 between the halves and a value a hair from an integer
+// boundary goes to the other side of it. Measured, the batch path drifts from
+// the token path by two per cent of peak over thirty blocks while both stay
+// within one per cent of llama.cpp. So the tolerance here is the token path's,
+// unchanged, and the comparison is to the same recording.
+func TestVulkanBatchBlockByBlock(t *testing.T) {
+	f, m := load26BStack(t)
+	m.TraceBlocks()
+	m.ForwardBatch(f.Tokens, 0)
+	last := len(f.Tokens) - 1
+	for _, il := range moeBlocks {
+		compareRelative(t, "l_out-"+itoa(il)+" at position "+itoa(last),
+			m.BlockOutput(il), f.column(t, "l_out-"+itoa(il), last), 5e-2)
+	}
+}
+
+// TestVulkanBatchGreedyMatchesTheReference is the same prompt read as a batch,
+// carried on into the continuation the reference recorded. What the test above
+// checks per block, this checks where it ends up: a prompt whose cache was
+// filled by the by-expert branch has to answer what one filled a token at a
+// time answers.
+func TestVulkanBatchGreedyMatchesTheReference(t *testing.T) {
+	f, m := load26BStack(t)
+	hidden := m.ForwardBatch(f.Tokens, 0)
+	last := hidden[len(hidden)-1]
+	pos := len(f.Tokens)
+
+	const tie = 4
+	logits := make([]float32, m.Cfg.Vocab)
+	for step, want := range f.Greedy {
+		m.Logits(last, logits)
+		if got := Argmax(logits); got != want {
+			if margin := logits[got] - logits[want]; margin > tie {
+				t.Fatalf("step %d: chose %d over the reference's %d by %v, which is past a tie",
+					step, got, want, margin)
+			} else {
+				t.Logf("step %d: chose %d over %d by %v, a tie inside the measured gap",
+					step, got, want, margin)
+			}
+		}
+		last = m.Forward(want, pos)
+		pos++
+	}
+}
+
+// BenchmarkMoEPrefillVulkan is a prompt on the card, at several lengths. It is
+// the number the by-expert branch was written for: the expert stack is read
+// once for a pass rather than once for each of its columns, so what this
+// reports should rise with the width of the pass and not stay flat.
+func BenchmarkMoEPrefillVulkan(b *testing.B) {
+	for _, n := range []int{64, 128, 256} {
+		b.Run(itoa(n), func(b *testing.B) {
+			m := open26BEngine(b)
+			if err := m.UseVulkanStack(); err != nil {
+				b.Skipf("no Vulkan stack: %v", err)
+			}
+			tokens := make([]int32, n)
+			for i := range tokens {
+				tokens[i] = int32(100 + i)
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				m.Reset()
+				m.ForwardBatch(tokens, 0)
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(n)*float64(b.N)/b.Elapsed().Seconds(), "tok/s")
+		})
+	}
+}

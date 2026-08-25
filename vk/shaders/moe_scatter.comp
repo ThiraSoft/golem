@@ -1,0 +1,58 @@
+#version 450
+
+// The routing, turned inside out.
+//
+// A token routes to eight experts of a hundred and twenty-eight, so a pass of
+// one column has nothing to share: eight matrices are read for one column and
+// that is the whole of the expert branch's cost. A pass of a hundred and
+// twenty-eight columns chooses a thousand and twenty-four times among the same
+// hundred and twenty-eight matrices, and every expert is wanted by eight
+// columns on average. Read per expert instead of per column and the same work
+// reads the stack once rather than eight times over — which is what
+// llama.cpp's mul_mat_id does and why its mixture prompt is six times ours.
+//
+// This kernel is the change of address. The router leaves ids[] as the pass
+// laid it out, one column's eight choices after another; this walks that and
+// writes, for each expert, the list of pairs that chose it. A pair is a column
+// and one of its eight slots, packed as column * used + slot, which is exactly
+// the index ids[] was read at — so the list entry is the index itself and
+// nothing has to be unpacked to find its way back.
+//
+// One workgroup, because the counters have to be seen by everything that
+// increments them and a barrier only reaches inside a workgroup. There are at
+// most a thousand and twenty-four pairs to place; the kernel costs less than
+// the dispatch that carries it.
+//
+// The order inside an expert's list is whatever the atomics decided, and that
+// is deliberately not made deterministic: nothing downstream reads the list in
+// order. Each pair carries its own slot, the down projection writes that
+// slot's own row, and the sum over slots is done in slot order by
+// shaders/moe_id_combine.comp. Two runs of the same prompt give the same
+// floats in the same order.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer ID { int  ids[];    };  // the chosen experts, by column
+layout(std430, binding = 1)           buffer CN { uint counts[]; };  // how many columns chose each
+layout(std430, binding = 2) writeonly buffer PR { uint pairs[];  };  // and which, per expert
+
+layout(push_constant) uniform Push {
+    uint columns;  // the width of the pass
+    uint used;     // experts to a column
+    uint experts;  // experts in the model
+    uint cap;      // room in one expert's list, which is maxColumns
+} p;
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    for (uint e = t; e < p.experts; e += 256u) counts[e] = 0u;
+    memoryBarrierBuffer();
+    barrier();
+
+    uint n = p.columns * p.used;
+    for (uint i = t; i < n; i += 256u) {
+        uint e = uint(ids[i]);
+        uint slot = atomicAdd(counts[e], 1u);
+        if (slot < p.cap) pairs[e * p.cap + slot] = i;
+    }
+}

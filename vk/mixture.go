@@ -33,6 +33,26 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_down.comp -o shaders/moe_down.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec.spv
 
+// The prompt path of the expert branch, which reads the stack by expert
+// rather than by column. shaders/moe_scatter.comp says why.
+//
+//go:generate glslc -O -DCOLUMNS=8 -DBYID --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_id8.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_id_down.comp -o shaders/moe_id_down.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_scatter.comp -o shaders/moe_scatter.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_id_combine.comp -o shaders/moe_id_combine.spv
+
+//go:embed shaders/moe_gateup_id8.spv
+var moeGateUpByIDSPIRV []byte
+
+//go:embed shaders/moe_id_down.spv
+var moeDownByIDSPIRV []byte
+
+//go:embed shaders/moe_scatter.spv
+var moeScatterSPIRV []byte
+
+//go:embed shaders/moe_id_combine.spv
+var moeIDCombineSPIRV []byte
+
 //go:embed shaders/moe_gateup.spv
 var moeGateUpSPIRV []byte
 
@@ -134,6 +154,16 @@ type Mixture struct {
 	act                      Activation
 
 	gateUp, down, denseDown *Pipeline
+	// The same two halves read by expert, for a prompt: idGateUp and idDown
+	// belong to an expert where gateUp and down belong to a column, scatter
+	// builds the lists they walk, and idCombine adds a column's eight slots
+	// back together. shaders/moe_scatter.comp says why a prompt wants this.
+	idGateUp, idDown   *Pipeline
+	scatter, idCombine *Pipeline
+	scatterSet         *Set
+	combineSet         *Set
+	counts, pairs      *Buffer
+	dpart              *Buffer
 	// reduce folds the slices of a split shared-branch down projection, and
 	// splitDown is how many there are. matmulSplit says which matrices want
 	// it: this one has the stack's fewest rows and the most weight behind
@@ -163,6 +193,7 @@ type mixtureBlock struct {
 	setGateUp, setDown     *Set
 	setDenseUp, setDenseDn *Set
 	setDenseDnParts        *Set // the same, writing the slices of a split product
+	setIDGateUp, setIDDown *Set // the expert branch read by expert, for a prompt
 }
 
 // moePush is what all three kernels take. matvec.comp reads the first three
@@ -183,6 +214,35 @@ type moePush struct {
 	// means each slice writes its own copy and shaders/matmul_reduce.comp adds
 	// them. Every other kernel declares fewer uints and ignores this one.
 	split uint32
+	// cap is the room in one expert's list of columns, which the two kernels
+	// that read those lists index by. Every other kernel declares fewer uints
+	// and ignores it.
+	cap uint32
+}
+
+// idDownOuts is shaders/moe_id_down.comp's OUTS: how many outputs one of its
+// workgroups writes.
+const idDownOuts = 64
+
+// scatterPush is shaders/moe_scatter.comp's, which counts rather than
+// multiplies and takes none of the shapes the others do.
+// It is padded to moePush's size because that is what every pipeline here
+// declares its push range as, and a recorder copies the range and not the
+// struct.
+type scatterPush struct {
+	columns uint32
+	used    uint32
+	experts uint32
+	cap     uint32
+	_       [3]uint32
+}
+
+// combinePairsPush is shaders/moe_id_combine.comp's.
+type combinePairsPush struct {
+	dim     uint32
+	used    uint32
+	columns uint32
+	_       [4]uint32
 }
 
 // An Activation is what a gated feed forward puts on its gate. Gemma 4 looks
@@ -230,11 +290,19 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		{&m.reduce, matmulReduceSPIRV, 2},
 	}
 	if experts > 0 {
-		pipes = append(pipes, struct {
+		for _, spec := range []struct {
 			into     **Pipeline
 			spirv    []byte
 			bindings int
-		}{&m.down, moeDownSPIRV, 6})
+		}{
+			{&m.down, moeDownSPIRV, 6},
+			{&m.idGateUp, moeGateUpByIDSPIRV, 9},
+			{&m.idDown, moeDownByIDSPIRV, 6},
+			{&m.scatter, moeScatterSPIRV, 3},
+			{&m.idCombine, moeIDCombineSPIRV, 3},
+		} {
+			pipes = append(pipes, spec)
+		}
 	}
 	for _, spec := range pipes {
 		if *spec.into, err = d.NewPipeline(spec.spirv, spec.bindings, push); err != nil {
@@ -299,15 +367,25 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		{&m.das, 2 * dmid * 4 * maxColumns, true}, //
 	}
 	if experts > 0 {
+		// Every column of a pass routes for itself, and the buffers between
+		// the two halves are one row per pair of a column and one of its
+		// eight slots. A hundred and twenty-eight columns is a thousand and
+		// twenty-four rows: 720 kilobytes of intermediate and ten megabytes
+		// of down projection, against the twelve gigabytes the pass saves
+		// reading the stack once instead of once a column.
 		mid := ffn / nn.QuantBlock
+		pairs := maxColumns * expertsUsed
 		bufs = append(bufs,
-			bufSpec{&m.xq, dim, true},                       // the expert branch's input
-			bufSpec{&m.xs, 2 * in * 4, true},                // its scales, then its corrections
-			bufSpec{&m.ids, expertsUsed * 4, false},         // the chosen experts
-			bufSpec{&m.cw, expertsUsed * 4, false},          // routing weight times expert scale
-			bufSpec{&m.out, dim * 4, true},                  // that branch's output
-			bufSpec{&m.aq, expertsUsed * ffn, true},         // its intermediate
-			bufSpec{&m.as, 2 * expertsUsed * mid * 4, true}, // and that intermediate's scales
+			bufSpec{&m.xq, dim * maxColumns, true},            // the expert branch's input
+			bufSpec{&m.xs, 2 * in * 4 * maxColumns, true},     // its scales, then its corrections
+			bufSpec{&m.ids, pairs * 4, false},                 // the chosen experts, a column at a time
+			bufSpec{&m.cw, pairs * 4, false},                  // routing weight times expert scale
+			bufSpec{&m.out, dim * 4 * maxColumns, true},       // that branch's output
+			bufSpec{&m.aq, pairs * ffn, true},                 // its intermediate, a row per pair
+			bufSpec{&m.as, 2 * pairs * mid * 4, true},         // and that intermediate's scales
+			bufSpec{&m.counts, experts * 4, true},             // columns that chose each expert
+			bufSpec{&m.pairs, experts * maxColumns * 4, true}, // and which
+			bufSpec{&m.dpart, pairs * dim * 4, true},          // the down projection, a row per pair
 		)
 	}
 	for _, spec := range bufs {
@@ -325,6 +403,17 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 	}
 	if m.splitDown > 1 {
 		if m.reduceSet, err = m.reduce.NewSet([]*Buffer{m.doutParts, m.dout}); err != nil {
+			m.Close()
+			return nil, err
+		}
+	}
+	if experts > 0 {
+		// Neither of these reads a weight, so one set serves every block.
+		if m.scatterSet, err = m.scatter.NewSet([]*Buffer{m.ids, m.counts, m.pairs}); err != nil {
+			m.Close()
+			return nil, err
+		}
+		if m.combineSet, err = m.idCombine.NewSet([]*Buffer{m.dpart, m.cw, m.out}); err != nil {
 			m.Close()
 			return nil, err
 		}
@@ -415,6 +504,10 @@ func (m *Mixture) AddBlock(gateUpExps, downExps, gate, up, down []byte) error {
 		sets = append(sets,
 			setSpec{&b.setGateUp, m.gateUp, []*Buffer{b.gateUp, m.xq, m.xs, m.ids, m.gelu, m.aq, m.as}},
 			setSpec{&b.setDown, m.down, []*Buffer{b.down, m.aq, m.as, m.ids, m.cw, m.out}},
+			setSpec{&b.setIDGateUp, m.idGateUp,
+				[]*Buffer{b.gateUp, m.xq, m.xs, m.ids, m.gelu, m.aq, m.as, m.counts, m.pairs}},
+			setSpec{&b.setIDDown, m.idDown,
+				[]*Buffer{b.down, m.aq, m.as, m.counts, m.pairs, m.dpart}},
 		)
 	}
 	for _, spec := range sets {
@@ -436,14 +529,28 @@ func (m *Mixture) Profile(t *Timeline) { m.tl = t }
 // number of columns. More than one is a stretch of a prompt, and only the
 // shared branch can take it — see the note beside the wide pipelines above.
 func (m *Mixture) Record(r *Recorder, block, columns int) {
-	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed, act: uint32(m.act)}
+	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed, act: uint32(m.act),
+		cap: uint32(maxColumns)}
 	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act)}
 	b := m.blocks[block]
 	width := passWidth(columns)
 	up, down := uint32(m.dense/nn.QuantBlock), productGroups(width, m.dim)
 	// Nothing in either branch waits on the other, so they go in without a
 	// barrier between them and the card runs them together.
-	if m.experts > 0 {
+	// A token reads the expert stack a column at a time — eight matrices for
+	// one position, and nothing between two positions to share. A prompt reads
+	// it by expert instead: shaders/moe_scatter.comp turns the routing inside
+	// out, and the two halves below walk one expert's list of columns rather
+	// than one column's list of experts. Same answer, and the stack read once
+	// for a pass instead of once for each of its columns.
+	byExpert := m.experts > 0 && columns > 1
+	if byExpert {
+		scat := scatterPush{columns: uint32(columns), used: expertsUsed,
+			experts: uint32(m.experts), cap: uint32(maxColumns)}
+		r.Dispatch(m.scatterSet, 1, unsafe.Pointer(&scat))
+		r.Barrier()
+		r.Dispatch(b.setIDGateUp, uint32(m.experts*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
+	} else if m.experts > 0 {
 		r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
 	}
 	if width > 1 {
@@ -461,7 +568,10 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 	}
 	r.Barrier()
 	m.tl.Stamp(r, "moe gate/up")
-	if m.experts > 0 {
+	if byExpert {
+		perExpert := (m.dim + idDownOuts - 1) / idDownOuts
+		r.Dispatch(b.setIDDown, uint32(m.experts*perExpert), unsafe.Pointer(&experts))
+	} else if m.experts > 0 {
 		r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
 	}
 	if b.setDenseDnParts != nil && width >= tiledColumns {
@@ -475,6 +585,14 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 		r.DispatchWide(b.setDenseDn, width, down, unsafe.Pointer(&shared))
 	} else {
 		r.Dispatch(b.setDenseDn, down, unsafe.Pointer(&shared))
+	}
+	if byExpert {
+		// The eight rows a column's experts wrote, weighted and added. It
+		// waits on the down projection above and on nothing else, so it goes
+		// in after the shared branch rather than between the two.
+		r.Barrier()
+		fold := combinePairsPush{dim: uint32(m.dim), used: expertsUsed, columns: uint32(columns)}
+		r.Dispatch(m.combineSet, uint32((m.dim*columns+255)/256), unsafe.Pointer(&fold))
 	}
 }
 
@@ -502,6 +620,7 @@ func (m *Mixture) Close() {
 	for _, b := range []**Buffer{
 		&m.das, &m.daq, &m.doutParts, &m.dout, &m.dxs, &m.dxq,
 		&m.as, &m.aq, &m.out, &m.cw, &m.ids, &m.xs, &m.xq,
+		&m.dpart, &m.pairs, &m.counts,
 		&m.zero, &m.gelu,
 	} {
 		if *b != nil {
@@ -509,11 +628,16 @@ func (m *Mixture) Close() {
 			*b = nil
 		}
 	}
-	if m.reduceSet != nil {
-		m.reduceSet.Close()
-		m.reduceSet = nil
+	for _, s := range []**Set{&m.reduceSet, &m.scatterSet, &m.combineSet} {
+		if *s != nil {
+			(*s).Close()
+			*s = nil
+		}
 	}
-	for _, p := range []**Pipeline{&m.denseDown, &m.down, &m.gateUp, &m.reduce} {
+	for _, p := range []**Pipeline{
+		&m.denseDown, &m.down, &m.gateUp, &m.reduce,
+		&m.idGateUp, &m.idDown, &m.scatter, &m.idCombine,
+	} {
 		if *p != nil {
 			(*p).Close()
 			*p = nil
@@ -522,7 +646,10 @@ func (m *Mixture) Close() {
 }
 
 func (b *mixtureBlock) close() {
-	for _, s := range []**Set{&b.setDenseDn, &b.setDenseUp, &b.setDown, &b.setGateUp} {
+	for _, s := range []**Set{
+		&b.setDenseDn, &b.setDenseDnParts, &b.setDenseUp,
+		&b.setDown, &b.setGateUp, &b.setIDGateUp, &b.setIDDown,
+	} {
 		if *s != nil {
 			(*s).Close()
 			*s = nil

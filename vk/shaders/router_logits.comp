@@ -24,18 +24,24 @@ layout(push_constant) uniform Push {
 
 shared float partial[256];
 
+// The column of the pass this workgroup routes. A prompt routes every one of
+// its positions, and each has its own eight experts: the second axis of the
+// dispatch is which.
+#define COL (gl_WorkGroupID.y)
+
 void main() {
     uint e = gl_WorkGroupID.x;
     uint t = gl_LocalInvocationID.x;
     uint at = e * p.n;
+    uint xb = COL * p.n;
 
     precise float sum = 0.0;
-    for (uint i = t; i < p.n; i += 256u) sum += w[at + i] * x[i];
+    for (uint i = t; i < p.n; i += 256u) sum += w[at + i] * x[xb + i];
     partial[t] = sum;
     barrier();
     for (uint stride = 128u; stride > 0u; stride >>= 1) {
         if (t < stride) partial[t] += partial[t + stride];
         barrier();
     }
-    if (t == 0u) logits[e] = partial[0];
+    if (t == 0u) logits[COL * p.experts + e] = partial[0];
 }

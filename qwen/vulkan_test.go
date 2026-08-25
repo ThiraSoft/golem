@@ -190,7 +190,6 @@ func BenchmarkQuantizedPrefillVulkan(b *testing.B) {
 	}
 }
 
-
 // TestVulkanPromptProfile is not a test of anything; it is the instrument that
 // says which stage of a block a stretch of prompt is spent in. Run it with -v.
 func TestVulkanPromptProfile(t *testing.T) {
