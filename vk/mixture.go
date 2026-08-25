@@ -57,6 +57,15 @@ var matvecWideSPIRV []byte
 //go:embed shaders/moe_gateup8.spv
 var moeGateUpWideSPIRV []byte
 
+// The tiled product, which is the shape a prompt wants where the mat-vec is
+// the shape a token wants. shaders/matmul.comp says why.
+//
+//go:embed shaders/matmul32.spv
+var matmulWideSPIRV []byte
+
+//go:embed shaders/matmul8.spv
+var matmulSmallSPIRV []byte
+
 // expertsUsed is what the mixture's down kernel is written for: its workgroup
 // is eight outputs by eight experts. A checkpoint that chose a different
 // number would need the shape changed, not a constant.

@@ -1,0 +1,236 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// y = W * X for one Q4_0 matrix against a batch of Q8_0 activations.
+//
+// shaders/matvec.comp is the same product for one column, and for a token that
+// is the right shape: there is nothing to share, and the weights are read at
+// the card's memory ceiling. It is the wrong shape for a prompt. Giving it
+// eight columns instead of one takes the weight traffic down eightfold and
+// leaves the kernel reading the activation fourteen times for every once it
+// reads the weights — measured, that holds an eight-column pass at 144
+// gigabytes a second where a four-column pass reaches 306.
+//
+// The number that governs it is how much arithmetic a thread does for each
+// load it issues. One row by eight columns is eight products against nine
+// loads. This kernel gives a thread TM rows by TN columns: TM*TN*8 products
+// against TM*5 + TN*10 loads, which at four by four is two and a half times
+// better and at eight by four is three and a half. llama.cpp's own Vulkan
+// backend draws the same line — its mat-vec kernel stops at eight columns and
+// a tiled product takes over above that, and on this architecture its mat-vec
+// carries one row per thread exactly as ours does.
+//
+// So: a workgroup owns BM rows by COLUMNS columns of the answer. It walks the
+// shared dimension in chunks of KSTEP blocks, staging both operands in shared
+// memory, and each thread keeps its own TM by TN tile of the result in
+// registers for the whole walk. Nothing is reduced across threads at the end,
+// which is the other thing the mat-vec kernel spends: there, eight lanes split
+// one row and fold their partial sums through shared memory.
+//
+// The weights are in the layout vk/mixture.go uploads: a row is all of its
+// fp16 scales, then all of its nibbles. The activation is one column after
+// another, its magnitudes then its scales then its corrections — the same
+// buffers shaders/matvec.comp reads, so the two kernels could share a
+// descriptor set and the caller pick between them by the width of the pass.
+//
+// **Nothing binds this yet, and here is what it measures.** On the Qwen3 4B's
+// ffn_down, thirty-two columns a pass: 10 microseconds a column, against the
+// eight-column mat-vec's 14 and the one-column mat-vec's 38. A factor of 1.4
+// over what the engine already does, where the tile arithmetic above says
+// three or four. It is committed as the bench the next attempt is made on,
+// not as a kernel to switch to.
+//
+// What was ruled out on the way, so that it is not ruled out again:
+//
+//   - **Bank conflicts were real and are fixed.** A column of the activation
+//     was KSTEP*8 uints, which at KSTEP four is thirty-two exactly — the bank
+//     count — so every thread of a wave read one bank. Padding the strides by
+//     one uint was worth 1.5x, from 24 to 36 gigabytes a second.
+//   - **It is not the workgroup count.** ffn_gate is four times as tall as
+//     ffn_down and gives a hundred and fifty-two workgroups against forty; the
+//     two run within seven per cent of each other.
+//   - **It is not the tile being too small.** Every tile larger than two by
+//     two measured slower, monotonically, up to eight by four — which is
+//     llama.cpp's own shape and the worst here at 9 gigabytes a second. More
+//     threads always won, which says the kernel is short of work in flight
+//     rather than short of arithmetic to do.
+//   - **Removing half the kernel measures nothing.** Compiled without the
+//     staging, the compute reads a loop-invariant shared array and the whole
+//     walk is hoisted out; compiled without the compute, the staging is dead
+//     and removed. Both report four hundred gigabytes a second and both are
+//     lies.
+//
+// What has not been ruled out is the one thing a Vulkan profile would settle,
+// and this machine has no vulkan-headers to build llama.cpp's own Vulkan
+// backend against for a second opinion.
+
+#ifndef COLUMNS
+#define COLUMNS 32
+#endif
+
+// The tile, as preprocessor arithmetic because the workgroup size has to be a
+// literal. TM rows by TN columns to a thread, BM rows by COLUMNS to a group.
+// The tile, swept rather than reasoned to. Two by two beat every larger tile
+// measured, which is the opposite of what arithmetic intensity predicts and is
+// the finding this kernel is worth keeping for: on this card the product is
+// not short of instructions to issue, it is short of work in flight.
+#ifndef TM
+#define TM     2
+#endif
+#ifndef TN
+#define TN     2
+#endif
+#ifndef BM
+#define BM     64
+#endif
+#ifndef KSTEP
+#define KSTEP  8
+#endif
+#define COLTH  (COLUMNS / TN)
+#define THREADS ((BM / TM) * COLTH)
+
+const uint BN = COLUMNS;
+
+// The strides of the staged operands, padded by one.
+//
+// Shared memory is thirty-two banks of four bytes, and two addresses a
+// multiple of thirty-two apart are the same bank. A column of the activation
+// is KSTEP*8 uints, which at KSTEP four is thirty-two exactly: every thread of
+// a wave would read the same bank on every load, sixteen ways at once.
+// Measured, that alone held this kernel at 24 gigabytes a second. One uint of
+// padding makes the stride odd and spreads the wave over the banks.
+#define SA_STRIDE (KSTEP * 4 + 1)
+#define SB_STRIDE (KSTEP * 8 + 1)
+#define SD_STRIDE (KSTEP + 1)
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer W  { uint  w[];   };
+layout(std430, binding = 1) readonly  buffer AQ { uint  aq[];  };  // the activation, Q8_0
+layout(std430, binding = 2) readonly  buffer AS { float as_[]; };  // its scales, then its corrections
+layout(std430, binding = 3) writeonly buffer Y  { float y[];   };
+
+layout(push_constant) uniform Push {
+    uint dim;   // outputs
+    uint ffn;   // inputs
+    uint used;  // one, and only here so that every kernel takes the same block
+    uint act;   // the activation, which is spent before this kernel runs
+} p;
+
+// The staged operands. Ten kilobytes, which leaves a compute unit several
+// workgroups.
+shared uint  sa[BM * SA_STRIDE];        // the nibbles, four uints a block
+shared float sad[BM * SD_STRIDE];       // the weight scales
+shared uint  sb[COLUMNS * SB_STRIDE];   // the magnitudes, eight uints a block
+shared float sbd[COLUMNS * SD_STRIDE];  // the activation scales
+shared float sbc[COLUMNS * SD_STRIDE];  // its corrections, the scale times the sum, eight times over
+
+void main() {
+    uint t   = gl_LocalInvocationID.x;
+    uint tr  = t / uint(COLTH);            // which TM rows this thread owns
+    uint tc  = t % uint(COLTH);            // which TN columns
+    uint row0 = gl_WorkGroupID.x * uint(BM);
+
+    uint nb  = p.ffn >> 5;           // blocks of the shared dimension
+    uint aw  = p.ffn >> 2;           // one column of the activation, in uints
+    uint rowBytes = nb * 18u;
+
+    float acc[TM][TN];
+    [[unroll]] for (uint r = 0u; r < TM; r++) {
+        [[unroll]] for (uint c = 0u; c < TN; c++) acc[r][c] = 0.0;
+    }
+
+    for (uint kb = 0u; kb < nb; kb += uint(KSTEP)) {
+        barrier();
+
+        // The weights: BM rows by KSTEP blocks, nibbles then scale.
+        for (uint idx = t; idx < BM * KSTEP * 4u; idx += uint(THREADS)) {
+            uint rest = idx & (KSTEP * 4u - 1u);
+            uint r    = idx / (KSTEP * 4u);
+            uint k    = rest >> 2, u = rest & 3u;
+            uint row  = row0 + r;
+            uint b    = kb + k;
+            sa[r * uint(SA_STRIDE) + k * 4u + u] = (row < p.dim && b < nb)
+                    ? w[((row * rowBytes + 2u * nb + 16u * b) >> 2) + u]
+                    : 0u;
+        }
+        for (uint idx = t; idx < BM * KSTEP; idx += uint(THREADS)) {
+            uint r   = idx / KSTEP, k = idx & (KSTEP - 1u);
+            uint row = row0 + r, b = kb + k;
+            if (row < p.dim && b < nb) {
+                vec2 pair = unpackHalf2x16(w[(row * rowBytes + 2u * b) >> 2]);
+                sad[r * uint(SD_STRIDE) + k] = pair[b & 1u];
+            } else {
+                sad[r * uint(SD_STRIDE) + k] = 0.0;
+            }
+        }
+
+        // The activation: COLUMNS columns by KSTEP blocks.
+        for (uint idx = t; idx < BN * KSTEP * 8u; idx += uint(THREADS)) {
+            uint rest = idx & (KSTEP * 8u - 1u);
+            uint c    = idx / (KSTEP * 8u);
+            uint k    = rest >> 3, u = rest & 7u;
+            uint b    = kb + k;
+            sb[c * uint(SB_STRIDE) + k * 8u + u] = (b < nb) ? aq[c * aw + b * 8u + u] : 0u;
+        }
+        for (uint idx = t; idx < BN * KSTEP; idx += uint(THREADS)) {
+            uint c = idx / KSTEP, k = idx & (KSTEP - 1u);
+            uint b = kb + k;
+            sbd[c * uint(SD_STRIDE) + k] = (b < nb) ? as_[c * 2u * nb + b] : 0.0;
+            sbc[c * uint(SD_STRIDE) + k] = (b < nb) ? as_[c * 2u * nb + nb + b] : 0.0;
+        }
+
+        barrier();
+
+        [[unroll]] for (uint k = 0u; k < KSTEP; k++) {
+            // This thread's TM weight blocks, held while every column meets
+            // them. That reuse is the whole point of the tile.
+            uint  areg[TM][4];
+            float ad[TM];
+            [[unroll]] for (uint r = 0u; r < TM; r++) {
+                uint row = tr * uint(TM) + r;
+                ad[r] = sad[row * uint(SD_STRIDE) + k];
+                [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                    areg[r][u] = sa[row * uint(SA_STRIDE) + k * 4u + u];
+                }
+            }
+
+            [[unroll]] for (uint c = 0u; c < TN; c++) {
+                uint col = tc * uint(TN) + c;
+                uint breg[8];
+                [[unroll]] for (uint u = 0u; u < 8u; u++) {
+                    breg[u] = sb[col * uint(SB_STRIDE) + k * 8u + u];
+                }
+                float bd = sbd[col * uint(SD_STRIDE) + k], bc = sbc[col * uint(SD_STRIDE) + k];
+
+                [[unroll]] for (uint r = 0u; r < TM; r++) {
+                    int qsum = 0;
+                    // Four products to an instruction. A Q4_0 word holds eight
+                    // weights as nibbles, and a mask and a shift give four of
+                    // them already sitting in the four bytes the dot product
+                    // wants. The accumulator is integer and exact.
+                    [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                        uint word = areg[r][u];
+                        qsum = dotPacked4x8AccSatEXT(word & 0x0F0F0F0Fu,        int(breg[u]),      qsum);
+                        qsum = dotPacked4x8AccSatEXT((word >> 4) & 0x0F0F0F0Fu, int(breg[u + 4u]), qsum);
+                    }
+                    // The nibble is the weight plus eight, and the correction
+                    // the activation carries is eight times its scale times
+                    // the sum of its quanta. ggml folds the two here, once a
+                    // block, rather than carrying a second accumulator.
+                    acc[r][c] += ad[r] * (float(qsum) * bd - bc);
+                }
+            }
+        }
+    }
+
+    barrier();
+    [[unroll]] for (uint r = 0u; r < TM; r++) {
+        uint row = row0 + tr * TM + r;
+        if (row >= p.dim) continue;
+        [[unroll]] for (uint c = 0u; c < TN; c++) {
+            y[(tc * TN + c) * p.dim + row] = acc[r][c];
+        }
+    }
+}
