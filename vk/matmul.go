@@ -29,7 +29,7 @@ const (
 )
 
 // matmulRows is shaders/matmul.comp's BM: how many rows one workgroup writes.
-const matmulRows = 64
+const matmulRows = 32
 
 // A MatMul is one Q4_0 matrix resident on a device with the buffers a batch
 // passes through.
