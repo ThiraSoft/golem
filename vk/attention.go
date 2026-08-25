@@ -81,8 +81,8 @@ type BlockShape struct {
 	// own, before it goes into the cache. Gemma 4 does that; Qwen3 hands the
 	// projection straight over, which is what llama.cpp's graph shows.
 	NormValue bool
-	KVSource   int
-	Eps        float32
+	KVSource  int
+	Eps       float32
 	// Scale multiplies the scores before the softmax. Gemma 4 scales by one
 	// and lets its query norm hold them in range; Qwen3 passes 1/sqrt(head_dim)
 	// the way llama.cpp does.
@@ -99,7 +99,7 @@ type Attention struct {
 	tl *Timeline // set by Profile, nil everywhere else
 
 	where *Buffer // one uvec4 a block: the position and the visible range
-	d *Device
+	d     *Device
 
 	dim        int // the stream's width, which is what the output projection makes
 	maxHeads   int // the widest block's query projection, for the shared buffers
@@ -221,15 +221,18 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 		size  int
 		local bool
 	}{
-		{&a.xq, dim * maxColumns, false},                         // the normed stream, Q8_0
-		{&a.xs, 2 * dim / nn.QuantBlock * 4 * maxColumns, false}, //
-		{&a.out, dim * 4 * maxColumns, false},                    // what the output projection makes
-		{&a.q, maxHeads * 4 * maxColumns, true},                  // the three projections, which never leave
-		{&a.k, maxKV * 4 * maxColumns, true},                     //
-		{&a.v, maxKV * 4 * maxColumns, true},                     //
-		{&a.qh, maxHeads * 4 * maxColumns, true},                 // the queries, rounded through fp16
+		// Everything here is device memory: the CPU writes none of it, and a
+		// shader reading system memory reaches across the bus. vk/device.go's
+		// Host says what that was worth.
+		{&a.xq, dim * maxColumns, true},                                   // the normed stream, Q8_0
+		{&a.xs, 2 * dim / nn.QuantBlock * 4 * maxColumns, true},           //
+		{&a.out, dim * 4 * maxColumns, true},                              // what the output projection makes
+		{&a.q, maxHeads * 4 * maxColumns, true},                           // the three projections, which never leave
+		{&a.k, maxKV * 4 * maxColumns, true},                              //
+		{&a.v, maxKV * 4 * maxColumns, true},                              //
+		{&a.qh, maxHeads * 4 * maxColumns, true},                          // the queries, rounded through fp16
 		{&a.scoreRows, maxQueryHeads * maxContext * 4 * maxColumns, true}, // one row of scores per head per column
-		{&a.aq, maxHeads * maxColumns, true},                     // the mixed values, Q8_0
+		{&a.aq, maxHeads * maxColumns, true},                              // the mixed values, Q8_0
 		{&a.as, 2 * maxHeads / nn.QuantBlock * 4 * maxColumns, true},
 		{&a.where, maxBlocks * maxColumns * 16, false}, // per block and column: position, first, last
 	} {
@@ -407,57 +410,6 @@ func (a *Attention) AddBlock(shape BlockShape, q, k, v, o []byte, qnorm, knorm [
 
 // caches is the pair this block reads, which is its own or an earlier one's.
 func (b *attentionBlock) caches() (*Buffer, *Buffer) { return b.ck, b.cv }
-
-// Attend is one block's whole attention for one position, in one submission.
-//
-// in is the stream under the block's attention norm, in its Q8_0 form. cos and
-// sin are the rotation for this position, half the rotated width each. pos is
-// where the keys and values go; first and last are the inclusive range the
-// query may read, which the caller works out because the window rule and the
-// ring agree and neither of them is this kernel's business.
-func (a *Attention) Attend(block int, in *nn.Batch, cos, sin []float32, pos, first, last int, out []float32) error {
-	if block < 0 || block >= len(a.blocks) {
-		return fmt.Errorf("vk: block %d of %d", block, len(a.blocks))
-	}
-	b := a.blocks[block]
-	s := b.shape
-	if in.Width != a.dim || in.Size != 1 {
-		return fmt.Errorf("vk: the attention reads one column of %d, given %d of %d", a.dim, in.Size, in.Width)
-	}
-	if in.Q == nil {
-		return fmt.Errorf("vk: the attention needs its input in the Q8_0 form")
-	}
-	if len(out) != a.dim {
-		return fmt.Errorf("vk: the output projection writes %d, given %d", a.dim, len(out))
-	}
-	if want := s.RoPEDims / 2; len(cos) != want || len(sin) != want {
-		return fmt.Errorf("vk: block %d rotates %d dimensions and wants %d angles, given %d", block, s.RoPEDims, want, len(cos))
-	}
-	if last >= a.maxContext || first > last {
-		return fmt.Errorf("vk: block %d was given positions %d to %d of a context of %d", block, first, last, a.maxContext)
-	}
-
-	dst := a.xq.Bytes()
-	for i, value := range in.Q[:a.dim] {
-		dst[i] = byte(value)
-	}
-	blocks := a.dim / nn.QuantBlock
-	scales := a.xs.Floats()
-	copy(scales[:blocks], in.Scales[:blocks])
-	copy(scales[blocks:2*blocks], in.Corr[:blocks])
-	if err := a.SetRotation(s.Rotation, 0, cos, sin); err != nil {
-		return err
-	}
-
-	if err := a.SetWhere(block, 0, pos, first, last); err != nil {
-		return err
-	}
-	if err := a.d.Submit(func(r *Recorder) { a.Record(r, block, 1) }); err != nil {
-		return err
-	}
-	copy(out, a.out.Floats()[:a.dim])
-	return nil
-}
 
 // Record puts one block's attention into a recording without submitting it,
 // which is what running a whole token in one submission needs. The input must

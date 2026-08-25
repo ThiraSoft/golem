@@ -50,12 +50,30 @@ var matvecSPIRV []byte
 //
 //go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec8.spv
 //go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup8.spv
+//go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup16.spv
+//go:generate glslc -O -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup32.spv
 
 //go:embed shaders/matvec8.spv
 var matvecWideSPIRV []byte
 
 //go:embed shaders/moe_gateup8.spv
 var moeGateUpWideSPIRV []byte
+
+//go:embed shaders/moe_gateup16.spv
+var moeGateUpMidSPIRV []byte
+
+//go:embed shaders/moe_gateup32.spv
+var moeGateUpWidestSPIRV []byte
+
+// gateColumns is how many columns one dispatch of the gate kernel answers.
+//
+// It is not the width of the pass, and the difference is measured. The kernel
+// keeps one accumulator a column in registers across its whole walk of the
+// shared dimension, so its width is bounded by what a wave can hold rather
+// than by shared memory: at eight columns a pass of thirty-two runs it four
+// times and reads the gate and up matrices four times, and that is still
+// faster than reading them once at thirty-two. See shaders/moe_gateup.comp.
+const gateColumns = 8
 
 // The tiled product, which is the shape a prompt wants where the mat-vec is
 // the shape a token wants. shaders/matmul.comp says why.
@@ -101,7 +119,7 @@ const matvecOuts = 16
 // kernels that read them and the small buffers a token passes through.
 type Mixture struct {
 	tl *Timeline // set by Profile, nil everywhere else
-	d *Device
+	d  *Device
 
 	dim, ffn, dense, experts int
 	act                      Activation
@@ -204,19 +222,21 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 	// when there is one. An expert branch never does: each position routes to
 	// its own eight matrices, so there is nothing between two of them to share.
 	//
-	// The down projection has two wide forms and the gate has one: above eight
-	// columns the down projection is the tiled product of shaders/matmul.comp,
-	// which takes the same bindings and the same push block as the mat-vec, so
-	// one Set reaches both. The gate is its own kernel — it fuses two matrices
-	// and an activation — and stops at eight, because its shared memory grows
-	// with the width and eight already spends sixteen kilobytes of the
-	// thirty-two a workgroup has. A wider pass runs it repeatedly at an offset.
+	// Both projections are built at both widths. Above eight columns the down
+	// projection is the tiled product of shaders/matmul.comp, which takes the
+	// same bindings and the same push block as the mat-vec, so one Set reaches
+	// both; the gate is its own kernel, fusing two matrices and an activation,
+	// and is simply built wider. It could not be until its reduction stopped
+	// folding through shared memory — shaders/moe_gateup.comp says what that
+	// array cost and why a wide pass used to run the kernel four times.
 	for _, spec := range []struct {
 		pipe    **Pipeline
 		columns int
 		spirv   []byte
 	}{
 		{&m.gateUp, smallColumns, moeGateUpWideSPIRV},
+		{&m.gateUp, 16, moeGateUpMidSPIRV},
+		{&m.gateUp, wideColumns, moeGateUpWidestSPIRV},
 		{&m.denseDown, smallColumns, matvecWideSPIRV},
 		{&m.denseDown, wideColumns, matmulWideSPIRV},
 	} {
@@ -243,20 +263,20 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		local bool
 	}
 	bufs := []bufSpec{
-		{&m.dxq, dim * maxColumns, false},         // the shared branch's input
-		{&m.dxs, 2 * in * 4 * maxColumns, false},  //
-		{&m.dout, dim * 4 * maxColumns, false},    // its output
+		{&m.dxq, dim * maxColumns, true},          // the shared branch's input
+		{&m.dxs, 2 * in * 4 * maxColumns, true},   //
+		{&m.dout, dim * 4 * maxColumns, true},     // its output
 		{&m.daq, dense * maxColumns, true},        // its intermediate
 		{&m.das, 2 * dmid * 4 * maxColumns, true}, //
 	}
 	if experts > 0 {
 		mid := ffn / nn.QuantBlock
 		bufs = append(bufs,
-			bufSpec{&m.xq, dim, false},                      // the expert branch's input
-			bufSpec{&m.xs, 2 * in * 4, false},               // its scales, then its corrections
+			bufSpec{&m.xq, dim, true},                       // the expert branch's input
+			bufSpec{&m.xs, 2 * in * 4, true},                // its scales, then its corrections
 			bufSpec{&m.ids, expertsUsed * 4, false},         // the chosen experts
 			bufSpec{&m.cw, expertsUsed * 4, false},          // routing weight times expert scale
-			bufSpec{&m.out, dim * 4, false},                 // that branch's output
+			bufSpec{&m.out, dim * 4, true},                  // that branch's output
 			bufSpec{&m.aq, expertsUsed * ffn, true},         // its intermediate
 			bufSpec{&m.as, 2 * expertsUsed * mid * 4, true}, // and that intermediate's scales
 		)
@@ -367,110 +387,6 @@ func (m *Mixture) AddBlock(gateUpExps, downExps, gate, up, down []byte) error {
 	return nil
 }
 
-// Run computes one block's whole feed-forward half for one position.
-//
-// shared and expert carry the two branches' normed inputs in their Q8_0 form,
-// one column each; they are different vectors because the two branches read
-// the residual under different norms. ids are the chosen experts and weights
-// their routing weights with the per-expert scale already folded in. The two
-// outputs are written, unnormed and unadded: the norms between here and the
-// stream are the block's business.
-func (m *Mixture) Run(block int, shared, expert *nn.Batch, ids []int32, weights []float32, sharedOut, expertOut []float32) error {
-	if m.experts == 0 {
-		return fmt.Errorf("vk: this mixture has no experts, and Run computes both branches")
-	}
-	if block < 0 || block >= len(m.blocks) {
-		return fmt.Errorf("vk: block %d of %d", block, len(m.blocks))
-	}
-	for _, b := range []*nn.Batch{shared, expert} {
-		if b.Width != m.dim || b.Size != 1 {
-			return fmt.Errorf("vk: a branch reads one column of %d, given %d of %d", m.dim, b.Size, b.Width)
-		}
-		if b.Q == nil {
-			return fmt.Errorf("vk: a branch needs its input in the Q8_0 form")
-		}
-	}
-	if len(ids) != expertsUsed || len(weights) != expertsUsed {
-		return fmt.Errorf("vk: %d experts expected, given %d ids and %d weights", expertsUsed, len(ids), len(weights))
-	}
-	for _, o := range [][]float32{sharedOut, expertOut} {
-		if len(o) != m.dim {
-			return fmt.Errorf("vk: a branch writes %d outputs, given %d", m.dim, len(o))
-		}
-	}
-
-	in := m.dim / nn.QuantBlock
-	for _, spec := range []struct {
-		from *nn.Batch
-		q    *Buffer
-		s    *Buffer
-	}{{expert, m.xq, m.xs}, {shared, m.dxq, m.dxs}} {
-		q := spec.q.Bytes()
-		for i, v := range spec.from.Q[:m.dim] {
-			q[i] = byte(v)
-		}
-		scales := spec.s.Floats()
-		copy(scales[:in], spec.from.Scales[:in])
-		copy(scales[in:2*in], spec.from.Corr[:in])
-	}
-
-	chosen := unsafe.Slice((*int32)(unsafe.Pointer(&m.ids.Bytes()[0])), expertsUsed)
-	copy(chosen, ids)
-	copy(m.cw.Floats()[:expertsUsed], weights)
-
-	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed, act: uint32(m.act)}
-	sharedPush := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act)}
-	b := m.blocks[block]
-	err := m.d.Submit(func(r *Recorder) {
-		// Nothing in either branch waits on the other, so they go in without a
-		// barrier between them and the card runs them together.
-		r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
-		r.Dispatch(b.setDenseUp, uint32(m.dense/nn.QuantBlock), unsafe.Pointer(&sharedPush))
-		r.Barrier()
-		r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
-		r.Dispatch(b.setDenseDn, uint32((m.dim+matvecOuts-1)/matvecOuts), unsafe.Pointer(&sharedPush))
-	})
-	if err != nil {
-		return err
-	}
-	copy(expertOut, m.out.Floats()[:m.dim])
-	copy(sharedOut, m.dout.Floats()[:m.dim])
-	return nil
-}
-
-// RunTimes repeats one block's submission n times inside a single one, with
-// the inputs already in place from a previous Run.
-//
-// It measures the kernels rather than the token. A block's work is three
-// hundred microseconds and the CPU takes the next thirty back, so the card
-// never leaves its low clocks: measured one submission at a time this runs at
-// a quarter of the bandwidth it reaches when it is not allowed to rest. Both
-// numbers are worth having and they are not the same number — vk/compute.go
-// says the same thing about the logit head.
-func (m *Mixture) RunTimes(block, n int) error {
-	if m.experts == 0 {
-		return fmt.Errorf("vk: this mixture has no experts, and RunTimes repeats both branches")
-	}
-	if block < 0 || block >= len(m.blocks) {
-		return fmt.Errorf("vk: block %d of %d", block, len(m.blocks))
-	}
-	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed, act: uint32(m.act)}
-	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act)}
-	b := m.blocks[block]
-	return m.d.Submit(func(r *Recorder) {
-		for i := 0; i < n; i++ {
-			if i > 0 {
-				r.Barrier()
-			}
-			r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
-			r.Dispatch(b.setDenseUp, uint32(m.dense/nn.QuantBlock), unsafe.Pointer(&shared))
-			r.Barrier()
-			r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
-			r.Dispatch(b.setDenseDn, uint32((m.dim+matvecOuts-1)/matvecOuts), unsafe.Pointer(&shared))
-		}
-	})
-}
-
 // Record puts one block's two branches into a recording without submitting
 // it, which is what running a whole token in one submission needs. The inputs
 // and the routing must already be in the buffers the accessors below name.
@@ -492,11 +408,14 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 		r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
 	}
 	if width > 1 {
-		// The gate at eight columns at a time, however wide the pass is.
-		for c := 0; c < width; c += smallColumns {
+		gate := gateColumns
+		if width < gate {
+			gate = width
+		}
+		for c := 0; c < width; c += gate {
 			at := shared
 			at.col = uint32(c)
-			r.DispatchWide(b.setDenseUp, smallColumns, up, unsafe.Pointer(&at))
+			r.DispatchWide(b.setDenseUp, gate, up, unsafe.Pointer(&at))
 		}
 	} else {
 		r.Dispatch(b.setDenseUp, up, unsafe.Pointer(&shared))

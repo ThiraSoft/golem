@@ -1,4 +1,6 @@
 #version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
 
 // The RMS norm, and the residual add that usually precedes it.
 //
@@ -51,7 +53,13 @@ const uint QUANT  = 32u;  // write its Q8_0 form
 const uint MAXN = 4096u;
 
 shared float v[MAXN];
-shared float partial[1024];
+// One partial a wave, not one a thread.
+//
+// A thousand and twenty-four threads folded through shared memory is ten
+// steps and ten barriers, and a barrier here syncs sixteen waves on one
+// compute unit. A wave folds its own sum in registers with no barrier at all,
+// and what is left is sixteen numbers every thread can add up for itself.
+shared float partial[32];
 
 int nearestInt(float f) {
     return (floatBitsToInt(f + 12582912.0) & 0x007fffff) - 0x00400000;
@@ -102,14 +110,12 @@ void main() {
         if ((p.flags & SUM) != 0u) sum[base + i] = x;
         s += x * x;
     }
-    partial[t] = s;
+    float folded = subgroupAdd(s);
+    if (subgroupElect()) partial[gl_SubgroupID] = folded;
     barrier();
-    for (uint stride = 512u; stride > 0u; stride >>= 1) {
-        if (t < stride) partial[t] += partial[t + stride];
-        barrier();
-    }
-    float scale = 1.0 / sqrt(partial[0] / float(p.n) + p.eps);
-    barrier();
+    float whole = 0.0;
+    for (uint i = 0u; i < gl_NumSubgroups; i++) whole += partial[i];
+    float scale = 1.0 / sqrt(whole / float(p.n) + p.eps);
 
     for (uint i = t; i < p.n; i += 1024u) {
         float x = v[i] * scale;

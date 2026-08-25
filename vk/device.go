@@ -309,10 +309,21 @@ func (d *Device) newBuffer(size uint64, usage uint32, props uint32) (*Buffer, er
 	return b, nil
 }
 
-// Host allocates a buffer the CPU writes and the shader reads directly. It is
-// what the small per-token inputs use: an activation is a few kilobytes and
-// staging it through device memory would cost more than reading it over the
-// bus once.
+// Host allocates a buffer the CPU writes and the shader reads directly.
+//
+// It is for what the CPU actually writes each pass — the positions, the
+// rotation angles — and for nothing else. A buffer allocated here lives in
+// system memory, and a shader reading it reaches across the bus for every line
+// of it that is not already in a cache.
+//
+// **That is not a small thing, and it was the largest single cost in the
+// prompt.** The stream between two kernels — the normed activation, what the
+// output projection makes, the shared branch's input — is written by the card
+// and read by the card, and it was allocated here because the per-block API
+// that has since been replaced wanted to write it from this side. Moving those
+// six buffers to Local took a prefill of sixty-four positions on the Qwen3 4B
+// from 71.9 milliseconds to 46.9, and a token of the 26B from 96.8 to 102.8 a
+// second. Anything a kernel writes and a kernel reads belongs in Local.
 func (d *Device) Host(size int, usage uint32) (*Buffer, error) {
 	return d.newBuffer(uint64(size), usage, memoryHostVisible|memoryHostCoherent)
 }

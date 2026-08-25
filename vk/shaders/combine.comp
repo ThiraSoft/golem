@@ -1,4 +1,6 @@
 #version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
 
 // The end of a mixture block: three post-norms, the sum of the two branches,
 // and the residual that puts it back in the stream.

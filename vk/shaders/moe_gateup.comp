@@ -1,4 +1,6 @@
 #version 450
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_integer_dot_product : require
 
 // The first half of one expert: the fused gate-and-up projection, ggml's GELU,
@@ -68,7 +70,6 @@ layout(push_constant) uniform Push {
 
 const uint LANES = 8u;
 
-shared float partial[512 * COLUMNS];
 shared float half_[64 * COLUMNS];
 shared int   q32[32 * COLUMNS];
 
@@ -132,9 +133,18 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
     uint nib = rowBase + 2u * nb;
     uint xw  = p.dim >> 2;   // one column of the input, in uints
 
+    // One accumulator a column, not two.
+    //
+    // The magnitude and the correction used to be summed apart and subtracted
+    // at the end, which is two arrays of COLUMNS floats alive across the whole
+    // walk. At eight columns the card holds them; at thirty-two it does not,
+    // and an array it cannot hold is not slow, it is in scratch memory —
+    // measured, a thirty-two column build of the two-array form ran two and a
+    // half times slower than four eight-column dispatches of it. Folding the
+    // correction into the same sum is one array, and the same number to within
+    // the order it is added in.
     precise float s[COLUMNS];
-    precise float c[COLUMNS];
-    for (uint k = 0u; k < COLUMNS; k++) { s[k] = 0.0; c[k] = 0.0; }
+    [[unroll]] for (uint k = 0u; k < COLUMNS; k++) s[k] = 0.0;
 
     for (uint b = lane; b < nb; b += LANES) {
         vec2  pair = unpackHalf2x16(w[(rowBase + 2u * b) >> 2]);
@@ -158,19 +168,18 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
         // The weights are stored shifted by eight, and the correction the
         // input carries is 8 x scale x sum(q) — the same for every row it
         // meets, which is why it is not in this loop's arithmetic.
-        for (uint k = 0u; k < COLUMNS; k++) {
+        [[unroll]] for (uint k = 0u; k < COLUMNS; k++) {
             uint xc = (p.col + k) * xw + ab;
             int acc = 0;
-            for (uint u = 0u; u < 4u; u++) {
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
                 acc = dotPacked4x8AccSatEXT(lo[u], int(xq[xc + u]),      acc);
                 acc = dotPacked4x8AccSatEXT(hi[u], int(xq[xc + u + 4u]), acc);
             }
             uint sc = (p.col + k) * 2u * nb;
-            s[k] += float(acc) * ws * xs[sc + b];
-            c[k] += ws * xs[sc + nb + b];
+            s[k] += ws * (float(acc) * xs[sc + b] - xs[sc + nb + b]);
         }
     }
-    for (uint k = 0u; k < COLUMNS; k++) answer[k] = s[k] - c[k];
+    [[unroll]] for (uint k = 0u; k < COLUMNS; k++) answer[k] = s[k];
 }
 
 void main() {
@@ -188,26 +197,28 @@ void main() {
     uint expert   = uint(ids[e]) * 2u * p.ffn * rowBytes;
     uint row      = (r < 32u) ? (blk * 32u + j) : (p.ffn + blk * 32u + j);
 
+    // The eight lanes of a row fold their partial sums inside the wave.
+    //
+    // They used to fold through shared memory, five hundred and twelve floats
+    // a column, with a barrier at each of the three steps. That array is what
+    // stopped this kernel being built for a wide pass: at thirty-two columns
+    // it asks for sixty-four kilobytes, which is the whole of a workgroup's
+    // shared memory, and the driver dies inside vkCreateShaderModule rather
+    // than refusing the module. A clustered add over eight consecutive
+    // invocations is the same sum with no memory and no barrier — the lanes of
+    // a row are consecutive by construction, t = r * LANES + lane.
     float part[COLUMNS];
     lanePart(expert + row * rowBytes, lane, part);
-    for (uint k = 0u; k < COLUMNS; k++) partial[t * COLUMNS + k] = part[k];
-    barrier();
-    for (uint stride = LANES >> 1; stride > 0u; stride >>= 1) {
-        if (lane < stride) {
-            for (uint k = 0u; k < COLUMNS; k++) {
-                partial[t * COLUMNS + k] += partial[(t + stride) * COLUMNS + k];
-            }
-        }
-        barrier();
-    }
-    if (lane == 0u) {
-        for (uint k = 0u; k < COLUMNS; k++) half_[k * 64u + r] = partial[t * COLUMNS + k];
+    for (uint k = 0u; k < COLUMNS; k++) {
+        float sum = subgroupClusteredAdd(part[k], LANES);
+        if (lane == 0u) half_[k * 64u + r] = sum;
     }
     barrier();
 
-    // One thread to a value of a column: thirty-two values by COLUMNS of them.
-    if (t < 32u * COLUMNS) {
-        uint k = t / 32u, j2 = t % 32u;
+    // One thread to a value of a column: thirty-two values by COLUMNS of them,
+    // which above sixteen columns is more of them than the workgroup has.
+    for (uint i = t; i < 32u * COLUMNS; i += 512u) {
+        uint k = i / 32u, j2 = i % 32u;
         float g = half_[k * 64u + j2];
         float a;
         if (p.act == 1u) {
@@ -229,8 +240,7 @@ void main() {
 
     // The Q8_0 block, on one thread. Thirty-two values is less work than the
     // barriers a reduction would cost.
-    if (t < COLUMNS) {
-        uint k  = t;
+    for (uint k = t; k < COLUMNS; k += 512u) {
         uint hb = k * 64u;
         uint qb = k * 32u;
         float peak = 0.0;

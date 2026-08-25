@@ -1,4 +1,6 @@
 #version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
 
 // The attention itself: one query head against everything it can see, the
 // softmax over that, and the values mixed by it.
@@ -51,8 +53,9 @@ const uint WHERE_COLUMNS = 32u;
 
 shared float partial[256];
 shared float acc[512];
-shared float top;
-shared float total;
+// top and total used to be shared, written by one thread and read by all after
+// a barrier. They are ordinary locals now: every thread folds the same sixteen
+// numbers and arrives at the same answer, which is cheaper than a barrier.
 
 uint floatToHalf(float f) {
     uint bits     = floatBitsToUint(f);
@@ -120,14 +123,13 @@ void main() {
     // The softmax, over however many positions there are.
     float best = -1.0 / 0.0;
     for (uint m = t; m < n; m += 256u) best = max(best, scores[sb + m]);
-    partial[t] = best;
+    // The wave folds its own, and the four of them meet once. The tree this
+    // replaces was eight steps and eight barriers, twice over.
+    float foldedBest = subgroupMax(best);
+    if (subgroupElect()) partial[gl_SubgroupID] = foldedBest;
     barrier();
-    for (uint stride = 128u; stride > 0u; stride >>= 1) {
-        if (t < stride) partial[t] = max(partial[t], partial[t + stride]);
-        barrier();
-    }
-    if (t == 0u) top = partial[0];
-    barrier();
+    float top = partial[0];
+    for (uint i = 1u; i < gl_NumSubgroups; i++) top = max(top, partial[i]);
 
     float sum = 0.0;
     for (uint m = t; m < n; m += 256u) {
@@ -135,14 +137,12 @@ void main() {
         scores[sb + m] = e;
         sum += e;
     }
-    partial[t] = sum;
+    float foldedSum = subgroupAdd(sum);
     barrier();
-    for (uint stride = 128u; stride > 0u; stride >>= 1) {
-        if (t < stride) partial[t] += partial[t + stride];
-        barrier();
-    }
-    if (t == 0u) total = partial[0];
+    if (subgroupElect()) partial[gl_SubgroupID] = foldedSum;
     barrier();
+    float total = 0.0;
+    for (uint i = 0u; i < gl_NumSubgroups; i++) total += partial[i];
 
     // And the probabilities reach the value product as halves.
     for (uint m = t; m < n; m += 256u) scores[sb + m] = roundHalf(scores[sb + m] / total);
