@@ -17,6 +17,13 @@
 // always zero, with the gate matrix and the up matrix concatenated on upload
 // into the one matrix of twice the width this reads.
 //
+// COLUMNS is how many activations one pass answers. It is a compile-time
+// constant, and shaders/matvec.comp says why: reading a weight once for eight
+// columns instead of once for each is what makes a prompt eight times cheaper
+// than eight tokens. The wide form is bound to the shared branch alone — an
+// expert branch routes each position to its own eight matrices, so there is
+// nothing to share between two of them.
+//
 // Eight threads to a row, striding the blocks. The first version of this gave
 // a whole row to one thread, which needed no reduction at all and ran at 113
 // gigabytes a second — a fifth of what the same card does on the logit head.
@@ -24,6 +31,10 @@
 // load in a wave touched thirty-two separate lines. Eight lanes stepping
 // through the blocks together read a hundred and twenty-eight contiguous bytes
 // per iteration instead, and pay three barriers for it.
+
+#ifndef COLUMNS
+#define COLUMNS 1
+#endif
 
 layout(local_size_x = 512) in;   // sixty-four rows, eight lanes each
 
@@ -44,12 +55,9 @@ layout(push_constant) uniform Push {
 
 const uint LANES = 8u;
 
-shared float partial[512];
-shared float half_[64];
-shared int   q32[32];
-
-// abyte reads one signed byte of the input's magnitudes.
-int abyte(uint b) { return bitfieldExtract(int(xq[b >> 2]), int((b & 3u) * 8u), 8); }
+shared float partial[512 * COLUMNS];
+shared float half_[64 * COLUMNS];
+shared int   q32[32 * COLUMNS];
 
 // floatToHalf is nn/half.go, bit for bit.
 //
@@ -106,17 +114,19 @@ int nearestInt(float f) {
 // of four, so every other block of a row would start off alignment. The upload
 // splits the row instead: all of its scales first, then all of its nibbles.
 // Same bytes, same count, and every load lands where a uint array can reach it.
-void lanePart(uint rowBase, uint lane, out float sum, out float corr) {
+void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
     uint nb  = p.dim >> 5;
     uint nib = rowBase + 2u * nb;
+    uint xw  = p.dim >> 2;   // one column of the input, in uints
 
-    precise float s = 0.0;
-    precise float c = 0.0;
+    precise float s[COLUMNS];
+    precise float c[COLUMNS];
+    for (uint k = 0u; k < COLUMNS; k++) { s[k] = 0.0; c[k] = 0.0; }
+
     for (uint b = lane; b < nb; b += LANES) {
         vec2  pair = unpackHalf2x16(w[(rowBase + 2u * b) >> 2]);
         float ws   = pair[b & 1u];
 
-        int acc = 0;
         uint at = (nib + 16u * b) >> 2;
         uint ab = b * 8u;
         // Four products to an instruction. A Q4_0 word holds eight weights
@@ -126,19 +136,28 @@ void lanePart(uint rowBase, uint lane, out float sum, out float corr) {
         // dot product wants. The accumulator is integer and exact, so this is
         // the same number the unpacked loop produced, in a quarter of the
         // instructions. vk/device.go says what the card is asked for.
+        uint lo[4], hi[4];
         for (uint u = 0u; u < 4u; u++) {
             uint word = w[at + u];
-            acc = dotPacked4x8AccSatEXT(word & 0x0F0F0F0Fu,        int(xq[ab + u]),      acc);
-            acc = dotPacked4x8AccSatEXT((word >> 4) & 0x0F0F0F0Fu, int(xq[ab + u + 4u]), acc);
+            lo[u] = word & 0x0F0F0F0Fu;
+            hi[u] = (word >> 4) & 0x0F0F0F0Fu;
         }
         // The weights are stored shifted by eight, and the correction the
         // input carries is 8 x scale x sum(q) — the same for every row it
         // meets, which is why it is not in this loop's arithmetic.
-        s += float(acc) * ws * xs[b];
-        c += ws * xs[nb + b];
+        for (uint k = 0u; k < COLUMNS; k++) {
+            uint xc = k * xw + ab;
+            int acc = 0;
+            for (uint u = 0u; u < 4u; u++) {
+                acc = dotPacked4x8AccSatEXT(lo[u], int(xq[xc + u]),      acc);
+                acc = dotPacked4x8AccSatEXT(hi[u], int(xq[xc + u + 4u]), acc);
+            }
+            uint sc = k * 2u * nb;
+            s[k] += float(acc) * ws * xs[sc + b];
+            c[k] += ws * xs[sc + nb + b];
+        }
     }
-    sum = s;
-    corr = c;
+    for (uint k = 0u; k < COLUMNS; k++) answer[k] = s[k] - c[k];
 }
 
 void main() {
@@ -156,19 +175,27 @@ void main() {
     uint expert   = uint(ids[e]) * 2u * p.ffn * rowBytes;
     uint row      = (r < 32u) ? (blk * 32u + j) : (p.ffn + blk * 32u + j);
 
-    float sum, corr;
-    lanePart(expert + row * rowBytes, lane, sum, corr);
-    partial[t] = sum - corr;
+    float part[COLUMNS];
+    lanePart(expert + row * rowBytes, lane, part);
+    for (uint k = 0u; k < COLUMNS; k++) partial[t * COLUMNS + k] = part[k];
     barrier();
     for (uint stride = LANES >> 1; stride > 0u; stride >>= 1) {
-        if (lane < stride) partial[t] += partial[t + stride];
+        if (lane < stride) {
+            for (uint k = 0u; k < COLUMNS; k++) {
+                partial[t * COLUMNS + k] += partial[(t + stride) * COLUMNS + k];
+            }
+        }
         barrier();
     }
-    if (lane == 0u) half_[r] = partial[t];
+    if (lane == 0u) {
+        for (uint k = 0u; k < COLUMNS; k++) half_[k * 64u + r] = partial[t * COLUMNS + k];
+    }
     barrier();
 
-    if (t < 32u) {
-        float g = half_[t];
+    // One thread to a value of a column: thirty-two values by COLUMNS of them.
+    if (t < 32u * COLUMNS) {
+        uint k = t / 32u, j2 = t % 32u;
+        float g = half_[k * 64u + j2];
         float a;
         if (p.act == 1u) {
             // SiLU, evaluated rather than looked up: ggml computes a swiglu's
@@ -183,15 +210,18 @@ void main() {
         } else {
             a = gelu[floatToHalf(g)];
         }
-        half_[t] = a * half_[32u + t];
+        half_[k * 64u + j2] = a * half_[k * 64u + 32u + j2];
     }
     barrier();
 
     // The Q8_0 block, on one thread. Thirty-two values is less work than the
     // barriers a reduction would cost.
-    if (t == 0u) {
+    if (t < COLUMNS) {
+        uint k  = t;
+        uint hb = k * 64u;
+        uint qb = k * 32u;
         float peak = 0.0;
-        for (uint i = 0u; i < 32u; i++) peak = max(peak, abs(half_[i]));
+        for (uint i = 0u; i < 32u; i++) peak = max(peak, abs(half_[hb + i]));
 
         float scale = 0.0;
         int   total = 0;
@@ -204,24 +234,24 @@ void main() {
                 // rounds correctly when the product it is added to has already
                 // been rounded to float32. Left alone the compiler contracts
                 // the two into a fused multiply-add.
-                precise float scaled = half_[i] * inverse;
+                precise float scaled = half_[hb + i] * inverse;
                 int n = clamp(nearestInt(scaled), -128, 127);
-                q32[i] = n;
+                q32[qb + i] = n;
                 total += n;
             }
         } else {
-            for (uint i = 0u; i < 32u; i++) q32[i] = 0;
+            for (uint i = 0u; i < 32u; i++) q32[qb + i] = 0;
         }
 
-        uint at = (e * p.ffn + blk * 32u) >> 2;
+        uint at = (k * p.used * p.ffn + e * p.ffn + blk * 32u) >> 2;
         for (uint u = 0u; u < 8u; u++) {
             uint word = 0u;
-            for (uint k = 0u; k < 4u; k++) {
-                word |= (uint(q32[u * 4u + k]) & 0xFFu) << (k * 8u);
+            for (uint m = 0u; m < 4u; m++) {
+                word |= (uint(q32[qb + u * 4u + m]) & 0xFFu) << (m * 8u);
             }
             aq[at + u] = word;
         }
-        uint slot = e * blocks + blk;
+        uint slot = k * 2u * p.used * blocks + e * blocks + blk;
         as_[slot] = scale;
         as_[p.used * blocks + slot] = 8.0 * scale * float(total);
     }

@@ -31,6 +31,12 @@ type Pipeline struct {
 	pipeline  uint64
 	pushBytes uint32
 	bindings  int
+
+	// The wide form of the same kernel, built from a second SPIR-V over the
+	// same layout, so that one Set serves both. Wide says what that means:
+	// a kernel that answers several columns in one pass rather than one.
+	wideModule uint64
+	wide       uint64
 }
 
 // NewPipeline compiles one SPIR-V compute shader that reads the given number
@@ -99,7 +105,46 @@ func (d *Device) NewPipeline(spirv []byte, bindings int, pushBytes uint32) (*Pip
 	return p, nil
 }
 
+// Wide compiles a second binary of the same kernel over this pipeline's own
+// layout — same bindings, same push block, different code. The sets already
+// made for the pipeline reach it without being made again, which is the point:
+// there are sixty-five of them on a deep model and they name the same buffers.
+//
+// What differs in the binary is the number of columns it answers, which is a
+// compile-time constant there because the accumulators have to stay in
+// registers. shaders/matvec.comp says why.
+func (p *Pipeline) Wide(spirv []byte) error {
+	smci := shaderModuleCreateInfo{
+		sType:    structShaderModuleCreateInfo,
+		codeSize: uint64(len(spirv)),
+		pCode:    uintptr(unsafe.Pointer(&spirv[0])),
+	}
+	if err := check("vkCreateShaderModule", vkCreateShaderModule(p.d.dev, &smci, 0, &p.wideModule)); err != nil {
+		return err
+	}
+	name := append([]byte("main"), 0)
+	cpci := computePipelineCreateInfo{
+		sType: structComputePipelineCreateInfo,
+		stage: pipelineShaderStageCreateInfo{
+			sType:  structPipelineShaderStageInfo,
+			stage:  shaderStageCompute,
+			module: p.wideModule,
+			pName:  uintptr(unsafe.Pointer(&name[0])),
+		},
+		layout: p.layout,
+	}
+	return check("vkCreateComputePipelines", vkCreateComputePipelines(p.d.dev, 0, 1, &cpci, 0, &p.wide))
+}
+
 func (p *Pipeline) Close() {
+	if p.wide != 0 {
+		vkDestroyPipeline(p.d.dev, p.wide, 0)
+		p.wide = 0
+	}
+	if p.wideModule != 0 {
+		vkDestroyShaderModule(p.d.dev, p.wideModule, 0)
+		p.wideModule = 0
+	}
 	if p.pipeline != 0 {
 		vkDestroyPipeline(p.d.dev, p.pipeline, 0)
 		p.pipeline = 0
@@ -184,13 +229,33 @@ type Recorder struct{ cb commandBuffer }
 
 // Dispatch runs a set's pipeline over groups workgroups.
 func (r *Recorder) Dispatch(s *Set, groups uint32, push unsafe.Pointer) {
+	r.dispatch(s, s.p.pipeline, groups, 1, push)
+}
+
+// DispatchColumns is Dispatch with a second axis, which the kernels that carry
+// one column per workgroup use for exactly that: the norms, the combine, and
+// both halves of the attention. A prompt passes one column per position and a
+// token passes one, and nothing else about the two differs.
+func (r *Recorder) DispatchColumns(s *Set, groups, columns uint32, push unsafe.Pointer) {
+	r.dispatch(s, s.p.pipeline, groups, columns, push)
+}
+
+// DispatchWide runs the binary Pipeline.Wide compiled. Its columns are inside
+// the kernel rather than on an axis — that is the whole difference between a
+// prompt that reads the weights once for eight positions and one that reads
+// them eight times — so the grid is the same as the narrow form's.
+func (r *Recorder) DispatchWide(s *Set, groups uint32, push unsafe.Pointer) {
+	r.dispatch(s, s.p.wide, groups, 1, push)
+}
+
+func (r *Recorder) dispatch(s *Set, pipeline uint64, groups, columns uint32, push unsafe.Pointer) {
 	p := s.p
-	vkCmdBindPipeline(r.cb, pipelineBindCompute, p.pipeline)
+	vkCmdBindPipeline(r.cb, pipelineBindCompute, pipeline)
 	vkCmdBindDescriptorSets(r.cb, pipelineBindCompute, p.layout, 0, 1, &s.set, 0, 0)
 	if p.pushBytes > 0 {
 		vkCmdPushConstants(r.cb, p.layout, shaderStageCompute, 0, p.pushBytes, push)
 	}
-	vkCmdDispatch(r.cb, groups, 1, 1)
+	vkCmdDispatch(r.cb, groups, columns, 1)
 }
 
 // Barrier separates a dispatch that writes from one that reads what it wrote,
@@ -209,7 +274,13 @@ func (r *Recorder) Barrier() {
 // Copy takes size bytes from the start of src into dst at an offset. It is how
 // a recording keeps a waypoint it would otherwise overwrite.
 func (r *Recorder) Copy(dst *Buffer, offset int, src *Buffer, size int) {
-	region := bufferCopy{srcOffset: 0, dstOffset: uint64(offset), size: uint64(size)}
+	r.CopyFrom(dst, offset, src, 0, size)
+}
+
+// CopyFrom is Copy from somewhere other than the start of the source, which is
+// what a pass carrying several columns needs: the tracer keeps one of them.
+func (r *Recorder) CopyFrom(dst *Buffer, offset int, src *Buffer, from, size int) {
+	region := bufferCopy{srcOffset: uint64(from), dstOffset: uint64(offset), size: uint64(size)}
 	vkCmdCopyBuffer(r.cb, src.handle, dst.handle, 1, &region)
 }
 

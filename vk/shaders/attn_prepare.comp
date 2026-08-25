@@ -38,8 +38,18 @@ layout(push_constant) uniform Push {
     uint mask;        // capacity - 1 when that is a mask, and zero otherwise
     uint valueIsKey;  // the value is the key before the key was rotated
     uint normValue;   // Gemma 4 norms the value with no gain; Qwen3 does not
+    uint rotStride;   // one column's angles in the rotation tables
     float eps;
 } p;
+
+// WHERE_COLUMNS is how many columns the position buffer holds per block. It is
+// vk/attention.go's maxColumns, and the two have to agree.
+const uint WHERE_COLUMNS = 8u;
+
+// The column this workgroup carries. A prompt dispatches one per position and
+// a token dispatches one; nothing else about the two differs here, because a
+// position's projections, norms and rotation depend on that position alone.
+#define COL (gl_WorkGroupID.y)
 
 shared float partial[256];
 
@@ -75,7 +85,7 @@ uint floatToHalf(float f) {
 
 // The ring, in units of one half.
 uint slot(uint head) {
-    uint pos = where_[p.block].x;
+    uint pos = where_[p.block * WHERE_COLUMNS + COL].x;
     uint at = (p.mask != 0u) ? (pos & p.mask) : (pos % p.capacity);
     return (at * p.kvHeads + head) * p.headDim;
 }
@@ -102,8 +112,15 @@ void main() {
     uint t  = gl_LocalInvocationID.x;
     uint hd = p.headDim;
 
+    // Every buffer below holds one column after another, packed at exactly the
+    // width this block uses — which is what shaders/matvec.comp writes and
+    // reads, since it knows a projection's own width and not the widest one.
+    uint qbase  = COL * p.heads * hd;
+    uint kvbase = COL * p.kvHeads * hd;
+    uint rbase  = COL * p.rotStride;
+
     if (u < p.heads) {
-        uint base = u * hd;
+        uint base = qbase + u * hd;
 
         float s = 0.0;
         for (uint i = t; i < hd; i += 256u) { float x = q[base + i]; s += x * x; }
@@ -116,8 +133,8 @@ void main() {
         uint half_ = p.ropeDims >> 1;
         for (uint i = t; i < half_; i += 256u) {
             float re = q[base + i], im = q[base + i + half_];
-            q[base + i]          = re * rcos[i] - im * rsin[i];
-            q[base + i + half_]  = re * rsin[i] + im * rcos[i];
+            q[base + i]          = re * rcos[rbase + i] - im * rsin[rbase + i];
+            q[base + i + half_]  = re * rsin[rbase + i] + im * rcos[rbase + i];
         }
         barrier();
 
@@ -130,7 +147,7 @@ void main() {
     }
 
     uint h    = u - p.heads;
-    uint base = h * hd;
+    uint base = kvbase + h * hd;
     uint o    = slot(h) >> 1;   // in uints, two halves to each
 
     // The value is taken before the key is normed or rotated, where a block
@@ -165,8 +182,8 @@ void main() {
     uint half_ = p.ropeDims >> 1;
     for (uint i = t; i < half_; i += 256u) {
         float re = k[base + i], im = k[base + i + half_];
-        k[base + i]         = re * rcos[i] - im * rsin[i];
-        k[base + i + half_] = re * rsin[i] + im * rcos[i];
+        k[base + i]         = re * rcos[rbase + i] - im * rsin[rbase + i];
+        k[base + i + half_] = re * rsin[rbase + i] + im * rcos[rbase + i];
     }
     barrier();
 

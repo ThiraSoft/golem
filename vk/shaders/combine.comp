@@ -61,7 +61,8 @@ void reduce2(float a, float b, out float sa, out float sb) {
 }
 
 void main() {
-    uint t = gl_LocalInvocationID.x;
+    uint t    = gl_LocalInvocationID.x;
+    uint base = gl_WorkGroupID.y * p.n;   // the column is the second axis
 
     // A dense block has one branch and one post-norm. Running it through the
     // path below would norm the normed vector a second time — which RMS norm
@@ -71,7 +72,7 @@ void main() {
         // A pre-norm block: the feed forward rejoins the residual with nothing
         // between them. qwen/block.go is the other copy.
         for (uint i = t; i < p.n; i += LANES) {
-            xs[i] = (resid[i] + shared_[i]) * p.outScale;
+            xs[base + i] = (resid[base + i] + shared_[base + i]) * p.outScale;
         }
         return;
     }
@@ -79,7 +80,7 @@ void main() {
     if (p.layout_ != 0u) {
         float q = 0.0;
         for (uint i = t; i < p.n; i += LANES) {
-            float a = shared_[i];
+            float a = shared_[base + i];
             u[i] = a;
             q += a * a;
         }
@@ -89,14 +90,14 @@ void main() {
         float s = 1.0 / sqrt(tq / float(p.n) + p.eps);
         barrier();
         for (uint i = t; i < p.n; i += LANES) {
-            xs[i] = (resid[i] + u[i] * s * g3[i]) * p.outScale;
+            xs[base + i] = (resid[base + i] + u[i] * s * g3[i]) * p.outScale;
         }
         return;
     }
 
     float qu = 0.0, qw = 0.0;
     for (uint i = t; i < p.n; i += LANES) {
-        float a = shared_[i], b = experts[i];
+        float a = shared_[base + i], b = experts[base + i];
         u[i] = a;
         w[i] = b;
         qu += a * a;
@@ -122,6 +123,6 @@ void main() {
     barrier();
 
     for (uint i = t; i < p.n; i += LANES) {
-        xs[i] = (resid[i] + u[i] * sc * g3[i]) * p.outScale;
+        xs[base + i] = (resid[base + i] + u[i] * sc * g3[i]) * p.outScale;
     }
 }

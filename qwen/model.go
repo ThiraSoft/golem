@@ -144,6 +144,22 @@ func (m *Model) ForwardBatch(tokens []int32, startPos int) [][]float32 {
 // and where. One read of the weights then serves several conversations, which
 // is what lets a server answer more than one at a time.
 func (m *Model) ForwardMixed(tokens []int32, at []Place) [][]float32 {
+	// A pass of the device carries at most so many columns, so a longer prompt
+	// is cut into stretches of that width. What each stretch buys is the one
+	// thing a batch was ever for: every matrix read once for all of them.
+	if m.stack != nil && len(tokens) > m.stack.Columns() {
+		width := m.stack.Columns()
+		out := make([][]float32, len(tokens))
+		for from := 0; from < len(tokens); from += width {
+			to := min(from+width, len(tokens))
+			hidden := m.ForwardMixed(tokens[from:to], at[from:to])
+			for i := range hidden {
+				out[from+i] = append([]float32(nil), hidden[i]...)
+			}
+		}
+		return out
+	}
+
 	cfg, w := m.Cfg, m.W
 	batch := len(tokens)
 	m.reserve(batch)
@@ -168,12 +184,13 @@ func (m *Model) ForwardMixed(tokens []int32, at []Place) [][]float32 {
 		copy(xs[t], embedded.F[t])
 	}
 
-	// A model whose attention is on the card reads its prompt a position at a
-	// time: the kernels score one column, and two caches that parted would be
-	// worse than a slow prompt. gemma/model.go says the same.
+	// A device holding the attention keeps the keys and values itself, and a
+	// pass carries at most so many columns; ForwardMixed above has already cut
+	// a longer prompt into stretches of that width. gemma/model.go says the
+	// same.
 	if m.stack != nil {
+		m.runStack(xs, at)
 		for t := range tokens {
-			m.runStack(xs[t], at[t])
 			copy(m.hidden[t], xs[t])
 			nn.RMSNormPlain(m.hidden[t], w.OutputNorm, cfg.Eps)
 		}

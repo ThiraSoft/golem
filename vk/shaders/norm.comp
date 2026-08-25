@@ -13,6 +13,10 @@
 // the residual add with the feed-forward norm on top of it, and the expert
 // branch's own norm. What differs between them is which of the optional parts
 // they want, and each is one bit.
+//
+// A workgroup takes one column, and a prompt dispatches one per position. The
+// norm of a position depends on that position alone, so there is nothing to
+// share between them and nothing to say about the batch beyond the offset.
 
 layout(local_size_x = 1024) in;
 
@@ -31,6 +35,11 @@ layout(push_constant) uniform Push {
     float eps;
     float scalar;   // multiplies after the norm; one when there is none
 } p;
+
+// The column this workgroup carries, and the offsets into the buffers that
+// hold one entry per column.
+#define COL   (gl_WorkGroupID.y)
+#define BASE  (COL * p.n)
 
 const uint ADD    = 1u;   // the input is a + b rather than a
 const uint SUM    = 2u;   // write that sum out, which is the block's residual
@@ -78,7 +87,8 @@ uint floatToHalf(float f) {
 }
 
 void main() {
-    uint t = gl_LocalInvocationID.x;
+    uint t    = gl_LocalInvocationID.x;
+    uint base = BASE;
 
     // The squares are summed in the same walk that loads the vector: a pass
     // over this vector is a memory latency an iteration on the one compute
@@ -87,9 +97,9 @@ void main() {
     // through a tree, which is nearer float64 than a straight loop would be.
     float s = 0.0;
     for (uint i = t; i < p.n; i += 1024u) {
-        float x = ((p.flags & ADD) != 0u) ? (a[i] + b[i]) : a[i];
+        float x = ((p.flags & ADD) != 0u) ? (a[base + i] + b[base + i]) : a[base + i];
         v[i] = x;
-        if ((p.flags & SUM) != 0u) sum[i] = x;
+        if ((p.flags & SUM) != 0u) sum[base + i] = x;
         s += x * x;
     }
     partial[t] = s;
@@ -107,7 +117,7 @@ void main() {
         if ((p.flags & VSCALE) != 0u) x *= vscale[i];
         x *= p.scalar;
         v[i] = x;
-        if ((p.flags & FLOAT) != 0u) y[i] = x;
+        if ((p.flags & FLOAT) != 0u) y[base + i] = x;
     }
     barrier();
 
@@ -118,6 +128,8 @@ void main() {
     // inverting itself, halves round to even, and the scale the product uses
     // is the fp16 the reference would have stored.
     uint blocks = p.n >> 5;
+    uint qbase  = COL * (p.n >> 2);   // the Q8_0 magnitudes, in uints
+    uint sbase  = COL * 2u * blocks;  // its scales, then its corrections
     for (uint blk = t; blk < blocks; blk += 1024u) {
         uint at = blk << 5;
         float peak = 0.0;
@@ -139,12 +151,12 @@ void main() {
                     total += q;
                     word |= (uint(q) & 0xFFu) << (j * 8u);
                 }
-                yq[(at >> 2) + u] = word;
+                yq[qbase + (at >> 2) + u] = word;
             }
         } else {
-            for (uint u = 0u; u < 8u; u++) yq[(at >> 2) + u] = 0u;
+            for (uint u = 0u; u < 8u; u++) yq[qbase + (at >> 2) + u] = 0u;
         }
-        ys[blk]          = qscale;
-        ys[blocks + blk] = 8.0 * qscale * float(total);
+        ys[sbase + blk]          = qscale;
+        ys[sbase + blocks + blk] = 8.0 * qscale * float(total);
     }
 }

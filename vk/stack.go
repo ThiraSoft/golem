@@ -129,9 +129,11 @@ type Stack struct {
 	trace  bool // whether Run keeps each block's output; see traces
 	tl     *Timeline
 
-	// program is the recording, made on the first token and kept. Trace and
-	// Profile change what is recorded, so both drop it.
-	program *Program
+	// programs are the recordings, one per width of pass, made the first time
+	// that width is asked for and kept. A token is one column and a prompt is
+	// as many as vk.Columns allows, so a conversation makes two. Trace and
+	// Profile change what is recorded, so both drop them all.
+	programs map[int]*Program
 }
 
 // A stackBlock is one block's norms, its router, and the bindings that read
@@ -177,12 +179,12 @@ func NewStack(d *Device, dim int, eps float32, attn *Attention, mix *Mixture) (*
 		}
 	}
 
-	if s.xs, err = d.Readback(dim*4, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
+	if s.xs, err = d.Readback(dim*4*maxColumns, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
 		s.Close()
 		return nil, err
 	}
 	for _, into := range []**Buffer{&s.resid, &s.normed, &s.none, &s.routerIn} {
-		if *into, err = d.Local(dim*4, bufferUsageStorage); err != nil {
+		if *into, err = d.Local(dim*4*maxColumns, bufferUsageStorage); err != nil {
 			s.Close()
 			return nil, err
 		}
@@ -190,11 +192,17 @@ func NewStack(d *Device, dim int, eps float32, attn *Attention, mix *Mixture) (*
 	return s, nil
 }
 
-// SetRotation writes one geometry's angles for the position about to be read.
-func (s *Stack) SetRotation(i int, cos, sin []float32) error { return s.attn.SetRotation(i, cos, sin) }
+// SetRotation writes one geometry's angles for one column of the pass about to
+// be run.
+func (s *Stack) SetRotation(i, column int, cos, sin []float32) error {
+	return s.attn.SetRotation(i, column, cos, sin)
+}
 
-// Stream is the buffer the caller seeds with the embedding and reads the last
-// hidden state back from.
+// Columns is how many positions one pass may carry.
+func (s *Stack) Columns() int { return maxColumns }
+
+// Stream is the buffer the caller seeds with the embeddings and reads the last
+// hidden states back from, one column after another, dim floats each.
 func (s *Stack) Stream() *Buffer { return s.xs }
 
 // BlockNorms is one block's seven gain vectors, in the order the block uses
@@ -362,9 +370,9 @@ func (s *Stack) Profile(t *Timeline) {
 
 // forget drops the recording, which the next Run makes again.
 func (s *Stack) forget() {
-	if s.program != nil {
-		s.program.Close()
-		s.program = nil
+	for width, p := range s.programs {
+		p.Close()
+		delete(s.programs, width)
 	}
 }
 
@@ -399,27 +407,44 @@ type Position struct {
 // after it. What a token changes is in the buffers: the embedding in Stream,
 // the angles SetRotation wrote, and the position and cache range this writes
 // into the attention's own. vk/compute.go says what that is worth.
-func (s *Stack) Run(at Position, experts, used int) error {
-	if len(at.First) != len(s.blocks) || len(at.Last) != len(s.blocks) {
-		return fmt.Errorf("vk: %d blocks want %d ranges, given %d", len(s.blocks), len(s.blocks), len(at.First))
+func (s *Stack) Run(at []Position, experts, used int) error {
+	if len(at) == 0 || len(at) > maxColumns {
+		return fmt.Errorf("vk: a pass carries between one and %d columns, given %d", maxColumns, len(at))
 	}
-	for i := range s.blocks {
-		if err := s.attn.SetWhere(i, at.Pos, at.First[i], at.Last[i]); err != nil {
-			return err
+	if experts > 0 && len(at) > 1 {
+		// An expert branch routes each position to its own eight matrices, so
+		// a batch of them shares no read. A mixture reads its prompt the way
+		// it always did, a position at a time.
+		return fmt.Errorf("vk: a mixture carries one column at a time, given %d", len(at))
+	}
+	for c, one := range at {
+		if len(one.First) != len(s.blocks) || len(one.Last) != len(s.blocks) {
+			return fmt.Errorf("vk: %d blocks want %d ranges, given %d", len(s.blocks), len(s.blocks), len(one.First))
+		}
+		for i := range s.blocks {
+			if err := s.attn.SetWhere(i, c, one.Pos, one.First[i], one.Last[i]); err != nil {
+				return err
+			}
 		}
 	}
-	if s.program == nil {
-		p, err := s.d.Compile(func(r *Recorder) { s.record(r, experts, used) })
-		if err != nil {
+	columns := len(at)
+	if s.programs == nil {
+		s.programs = map[int]*Program{}
+	}
+	p, ok := s.programs[columns]
+	if !ok {
+		var err error
+		if p, err = s.d.Compile(func(r *Recorder) { s.record(r, experts, used, columns) }); err != nil {
 			return err
 		}
-		s.program = p
+		s.programs[columns] = p
 	}
-	return s.program.Run()
+	return p.Run()
 }
 
 // record is the whole stack, written into a command buffer once.
-func (s *Stack) record(r *Recorder, experts, used int) {
+func (s *Stack) record(r *Recorder, experts, used, columns int) {
+	cols := uint32(columns)
 	quant := normPush{n: uint32(s.dim), flags: normGain | normQuant, eps: s.eps, scalar: 1}
 	post := normPush{n: uint32(s.dim), flags: normGain | normFloat, eps: s.eps, scalar: 1}
 	resid := normPush{n: uint32(s.dim), flags: normAdd | normSum | normGain | normQuant, eps: s.eps, scalar: 1}
@@ -441,17 +466,17 @@ func (s *Stack) record(r *Recorder, experts, used int) {
 	for i, b := range s.blocks {
 		combine := combinePush{n: uint32(s.dim), eps: s.eps, outScale: b.outScale, layout: uint32(b.layout)}
 
-		r.Dispatch(b.setAttnNorm, 1, unsafe.Pointer(&quant))
+		r.DispatchColumns(b.setAttnNorm, 1, cols, unsafe.Pointer(&quant))
 		r.Barrier()
 		tl.Stamp(r, "attn norm")
-		s.attn.Record(r, i)
+		s.attn.Record(r, i, columns)
 		r.Barrier()
 		tl.Stamp(r, "attn out")
 		if b.layout != LayoutPreNorm {
-			r.Dispatch(b.setPostAttn, 1, unsafe.Pointer(&post))
+			r.DispatchColumns(b.setPostAttn, 1, cols, unsafe.Pointer(&post))
 			r.Barrier()
 		}
-		r.Dispatch(b.setResid, 1, unsafe.Pointer(&resid))
+		r.DispatchColumns(b.setResid, 1, cols, unsafe.Pointer(&resid))
 		r.Barrier()
 		tl.Stamp(r, "post+resid")
 		if b.layout == LayoutMixture {
@@ -468,14 +493,17 @@ func (s *Stack) record(r *Recorder, experts, used int) {
 			r.Barrier()
 			tl.Stamp(r, "pick")
 		}
-		s.mix.Record(r, i)
+		s.mix.Record(r, i, columns)
 		r.Barrier()
 		tl.Stamp(r, "moe down")
-		r.Dispatch(b.setCombine, 1, unsafe.Pointer(&combine))
+		r.DispatchColumns(b.setCombine, 1, cols, unsafe.Pointer(&combine))
 		r.Barrier()
 		tl.Stamp(r, "combine")
 		if s.trace {
-			r.Copy(s.traces, i*s.dim*4, s.xs, s.dim*4)
+			// The last column of the pass, which is what the CPU path keeps
+			// too: a batch's earlier positions are a prompt being read, and
+			// the waypoint a test names is the one at its end.
+			r.CopyFrom(s.traces, i*s.dim*4, s.xs, (columns-1)*s.dim*4, s.dim*4)
 			r.Barrier()
 		}
 	}

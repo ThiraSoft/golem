@@ -168,6 +168,31 @@ type rotation struct {
 	dims int
 }
 
+// VulkanColumns is how many positions one pass of the device carries, or zero
+// when there is no device.
+func (m *Model) VulkanColumns() int {
+	if m.stack == nil {
+		return 0
+	}
+	return m.stack.Columns()
+}
+
+// ProfileStack points the device path at a timeline, which stamps the card's
+// clock between the stages of every block. It is nil-safe and off by default.
+func (m *Model) ProfileStack(t *vk.Timeline) {
+	if m.stack != nil {
+		m.stack.Profile(t)
+	}
+}
+
+// NewStackTimeline is a timeline sized for one pass of this model's stack.
+func (m *Model) NewStackTimeline() (*vk.Timeline, error) {
+	if m.stack == nil {
+		return nil, fmt.Errorf("qwen: there is no device stack to profile")
+	}
+	return m.stack.NewTimeline()
+}
+
 // VulkanStack says whether the blocks are on a device.
 func (m *Model) VulkanStack() bool { return m.stack != nil }
 
@@ -205,32 +230,41 @@ func (m *Model) closeVulkan() {
 	}
 }
 
-// runStack carries one position through every block on the device, in one
-// submission. What crosses is this vector in and the same vector back.
-func (m *Model) runStack(xs []float32, at Place) {
+// runStack carries a stretch of positions through every block on the device,
+// in one submission. What crosses is those vectors in and the same vectors
+// back.
+func (m *Model) runStack(xs [][]float32, at []Place) {
 	cfg := m.Cfg
-	copy(m.stack.Stream().Floats(), xs)
+	stream := m.stack.Stream().Floats()
+	for t := range xs {
+		copy(stream[t*cfg.Dim:], xs[t])
+	}
 
 	if m.ropeTable == nil {
 		m.ropeTable = make([]nn.RoPETable, len(m.rotations))
 	}
-	for i, r := range m.rotations {
-		m.ropeTable[i].Prepare(r.dims, at.Pos, r.base, nil)
-		if err := m.stack.SetRotation(i, m.ropeTable[i].Cos, m.ropeTable[i].Sin); err != nil {
-			panic(fmt.Sprintf("qwen: the device refused a rotation: %v", err))
+	positions := make([]vk.Position, len(at))
+	for c, one := range at {
+		for i, r := range m.rotations {
+			m.ropeTable[i].Prepare(r.dims, one.Pos, r.base, nil)
+			if err := m.stack.SetRotation(i, c, m.ropeTable[i].Cos, m.ropeTable[i].Sin); err != nil {
+				panic(fmt.Sprintf("qwen: the device refused a rotation: %v", err))
+			}
+		}
+		positions[c] = vk.Position{Pos: one.Pos}
+		for _, bc := range cfg.Blocks {
+			first, last := one.Cache.Visible(bc, one.Pos)
+			positions[c].First = append(positions[c].First, first)
+			positions[c].Last = append(positions[c].Last, last)
 		}
 	}
-
-	pos := vk.Position{Pos: at.Pos}
-	for _, bc := range cfg.Blocks {
-		first, last := at.Cache.Visible(bc, at.Pos)
-		pos.First = append(pos.First, first)
-		pos.Last = append(pos.Last, last)
-	}
-	if err := m.stack.Run(pos, 0, 0); err != nil {
+	if err := m.stack.Run(positions, 0, 0); err != nil {
 		panic(fmt.Sprintf("qwen: the device failed: %v", err))
 	}
-	copy(xs, m.stack.Stream().Floats())
+	stream = m.stack.Stream().Floats()
+	for t := range xs {
+		copy(xs[t], stream[t*cfg.Dim:])
+	}
 }
 
 // TraceBlocks asks the device path to keep every block's output, which it does

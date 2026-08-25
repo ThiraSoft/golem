@@ -45,6 +45,18 @@ var moeDownSPIRV []byte
 //go:embed shaders/matvec.spv
 var matvecSPIRV []byte
 
+// The same two kernels built for a batch of columns. shaders/matvec.comp says
+// why the count is compiled in rather than pushed.
+//
+//go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec8.spv
+//go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup8.spv
+
+//go:embed shaders/matvec8.spv
+var matvecWideSPIRV []byte
+
+//go:embed shaders/moe_gateup8.spv
+var moeGateUpWideSPIRV []byte
+
 // expertsUsed is what the mixture's down kernel is written for: its workgroup
 // is eight outputs by eight experts. A checkpoint that chose a different
 // number would need the shape changed, not a constant.
@@ -155,6 +167,22 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		}
 	}
 
+	// The shared branch reads its weights once for a whole batch of positions
+	// when there is one. An expert branch never does: each position routes to
+	// its own eight matrices, so there is nothing between two of them to share.
+	for _, spec := range []struct {
+		pipe  **Pipeline
+		spirv []byte
+	}{
+		{&m.gateUp, moeGateUpWideSPIRV},
+		{&m.denseDown, matvecWideSPIRV},
+	} {
+		if err := (*spec.pipe).Wide(spec.spirv); err != nil {
+			m.Close()
+			return nil, err
+		}
+	}
+
 	if m.gelu, err = d.Upload(asBytes(nn.GELUTableData())); err != nil {
 		m.Close()
 		return nil, err
@@ -172,11 +200,11 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		local bool
 	}
 	bufs := []bufSpec{
-		{&m.dxq, dim, false},         // the shared branch's input
-		{&m.dxs, 2 * in * 4, false},  //
-		{&m.dout, dim * 4, false},    // its output
-		{&m.daq, dense, true},        // its intermediate
-		{&m.das, 2 * dmid * 4, true}, //
+		{&m.dxq, dim * maxColumns, false},         // the shared branch's input
+		{&m.dxs, 2 * in * 4 * maxColumns, false},  //
+		{&m.dout, dim * 4 * maxColumns, false},    // its output
+		{&m.daq, dense * maxColumns, true},        // its intermediate
+		{&m.das, 2 * dmid * 4 * maxColumns, true}, //
 	}
 	if experts > 0 {
 		mid := ffn / nn.QuantBlock
@@ -406,22 +434,34 @@ func (m *Mixture) RunTimes(block, n int) error {
 // Profile is Stack.Profile, forwarded: one stamp between the two halves.
 func (m *Mixture) Profile(t *Timeline) { m.tl = t }
 
-func (m *Mixture) Record(r *Recorder, block int) {
+// Record puts one block's feed-forward half into a recording, for the given
+// number of columns. More than one is a stretch of a prompt, and only the
+// shared branch can take it — see the note beside the wide pipelines above.
+func (m *Mixture) Record(r *Recorder, block, columns int) {
 	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed, act: uint32(m.act)}
 	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act)}
 	b := m.blocks[block]
+	up, down := uint32(m.dense/nn.QuantBlock), uint32((m.dim+matvecOuts-1)/matvecOuts)
 	// Nothing in either branch waits on the other, so they go in without a
 	// barrier between them and the card runs them together.
 	if m.experts > 0 {
 		r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
 	}
-	r.Dispatch(b.setDenseUp, uint32(m.dense/nn.QuantBlock), unsafe.Pointer(&shared))
+	if columns > 1 {
+		r.DispatchWide(b.setDenseUp, up, unsafe.Pointer(&shared))
+	} else {
+		r.Dispatch(b.setDenseUp, up, unsafe.Pointer(&shared))
+	}
 	r.Barrier()
 	m.tl.Stamp(r, "moe gate/up")
 	if m.experts > 0 {
 		r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
 	}
-	r.Dispatch(b.setDenseDn, uint32((m.dim+matvecOuts-1)/matvecOuts), unsafe.Pointer(&shared))
+	if columns > 1 {
+		r.DispatchWide(b.setDenseDn, down, unsafe.Pointer(&shared))
+	} else {
+		r.Dispatch(b.setDenseDn, down, unsafe.Pointer(&shared))
+	}
 }
 
 // The buffers a kernel upstream writes and one downstream reads, so that a

@@ -38,6 +38,17 @@ layout(push_constant) uniform Push {
     float scale;   // 1/sqrt(head_dim), or one where a query norm holds the range
 } p;
 
+// WHERE_COLUMNS is vk/attention.go's maxColumns, and the two have to agree.
+const uint WHERE_COLUMNS = 8u;
+
+// The column this workgroup carries. A prompt dispatches one per position, and
+// each of them sees its own stretch of the cache: shaders/attn_prepare.comp has
+// already written every position of the batch, so a query reads the keys of
+// the positions before it in the same batch as well as those before the batch.
+// That is the whole of what makes a batched prompt equal to the same tokens
+// read one at a time.
+#define COL (gl_WorkGroupID.y)
+
 shared float partial[256];
 shared float acc[512];
 shared float top;
@@ -86,11 +97,12 @@ void main() {
     uint h  = gl_WorkGroupID.x;
     uint t  = gl_LocalInvocationID.x;
     uint hd = p.headDim;
-    uint first = where_[p.block].y;
-    uint n  = where_[p.block].z - first + 1u;
+    uvec4 where = where_[p.block * WHERE_COLUMNS + COL];
+    uint first = where.y;
+    uint n  = where.z - first + 1u;
     uint kv = h / p.perKV;
-    uint qb = h * hd;
-    uint sb = h * p.stride;
+    uint qb = COL * p.heads * hd + h * hd;
+    uint sb = (COL * p.heads + h) * p.stride;
 
     // The scores.
     for (uint m = t; m < n; m += 256u) {
@@ -181,9 +193,12 @@ void main() {
         }
         // Scales first, then corrections, which is the layout every kernel
         // here reads an activation in.
-        uint slot   = (qb >> 5) + b;
+        // The scales of a column come before its corrections, and one column
+        // after another — the layout every activation here is read in.
         uint blocks = (p.heads * hd) >> 5;
-        as_[slot]          = scale;
-        as_[blocks + slot] = 8.0 * scale * float(count);
+        uint base   = COL * 2u * blocks;
+        uint slot   = ((h * hd) >> 5) + b;
+        as_[base + slot]          = scale;
+        as_[base + blocks + slot] = 8.0 * scale * float(count);
     }
 }

@@ -246,10 +246,16 @@ Worth knowing before you clone it:
   a device, and the engine falls back to the CPU as it does when there is no
   Vulkan at all.
 
-  A model whose attention is on the card also reads its prompt a position at a
-  time, because the kernels score one column and the two caches must not part.
-  That turned out to cost nothing: the prompt is faster this way than the
-  batched CPU path it replaces.
+  A model whose attention is on the card reads its prompt in stretches of
+  eight positions, because the keys and values are the card's and the two
+  caches must not part. Eight of them in one pass is what a batch was always
+  for: every matrix of the model read once for all eight instead of once for
+  each, which is the whole of the difference between a prompt at the memory
+  ceiling and a prompt eight times over it. On the 12B that took the prompt
+  from 71 tokens a second to 245, on the Qwen3 4B from 179 to 568, and on the
+  0.6B from 420 to 1793. Generation is untouched, and reads the same binaries
+  it always did: the column count is compiled into the kernel rather than
+  pushed, so there are two of each and a token draws the narrow one.
 
   It is not bit-identical to the CPU path and cannot be: the two sum the same
   products in different orders, and a mixture amplifies that because its
@@ -282,11 +288,13 @@ Worth knowing before you clone it:
 - **The prompt path on Gemma is a factor of one and two thirds behind ggml's
   best**, even where it beats the default build; `gemma/README.md` says where
   the remainder sits.
-- **On a card, the prompt is read a position at a time.** The kernels score one
-  column, and a device cache that parted from the engine's would be worse than
-  a slow prompt — so generation reaches or passes llama.cpp's ROCm build while
-  the prompt does not: 179 tokens a second against 1906 on the Qwen3 4B. It is
-  the largest thing left on this path.
+- **On a card, the prompt is still behind.** Generation reaches or passes
+  llama.cpp's ROCm build; the prompt does not — 568 tokens a second against
+  1906 on the Qwen3 4B. What is left is not the weights, which are now read
+  once for eight positions and at the card's memory ceiling doing it, but the
+  activation: every workgroup reads all eight columns of it for the sixteen
+  rows it owns, and that traffic grows with the batch where the weight traffic
+  does not. It is the largest thing left on this path.
 
 ## What is here, and what is not
 

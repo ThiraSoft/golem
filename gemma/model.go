@@ -160,25 +160,27 @@ func (m *Model) ForwardMixed(tokens []int32, at []Place) [][]float32 {
 // of an embedding batch, and passing zeros there is what agrees with it.
 // Callers with no picture pass tokens for both.
 func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32, at []Place) [][]float32 {
-	// A device holding the attention keeps the keys and values itself, and its
-	// kernels score one column. A batch therefore goes through a position at a
-	// time: the answer is the same one the batch would have given, and a
-	// prompt pays per token what a token pays. What it loses is the one thing
-	// a batch was for — reading each matrix once for all of the positions that
-	// meet it — so a prompt is slower this way, and measurably.
-	if m.stack != nil && len(tokens) > 1 {
+	// A device holding the attention keeps the keys and values itself, and a
+	// pass carries at most so many columns, so a longer prompt is cut into
+	// stretches of that width. What each stretch buys is the one thing a batch
+	// was ever for: every matrix of the model read once for all of the
+	// positions in it.
+	if width := m.stackColumns(); width > 0 && len(tokens) > width {
 		out := make([][]float32, len(tokens))
-		for i := range tokens {
-			var one [][]float32
+		for from := 0; from < len(tokens); from += width {
+			to := min(from+width, len(tokens))
+			var some [][]float32
 			if embeds != nil {
-				one = embeds[i : i+1]
+				some = embeds[from:to]
 			}
-			var single []int32
+			var slice []int32
 			if ple != nil {
-				single = ple[i : i+1]
+				slice = ple[from:to]
 			}
-			hidden := m.ForwardEmbedded(tokens[i:i+1], one, single, at[i:i+1])
-			out[i] = append([]float32(nil), hidden[0]...)
+			hidden := m.ForwardEmbedded(tokens[from:to], some, slice, at[from:to])
+			for i := range hidden {
+				out[from+i] = append([]float32(nil), hidden[i]...)
+			}
 		}
 		return out
 	}
@@ -213,10 +215,12 @@ func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32,
 		copy(xs[t], embedded.F[t])
 	}
 	if m.stack != nil {
-		m.runStack(xs[0], at[0])
-		copy(m.hidden[0], xs[0])
-		nn.RMSNormPlain(m.hidden[0], w.OutputNorm, cfg.Eps)
-		return m.hidden[:1]
+		m.runStack(xs, at)
+		for t := range tokens {
+			copy(m.hidden[t], xs[t])
+			nn.RMSNormPlain(m.hidden[t], w.OutputNorm, cfg.Eps)
+		}
+		return m.hidden[:batch]
 	}
 
 	blockPLE := make([][]float32, batch)
@@ -278,37 +282,60 @@ func (m *Model) BlockOutput(block int) []float32 {
 	return m.outputs[block]
 }
 
-// runStack carries one position through every block on the device, in one
-// submission. What crosses is this vector in and the same vector back.
-func (m *Model) runStack(xs []float32, at Place) {
-	cfg := m.Cfg
-	copy(m.stack.Stream().Floats(), xs)
+// stackColumns is how many positions one pass of the device carries, or zero
+// when there is no device. A mixture is one: an expert branch routes each
+// position to its own eight matrices, so a batch of them shares no read, and
+// vk/stack.go refuses one rather than pretending.
+func (m *Model) stackColumns() int {
+	switch {
+	case m.stack == nil:
+		return 0
+	case m.Cfg.Experts > 0:
+		return 1
+	}
+	return m.stack.Columns()
+}
 
-	// The angles for this position, one geometry at a time. They depend on the
-	// position and the geometry and on nothing else, so a token computes them
-	// twice rather than sixty times.
+// runStack carries a stretch of positions through every block on the device,
+// in one submission. What crosses is those vectors in and the same vectors
+// back.
+func (m *Model) runStack(xs [][]float32, at []Place) {
+	cfg := m.Cfg
+	stream := m.stack.Stream().Floats()
+	for t := range xs {
+		copy(stream[t*cfg.Dim:], xs[t])
+	}
+
+	// The angles for each position, one geometry at a time. They depend on the
+	// position and the geometry and on nothing else, so a pass computes them
+	// twice per column rather than sixty times.
 	if m.ropeTable == nil {
 		m.ropeTable = make([]nn.RoPETable, len(m.rotations))
 	}
-	for i, r := range m.rotations {
-		m.ropeTable[i].Prepare(r.dims, at.Pos, r.base, r.freqs)
-		if err := m.stack.SetRotation(i, m.ropeTable[i].Cos, m.ropeTable[i].Sin); err != nil {
-			panic(fmt.Sprintf("gemma: the device refused a rotation: %v", err))
-		}
-	}
-
 	// The window rule and the ring agree, so the range is worked out here and
 	// neither kernel has to check the other.
-	pos := vk.Position{Pos: at.Pos}
-	for _, bc := range cfg.Blocks {
-		first, last := at.Cache.Visible(bc, at.Pos, at.Until)
-		pos.First = append(pos.First, first)
-		pos.Last = append(pos.Last, last)
+	positions := make([]vk.Position, len(at))
+	for c, one := range at {
+		for i, r := range m.rotations {
+			m.ropeTable[i].Prepare(r.dims, one.Pos, r.base, r.freqs)
+			if err := m.stack.SetRotation(i, c, m.ropeTable[i].Cos, m.ropeTable[i].Sin); err != nil {
+				panic(fmt.Sprintf("gemma: the device refused a rotation: %v", err))
+			}
+		}
+		positions[c] = vk.Position{Pos: one.Pos}
+		for _, bc := range cfg.Blocks {
+			first, last := one.Cache.Visible(bc, one.Pos, one.Until)
+			positions[c].First = append(positions[c].First, first)
+			positions[c].Last = append(positions[c].Last, last)
+		}
 	}
-	if err := m.stack.Run(pos, cfg.Experts, cfg.ExpertsUsed); err != nil {
+	if err := m.stack.Run(positions, cfg.Experts, cfg.ExpertsUsed); err != nil {
 		panic(fmt.Sprintf("gemma: the device failed: %v", err))
 	}
-	copy(xs, m.stack.Stream().Floats())
+	stream = m.stack.Stream().Floats()
+	for t := range xs {
+		copy(xs[t], stream[t*cfg.Dim:])
+	}
 }
 
 // Logits scores the whole vocabulary. The head is the input embedding read the

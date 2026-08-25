@@ -36,6 +36,12 @@ var attnPrepareSPIRV []byte
 //go:embed shaders/attn_scores.spv
 var attnScoresSPIRV []byte
 
+// maxColumns is how many positions of a prompt one pass carries: the COLUMNS
+// the wide shaders are built at, the WHERE_COLUMNS they index the position
+// buffer by, and the width every per-column buffer here is allocated for. The
+// three have to agree, and nothing checks it but this comment.
+const maxColumns = 8
+
 // A BlockShape is what one block's attention is, as the kernels need to know
 // it. It is the block answering for itself rather than a branch on its number.
 type BlockShape struct {
@@ -63,6 +69,10 @@ type BlockShape struct {
 	// the way llama.cpp does.
 	Scale float32
 }
+
+// Columns is how many positions one pass may carry, which callers need in
+// order to cut a prompt into batches of it.
+func Columns() int { return maxColumns }
 
 // An Attention is every attention matrix and every key-value cache of a model,
 // resident, and the buffers one position passes through.
@@ -120,6 +130,7 @@ type attnPush struct {
 	mask       uint32
 	valueIsKey uint32
 	normValue  uint32
+	rotStride  uint32
 	eps        float32
 }
 
@@ -162,23 +173,29 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxContext, rotations int) (*
 			return nil, err
 		}
 	}
+	// The four projections read their weights once for a whole batch of
+	// positions when there is one. shaders/matvec.comp says what that is worth.
+	if err := a.matvec.Wide(matvecWideSPIRV); err != nil {
+		a.Close()
+		return nil, err
+	}
 
 	for _, spec := range []struct {
 		into  **Buffer
 		size  int
 		local bool
 	}{
-		{&a.xq, dim, false},                         // the normed stream, Q8_0
-		{&a.xs, 2 * dim / nn.QuantBlock * 4, false}, //
-		{&a.out, dim * 4, false},                    // what the output projection makes
-		{&a.q, maxHeads * 4, true},                  // the three projections, which never leave
-		{&a.k, maxKV * 4, true},                     //
-		{&a.v, maxKV * 4, true},                     //
-		{&a.qh, maxHeads * 4, true},                 // the queries, rounded through fp16
-		{&a.scoreRows, maxHeads * maxContext, true}, // one row of scores per head, four bytes each
-		{&a.aq, maxHeads, true},                     // the mixed values, Q8_0
-		{&a.as, 2 * maxHeads / nn.QuantBlock * 4, true},
-		{&a.where, maxBlocks * 16, false}, // one uvec4 a block: position, first, last
+		{&a.xq, dim * maxColumns, false},                         // the normed stream, Q8_0
+		{&a.xs, 2 * dim / nn.QuantBlock * 4 * maxColumns, false}, //
+		{&a.out, dim * 4 * maxColumns, false},                    // what the output projection makes
+		{&a.q, maxHeads * 4 * maxColumns, true},                  // the three projections, which never leave
+		{&a.k, maxKV * 4 * maxColumns, true},                     //
+		{&a.v, maxKV * 4 * maxColumns, true},                     //
+		{&a.qh, maxHeads * 4 * maxColumns, true},                 // the queries, rounded through fp16
+		{&a.scoreRows, maxHeads * maxContext * maxColumns, true}, // one row of scores per head per column
+		{&a.aq, maxHeads * maxColumns, true},                     // the mixed values, Q8_0
+		{&a.as, 2 * maxHeads / nn.QuantBlock * 4 * maxColumns, true},
+		{&a.where, maxBlocks * maxColumns * 16, false}, // per block and column: position, first, last
 	} {
 		var b *Buffer
 		if spec.local {
@@ -196,12 +213,12 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxContext, rotations int) (*
 	// block: the angles depend on the position and the geometry and on nothing
 	// else, which is what nn/rope.go tabulates them for.
 	for i := 0; i < rotations; i++ {
-		cos, err := d.Host(maxHeads*4, bufferUsageStorage)
+		cos, err := d.Host(maxHeads*4*maxColumns, bufferUsageStorage)
 		if err != nil {
 			a.Close()
 			return nil, err
 		}
-		sin, err := d.Host(maxHeads*4, bufferUsageStorage)
+		sin, err := d.Host(maxHeads*4*maxColumns, bufferUsageStorage)
 		if err != nil {
 			a.Close()
 			return nil, err
@@ -212,13 +229,18 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxContext, rotations int) (*
 	return a, nil
 }
 
-// SetRotation writes one geometry's angles for the position about to be read.
-func (a *Attention) SetRotation(i int, cos, sin []float32) error {
+// SetRotation writes one geometry's angles for one column of the pass about to
+// be recorded. A prompt writes one set per position; a token writes one.
+func (a *Attention) SetRotation(i, column int, cos, sin []float32) error {
 	if i < 0 || i >= len(a.rcos) {
 		return fmt.Errorf("vk: rotation %d of %d", i, len(a.rcos))
 	}
-	copy(a.rcos[i].Floats(), cos)
-	copy(a.rsin[i].Floats(), sin)
+	if column < 0 || column >= maxColumns {
+		return fmt.Errorf("vk: column %d of the %d one pass carries", column, maxColumns)
+	}
+	at := column * a.maxHeads
+	copy(a.rcos[i].Floats()[at:at+a.maxHeads], cos)
+	copy(a.rsin[i].Floats()[at:at+a.maxHeads], sin)
 	return nil
 }
 
@@ -387,14 +409,14 @@ func (a *Attention) Attend(block int, in *nn.Batch, cos, sin []float32, pos, fir
 	scales := a.xs.Floats()
 	copy(scales[:blocks], in.Scales[:blocks])
 	copy(scales[blocks:2*blocks], in.Corr[:blocks])
-	if err := a.SetRotation(s.Rotation, cos, sin); err != nil {
+	if err := a.SetRotation(s.Rotation, 0, cos, sin); err != nil {
 		return err
 	}
 
-	if err := a.SetWhere(block, pos, first, last); err != nil {
+	if err := a.SetWhere(block, 0, pos, first, last); err != nil {
 		return err
 	}
-	if err := a.d.Submit(func(r *Recorder) { a.Record(r, block) }); err != nil {
+	if err := a.d.Submit(func(r *Recorder) { a.Record(r, block, 1) }); err != nil {
 		return err
 	}
 	copy(out, a.out.Floats()[:a.dim])
@@ -412,16 +434,24 @@ func (a *Attention) Profile(t *Timeline) { a.tl = t }
 // about a token that a recording cannot hold. It is what lets the recording be
 // made once: the two kernels read these three numbers out of a buffer instead
 // of out of the command buffer's push constants.
-func (a *Attention) SetWhere(block, pos, first, last int) error {
+func (a *Attention) SetWhere(block, column, pos, first, last int) error {
 	if block < 0 || block >= maxBlocks {
 		return fmt.Errorf("vk: block %d of the %d the position buffer holds", block, maxBlocks)
 	}
-	at := unsafe.Slice((*uint32)(unsafe.Pointer(&a.where.Bytes()[0])), maxBlocks*4)[block*4:]
+	if column < 0 || column >= maxColumns {
+		return fmt.Errorf("vk: column %d of the %d one pass carries", column, maxColumns)
+	}
+	entries := unsafe.Slice((*uint32)(unsafe.Pointer(&a.where.Bytes()[0])), maxBlocks*maxColumns*4)
+	at := entries[(block*maxColumns+column)*4:]
 	at[0], at[1], at[2] = uint32(pos), uint32(first), uint32(last)
 	return nil
 }
 
-func (a *Attention) Record(r *Recorder, block int) {
+// Record puts one block's attention into a recording, for the given number of
+// columns. One column is a token; more is a stretch of a prompt, and the four
+// projections then read their weights once for all of them — which is the
+// whole of why a prompt need not cost what the same tokens cost one at a time.
+func (a *Attention) Record(r *Recorder, block, columns int) {
 	b := a.blocks[block]
 	s := b.shape
 	heads, kv := s.Heads*s.HeadDim, s.KVHeads*s.HeadDim
@@ -433,7 +463,7 @@ func (a *Attention) Record(r *Recorder, block int) {
 		heads: uint32(s.Heads), kvHeads: uint32(s.KVHeads), headDim: uint32(s.HeadDim),
 		ropeDims: uint32(s.RoPEDims), block: uint32(block), capacity: uint32(s.Capacity),
 		mask: uint32(ringMask(s.Capacity)), valueIsKey: boolTo(s.ValueIsKey),
-		normValue: boolTo(s.NormValue), eps: s.Eps,
+		normValue: boolTo(s.NormValue), rotStride: uint32(a.maxHeads), eps: s.Eps,
 	}
 	score := scorePush{
 		heads: uint32(s.Heads), kvHeads: uint32(s.KVHeads), headDim: uint32(s.HeadDim),
@@ -446,22 +476,31 @@ func (a *Attention) Record(r *Recorder, block int) {
 		units += uint32(s.KVHeads)
 	}
 
-	r.Dispatch(b.setQ, groups(heads), unsafe.Pointer(&project))
+	wide := columns > 1
+	product := func(set *Set, outs int, push unsafe.Pointer) {
+		if wide {
+			r.DispatchWide(set, groups(outs), push)
+			return
+		}
+		r.Dispatch(set, groups(outs), push)
+	}
+
+	product(b.setQ, heads, unsafe.Pointer(&project))
 	if b.setK != nil {
-		r.Dispatch(b.setK, groups(kv), unsafe.Pointer(&kvProject))
+		product(b.setK, kv, unsafe.Pointer(&kvProject))
 	}
 	if b.setV != nil {
-		r.Dispatch(b.setV, groups(kv), unsafe.Pointer(&kvProject))
+		product(b.setV, kv, unsafe.Pointer(&kvProject))
 	}
 	r.Barrier()
 	a.tl.Stamp(r, "attn qkv")
-	r.Dispatch(b.setPrepare, units, unsafe.Pointer(&prepare))
+	r.DispatchColumns(b.setPrepare, units, uint32(columns), unsafe.Pointer(&prepare))
 	r.Barrier()
 	a.tl.Stamp(r, "attn cache")
-	r.Dispatch(b.setScores, uint32(s.Heads), unsafe.Pointer(&score))
+	r.DispatchColumns(b.setScores, uint32(s.Heads), uint32(columns), unsafe.Pointer(&score))
 	r.Barrier()
 	a.tl.Stamp(r, "attn scores")
-	r.Dispatch(b.setO, groups(a.dim), unsafe.Pointer(&outProject))
+	product(b.setO, a.dim, unsafe.Pointer(&outProject))
 }
 
 // ringMask is nn's rule, and gemma/cache.go's: the capacity less one when that

@@ -8,7 +8,10 @@ package qwen
 // show it is to run the quantized reference tests again through the card at
 // the tolerances they already hold to.
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func openQuantizedStack(t *testing.T) (*fixture, *Model) {
 	t.Helper()
@@ -177,4 +180,35 @@ func BenchmarkQuantizedPrefillVulkan(b *testing.B) {
 		m.Reset()
 		m.ForwardBatch(tokens, 0)
 	}
+}
+
+// TestVulkanPromptProfile is not a test of anything; it is the instrument that
+// says which stage of a block a stretch of prompt is spent in. Run it with -v.
+func TestVulkanPromptProfile(t *testing.T) {
+	_, m := openQuantizedStack(t)
+	tl, err := m.NewStackTimeline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tl.Close()
+
+	width := m.VulkanColumns()
+	tokens := make([]int32, width)
+	for i := range tokens {
+		tokens[i] = int32(100 + i)
+	}
+	m.Reset()
+	m.ForwardBatch(tokens, 0) // warm the clocks and make the recording
+	m.Reset()
+	m.ProfileStack(tl)
+	start := time.Now()
+	m.ForwardBatch(tokens, 0)
+	took := time.Since(start)
+	m.ProfileStack(nil)
+
+	report, err := tl.Report(took)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("%d columns in %v\n%s", width, took, report)
 }

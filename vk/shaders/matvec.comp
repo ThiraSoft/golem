@@ -16,6 +16,26 @@
 // projection with forty-four workgroups for sixty-four compute units, and a
 // fifth of the card idle for the length of the kernel. Sixteen gives it a
 // hundred and seventy-six.
+//
+// COLUMNS is how many activations one pass answers, and it is the whole of why
+// a prompt is not the same shape as a token. Generating reads every weight in
+// the model to produce one column, and the card is at its memory ceiling doing
+// it — measured, 350 gigabytes a second on this one. A prompt of sixty-four
+// positions needs the same weights sixty-four times, and reading them once for
+// eight columns instead of once for each is eight times less traffic for the
+// same arithmetic. The weight word is loaded outside the column loop; that one
+// line is the optimization.
+//
+// It is a compile-time constant rather than a push constant so that the
+// accumulators stay in registers: an array indexed by a loop whose bound the
+// compiler does not know goes to scratch memory, and the kernel would spend
+// what it saved. The file is built twice, at one and at eight — vk/mixture.go
+// names both — and a token drawn one at a time reads the same binary it
+// always did.
+
+#ifndef COLUMNS
+#define COLUMNS 1
+#endif
 
 layout(local_size_x = 128) in;   // sixteen outputs, eight lanes each
 
@@ -28,30 +48,31 @@ layout(push_constant) uniform Push {
     uint dim;   // outputs
     uint ffn;   // inputs
     uint used;  // one, and only here so that every kernel takes the same block
+    uint act;   // the activation, which is spent before this kernel runs
 } p;
 
 const uint LANES = 8u;
 const uint OUTS  = 16u;   // outputs to a workgroup, which is 128 / LANES
 
-shared float partial[128];
+shared float partial[128 * COLUMNS];
 
-// abyte reads one signed byte of the activation.
-int abyte(uint b) { return bitfieldExtract(int(aq[b >> 2]), int((b & 3u) * 8u), 8); }
-
-// lanePart is one lane's share of a Q4_0 row against it.
-float lanePart(uint rowBase, uint lane) {
+// lanePart is one lane's share of a Q4_0 row against every column.
+void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
     uint nb  = p.ffn >> 5;
     uint nib = rowBase + 2u * nb;
+    uint aw  = p.ffn >> 2;   // one column of the activation, in uints
 
-    precise float sum = 0.0;
-    precise float corr = 0.0;
+    precise float sum[COLUMNS];
+    precise float corr[COLUMNS];
+    for (uint c = 0u; c < COLUMNS; c++) { sum[c] = 0.0; corr[c] = 0.0; }
+
     for (uint b = lane; b < nb; b += LANES) {
         vec2  pair = unpackHalf2x16(w[(rowBase + 2u * b) >> 2]);
         float ws   = pair[b & 1u];
 
-        int acc = 0;
         uint at = (nib + 16u * b) >> 2;
         uint ab = b * 8u;
+        // The weight word is read here, once, and met by every column below.
         // Four products to an instruction. A Q4_0 word holds eight weights
         // as nibbles, and the two halves of it come out as two packed
         // quadruples with one mask each — which is the layout's gift: a mask
@@ -59,15 +80,25 @@ float lanePart(uint rowBase, uint lane) {
         // dot product wants. The accumulator is integer and exact, so this is
         // the same number the unpacked loop produced, in a quarter of the
         // instructions. vk/device.go says what the card is asked for.
+        uint lo[4], hi[4];
         for (uint u = 0u; u < 4u; u++) {
             uint word = w[at + u];
-            acc = dotPacked4x8AccSatEXT(word & 0x0F0F0F0Fu,        int(aq[ab + u]),      acc);
-            acc = dotPacked4x8AccSatEXT((word >> 4) & 0x0F0F0F0Fu, int(aq[ab + u + 4u]), acc);
+            lo[u] = word & 0x0F0F0F0Fu;
+            hi[u] = (word >> 4) & 0x0F0F0F0Fu;
         }
-        sum  += float(acc) * ws * as_[b];
-        corr += ws * as_[p.used * nb + b];
+        for (uint c = 0u; c < COLUMNS; c++) {
+            uint ac = c * aw + ab;
+            int acc = 0;
+            for (uint u = 0u; u < 4u; u++) {
+                acc = dotPacked4x8AccSatEXT(lo[u], int(aq[ac + u]),      acc);
+                acc = dotPacked4x8AccSatEXT(hi[u], int(aq[ac + u + 4u]), acc);
+            }
+            uint sc = c * 2u * nb;
+            sum[c]  += float(acc) * ws * as_[sc + b];
+            corr[c] += ws * as_[sc + nb + b];
+        }
     }
-    return sum - corr;
+    for (uint c = 0u; c < COLUMNS; c++) answer[c] = sum[c] - corr[c];
 }
 
 void main() {
@@ -76,11 +107,23 @@ void main() {
     uint i    = gl_WorkGroupID.x * OUTS + (t >> 3);
 
     uint rowBytes = (p.ffn >> 5) * 18u;
-    partial[t] = (i < p.dim) ? lanePart(i * rowBytes, lane) : 0.0;
+    float part[COLUMNS];
+    if (i < p.dim) {
+        lanePart(i * rowBytes, lane, part);
+    } else {
+        for (uint c = 0u; c < COLUMNS; c++) part[c] = 0.0;
+    }
+    for (uint c = 0u; c < COLUMNS; c++) partial[t * COLUMNS + c] = part[c];
     barrier();
     for (uint stride = LANES >> 1; stride > 0u; stride >>= 1) {
-        if (lane < stride) partial[t] += partial[t + stride];
+        if (lane < stride) {
+            for (uint c = 0u; c < COLUMNS; c++) {
+                partial[t * COLUMNS + c] += partial[(t + stride) * COLUMNS + c];
+            }
+        }
         barrier();
     }
-    if (lane == 0u && i < p.dim) y[i] = partial[t];
+    if (lane == 0u && i < p.dim) {
+        for (uint c = 0u; c < COLUMNS; c++) y[c * p.dim + i] = partial[t * COLUMNS + c];
+    }
 }
