@@ -192,8 +192,9 @@ Worth knowing before you clone it:
   ceiling is about 43.
 
   `-vulkan` moves all four, and then everything between them. On the 26B A4B,
-  **13.4 tokens a second becomes 96.8** — llama.cpp's Vulkan build is at 116.5
-  and its ROCm build at 99.8 on the same card — and the prompt goes from 40 a second to 135. It costs those
+  **13.4 tokens a second becomes 98.3** — llama.cpp's Vulkan build is at 124.5
+  and its ROCm build at 98.6 on the same card — and the prompt goes from 40 a
+  second to 1474. It costs those
   matrices being resident — 12.8 gibibytes, which is why a card with sixteen is
   the smallest that can do this — and about nine seconds of upload.
 
@@ -321,41 +322,59 @@ Worth knowing before you clone it:
 - **The prompt path on Gemma is a factor of one and two thirds behind ggml's
   best**, even where it beats the default build; `gemma/README.md` says where
   the remainder sits.
-- **On a card, generation is within a tenth and the prompt is a factor of two
-  to three behind, widening with the length of the prompt.** Measured against
-  llama.cpp's own Vulkan build on the same card, which is the fair comparison
-  for a Vulkan engine and is faster than its ROCm build at everything here.
-  Both columns of each pair were measured the same evening; a prompt is given
-  at two lengths because the two engines answer them differently:
+- **On a card, generation is a tenth to a fifth behind and the prompt is a
+  factor of two to three behind, widening with the length of the prompt.**
+  Measured against llama.cpp's own Vulkan build on the same card, which is the
+  fair comparison for a Vulkan engine: its ROCm build generates a fifth slower
+  on the 26B and answers a short prompt a third faster, so it is neither a
+  ceiling nor a floor. Both columns of each pair were measured the same
+  evening, one benchmark at a time; a prompt is given at two lengths because
+  the two engines answer them differently:
 
   | tokens a second | golem gen | llama gen | golem pp64 | llama pp64 | golem pp256 | llama pp256 |
   | --------------- | --------: | --------: | ---------: | ---------: | ----------: | ----------: |
-  | Gemma 4 26B A4B |      98.0 |     116.5 |       1436 |       1049 |        1566 |        3107 |
-  | Gemma 4 12B     |      59.3 |      64.2 |        686 |       1211 |         694 |        2548 |
-  | Qwen3 4B        |     158.5 |     165.9 |       1622 |       3144 |        1472 |        5688 |
-  | Qwen3 0.6B      |     337.7 |     353.1 |       7047 |       9816 |        6612 |       19566 |
+  | Gemma 4 26B A4B |      98.3 |     124.5 |       1474 |       1052 |        1524 |        2877 |
+  | Gemma 4 12B     |      58.7 |      64.6 |        661 |       1206 |         693 |        2577 |
+  | Qwen3 0.6B      |     296.4 |     353.3 |       6504 |      10339 |        7008 |       19460 |
+
+  A benchmark of three iterations reads a third low on the largest model: the
+  card is at its idle clocks for the first of them and a prompt of sixty-four
+  positions is over before it has left them. Every golem number above was
+  taken with enough iterations for that to stop mattering, which on the 26B is
+  where 1053 becomes 1474.
 
   **The shape of the gap is the story.** golem's prompt is flat in the length
   of the prompt and llama.cpp's is not: from sixty-four positions to two
   hundred and fifty-six it gains a factor of two and a half on every model and
-  golem gains nothing. On the 26B that is enough for golem to be ahead at
-  sixty-four and a factor of two behind at two hundred and fifty-six, off the
-  same kernels.
+  golem gains a few per cent. On the 26B that is enough for golem to be ahead
+  by two fifths at sixty-four and a factor of one and nine tenths behind at
+  two hundred and fifty-six, off the same kernels. Further out llama.cpp
+  reaches 4055 at five hundred and twelve positions and flattens there against
+  its own micro-batch; golem reaches 1486 and then falls back to 1319 at a
+  thousand and twenty-four, where a pass is cut into chunks of two hundred and
+  fifty-six and the expert stack is read once for each chunk.
 
   The 26B's row is the one that moved this far at all. Its prompt used to go a
   position at a time, because each position routes to its own eight matrices
   of a hundred and twenty-eight and two positions share no read; read by
   expert instead — for each expert, the columns that chose it — it went from
-  173 tokens a second to 1436. What the by-expert kernels do not yet have is
-  the tiled product's shape. They run at about ninety gigabytes a second where
-  the tiled product beside them reaches two hundred and sixty-seven, and
-  nothing parametric moves them: holding sixteen, thirty-two or sixty-four
-  columns to a weight read instead of eight is monotonically worse even though
-  it halves and quarters the traffic, and the lane count is flat. A kernel
-  whose speed does not answer to its traffic is not short of bandwidth, and
-  `vk/shaders/moe_id_down.comp` says what it is short of.
+  173 tokens a second to 1474, and it is the one row here where golem leads.
 
-  Generation is within a tenth. The prompt is not, and what is left of the gap
+  **The by-expert down projection is now the tiled product itself**, built
+  with BYID over an expert's list rather than the batch's columns, and its own
+  kernel is gone. That stage went from 43.5 milliseconds to 34.4 over thirty
+  blocks. The whole pass went from 243 to 240, which is the more useful
+  number: the rewrite was aimed at bandwidth and the pass is not made of
+  bandwidth. Two hundred and fifty-six columns cost 240 milliseconds and
+  sixty-four cost 70 — a straight line of nine tenths of a millisecond a
+  column over an intercept of eleven. The expert stack is read once either
+  way, so what the extra columns buy is arithmetic. Nothing is spilling
+  either: 13.6 gibibytes of video memory in use against sixteen, and 340
+  mebibytes of system memory. `vk/shaders/matmul.comp` carries the whole
+  measurement, including what the shape it replaced could not reach.
+
+  Generation is a tenth behind on the small models and a fifth on the 26B. The
+  prompt is further, and what is left of the gap
   has been measured rather than guessed. The cost of a tiled product is a
   straight line — the weights, which are already read at two hundred and
   twenty-five gigabytes a second, plus a term per column that is instructions
