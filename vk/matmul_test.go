@@ -79,7 +79,12 @@ func TestMatMulMatchesCPU(t *testing.T) {
 	for _, columns := range []int{32, 64, 128} {
 		t.Run("tiled"+itoa(columns), func(t *testing.T) { matMulMatchesCPU(t, columns, false) })
 	}
-	t.Run("coopmat", func(t *testing.T) { matMulMatchesCPU(t, 32, true) })
+	// The same widths for the cooperative product, and for the same reason:
+	// it has its own BN and its own split, and either one left uncounted in
+	// the dispatch answers a fraction of the batch and reads as a speed-up.
+	for _, columns := range []int{32, 64, 128, 256} {
+		t.Run("coopmat"+itoa(columns), func(t *testing.T) { matMulMatchesCPU(t, columns, true) })
+	}
 }
 
 func matMulMatchesCPU(t *testing.T, cols int, coop bool) {
@@ -155,7 +160,7 @@ func BenchmarkMatMul(b *testing.B) {
 			name    string
 			columns int
 			coop    bool
-		}{{"8", 8, false}, {"32", 32, false}, {"64", 64, false}, {"128", 128, false}, {"coop32", 32, true}, {"coop64", 64, true}, {"coop128", 128, true}, {"coop256", 256, true}} {
+		}{{"8", 8, false}, {"32", 32, false}, {"64", 64, false}, {"128", 128, false}, {"256", 256, false}, {"coop32", 32, true}, {"coop64", 64, true}, {"coop128", 128, true}, {"coop256", 256, true}} {
 			columns, coop := spec.columns, spec.coop
 			b.Run(shape.name+"/"+spec.name, func(b *testing.B) {
 				g, m := namedQ4_0(b, shape.tensor)

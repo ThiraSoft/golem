@@ -67,9 +67,22 @@
 // twenty-eight columns, against the integer product's 4.24 at thirty-two. That
 // is the first time the cores have been ahead of the dot products.
 //
-// It is still not bound in, for two reasons. It wants a pass of at least a
-// hundred and twenty-eight columns to get there, which is four times what the
-// stack carries; and **ffn_gate does not move**. That shape — many rows, a
+// **Measured again once the harness stopped lying about it, it is at parity
+// and not ahead.** vk/matmul.go used to force this kernel's split to one and
+// pass it no BN at all, so every number the benchmark had ever printed for it
+// was of a kernel without the two things that put it ahead — and the dispatch
+// did not count its column groups either, which for a kernel nothing binds is
+// a bug waiting rather than a bug. With all three fixed, on the 12B at two
+// hundred and fifty-six columns, which is the width the stack now carries:
+// ffn_down 4.76 microseconds a column against the integer product's 4.69, and
+// ffn_gate 9.01 against 8.90. The cores are level with the dot products and
+// marginally behind, which is what this file's own analysis predicted — eighty
+// per cent of the pass is the staging, and the staging is the same.
+//
+// It is still not bound in, and now for one reason rather than two. It wanted
+// a pass of at least a hundred and twenty-eight columns, and the stack carries
+// two hundred and fifty-six now, so that objection is gone; what remains is
+// that there is nothing to win. And **ffn_gate does not move**. That shape — many rows, a
 // short shared dimension, which is what every gate, up and qkv projection is —
 // sits at six microseconds a column under every combination of BM, BN, BK,
 // split and width measured, integer or cooperative, while ffn_down's shape
