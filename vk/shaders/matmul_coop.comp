@@ -1,0 +1,250 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// y = W * X on the matrix cores, for one Q4_0 matrix against a batch of Q8_0
+// activations.
+//
+// **This is not bound in, and here is what it measures and why it was
+// written.** llama.cpp's own Vulkan build on this card says
+// `matrix cores: KHR_coopmat` in its log, and turning them off with
+// GGML_VK_DISABLE_COOPMAT=1 takes its Qwen3 4B prompt from 2958 tokens a
+// second to 1532. That factor of 1.93 is the largest single piece of the gap
+// between golem's prompt and theirs, and this file is the attempt at it.
+//
+// RDNA's cores multiply a sixteen by sixteen block in one instruction. The
+// trade they ask for is that both operands arrive as ordinary numbers, so this
+// kernel dequantises the weights and the activation into shared memory as fp16
+// and multiplies what it staged — which is what llama.cpp's own mul_mm does,
+// and is why there is no correction term here where the integer kernels carry
+// one: the weights are recentred by eight as they are unpacked rather than
+// eight blocks later.
+//
+// It agrees with the CPU to a part in six thousand and it is slower than
+// shaders/matmul.comp: 9.1 microseconds a column against 5.9 on the Qwen3 4B's
+// ffn_down at thirty-two columns, 6.5 against nothing at all at two hundred
+// and fifty-six. What that cost is made of was measured by compiling pieces of
+// it away:
+//
+//   - **The cores are not the problem.** Repeating the multiply loop four and
+//     sixteen times over the same staged tile costs 0.66 microseconds a column
+//     each time, which puts the multiply at 76 TFLOP/s — the same order as
+//     llama.cpp's own 70 on a 512-column product. Seven per cent of the pass.
+//   - **The dequantising is not the problem either.** Compiled with the
+//     unpacking replaced by a store that still depends on the block, the pass
+//     goes from 9.1 to 7.8. Fourteen per cent.
+//   - So about eighty per cent of it is the staging: the global reads, the
+//     shared writes, and the barriers between them. That is the same eighty
+//     per cent shaders/matmul.comp spends, and neither kernel has found it.
+//
+// What was tried against that and measured worse, so that it is not tried
+// again:
+//
+//   - **A bigger BK.** Sixty-four, a hundred and twenty-eight and two hundred
+//     and fifty-six all lose, monotonically, and the reason is that the staged
+//     tile is what decides how many workgroups a compute unit holds. At BK=32
+//     this kernel is under eight kilobytes and the card runs eight of them.
+//   - **A bigger BM.** A hundred and twenty-eight and two hundred and
+//     fifty-six lose the same way and for the same reason.
+//   - **Interleaving the weights by tile** so that a workgroup's read of one
+//     block is one contiguous run instead of BM sixteen-byte pieces a row
+//     apart — vk/mixture.go's tileQ4_0. It is the layout this kernel reads and
+//     it changed nothing measurable, which says the level two cache was
+//     already absorbing the waste.
+//   - **Reading the activation as fp16 straight from a buffer** instead of
+//     staging it, so that forty workgroups stop dequantising the same twelve
+//     million values into forty copies. Thirty-two columns got worse (11.1
+//     against 9.1) and only a hundred and twenty-eight got better.
+//
+// The one thing the plan calls for and that has not been tried is splitting
+// the shared dimension across workgroups with a reduce pass. Every sweep in
+// this file says the card wants more work in flight and less of it per thread,
+// and that is the only lever left that gives it any.
+
+#ifndef COLUMNS
+#define COLUMNS 32
+#endif
+
+// BM rows to a workgroup, BK of the shared dimension at a time. BK is a
+// multiple of thirty-two because a Q4_0 block is thirty-two values and a block
+// is the unit a scale belongs to.
+#ifndef BM
+#define BM 64
+#endif
+#ifndef BK
+#define BK 32
+#endif
+#ifndef THREADS
+#define THREADS 256
+#endif
+
+// WAVE is the width vk/device.go asks the driver for, and the reason it has to
+// be asked for rather than taken: WAVES below is how many row blocks each wave
+// owns, and an accumulator array indexed by anything the compiler cannot fold
+// is not in registers at all. It is in scratch memory, and a cooperative
+// matrix in scratch memory is the difference between a kernel that runs at the
+// cores' speed and one that runs at a fifth of it.
+#ifndef WAVE
+#define WAVE 64
+#endif
+#define WAVES (THREADS / WAVE)
+
+// The cooperative matrix is sixteen by sixteen by sixteen, which is the only
+// shape this driver offers. RDNA has others in hardware; the extension does
+// not expose them.
+#define TILE 16
+
+// The staged operands, padded so that a wave's lanes do not land on one bank.
+// Shared memory is thirty-two banks of four bytes and these are two-byte
+// values, so the padding is eight of them.
+#define SA_STRIDE (BK + 8)
+#define SB_STRIDE (BK + 8)
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer W  { uint  w[];   };
+layout(std430, binding = 1) readonly  buffer AQ { uint  aq[];  };  // the activation, Q8_0
+layout(std430, binding = 2) readonly  buffer AS { float as_[]; };  // its scales, then its corrections
+layout(std430, binding = 3) writeonly buffer Y  { float y[];   };
+
+
+layout(push_constant) uniform Push {
+    uint dim;   // outputs
+    uint ffn;   // inputs
+    uint used;  // one, and only here so that every kernel takes the same block
+    uint act;   // the activation, which is spent before this kernel runs
+} p;
+
+shared float16_t sa[BM * SA_STRIDE];
+shared float16_t sb[COLUMNS * SB_STRIDE];
+
+// The answer goes straight out. A cooperative matrix is stored to a stride the
+// whole sixteen-row tile has to exist for, which is why vk/matmul.go refuses a
+// matrix whose row count is not a multiple of sixteen: with that, a row block
+// is either wholly inside the matrix or wholly outside it, and the one below
+// skips the outside ones.
+
+void main() {
+    uint t    = gl_LocalInvocationID.x;
+    uint row0 = gl_WorkGroupID.x * uint(BM);
+    uint nb   = p.ffn >> 5;          // blocks of the shared dimension
+    uint aw   = p.ffn >> 2;          // one column of the activation, in uints
+    uint rowBytes = nb * 18u;
+    const uint KB = uint(BK) >> 5;   // Q4_0 blocks in one step
+
+    // The tile this wave owns: RSUB row blocks by every column block, which
+    // are static counts, so the accumulators stay in registers.
+    const uint RB = uint(BM) / uint(TILE);
+    const uint CB = uint(COLUMNS) / uint(TILE);
+    const uint RSUB = RB / uint(WAVES);
+    uint rbase = gl_SubgroupID * RSUB;
+
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc[RSUB][CB];
+    [[unroll]] for (uint r = 0u; r < RSUB; r++) {
+        [[unroll]] for (uint c = 0u; c < CB; c++) {
+            acc[r][c] = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    for (uint kb = 0u; kb < nb; kb += KB) {
+        barrier();
+
+        // The weights, dequantised.
+        //
+        // The layout is vk/mixture.go's tileQ4_0: this workgroup's BM rows are
+        // interleaved, so one block of the shared dimension is BM fp16 scales
+        // and then BM sets of sixteen nibble bytes, all of it one run. A wave
+        // reading it reads consecutive addresses, which is the difference
+        // between using a cache line and using an eighth of one.
+        //
+        // A thread takes one uint of nibbles, which is eight weights: four in
+        // the low nibbles at k, four in the high nibbles sixteen further on.
+        // That is the Q4_0 layout, not a choice.
+        for (uint idx = t; idx < BM * KB * 4u; idx += uint(THREADS)) {
+            uint u    = idx & 3u;
+            uint rest = idx >> 2;
+            uint r    = rest & (uint(BM) - 1u);
+            uint k    = rest / uint(BM);
+            uint b    = kb + k;
+            uint word = 0u;
+            float ws = 0.0;
+            if (row0 + r < p.dim && b < nb) {
+                uint base = (gl_WorkGroupID.x * nb + b) * uint(BM) * 18u;
+                word = w[((base + uint(BM) * 2u + r * 16u) >> 2) + u];
+                ws   = unpackHalf2x16(w[(base + 2u * r) >> 2])[r & 1u];
+            }
+            uint at = r * uint(SA_STRIDE) + k * 32u + u * 4u;
+            [[unroll]] for (uint m = 0u; m < 4u; m++) {
+                uint byte = (word >> (8u * m)) & 0xFFu;
+                sa[at + m]       = float16_t((float(byte & 0x0Fu) - 8.0) * ws);
+                sa[at + 16u + m] = float16_t((float(byte >> 4)    - 8.0) * ws);
+            }
+        }
+
+        // The activation, dequantised. A thread takes one uint, four
+        // magnitudes, signed. This one does pass through shared memory: read
+        // straight from a buffer instead, as fp16 written once by the kernel
+        // upstream, a thirty-two column pass measured worse and only a
+        // hundred-and-twenty-eight column pass measured better.
+        for (uint idx = t; idx < COLUMNS * KB * 8u; idx += uint(THREADS)) {
+            uint u    = idx & 7u;
+            uint rest = idx >> 3;
+            uint k    = rest % KB;
+            uint c    = rest / KB;
+            uint b    = kb + k;
+            uint word = 0u;
+            float as = 0.0;
+            if (b < nb) {
+                word = aq[c * aw + b * 8u + u];
+                as   = as_[c * 2u * nb + b];
+            }
+            uint base = c * uint(SB_STRIDE) + k * 32u + u * 4u;
+            [[unroll]] for (uint m = 0u; m < 4u; m++) {
+                int q = int((word >> (8u * m)) & 0xFFu);
+                if (q > 127) q -= 256;
+                sb[base + m] = float16_t(float(q) * as);
+            }
+        }
+
+        barrier();
+
+        // The cores.
+        //
+        // The order of these three loops is the kernel. A cooperative load and
+        // a cooperative multiply cost about the same, so a loop that loads
+        // both operands for every multiply spends half its time loading and
+        // reaches a fraction of what the cores can do. The K step is outermost
+        // and the column fragments are loaded once into registers there; then
+        // each row block loads its own fragment once and meets all of them.
+        // That is CB + RB loads for RB * CB multiplies instead of two for one.
+        [[unroll]] for (uint kk = 0u; kk < uint(BK) / uint(TILE); kk++) {
+            coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> B[CB];
+            [[unroll]] for (uint c = 0u; c < CB; c++) {
+                // The activation is one column after another, so a K by N
+                // block of it is column major.
+                coopMatLoad(B[c], sb, c * uint(TILE) * uint(SB_STRIDE) + kk * uint(TILE),
+                            uint(SB_STRIDE), gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint r = 0u; r < RSUB; r++) {
+                coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> A;
+                coopMatLoad(A, sa, (rbase + r) * uint(TILE) * uint(SA_STRIDE) + kk * uint(TILE),
+                            uint(SA_STRIDE), gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint c = 0u; c < CB; c++) {
+                    acc[r][c] = coopMatMulAdd(A, B[c], acc[r][c]);
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0u; r < RSUB; r++) {
+        uint row = row0 + (rbase + r) * uint(TILE);
+        if (row >= p.dim) continue;
+        [[unroll]] for (uint c = 0u; c < CB; c++) {
+            coopMatStore(acc[r][c], y, c * uint(TILE) * p.dim + row,
+                         p.dim, gl_CooperativeMatrixLayoutColumnMajor);
+        }
+    }
+}

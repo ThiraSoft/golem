@@ -20,6 +20,10 @@ type Device struct {
 	memory  physicalDeviceMemoryProperties
 	cmdPool uint64
 	cmd     commandBuffer
+
+	// coopmat says the device took the matrix-core extensions at creation, so
+	// a kernel that declares CooperativeMatrixKHR may be compiled on it.
+	coopmat bool
 }
 
 // Open finds the first device with a compute queue and takes it.
@@ -90,20 +94,56 @@ func Open() (*Device, error) {
 		queueCount:       1,
 		pQueuePriorities: uintptr(unsafe.Pointer(&priority)),
 	}
-	if err := d.requireDotProduct(); err != nil {
+	have, err := d.extensions()
+	if err != nil {
 		d.Close()
 		return nil, err
 	}
-	ext := append([]byte(dotProductExtension), 0)
-	extName := uintptr(unsafe.Pointer(&ext[0]))
-	feat := shaderIntegerDotProductFeatures{sType: structDotProductFeatures, shaderIntegerDotProduct: 1}
+	if !have[dotProductExtension] {
+		d.Close()
+		return nil, fmt.Errorf("vk: the device does not offer %s", dotProductExtension)
+	}
+	names := [][]byte{append([]byte(dotProductExtension), 0)}
+
+	// The matrix cores, if this device has them. They are asked for as a group
+	// or not at all — the product needs all four capabilities — and a device
+	// without them keeps the kernel that reaches the same answer with a
+	// four-byte dot product. shaders/matmul_coop.comp says what the difference
+	// is worth.
+	dot := shaderIntegerDotProductFeatures{sType: structDotProductFeatures, shaderIntegerDotProduct: 1}
+	coop := cooperativeMatrixFeatures{sType: structCooperativeMatrixFeatures, cooperativeMatrix: 1}
+	model := memoryModelFeatures{sType: structMemoryModelFeatures, vulkanMemoryModel: 1}
+	f16 := shaderFloat16Int8Features{sType: structFloat16Int8Features, shaderFloat16: 1, shaderInt8: 1}
+	st16 := storage16BitFeatures{sType: struct16BitStorageFeatures, storageBuffer16BitAccess: 1, uniformAndStorageBuffer16BitAccess: 1}
+	waves := subgroupSizeFeatures{sType: structSubgroupSizeFeatures, subgroupSizeControl: 1, computeFullSubgroups: 1}
+	chain := uintptr(unsafe.Pointer(&dot))
+	d.coopmat = true
+	for _, name := range coopmatExtensions {
+		if !have[name] {
+			d.coopmat = false
+		}
+	}
+	if d.coopmat {
+		for _, name := range coopmatExtensions {
+			names = append(names, append([]byte(name), 0))
+		}
+		dot.pNext = uintptr(unsafe.Pointer(&coop))
+		coop.pNext = uintptr(unsafe.Pointer(&model))
+		model.pNext = uintptr(unsafe.Pointer(&f16))
+		f16.pNext = uintptr(unsafe.Pointer(&st16))
+		st16.pNext = uintptr(unsafe.Pointer(&waves))
+	}
+	pointers := make([]uintptr, len(names))
+	for i := range names {
+		pointers[i] = uintptr(unsafe.Pointer(&names[i][0]))
+	}
 	dci := deviceCreateInfo{
 		sType:                   structDeviceCreateInfo,
-		pNext:                   uintptr(unsafe.Pointer(&feat)),
+		pNext:                   chain,
 		queueCreateInfoCount:    1,
 		pQueueCreateInfos:       uintptr(unsafe.Pointer(&qci)),
-		enabledExtensionCount:   1,
-		ppEnabledExtensionNames: uintptr(unsafe.Pointer(&extName)),
+		enabledExtensionCount:   uint32(len(pointers)),
+		ppEnabledExtensionNames: uintptr(unsafe.Pointer(&pointers[0])),
 	}
 	if err := check("vkCreateDevice", vkCreateDevice(d.phys, &dci, 0, &d.dev)); err != nil {
 		d.Close()
@@ -144,31 +184,52 @@ func Open() (*Device, error) {
 // falls back to the CPU as it does when there is no Vulkan at all.
 const dotProductExtension = "VK_KHR_shader_integer_dot_product"
 
-// requireDotProduct fails unless the chosen device offers it.
-func (d *Device) requireDotProduct() error {
+// coopmatExtensions is what the cooperative-matrix product is written
+// against: the matrix cores, the memory model its loads are defined in, and
+// the sixteen-bit types the dequantised tiles are staged as.
+var coopmatExtensions = []string{
+	"VK_KHR_cooperative_matrix",
+	"VK_KHR_vulkan_memory_model",
+	"VK_KHR_shader_float16_int8",
+	"VK_KHR_16bit_storage",
+	"VK_EXT_subgroup_size_control",
+}
+
+// coopmatWave is the width the cooperative product is built for. The shader
+// divides its rows between a fixed number of waves, so the number has to be
+// fixed: shaders/matmul_coop.comp's THREADS divided by this. RADV runs compute
+// at sixty-four by default and offers thirty-two, and this asks for what the
+// shader was written against rather than taking what it is given.
+const coopmatWave = 64
+
+// Coopmat says whether this device took the matrix cores, which decides which
+// product a wide pass runs.
+func (d *Device) Coopmat() bool { return d.coopmat }
+
+// extensions is the set the chosen device offers.
+func (d *Device) extensions() (map[string]bool, error) {
 	var n uint32
 	if err := check("vkEnumerateDeviceExtensionProperties",
 		vkEnumerateDeviceExtensionProperties(d.phys, 0, &n, nil)); err != nil {
-		return err
+		return nil, err
 	}
+	have := map[string]bool{}
 	if n == 0 {
-		return fmt.Errorf("vk: the device offers no extensions, and %s is needed", dotProductExtension)
+		return have, nil
 	}
 	props := make([]extensionProperties, n)
 	if err := check("vkEnumerateDeviceExtensionProperties",
 		vkEnumerateDeviceExtensionProperties(d.phys, 0, &n, &props[0])); err != nil {
-		return err
+		return nil, err
 	}
 	for _, p := range props[:n] {
 		end := 0
 		for end < len(p.name) && p.name[end] != 0 {
 			end++
 		}
-		if string(p.name[:end]) == dotProductExtension {
-			return nil
-		}
+		have[string(p.name[:end])] = true
 	}
-	return fmt.Errorf("vk: the device does not offer %s", dotProductExtension)
+	return have, nil
 }
 
 // Close releases the device. Buffers and pipelines built on it must be closed

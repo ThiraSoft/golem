@@ -14,6 +14,10 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 )
 
+//go:generate glslc -O -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop32.spv
+//go:generate glslc -O -DCOLUMNS=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop64.spv
+//go:generate glslc -O -DCOLUMNS=128 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop128.spv
+//go:generate glslc -O -DCOLUMNS=256 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop256.spv
 //go:generate glslc -O -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul32.spv
 //go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul8.spv
 
@@ -31,21 +35,28 @@ const (
 // matmulRows is shaders/matmul.comp's BM: how many rows one workgroup writes.
 const matmulRows = 32
 
+// matmulCoopRows is shaders/matmul_coop.comp's BM, which is its own number:
+// the cooperative product works in sixteen-row blocks and takes four of them.
+const matmulCoopRows = 64
+
 // A MatMul is one Q4_0 matrix resident on a device with the buffers a batch
 // passes through.
 type MatMul struct {
 	d          *Device
 	rows, cols int
 	columns    int
+	// perGroup is how many rows one workgroup of the chosen kernel writes.
+	perGroup int
 
 	weights, aq, as, out *Buffer
+	coop                 bool
 	pipe                 *Pipeline
 	set                  *Set
 }
 
 // NewMatMul uploads a Q4_0 matrix in the file's own layout and binds the tiled
 // product to it, for passes of the given width.
-func NewMatMul(d *Device, data []byte, rows, cols, columns int) (*MatMul, error) {
+func NewMatMul(d *Device, data []byte, rows, cols, columns int, coop bool) (*MatMul, error) {
 	if cols%nn.QuantBlock != 0 {
 		return nil, fmt.Errorf("vk: a Q4_0 row needs a multiple of %d columns, given %d", nn.QuantBlock, cols)
 	}
@@ -53,12 +64,27 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int) (*MatMul, error)
 		return nil, fmt.Errorf("vk: %d rows of %d columns need %d bytes, given %d", rows, cols, want, len(data))
 	}
 	spirv, err := matmulSPIRV(columns)
-	if err != nil {
+	if err != nil && !coop {
 		return nil, err
 	}
+	perGroup, wave := matmulRows, uint32(0)
+	if coop && d.Coopmat() {
+		wave = coopmatWave
+		if rows%coopTile != 0 {
+			return nil, fmt.Errorf("vk: the cooperative product writes %d rows at a time, and %d is not a multiple of it", coopTile, rows)
+		}
+		if spirv, err = matmulCoopSPIRV(columns); err != nil {
+			return nil, err
+		}
+		perGroup = matmulCoopRows
+	}
 
-	m := &MatMul{d: d, rows: rows, cols: cols, columns: columns}
-	if m.weights, err = d.Upload(splitQ4_0(data, rows, cols)); err != nil {
+	m := &MatMul{d: d, rows: rows, cols: cols, columns: columns, perGroup: perGroup, coop: coop && d.Coopmat()}
+	layout := splitQ4_0(data, rows, cols)
+	if coop && d.Coopmat() {
+		layout = tileQ4_0(data, rows, cols, perGroup)
+	}
+	if m.weights, err = d.Upload(layout); err != nil {
 		return nil, err
 	}
 	nb := cols / nn.QuantBlock
@@ -85,7 +111,7 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int) (*MatMul, error)
 	}
 
 	buffers := []*Buffer{m.weights, m.aq, m.as, m.out}
-	if m.pipe, err = d.NewPipeline(spirv, len(buffers), uint32(unsafe.Sizeof(moePush{}))); err != nil {
+	if m.pipe, err = d.newPipeline(spirv, len(buffers), uint32(unsafe.Sizeof(moePush{})), wave); err != nil {
 		m.Close()
 		return nil, err
 	}
@@ -94,6 +120,21 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int) (*MatMul, error)
 		return nil, err
 	}
 	return m, nil
+}
+
+// matmulCoopSPIRV is the cooperative product built for that many columns.
+func matmulCoopSPIRV(columns int) ([]byte, error) {
+	switch columns {
+	case 32:
+		return matmulCoop32SPIRV, nil
+	case 64:
+		return matmulCoop64SPIRV, nil
+	case 128:
+		return matmulCoop128SPIRV, nil
+	case 256:
+		return matmulCoop256SPIRV, nil
+	}
+	return nil, fmt.Errorf("vk: the cooperative product is built at 32, 64 and 128 columns, not %d", columns)
 }
 
 // matmulSPIRV is the binary built for that many columns.
@@ -144,7 +185,7 @@ func (m *MatMul) Run(out [][]float32) error {
 		}
 	}
 	push := moePush{dim: uint32(m.rows), ffn: uint32(m.cols), used: 1}
-	groups := uint32((m.rows + matmulRows - 1) / matmulRows)
+	groups := uint32((m.rows + m.perGroup - 1) / m.perGroup)
 	if err := m.set.Dispatch(groups, unsafe.Pointer(&push)); err != nil {
 		return err
 	}
@@ -162,7 +203,7 @@ func (m *MatMul) Run(out [][]float32) error {
 // says the same about the feed forward.
 func (m *MatMul) RunTimes(n int) error {
 	push := moePush{dim: uint32(m.rows), ffn: uint32(m.cols), used: 1}
-	groups := uint32((m.rows + matmulRows - 1) / matmulRows)
+	groups := uint32((m.rows + m.perGroup - 1) / m.perGroup)
 	return m.d.Submit(func(r *Recorder) {
 		for i := 0; i < n; i++ {
 			if i > 0 {

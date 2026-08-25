@@ -45,6 +45,10 @@ type Pipeline struct {
 // NewPipeline compiles one SPIR-V compute shader that reads the given number
 // of storage buffers, at bindings 0..bindings-1.
 func (d *Device) NewPipeline(spirv []byte, bindings int, pushBytes uint32) (*Pipeline, error) {
+	return d.newPipeline(spirv, bindings, pushBytes, 0)
+}
+
+func (d *Device) newPipeline(spirv []byte, bindings int, pushBytes uint32, wave uint32) (*Pipeline, error) {
 	p := &Pipeline{d: d, pushBytes: pushBytes, bindings: bindings}
 
 	smci := shaderModuleCreateInfo{
@@ -91,10 +95,18 @@ func (d *Device) NewPipeline(spirv []byte, bindings int, pushBytes uint32) (*Pip
 	}
 
 	name := append([]byte("main"), 0)
+	// A wave width, where the kernel was written for one. The structure has
+	// to outlive the call, which it does: the driver reads it there and then.
+	size := requiredSubgroupSizeCreateInfo{sType: structRequiredSubgroupSize, requiredSubgroupSize: wave}
+	var pNext uintptr
+	if wave != 0 {
+		pNext = uintptr(unsafe.Pointer(&size))
+	}
 	cpci := computePipelineCreateInfo{
 		sType: structComputePipelineCreateInfo,
 		stage: pipelineShaderStageCreateInfo{
 			sType:  structPipelineShaderStageInfo,
+			pNext:  pNext,
 			stage:  shaderStageCompute,
 			module: p.module,
 			pName:  uintptr(unsafe.Pointer(&name[0])),
@@ -118,6 +130,15 @@ func (d *Device) NewPipeline(spirv []byte, bindings int, pushBytes uint32) (*Pip
 // which is a compile-time constant there because the accumulators have to stay
 // in registers. shaders/matvec.comp says why.
 func (p *Pipeline) Wide(columns int, spirv []byte) error {
+	return p.wideAt(columns, spirv, 0)
+}
+
+// WideWave is Wide for a binary that has to run at a named wave width.
+func (p *Pipeline) WideWave(columns int, spirv []byte, wave uint32) error {
+	return p.wideAt(columns, spirv, wave)
+}
+
+func (p *Pipeline) wideAt(columns int, spirv []byte, wave uint32) error {
 	smci := shaderModuleCreateInfo{
 		sType:    structShaderModuleCreateInfo,
 		codeSize: uint64(len(spirv)),
@@ -132,10 +153,18 @@ func (p *Pipeline) Wide(columns int, spirv []byte) error {
 	}
 	p.wideModules[columns] = module
 	name := append([]byte("main"), 0)
+	// A wave width, where the kernel was written for one. The structure has
+	// to outlive the call, which it does: the driver reads it there and then.
+	size := requiredSubgroupSizeCreateInfo{sType: structRequiredSubgroupSize, requiredSubgroupSize: wave}
+	var pNext uintptr
+	if wave != 0 {
+		pNext = uintptr(unsafe.Pointer(&size))
+	}
 	cpci := computePipelineCreateInfo{
 		sType: structComputePipelineCreateInfo,
 		stage: pipelineShaderStageCreateInfo{
 			sType:  structPipelineShaderStageInfo,
+			pNext:  pNext,
 			stage:  shaderStageCompute,
 			module: module,
 			pName:  uintptr(unsafe.Pointer(&name[0])),

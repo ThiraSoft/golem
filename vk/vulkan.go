@@ -52,9 +52,15 @@ const (
 	structMemoryBarrier             = 46
 	structApplicationInfo           = 0
 	structDotProductFeatures        = 1000280000
+	structFloat16Int8Features       = 1000082000
+	struct16BitStorageFeatures      = 1000083000
+	structMemoryModelFeatures       = 1000211000
+	structCooperativeMatrixFeatures = 1000506000
+	structSubgroupSizeFeatures      = 1000225002
+	structRequiredSubgroupSize      = 1000225001
 
-	apiVersion11 = 1 << 22 // VK_API_VERSION_1_1
-	structQueryPoolCreateInfo       = 11
+	apiVersion11              = 1 << 22 // VK_API_VERSION_1_1
+	structQueryPoolCreateInfo = 11
 
 	queryTypeTimestamp = 2
 
@@ -112,6 +118,75 @@ type shaderIntegerDotProductFeatures struct {
 	pNext                   uintptr
 	shaderIntegerDotProduct uint32
 	_                       uint32
+}
+
+// The four the cooperative-matrix product needs, in the shape the driver reads
+// them: a chain of structures hung off the device's pNext, each one a header
+// and its flags. A capability the SPIR-V declares and the device was not asked
+// for is undefined behaviour, and on this driver it is a crash inside
+// vkCreateShaderModule rather than an error, so the ask has to be exact.
+// spirv-dis on shaders/matmul_coop.comp is where the list comes from.
+
+// shaderFloat16Int8Features asks for the Float16 capability.
+type shaderFloat16Int8Features struct {
+	sType         uint32
+	_             uint32
+	pNext         uintptr
+	shaderFloat16 uint32
+	shaderInt8    uint32
+}
+
+// storage16BitFeatures asks for 16-bit types in a storage buffer, which is how
+// the dequantised tiles reach the product.
+type storage16BitFeatures struct {
+	sType                              uint32
+	_                                  uint32
+	pNext                              uintptr
+	storageBuffer16BitAccess           uint32
+	uniformAndStorageBuffer16BitAccess uint32
+	storagePushConstant16              uint32
+	storageInputOutput16               uint32
+}
+
+// memoryModelFeatures asks for the Vulkan memory model, which the cooperative
+// matrix's loads and stores are defined in terms of.
+type memoryModelFeatures struct {
+	sType                                         uint32
+	_                                             uint32
+	pNext                                         uintptr
+	vulkanMemoryModel                             uint32
+	vulkanMemoryModelDeviceScope                  uint32
+	vulkanMemoryModelAvailabilityVisibilityChains uint32
+}
+
+// subgroupSizeFeatures asks to be allowed to name the width of a wave, which
+// the cooperative product needs: how many waves a workgroup has decides which
+// rows each of them owns, and that has to be a compile-time constant or the
+// accumulators fall out of registers into memory.
+type subgroupSizeFeatures struct {
+	sType                uint32
+	_                    uint32
+	pNext                uintptr
+	subgroupSizeControl  uint32
+	computeFullSubgroups uint32
+}
+
+// requiredSubgroupSize is hung off a stage at pipeline creation to name it.
+type requiredSubgroupSizeCreateInfo struct {
+	sType                uint32
+	_                    uint32
+	pNext                uintptr
+	requiredSubgroupSize uint32
+	_                    uint32
+}
+
+// cooperativeMatrixFeatures asks for the matrix cores themselves.
+type cooperativeMatrixFeatures struct {
+	sType                               uint32
+	_                                   uint32
+	pNext                               uintptr
+	cooperativeMatrix                   uint32
+	cooperativeMatrixRobustBufferAccess uint32
 }
 
 type extensionProperties struct {
@@ -440,55 +515,55 @@ type bufferCopy struct {
 
 // The entry points, bound once by load().
 var (
-	vkCreateInstance                    func(*instanceCreateInfo, uintptr, *instance) int32
+	vkCreateInstance                     func(*instanceCreateInfo, uintptr, *instance) int32
 	vkEnumerateDeviceExtensionProperties func(physicalDevice, uintptr, *uint32, *extensionProperties) int32
-	vkDestroyInstance                   func(instance, uintptr)
-	vkEnumeratePhysicalDevices          func(instance, *uint32, *physicalDevice) int32
-	vkGetPhysicalDeviceQueueFamilyProps func(physicalDevice, *uint32, *queueFamilyProperties)
-	vkGetPhysicalDeviceMemoryProperties func(physicalDevice, *physicalDeviceMemoryProperties)
-	vkCreateDevice                      func(physicalDevice, *deviceCreateInfo, uintptr, *device) int32
-	vkDestroyDevice                     func(device, uintptr)
-	vkGetDeviceQueue                    func(device, uint32, uint32, *queue)
-	vkCreateBuffer                      func(device, *bufferCreateInfo, uintptr, *uint64) int32
-	vkDestroyBuffer                     func(device, uint64, uintptr)
-	vkGetBufferMemoryRequirements       func(device, uint64, *memoryRequirements)
-	vkAllocateMemory                    func(device, *memoryAllocateInfo, uintptr, *uint64) int32
-	vkFreeMemory                        func(device, uint64, uintptr)
-	vkBindBufferMemory                  func(device, uint64, uint64, uint64) int32
-	vkMapMemory                         func(device, uint64, uint64, uint64, uint32, *uintptr) int32
-	vkUnmapMemory                       func(device, uint64)
-	vkCreateShaderModule                func(device, *shaderModuleCreateInfo, uintptr, *uint64) int32
-	vkDestroyShaderModule               func(device, uint64, uintptr)
-	vkCreateDescriptorSetLayout         func(device, *descriptorSetLayoutCreateInfo, uintptr, *uint64) int32
-	vkDestroyDescriptorSetLayout        func(device, uint64, uintptr)
-	vkCreatePipelineLayout              func(device, *pipelineLayoutCreateInfo, uintptr, *uint64) int32
-	vkDestroyPipelineLayout             func(device, uint64, uintptr)
-	vkCreateComputePipelines            func(device, uint64, uint32, *computePipelineCreateInfo, uintptr, *uint64) int32
-	vkDestroyPipeline                   func(device, uint64, uintptr)
-	vkCreateDescriptorPool              func(device, *descriptorPoolCreateInfo, uintptr, *uint64) int32
-	vkDestroyDescriptorPool             func(device, uint64, uintptr)
-	vkAllocateDescriptorSets            func(device, *descriptorSetAllocateInfo, *uint64) int32
-	vkUpdateDescriptorSets              func(device, uint32, *writeDescriptorSet, uint32, uintptr)
-	vkCreateCommandPool                 func(device, *commandPoolCreateInfo, uintptr, *uint64) int32
-	vkDestroyCommandPool                func(device, uint64, uintptr)
-	vkAllocateCommandBuffers            func(device, *commandBufferAllocateInfo, *commandBuffer) int32
-	vkFreeCommandBuffers                func(device, uint64, uint32, *commandBuffer)
-	vkBeginCommandBuffer                func(commandBuffer, *commandBufferBeginInfo) int32
-	vkEndCommandBuffer                  func(commandBuffer) int32
-	vkResetCommandBuffer                func(commandBuffer, uint32) int32
-	vkCmdBindPipeline                   func(commandBuffer, uint32, uint64)
-	vkCmdBindDescriptorSets             func(commandBuffer, uint32, uint64, uint32, uint32, *uint64, uint32, uintptr)
-	vkCmdPushConstants                  func(commandBuffer, uint64, uint32, uint32, uint32, unsafe.Pointer)
-	vkCmdDispatch                       func(commandBuffer, uint32, uint32, uint32)
-	vkCmdCopyBuffer                     func(commandBuffer, uint64, uint64, uint32, *bufferCopy)
-	vkCmdPipelineBarrier                func(commandBuffer, uint32, uint32, uint32, uint32, *memoryBarrier, uint32, uintptr, uint32, uintptr)
-	vkCreateQueryPool                   func(device, *queryPoolCreateInfo, uintptr, *uint64) int32
-	vkDestroyQueryPool                  func(device, uint64, uintptr)
-	vkCmdResetQueryPool                 func(commandBuffer, uint64, uint32, uint32)
-	vkCmdWriteTimestamp                 func(commandBuffer, uint32, uint64, uint32)
-	vkGetQueryPoolResults               func(device, uint64, uint32, uint32, uint64, unsafe.Pointer, uint64, uint32) int32
-	vkQueueSubmit                       func(queue, uint32, *submitInfo, uint64) int32
-	vkQueueWaitIdle                     func(queue) int32
+	vkDestroyInstance                    func(instance, uintptr)
+	vkEnumeratePhysicalDevices           func(instance, *uint32, *physicalDevice) int32
+	vkGetPhysicalDeviceQueueFamilyProps  func(physicalDevice, *uint32, *queueFamilyProperties)
+	vkGetPhysicalDeviceMemoryProperties  func(physicalDevice, *physicalDeviceMemoryProperties)
+	vkCreateDevice                       func(physicalDevice, *deviceCreateInfo, uintptr, *device) int32
+	vkDestroyDevice                      func(device, uintptr)
+	vkGetDeviceQueue                     func(device, uint32, uint32, *queue)
+	vkCreateBuffer                       func(device, *bufferCreateInfo, uintptr, *uint64) int32
+	vkDestroyBuffer                      func(device, uint64, uintptr)
+	vkGetBufferMemoryRequirements        func(device, uint64, *memoryRequirements)
+	vkAllocateMemory                     func(device, *memoryAllocateInfo, uintptr, *uint64) int32
+	vkFreeMemory                         func(device, uint64, uintptr)
+	vkBindBufferMemory                   func(device, uint64, uint64, uint64) int32
+	vkMapMemory                          func(device, uint64, uint64, uint64, uint32, *uintptr) int32
+	vkUnmapMemory                        func(device, uint64)
+	vkCreateShaderModule                 func(device, *shaderModuleCreateInfo, uintptr, *uint64) int32
+	vkDestroyShaderModule                func(device, uint64, uintptr)
+	vkCreateDescriptorSetLayout          func(device, *descriptorSetLayoutCreateInfo, uintptr, *uint64) int32
+	vkDestroyDescriptorSetLayout         func(device, uint64, uintptr)
+	vkCreatePipelineLayout               func(device, *pipelineLayoutCreateInfo, uintptr, *uint64) int32
+	vkDestroyPipelineLayout              func(device, uint64, uintptr)
+	vkCreateComputePipelines             func(device, uint64, uint32, *computePipelineCreateInfo, uintptr, *uint64) int32
+	vkDestroyPipeline                    func(device, uint64, uintptr)
+	vkCreateDescriptorPool               func(device, *descriptorPoolCreateInfo, uintptr, *uint64) int32
+	vkDestroyDescriptorPool              func(device, uint64, uintptr)
+	vkAllocateDescriptorSets             func(device, *descriptorSetAllocateInfo, *uint64) int32
+	vkUpdateDescriptorSets               func(device, uint32, *writeDescriptorSet, uint32, uintptr)
+	vkCreateCommandPool                  func(device, *commandPoolCreateInfo, uintptr, *uint64) int32
+	vkDestroyCommandPool                 func(device, uint64, uintptr)
+	vkAllocateCommandBuffers             func(device, *commandBufferAllocateInfo, *commandBuffer) int32
+	vkFreeCommandBuffers                 func(device, uint64, uint32, *commandBuffer)
+	vkBeginCommandBuffer                 func(commandBuffer, *commandBufferBeginInfo) int32
+	vkEndCommandBuffer                   func(commandBuffer) int32
+	vkResetCommandBuffer                 func(commandBuffer, uint32) int32
+	vkCmdBindPipeline                    func(commandBuffer, uint32, uint64)
+	vkCmdBindDescriptorSets              func(commandBuffer, uint32, uint64, uint32, uint32, *uint64, uint32, uintptr)
+	vkCmdPushConstants                   func(commandBuffer, uint64, uint32, uint32, uint32, unsafe.Pointer)
+	vkCmdDispatch                        func(commandBuffer, uint32, uint32, uint32)
+	vkCmdCopyBuffer                      func(commandBuffer, uint64, uint64, uint32, *bufferCopy)
+	vkCmdPipelineBarrier                 func(commandBuffer, uint32, uint32, uint32, uint32, *memoryBarrier, uint32, uintptr, uint32, uintptr)
+	vkCreateQueryPool                    func(device, *queryPoolCreateInfo, uintptr, *uint64) int32
+	vkDestroyQueryPool                   func(device, uint64, uintptr)
+	vkCmdResetQueryPool                  func(commandBuffer, uint64, uint32, uint32)
+	vkCmdWriteTimestamp                  func(commandBuffer, uint32, uint64, uint32)
+	vkGetQueryPoolResults                func(device, uint64, uint32, uint32, uint64, unsafe.Pointer, uint64, uint32) int32
+	vkQueueSubmit                        func(queue, uint32, *submitInfo, uint64) int32
+	vkQueueWaitIdle                      func(queue) int32
 )
 
 var loaded bool

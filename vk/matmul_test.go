@@ -72,6 +72,16 @@ func oneColumn(b *nn.Batch, c int) *nn.Batch {
 }
 
 func TestMatMulMatchesCPU(t *testing.T) {
+	for _, coop := range []bool{false, true} {
+		name := "tiled"
+		if coop {
+			name = "coopmat"
+		}
+		t.Run(name, func(t *testing.T) { matMulMatchesCPU(t, coop) })
+	}
+}
+
+func matMulMatchesCPU(t *testing.T, coop bool) {
 	g, m := aQ4_0(t)
 	defer g.Close()
 	d := open(t)
@@ -87,7 +97,7 @@ func TestMatMulMatchesCPU(t *testing.T) {
 	}
 	m.MatVecBatch(batch, want)
 
-	mm, err := NewMatMul(d, m.Data, m.Rows, m.Cols, cols)
+	mm, err := NewMatMul(d, m.Data, m.Rows, m.Cols, cols, coop)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,14 +151,19 @@ func BenchmarkMatMul(b *testing.B) {
 		{"down", "blk.0.ffn_down.weight"}, // 2560 rows by 9728: forty workgroups
 		{"gate", "blk.0.ffn_gate.weight"}, // 9728 rows by 2560: a hundred and fifty-two
 	} {
-		for _, columns := range []int{8, 32} {
-			b.Run(shape.name+"/"+itoa(columns), func(b *testing.B) {
+		for _, spec := range []struct {
+			name    string
+			columns int
+			coop    bool
+		}{{"8", 8, false}, {"32", 32, false}, {"coop32", 32, true}, {"coop64", 64, true}, {"coop128", 128, true}, {"coop256", 256, true}} {
+			columns, coop := spec.columns, spec.coop
+			b.Run(shape.name+"/"+spec.name, func(b *testing.B) {
 				g, m := namedQ4_0(b, shape.tensor)
 				defer g.Close()
 				d := open(b)
 				defer d.Close()
 
-				mm, err := NewMatMul(d, m.Data, m.Rows, m.Cols, columns)
+				mm, err := NewMatMul(d, m.Data, m.Rows, m.Cols, columns, coop)
 				if err != nil {
 					b.Fatal(err)
 				}
