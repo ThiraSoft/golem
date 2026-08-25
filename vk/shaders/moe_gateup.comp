@@ -39,6 +39,7 @@ layout(push_constant) uniform Push {
     uint dim;   // inputs to the projection
     uint ffn;   // outputs of it, per half
     uint used;  // how many experts this dispatch is for; one, for a shared branch
+    uint act;   // 0: ggml's tabulated GELU; 1: SiLU, which is a swiglu's half
 } p;
 
 const uint LANES = 8u;
@@ -169,11 +170,19 @@ void main() {
     if (t < 32u) {
         float g = half_[t];
         float a;
-        // ggml does not evaluate GELU: it rounds to fp16 and looks the answer
-        // up, with the two ends left alone. nn/gelu_table.go says why.
-        if (g <= -10.0)      a = 0.0;
-        else if (g >= 10.0)  a = g;
-        else                 a = gelu[floatToHalf(g)];
+        if (p.act == 1u) {
+            // SiLU, evaluated rather than looked up: ggml computes a swiglu's
+            // half as x/(1+exp(-x)), and nn/swiglu.go is the other copy.
+            a = g / (1.0 + exp(-g));
+        } else if (g <= -10.0) {
+            // ggml does not evaluate GELU: it rounds to fp16 and looks the
+            // answer up, with the two ends left alone. nn/gelu_table.go says why.
+            a = 0.0;
+        } else if (g >= 10.0) {
+            a = g;
+        } else {
+            a = gelu[floatToHalf(g)];
+        }
         half_[t] = a * half_[32u + t];
     }
     barrier();

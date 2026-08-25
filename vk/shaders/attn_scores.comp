@@ -34,7 +34,8 @@ layout(push_constant) uniform Push {
     uint block;     // which entry of where_ holds the visible range
     uint capacity;
     uint mask;      // capacity - 1 when that is a mask, and zero otherwise
-    uint stride;    // scores kept per head
+    uint stride;   // scores kept per head
+    float scale;   // 1/sqrt(head_dim), or one where a query norm holds the range
 } p;
 
 shared float partial[256];
@@ -100,7 +101,7 @@ void main() {
             uint i = pair << 1;
             s += qh[qb + i] * key.x + qh[qb + i + 1u] * key.y;
         }
-        scores[sb + m] = s;
+        scores[sb + m] = s * p.scale;
     }
     barrier();
 

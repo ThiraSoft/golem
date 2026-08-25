@@ -204,6 +204,17 @@ Worth knowing before you clone it:
   12B, **5.0 tokens a second becomes 58.1**, against llama.cpp's 61.2 on the
   same card.
 
+  Qwen3 runs on the same stack. Four things differ and they are all the file
+  being read rather than a second path: an ordinary pre-norm block, where
+  neither half is normed on its way back into the stream; a SiLU on the gate
+  where Gemma looks ggml's GELU up in a table; scores scaled by one over the
+  square root of the head, which Gemma leaves at one because its query norm
+  holds them in range; and a value handed to the attention unnormed, which
+  Gemma norms. On the 4B, **14.6 tokens a second becomes 154.8**, against
+  llama.cpp's 142.7; on the 0.6B, 83.4 becomes 312.5 against 244.1. The head is
+  Q4_0 on those checkpoints rather than Q6_K, and reads through
+  `shaders/matvec.comp` — the kernel the attention's projections already use.
+
   The whole of a block goes: the norms, the rotation, the keys and values in
   fp16, the scores, the softmax and the mix, the router, the experts and the
   three post-norms that make a mixture block. Thirty blocks and the logit head
@@ -268,6 +279,11 @@ Worth knowing before you clone it:
 - **The prompt path on Gemma is a factor of one and two thirds behind ggml's
   best**, even where it beats the default build; `gemma/README.md` says where
   the remainder sits.
+- **On a card, the prompt is read a position at a time.** The kernels score one
+  column, and a device cache that parted from the engine's would be worse than
+  a slow prompt — so generation reaches or passes llama.cpp's ROCm build while
+  the prompt does not: 179 tokens a second against 1906 on the Qwen3 4B. It is
+  the largest thing left on this path.
 
 ## What is here, and what is not
 

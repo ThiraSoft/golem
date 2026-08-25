@@ -1,0 +1,242 @@
+package qwen
+
+// Qwen3 on a Vulkan device, over the same stack Gemma 4 runs on.
+//
+// vk/stack.go was written for Gemma 4's mixture and then for its dense block,
+// and what those two have in common with this one is nearly everything: the
+// four attention projections, a query norm and a key norm per head, a rotation,
+// a cache in fp16, the scores and the mix, and a gated feed forward whose
+// three matrices are read the same way. What differs is small enough to name.
+//
+//   - The block is an ordinary pre-norm one. The attention's projection rejoins
+//     the stream with no norm between them, and so does the feed forward. Gemma
+//     norms on the way out of both halves and scales the whole block by a
+//     scalar. vk.LayoutPreNorm is that difference.
+//   - The gate is a SiLU rather than ggml's tabulated GELU. vk.SiLU.
+//   - The scores are scaled by one over the square root of the head, which
+//     Gemma leaves at one because its query norm holds them in range.
+//   - The head is Q4_0, not Q6_K, so it is vk.Q40Head and not vk.Q6KHead.
+//
+// Everything else is the file being read rather than a second path.
+
+import (
+	"fmt"
+
+	"github.com/ThiraSoft/golem/nn"
+	"github.com/ThiraSoft/golem/vk"
+)
+
+// UseVulkanHead uploads the logit head to a Vulkan device and makes Logits
+// read it there. It fails, and changes nothing, when there is no device, when
+// the head is not Q4_0, or when the tensor does not fit in device memory.
+func (m *Model) UseVulkanHead() error {
+	if m.head != nil {
+		return nil
+	}
+	if m.W.TokenEmbd.Quant != nn.Q4_0 {
+		return fmt.Errorf("qwen: the Vulkan head wants a Q4_0 embedding, this one is %s", m.W.TokenEmbd.Quant)
+	}
+	d, err := m.device()
+	if err != nil {
+		return err
+	}
+	h, err := vk.NewQ40Head(d, m.W.TokenEmbd.Data, m.W.TokenEmbd.Rows, m.W.TokenEmbd.Cols)
+	if err != nil {
+		return err
+	}
+	m.head = h
+	return nil
+}
+
+// UseVulkanStack puts every block of the model on a Vulkan device: the
+// attention with its cache, the feed forward, and the two norms between them.
+// A token then crosses the bus twice — the embedding in and the last hidden
+// state out — instead of once a block.
+//
+// It fails rather than falling back: a model half on a card the caller
+// believed it was wholly on is a model whose speed nobody can explain.
+func (m *Model) UseVulkanStack() error {
+	if m.stack != nil {
+		return nil
+	}
+	cfg := m.Cfg
+	if len(m.caches) > 1 {
+		return fmt.Errorf("qwen: the device holds one cache, and this model was opened with %d slots", len(m.caches))
+	}
+	d, err := m.device()
+	if err != nil {
+		return err
+	}
+
+	// One rotation geometry per base, the way gemma/vulkan.go does it. This
+	// checkpoint has one; qwen35 declares a full_attention_interval and will
+	// not, so the table is built from the file rather than assumed.
+	m.rotations = nil
+	index := map[float64]int{}
+	for _, bc := range cfg.Blocks {
+		if _, ok := index[bc.RoPEBase]; ok {
+			continue
+		}
+		index[bc.RoPEBase] = len(m.rotations)
+		m.rotations = append(m.rotations, rotation{base: bc.RoPEBase, dims: bc.RoPEDims})
+	}
+
+	var maxHeads, maxKV int
+	ffn := cfg.Blocks[0].FFN
+	for i, bc := range cfg.Blocks {
+		maxHeads = max(maxHeads, bc.Heads*bc.HeadDim)
+		maxKV = max(maxKV, bc.KVHeads*bc.HeadDim)
+		if bc.FFN != ffn {
+			return fmt.Errorf("qwen: the feed-forward width is one buffer on the card, and block %d is %d wide against block 0's %d", i, bc.FFN, ffn)
+		}
+	}
+	attn, err := vk.NewAttention(d, cfg.Dim, maxHeads, maxKV, cfg.MaxContext, len(m.rotations))
+	if err != nil {
+		return err
+	}
+	// No experts, and the gate is a SiLU: this is a swiglu, not Gemma's
+	// tabulated GELU.
+	mix, err := vk.NewMixture(d, cfg.Dim, 0, ffn, 0, 0, vk.SiLU)
+	if err != nil {
+		attn.Close()
+		return err
+	}
+	stack, err := vk.NewStack(d, cfg.Dim, cfg.Eps, attn, mix)
+	if err != nil {
+		attn.Close()
+		mix.Close()
+		return err
+	}
+
+	for i := range cfg.Blocks {
+		bc, bw := cfg.Blocks[i], &m.W.Blocks[i]
+		for _, q := range []nn.Quant{bw.Q.Quant, bw.K.Quant, bw.V.Quant, bw.O.Quant, bw.Gate.Quant, bw.Up.Quant, bw.Down.Quant} {
+			if q != nn.Q4_0 {
+				stack.Close()
+				return fmt.Errorf("qwen: the kernels read Q4_0, block %d has a %s", i, q)
+			}
+		}
+		shape := vk.BlockShape{
+			Heads: bc.Heads, KVHeads: bc.KVHeads, HeadDim: bc.HeadDim,
+			RoPEDims: bc.RoPEDims, Capacity: cfg.MaxContext, Rotation: index[bc.RoPEBase],
+			OwnsKV: true, Eps: cfg.Eps,
+			// llama.cpp passes this into the softmax rather than scaling the
+			// query; qwen/attention.go is the other copy.
+			Scale: float32(1 / sqrtOf(bc.HeadDim)),
+		}
+		if err := attn.AddBlock(shape, bw.Q.Data, bw.K.Data, bw.V.Data, bw.O.Data, bw.QNorm, bw.KNorm); err != nil {
+			stack.Close()
+			return err
+		}
+		if err := mix.AddBlock(nil, nil, bw.Gate.Data, bw.Up.Data, bw.Down.Data); err != nil {
+			stack.Close()
+			return err
+		}
+		if err := stack.AddBlock(vk.BlockNorms{
+			Attn: bw.AttnNorm, FFN: bw.FFNNorm, OutScale: 1, Layout: vk.LayoutPreNorm,
+		}); err != nil {
+			stack.Close()
+			return err
+		}
+	}
+	if err := stack.Ready(); err != nil {
+		stack.Close()
+		return err
+	}
+	m.stack = stack
+	return nil
+}
+
+// sqrtOf is math.Sqrt on an int, by Newton's method, so that this file's
+// arithmetic is the same shape as vk/stack.go's.
+func sqrtOf(n int) float64 {
+	x := float64(n)
+	if x <= 0 {
+		return 1
+	}
+	guess := x
+	for i := 0; i < 40; i++ {
+		guess = 0.5 * (guess + x/guess)
+	}
+	return guess
+}
+
+// A rotation is one geometry of the model's rotation, tabulated once a token
+// rather than once a block.
+type rotation struct {
+	base float64
+	dims int
+}
+
+// VulkanStack says whether the blocks are on a device.
+func (m *Model) VulkanStack() bool { return m.stack != nil }
+
+// VulkanHead says whether the head is on a device.
+func (m *Model) VulkanHead() bool { return m.head != nil }
+
+// device opens the Vulkan device the model shares between its parts, or
+// returns the one it already has. The head and the blocks sit on the same card
+// and must: they are two halves of one token.
+func (m *Model) device() (*vk.Device, error) {
+	if m.dev != nil {
+		return m.dev, nil
+	}
+	d, err := vk.Open()
+	if err != nil {
+		return nil, err
+	}
+	m.dev = d
+	return d, nil
+}
+
+// closeVulkan releases the device. Close calls it.
+func (m *Model) closeVulkan() {
+	if m.stack != nil {
+		m.stack.Close()
+		m.stack = nil
+	}
+	if m.head != nil {
+		m.head.Close()
+		m.head = nil
+	}
+	if m.dev != nil {
+		m.dev.Close()
+		m.dev = nil
+	}
+}
+
+// runStack carries one position through every block on the device, in one
+// submission. What crosses is this vector in and the same vector back.
+func (m *Model) runStack(xs []float32, at Place) {
+	cfg := m.Cfg
+	copy(m.stack.Stream().Floats(), xs)
+
+	if m.ropeTable == nil {
+		m.ropeTable = make([]nn.RoPETable, len(m.rotations))
+	}
+	for i, r := range m.rotations {
+		m.ropeTable[i].Prepare(r.dims, at.Pos, r.base, nil)
+		if err := m.stack.SetRotation(i, m.ropeTable[i].Cos, m.ropeTable[i].Sin); err != nil {
+			panic(fmt.Sprintf("qwen: the device refused a rotation: %v", err))
+		}
+	}
+
+	pos := vk.Position{Pos: at.Pos}
+	for _, bc := range cfg.Blocks {
+		first, last := at.Cache.Visible(bc, at.Pos)
+		pos.First = append(pos.First, first)
+		pos.Last = append(pos.Last, last)
+	}
+	if err := m.stack.Run(pos, 0, 0); err != nil {
+		panic(fmt.Sprintf("qwen: the device failed: %v", err))
+	}
+	copy(xs, m.stack.Stream().Floats())
+}
+
+// TraceBlocks asks the device path to keep every block's output, which it does
+// not do by default.
+func (m *Model) TraceBlocks() {
+	if m.stack != nil {
+		m.stack.Trace(true)
+	}
+}

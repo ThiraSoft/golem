@@ -16,6 +16,7 @@ import (
 
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/tensors"
+	"github.com/ThiraSoft/golem/vk"
 )
 
 type Model struct {
@@ -33,6 +34,13 @@ type Model struct {
 	hidden      [][]float32
 	outputs     [][]float32 // one per block, for the tests that locate a divergence
 	batch       int
+
+	// The Vulkan path, when the caller asked for it. qwen/vulkan.go.
+	dev       *vk.Device
+	stack     *vk.Stack
+	head      *vk.Q40Head
+	rotations []rotation
+	ropeTable []nn.RoPETable
 }
 
 // Open maps a GGUF file and binds it. maxContext caps the cache; the file
@@ -92,7 +100,10 @@ func (m *Model) reserve(batch int) {
 	m.hidden = rows(batch, m.Cfg.Dim)
 }
 
-func (m *Model) Close() error { return m.file.Close() }
+func (m *Model) Close() error {
+	m.closeVulkan()
+	return m.file.Close()
+}
 
 // File is the mapped GGUF. The tokenizer lives in the same file as the weights,
 // and a caller that wants both should not have to open it twice.
@@ -156,6 +167,19 @@ func (m *Model) ForwardMixed(tokens []int32, at []Place) [][]float32 {
 	for t := range tokens {
 		copy(xs[t], embedded.F[t])
 	}
+
+	// A model whose attention is on the card reads its prompt a position at a
+	// time: the kernels score one column, and two caches that parted would be
+	// worse than a slow prompt. gemma/model.go says the same.
+	if m.stack != nil {
+		for t := range tokens {
+			m.runStack(xs[t], at[t])
+			copy(m.hidden[t], xs[t])
+			nn.RMSNormPlain(m.hidden[t], w.OutputNorm, cfg.Eps)
+		}
+		return m.hidden[:batch]
+	}
+
 	for i := range cfg.Blocks {
 		bc := cfg.Blocks[i]
 		ropes := m.scratch.RoPE(bc, at)
@@ -173,7 +197,12 @@ func (m *Model) ForwardMixed(tokens []int32, at []Place) [][]float32 {
 
 // BlockOutput is what the given block last produced, for the tests that have to
 // say which block a divergence began in.
-func (m *Model) BlockOutput(block int) []float32 { return m.outputs[block] }
+func (m *Model) BlockOutput(block int) []float32 {
+	if m.stack != nil {
+		return m.stack.BlockOutput(block)
+	}
+	return m.outputs[block]
+}
 
 // Logits scores the whole vocabulary. The head is the input embedding read the
 // other way round — this checkpoint ties them — so this reads the largest
@@ -187,6 +216,12 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 	// Rounds to bfloat16 when the head is bfloat16, and builds the Q8_0 form
 	// otherwise.
 	v.QuantizeColumnRange(0, 0, m.Cfg.Dim)
+	if m.head != nil {
+		if err := m.head.MatVec(v, out); err != nil {
+			panic(fmt.Sprintf("qwen: the device head failed: %v", err))
+		}
+		return
+	}
 	// A K-quantized head wants the activation cut in superblocks rather than in
 	// blocks of thirty-two.
 	v.QuantizeK()

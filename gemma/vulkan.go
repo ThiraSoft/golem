@@ -110,7 +110,7 @@ func (m *Model) UseVulkanStack() error {
 			return fmt.Errorf("gemma: the feed-forward width is one buffer on the card, and block %d is %d wide against block 0's %d", i, bc.FFN, dense)
 		}
 	}
-	mix, err := vk.NewMixture(d, cfg.Dim, cfg.ExpertFFN, dense, cfg.Experts, cfg.ExpertsUsed)
+	mix, err := vk.NewMixture(d, cfg.Dim, cfg.ExpertFFN, dense, cfg.Experts, cfg.ExpertsUsed, vk.GELU)
 	if err != nil {
 		attn.Close()
 		return err
@@ -160,8 +160,8 @@ func (m *Model) UseVulkanStack() error {
 		shape := vk.BlockShape{
 			Heads: bc.Heads, KVHeads: bc.KVHeads, HeadDim: bc.HeadDim,
 			RoPEDims: bc.RoPEDims, Capacity: capacity, Rotation: index[bc.RoPEBase],
-			ValueIsKey: bc.ValueIsKey, OwnsKV: bc.OwnsKV, KVSource: bc.KVSource,
-			Eps: cfg.Eps,
+			ValueIsKey: bc.ValueIsKey, OwnsKV: bc.OwnsKV, KVSource: bc.KVSource, NormValue: true,
+			Eps: cfg.Eps, Scale: 1, // Gemma 4's query norm holds the scores in range
 		}
 		if err := attn.AddBlock(shape, bw.Q.Data, k, v, bw.O.Data, bw.QNorm, bw.KNorm); err != nil {
 			stack.Close()
@@ -170,9 +170,10 @@ func (m *Model) UseVulkanStack() error {
 		var gateUpExps, downExps []byte
 		norms := vk.BlockNorms{
 			Attn: bw.AttnNorm, PostAttn: bw.PostAttnNorm, FFN: bw.FFNNorm,
-			PostFFW: bw.PostFFWNorm, OutScale: bw.OutScale, Dense: !bc.MoE,
+			PostFFW: bw.PostFFWNorm, OutScale: bw.OutScale, Layout: vk.LayoutDense,
 		}
 		if bc.MoE {
+			norms.Layout = vk.LayoutMixture
 			gateUpExps, downExps = bw.GateUpExps.Data, bw.DownExps.Data
 			norms.PreFFW2, norms.PostFFW1, norms.PostFFW2 = bw.PreFFWNorm2, bw.PostFFWNorm1, bw.PostFFWNorm2
 			norms.RouterScale, norms.DownScale, norms.Router = bw.RouterScale, bw.DownScale, routerRows(bw.Router)

@@ -37,6 +37,7 @@ layout(push_constant) uniform Push {
     uint capacity;
     uint mask;        // capacity - 1 when that is a mask, and zero otherwise
     uint valueIsKey;  // the value is the key before the key was rotated
+    uint normValue;   // Gemma 4 norms the value with no gain; Qwen3 does not
     float eps;
 } p;
 
@@ -144,15 +145,19 @@ void main() {
     float kscale = 1.0 / sqrt(reduce(s) / float(hd) + p.eps);
     barrier();
 
-    s = 0.0;
-    for (uint i = t; i < hd; i += 256u) { float x = v[base + i]; s += x * x; }
-    float vscale = 1.0 / sqrt(reduce(s) / float(hd) + p.eps);
-    barrier();
+    float vscale = 1.0;
+    if (p.normValue != 0u) {
+        s = 0.0;
+        for (uint i = t; i < hd; i += 256u) { float x = v[base + i]; s += x * x; }
+        vscale = 1.0 / sqrt(reduce(s) / float(hd) + p.eps);
+        barrier();
+    }
 
     for (uint i = t; i < hd; i += 256u) {
         k[base + i] = k[base + i] * kscale * knorm[i];
-        // The value is normalized with no gain of its own, and is not rotated:
-        // position enters through the key alone.
+        // Gemma 4 normalizes the value with no gain of its own; llama.cpp
+        // hands a Qwen3 value projection straight to the attention. Neither is
+        // rotated: position enters through the key alone.
         v[base + i] = v[base + i] * vscale;
     }
     barrier();

@@ -52,8 +52,16 @@ type BlockShape struct {
 	// KVSource's cache, and is given the same buffers rather than a copy.
 	ValueIsKey bool
 	OwnsKV     bool
+	// NormValue says the value projection is RMS-normed, with no gain of its
+	// own, before it goes into the cache. Gemma 4 does that; Qwen3 hands the
+	// projection straight over, which is what llama.cpp's graph shows.
+	NormValue bool
 	KVSource   int
 	Eps        float32
+	// Scale multiplies the scores before the softmax. Gemma 4 scales by one
+	// and lets its query norm hold them in range; Qwen3 passes 1/sqrt(head_dim)
+	// the way llama.cpp does.
+	Scale float32
 }
 
 // An Attention is every attention matrix and every key-value cache of a model,
@@ -111,6 +119,7 @@ type attnPush struct {
 	capacity   uint32
 	mask       uint32
 	valueIsKey uint32
+	normValue  uint32
 	eps        float32
 }
 
@@ -124,6 +133,7 @@ type scorePush struct {
 	capacity uint32
 	mask     uint32
 	stride   uint32
+	scale    float32
 }
 
 // NewAttention builds the kernels and the shared buffers, which are sized for
@@ -248,6 +258,12 @@ func (a *Attention) AddBlock(shape BlockShape, q, k, v, o []byte, qnorm, knorm [
 	}
 	if !shape.OwnsKV && (shape.KVSource < 0 || shape.KVSource >= len(a.blocks)) {
 		return fmt.Errorf("vk: block %d reads block %d's cache, which is not there yet", len(a.blocks), shape.KVSource)
+	}
+	if shape.Scale == 0 {
+		// A zero here would send every score to the same place and the softmax
+		// would answer with a uniform mix, fluently and wrongly. It is a
+		// caller that forgot the field, not a model that asked for it.
+		return fmt.Errorf("vk: block %d scores at a scale of zero", len(a.blocks))
 	}
 
 	b := &attentionBlock{shape: shape}
@@ -416,13 +432,14 @@ func (a *Attention) Record(r *Recorder, block int) {
 	prepare := attnPush{
 		heads: uint32(s.Heads), kvHeads: uint32(s.KVHeads), headDim: uint32(s.HeadDim),
 		ropeDims: uint32(s.RoPEDims), block: uint32(block), capacity: uint32(s.Capacity),
-		mask: uint32(ringMask(s.Capacity)), valueIsKey: boolTo(s.ValueIsKey), eps: s.Eps,
+		mask: uint32(ringMask(s.Capacity)), valueIsKey: boolTo(s.ValueIsKey),
+		normValue: boolTo(s.NormValue), eps: s.Eps,
 	}
 	score := scorePush{
 		heads: uint32(s.Heads), kvHeads: uint32(s.KVHeads), headDim: uint32(s.HeadDim),
 		perKV: uint32(s.Heads / s.KVHeads), block: uint32(block),
 		capacity: uint32(s.Capacity), mask: uint32(ringMask(s.Capacity)),
-		stride: uint32(a.maxContext),
+		stride: uint32(a.maxContext), scale: s.Scale,
 	}
 	units := uint32(s.Heads)
 	if s.OwnsKV {

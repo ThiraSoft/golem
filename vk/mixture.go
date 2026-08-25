@@ -64,6 +64,7 @@ type Mixture struct {
 	d *Device
 
 	dim, ffn, dense, experts int
+	act                      Activation
 
 	gateUp, down, denseDown *Pipeline
 	gelu                    *Buffer // ggml's GELU table, uploaded once
@@ -88,12 +89,23 @@ type mixtureBlock struct {
 	setDenseUp, setDenseDn *Set
 }
 
-// moePush is what all three kernels take.
+// moePush is what all three kernels take. matvec.comp reads the first three
+// fields and ignores the activation, which is spent before it runs.
 type moePush struct {
 	dim  uint32
 	ffn  uint32
 	used uint32
+	act  uint32
 }
+
+// An Activation is what a gated feed forward puts on its gate. Gemma 4 looks
+// ggml's GELU up in a table; Qwen3 evaluates a SiLU. There is no third.
+type Activation uint32
+
+const (
+	GELU Activation = iota
+	SiLU
+)
 
 // NewMixture builds the kernels and the shared buffers. AddBlock then uploads
 // one block at a time, so that a caller can report progress over twelve
@@ -101,7 +113,7 @@ type moePush struct {
 //
 // ffn is one expert's width and dense the shared branch's, which are not the
 // same number: 704 against 2112 on this checkpoint.
-func NewMixture(d *Device, dim, ffn, dense, experts, used int) (*Mixture, error) {
+func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (*Mixture, error) {
 	if experts > 0 && used != expertsUsed {
 		return nil, fmt.Errorf("vk: the expert kernels are written for %d experts a token, this model uses %d", expertsUsed, used)
 	}
@@ -117,7 +129,7 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int) (*Mixture, error)
 	if dim%downOuts != 0 {
 		return nil, fmt.Errorf("vk: the down kernel writes %d outputs at a time, and %d is not a multiple of it", downOuts, dim)
 	}
-	m := &Mixture{d: d, dim: dim, ffn: ffn, dense: dense, experts: experts}
+	m := &Mixture{d: d, dim: dim, ffn: ffn, dense: dense, experts: experts, act: act}
 
 	push := uint32(unsafe.Sizeof(moePush{}))
 	var err error
@@ -335,8 +347,8 @@ func (m *Mixture) Run(block int, shared, expert *nn.Batch, ids []int32, weights 
 	copy(chosen, ids)
 	copy(m.cw.Floats()[:expertsUsed], weights)
 
-	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed}
-	sharedPush := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1}
+	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed, act: uint32(m.act)}
+	sharedPush := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act)}
 	b := m.blocks[block]
 	err := m.d.Submit(func(r *Recorder) {
 		// Nothing in either branch waits on the other, so they go in without a
@@ -371,8 +383,8 @@ func (m *Mixture) RunTimes(block, n int) error {
 	if block < 0 || block >= len(m.blocks) {
 		return fmt.Errorf("vk: block %d of %d", block, len(m.blocks))
 	}
-	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed}
-	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1}
+	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed, act: uint32(m.act)}
+	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act)}
 	b := m.blocks[block]
 	return m.d.Submit(func(r *Recorder) {
 		for i := 0; i < n; i++ {
@@ -395,8 +407,8 @@ func (m *Mixture) RunTimes(block, n int) error {
 func (m *Mixture) Profile(t *Timeline) { m.tl = t }
 
 func (m *Mixture) Record(r *Recorder, block int) {
-	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed}
-	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1}
+	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed, act: uint32(m.act)}
+	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act)}
 	b := m.blocks[block]
 	// Nothing in either branch waits on the other, so they go in without a
 	// barrier between them and the card runs them together.

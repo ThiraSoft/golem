@@ -30,7 +30,8 @@ layout(push_constant) uniform Push {
     uint  n;
     float eps;
     float outScale;   // the one scalar the file carries per block
-    uint  dense;      // a block with no expert branch: one post-norm, not three
+    uint  layout_;    // 0: a mixture's three post-norms; 1: a dense block's one;
+                      // 2: none at all, which is an ordinary pre-norm block
 } p;
 
 const uint MAXN  = 4096u;
@@ -66,7 +67,16 @@ void main() {
     // path below would norm the normed vector a second time — which RMS norm
     // very nearly forgives, and "very nearly" is not what a reference test is
     // for — and would read an expert branch that was never written.
-    if (p.dense != 0u) {
+    if (p.layout_ == 2u) {
+        // A pre-norm block: the feed forward rejoins the residual with nothing
+        // between them. qwen/block.go is the other copy.
+        for (uint i = t; i < p.n; i += LANES) {
+            xs[i] = (resid[i] + shared_[i]) * p.outScale;
+        }
+        return;
+    }
+
+    if (p.layout_ != 0u) {
         float q = 0.0;
         for (uint i = t; i < p.n; i += LANES) {
             float a = shared_[i];
