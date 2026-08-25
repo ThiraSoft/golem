@@ -13,6 +13,7 @@ const (
 	F32 Quant = iota
 	BF16
 	Q4_0
+	Q4_1
 	Q6_K
 )
 
@@ -24,6 +25,8 @@ func (q Quant) String() string {
 		return "BF16"
 	case Q4_0:
 		return "Q4_0"
+	case Q4_1:
+		return "Q4_1"
 	case Q6_K:
 		return "Q6_K"
 	}
@@ -39,6 +42,8 @@ func QuantOf(dtype string) (Quant, bool) {
 		return BF16, true
 	case "Q4_0":
 		return Q4_0, true
+	case "Q4_1":
+		return Q4_1, true
 	case "Q6_K":
 		return Q6_K, true
 	}
@@ -50,6 +55,8 @@ const (
 	QuantBlock = 32
 	// q4_0BlockBytes is one fp16 scale followed by 32 nibbles.
 	q4_0BlockBytes = 18
+	// q4_1BlockBytes is an fp16 scale and an fp16 minimum, then 32 nibbles.
+	q4_1BlockBytes = 20
 	// SuperBlock is the block size of the K-quants.
 	SuperBlock = 256
 	// q6_kBlockBytes is 128 low nibbles, 64 high pairs, 16 scales, one fp16.

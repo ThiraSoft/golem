@@ -1,0 +1,6 @@
+{
+  "q4_1_matvec":  {"tensor": "blk.0.ffn_down.weight", "type": "Q4_1", "rows": 64, "cols": 17408,
+                     "weights": "q4_1_matvec.w.bin", "x": "q4_1_matvec.x.bin", "y": "q4_1_matvec.y.bin"},
+  "q4_1_dequant": {"tensor": "blk.0.ffn_down.weight", "type": "Q4_1", "rows": 4, "cols": 17408,
+                     "weights": "q4_1_dequant.w.bin", "y": "q4_1_dequant.y.bin"}
+}

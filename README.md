@@ -275,7 +275,10 @@ Worth knowing before you clone it:
 - **The server speaks two endpoints.** `/v1/chat/completions`, images included
   when a projector is given, and `/v1/models`. No embeddings endpoint and no
   `/v1/completions`.
-- **Q4_0, Q6_K, bf16 and float32.** The K-quants beyond Q6_K are not read.
+- **Q4_0, Q4_1, Q6_K, bf16 and float32.** The K-quants beyond Q6_K are not
+  read. Q4_1 is where the published Q4_0 builds of Qwen3 keep `ffn_down`, and
+  where every `ffn_down` of Qwen3.8-27B is; it has a CPU kernel and no shader
+  yet, so a mixed file loads on the CPU path and is refused by `-vulkan`.
 - **The prompt path on Gemma is a factor of one and two thirds behind ggml's
   best**, even where it beats the default build; `gemma/README.md` says where
   the remainder sits.

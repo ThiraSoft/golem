@@ -206,6 +206,7 @@ var ggmlTypes = map[uint32]string{
 	0:  "F32",
 	1:  "F16",
 	2:  "Q4_0",
+	3:  "Q4_1",
 	8:  "Q8_0",
 	14: "Q6_K",
 	30: "BF16",
@@ -218,6 +219,7 @@ var blockGeometry = map[string][2]int{
 	"F16":  {1, 2},
 	"BF16": {1, 2},
 	"Q4_0": {32, 18},   // one fp16 scale, then 32 nibbles
+	"Q4_1": {32, 20},   // an fp16 scale and an fp16 minimum, then 32 nibbles
 	"Q8_0": {32, 34},   // one fp16 scale, then 32 signed bytes
 	"Q6_K": {256, 210}, // 128 low nibbles, 64 high pairs, 16 scales, one fp16
 }

@@ -10,8 +10,10 @@ package qwen
 // same weights this engine reads.
 //
 // The file is made with `llama-quantize --pure`, because the Q4_0 build
-// published alongside the BF16 one stores ffn_down as Q4_1, which
-// tensors/gguf.go refuses and should go on refusing.
+// published alongside the BF16 one stores ffn_down as Q4_1. That file now
+// loads and answers — nn/dot_q4_1.go reads the format — but a recording made
+// from it would be testing two kernels at once, and the point of this one is
+// the Q4_0 path.
 //
 // GOLEM_MODEL_QWEN_Q4 names it; a machine without it skips.
 

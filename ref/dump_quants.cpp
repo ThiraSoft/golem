@@ -1,9 +1,14 @@
 // Records what ggml computes, so that the Go kernels can be checked against it
 // without llama.cpp being present at test time.
 //
-// Three cases are written: a Q4_0 matrix-vector product performed by ggml
-// itself (which quantizes the activation to Q8_0 internally, exactly as the Go
-// kernel will), and one dequantized slab each of Q4_0 and Q6_K.
+// For every quantized format the given model carries, two cases are written: a
+// matrix-vector product performed by ggml itself (which quantizes the
+// activation to whatever that weight's dot wants, exactly as the Go kernel
+// will) and one dequantized slab.
+//
+// Which tensors those are depends on the model, and a model that has none of a
+// format simply records nothing for it: Gemma 4 gives Q4_0 and Q6_K, and
+// Qwen3.8-27B gives Q4_1 as well, on its ffn_down.
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -11,6 +16,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <random>
 #include <string>
@@ -63,64 +69,85 @@ int main(int argc, char ** argv) {
     gguf_context * gguf = gguf_init_from_file(model.c_str(), gp);
     if (!gguf) { fprintf(stderr, "cannot open %s\n", model.c_str()); return 1; }
 
-    ggml_tensor * q = ggml_get_tensor(meta, "blk.0.attn_q.weight");
-    ggml_tensor * e = ggml_get_tensor(meta, "token_embd.weight");
-    if (!q || !e) { fprintf(stderr, "expected tensors are missing\n"); return 1; }
+    // What to record, and where to look for it. A model that has none of a
+    // format is not an error: it records nothing under that name, and the Go
+    // test for it skips the way it already does when the fixtures are absent.
+    struct wanted { const char * label; const char * tensor; };
+    const wanted wants[] = {
+        {"q4_0", "blk.0.attn_q.weight"},
+        {"q4_1", "blk.0.ffn_down.weight"},
+        {"q6_k", "token_embd.weight"},
+    };
 
-    const int64_t cols = q->ne[0];          // shared dimension, 1536 for E2B
-    const int64_t rows = 64;                // enough to exercise the row loop
+    std::string entries;
+    for (const wanted & want : wants) {
+        ggml_tensor * t = ggml_get_tensor(meta, want.tensor);
+        if (!t) continue;
+        std::string type = ggml_type_name(t->type);   // ggml spells it in lower case
+        for (char & c : type) c = toupper(c);
+        // The label names the format, so a tensor that is not in it belongs to
+        // another model's recording and is skipped rather than mislabelled.
+        std::string expected = want.label;
+        for (char & c : expected) c = toupper(c);
+        if (type != expected) {
+            fprintf(stderr, "%s is %s, not %s: skipped\n", want.tensor, type.c_str(), expected.c_str());
+            continue;
+        }
 
-    // --- case 1: the matrix-vector product, as ggml performs it -------------
-    {
-        std::vector<uint8_t> w = take_rows(q, rows);
-        std::vector<float>   x = activation(cols);
+        const int64_t cols = t->ne[0];
+        const int64_t rows = 64;            // enough to exercise the row loop
+        const std::string label = want.label;
 
-        const size_t bufsize = w.size() + x.size() * 4 + rows * 4
-                             + ggml_tensor_overhead() * 8 + ggml_graph_overhead() + (1u << 20);
-        ggml_init_params ip = { bufsize, nullptr, false };
-        ggml_context * ctx = ggml_init(ip);
+        // --- the matrix-vector product, as ggml performs it -----------------
+        {
+            std::vector<uint8_t> w = take_rows(t, rows);
+            std::vector<float>   x = activation(cols);
 
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, q->type, cols, rows);
-        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, 1);
-        memcpy(a->data, w.data(), w.size());
-        memcpy(b->data, x.data(), x.size() * 4);
+            const size_t bufsize = w.size() + x.size() * 4 + rows * 4
+                                 + ggml_tensor_overhead() * 8 + ggml_graph_overhead() + (1u << 20);
+            ggml_init_params ip = { bufsize, nullptr, false };
+            ggml_context * ctx = ggml_init(ip);
 
-        ggml_tensor * y  = ggml_mul_mat(ctx, a, b);
-        ggml_cgraph  * gf = ggml_new_graph(ctx);
-        ggml_build_forward_expand(gf, y);
-        ggml_graph_compute_with_ctx(ctx, gf, 1);
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, t->type, cols, rows);
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, 1);
+            memcpy(a->data, w.data(), w.size());
+            memcpy(b->data, x.data(), x.size() * 4);
 
-        write_file(dir + "q4_0_matvec.w.bin", w.data(), w.size());
-        write_file(dir + "q4_0_matvec.x.bin", x.data(), x.size() * 4);
-        write_file(dir + "q4_0_matvec.y.bin", y->data, rows * 4);
-        ggml_free(ctx);
+            ggml_tensor * y  = ggml_mul_mat(ctx, a, b);
+            ggml_cgraph  * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, y);
+            ggml_graph_compute_with_ctx(ctx, gf, 1);
+
+            write_file(dir + label + "_matvec.w.bin", w.data(), w.size());
+            write_file(dir + label + "_matvec.x.bin", x.data(), x.size() * 4);
+            write_file(dir + label + "_matvec.y.bin", y->data, rows * 4);
+            ggml_free(ctx);
+        }
+
+        // --- dequantization of a few rows -----------------------------------
+        {
+            std::vector<uint8_t> w = take_rows(t, 4);
+            std::vector<float>   y; dequantize(t, 4, y);
+            write_file(dir + label + "_dequant.w.bin", w.data(), w.size());
+            write_file(dir + label + "_dequant.y.bin", y.data(), y.size() * 4);
+        }
+
+        char buf[1024];
+        snprintf(buf, sizeof buf,
+            "%s  \"%s_matvec\":  {\"tensor\": \"%s\", \"type\": \"%s\", \"rows\": %lld, \"cols\": %lld,\n"
+            "                     \"weights\": \"%s_matvec.w.bin\", \"x\": \"%s_matvec.x.bin\", \"y\": \"%s_matvec.y.bin\"},\n"
+            "  \"%s_dequant\": {\"tensor\": \"%s\", \"type\": \"%s\", \"rows\": 4, \"cols\": %lld,\n"
+            "                     \"weights\": \"%s_dequant.w.bin\", \"y\": \"%s_dequant.y.bin\"}",
+            entries.empty() ? "" : ",\n", label.c_str(), want.tensor, expected.c_str(),
+            (long long) rows, (long long) cols, label.c_str(), label.c_str(), label.c_str(),
+            label.c_str(), want.tensor, expected.c_str(), (long long) cols,
+            label.c_str(), label.c_str());
+        entries += buf;
     }
-
-    // --- case 2 and 3: dequantization of a few rows -------------------------
-    {
-        std::vector<uint8_t> w = take_rows(q, 4);
-        std::vector<float>   y; dequantize(q, 4, y);
-        write_file(dir + "q4_0_dequant.w.bin", w.data(), w.size());
-        write_file(dir + "q4_0_dequant.y.bin", y.data(), y.size() * 4);
-    }
-    {
-        std::vector<uint8_t> w = take_rows(e, 4);
-        std::vector<float>   y; dequantize(e, 4, y);
-        write_file(dir + "q6_k_dequant.w.bin", w.data(), w.size());
-        write_file(dir + "q6_k_dequant.y.bin", y.data(), y.size() * 4);
-    }
+    if (entries.empty()) { fprintf(stderr, "no tensor of a recorded format in %s\n", model.c_str()); return 1; }
 
     FILE * idx = fopen((dir + "index.json").c_str(), "w");
-    fprintf(idx,
-        "{\n"
-        "  \"q4_0_matvec\":  {\"tensor\": \"blk.0.attn_q.weight\", \"type\": \"Q4_0\", \"rows\": %lld, \"cols\": %lld,\n"
-        "                     \"weights\": \"q4_0_matvec.w.bin\", \"x\": \"q4_0_matvec.x.bin\", \"y\": \"q4_0_matvec.y.bin\"},\n"
-        "  \"q4_0_dequant\": {\"tensor\": \"blk.0.attn_q.weight\", \"type\": \"Q4_0\", \"rows\": 4, \"cols\": %lld,\n"
-        "                     \"weights\": \"q4_0_dequant.w.bin\", \"y\": \"q4_0_dequant.y.bin\"},\n"
-        "  \"q6_k_dequant\": {\"tensor\": \"token_embd.weight\", \"type\": \"Q6_K\", \"rows\": 4, \"cols\": %lld,\n"
-        "                     \"weights\": \"q6_k_dequant.w.bin\", \"y\": \"q6_k_dequant.y.bin\"}\n"
-        "}\n",
-        (long long) rows, (long long) cols, (long long) cols, (long long) e->ne[0]);
+    fprintf(idx, "{\n%s\n}\n", entries.c_str());
     fclose(idx);
 
     gguf_free(gguf);

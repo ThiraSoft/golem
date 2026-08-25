@@ -54,6 +54,8 @@ func (m Matrix) RowBytes() int {
 		return m.Cols * 2
 	case Q4_0:
 		return m.Cols / QuantBlock * q4_0BlockBytes
+	case Q4_1:
+		return m.Cols / QuantBlock * q4_1BlockBytes
 	case Q6_K:
 		return m.Cols / SuperBlock * q6_kBlockBytes
 	}
@@ -102,6 +104,8 @@ func (m Matrix) rows(b *Batch, ys [][]float32, start, end int) {
 		} else {
 			matVecQ4_0Rows(m.Data, b, m.Cols, ys, start, end)
 		}
+	case Q4_1:
+		matVecQ4_1Rows(m.Data, b, m.Cols, ys, start, end)
 	case BF16:
 		weights := unsafe.Slice((*uint16)(unsafe.Pointer(&m.Data[0])), len(m.Data)/2)
 		for r := start; r < end; r++ {
@@ -152,6 +156,8 @@ func (m Matrix) Row(index int, out []float32) {
 		}
 	case Q4_0:
 		dequantizeQ4_0Row(row, m.Cols, out)
+	case Q4_1:
+		dequantizeQ4_1Row(row, m.Cols, out)
 	}
 }
 

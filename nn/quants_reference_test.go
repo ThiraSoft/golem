@@ -48,22 +48,44 @@ func quantRoot(t *testing.T) string {
 	}
 }
 
+// quantDirs are the recordings, one per model that was asked for one. A format
+// is recorded where a model that has it lives: Gemma 4 gives Q4_0 and Q6_K,
+// and Qwen3.8-27B is where the Q4_1 that its ffn_down is stored in comes from.
+var quantDirs = []string{
+	filepath.Join("testdata", "gemma", "quants"),
+	filepath.Join("testdata", "qwen", "quants"),
+}
+
 func loadQuantFixture(t *testing.T, name string) quantFixture {
 	t.Helper()
-	dir := filepath.Join(quantRoot(t), "testdata", "gemma", "quants")
+	root := quantRoot(t)
 
-	raw, err := os.ReadFile(filepath.Join(dir, "index.json"))
-	if err != nil {
-		t.Skipf("quant fixtures missing (%v) — see ref/gemma/README.md", err)
+	var dir string
+	var entry quantIndexEntry
+	var found, any bool
+	for _, candidate := range quantDirs {
+		at := filepath.Join(root, candidate)
+		raw, err := os.ReadFile(filepath.Join(at, "index.json"))
+		if err != nil {
+			continue
+		}
+		any = true
+		var index map[string]quantIndexEntry
+		if err := json.Unmarshal(raw, &index); err != nil {
+			t.Fatal(err)
+		}
+		if e, ok := index[name]; ok {
+			dir, entry, found = at, e, true
+			break
+		}
 	}
-	var index map[string]quantIndexEntry
-	if err := json.Unmarshal(raw, &index); err != nil {
-		t.Fatal(err)
+	if !any {
+		t.Skip("quant fixtures missing — see ref/gemma/README.md")
 	}
-	entry, ok := index[name]
-	if !ok {
-		t.Fatalf("fixture %q is not in index.json", name)
+	if !found {
+		t.Skipf("fixture %q is in none of the recordings — see ref/README.md", name)
 	}
+	var err error
 
 	f := quantFixture{Rows: entry.Rows, Cols: entry.Cols}
 	if f.Weights, err = os.ReadFile(filepath.Join(dir, entry.Weights)); err != nil {
