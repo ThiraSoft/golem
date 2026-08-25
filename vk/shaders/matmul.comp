@@ -276,8 +276,38 @@
 // on ffn_down against thirty-two's 6.95. It still loses, by a fortieth rather
 // than by a quarter.
 //
-// So the tile is a hard local optimum, the wall has a name and a number, and
-// neither half of the trade moves it. What is left is not a geometry.
+// **The four-by-four tile was then measured properly, and it refutes the wall
+// above.** The 64x64 geometry it needs had been failing the parity test, for a
+// reason that turned out to be a bug rather than the geometry: BN above the
+// width of the pass made CGROUPS zero and the workgroup wrote the answer for
+// columns that do not exist, past the end of y. Only the thirty-two column
+// build failed, two widths away from the one under test, which is why it read
+// as the tile's fault. BN is clamped to COLUMNS now, and with that in place
+// 64x64 over four by four passes and measures 7.54 on ffn_down against 32x32
+// over two by two's 6.95, and 10.13 on ffn_gate against 9.22.
+//
+// It loses, and the assembly says it should have won. Same dump, same block,
+// the two geometries side by side:
+//
+//   32/32 two by two, KSTEP 16   0.469 LDS dwords a dot4   2.152 VALU   0.223 waits
+//   64/64 four by four, KSTEP 8  0.234                     1.781        0.131
+//
+// Every axis improves — the shared traffic halves, exactly as 1/TM + 1/(2*TN)
+// predicts — and the kernel gets eight per cent slower. So it is not bound by
+// the shared memory after all, nor by the vector issue, nor by DRAM: 33
+// megabytes in 1.77 milliseconds is nineteen gigabytes a second on a card that
+// gives 640. What is left is latency, and what covers latency is waves in
+// flight rather than work per wave. That reading also explains why every sweep
+// in this file has lost in both directions at once.
+//
+// **And downward is closed too**, which no sweep had tried: every one of them
+// went up. BN sixteen is 7.75 on ffn_down and BN eight is 10.45; BM sixteen at
+// BN sixteen is 10.14. With matmulRows and matmulColBlock moved in step and
+// the parity test green at every point, 32x32 over two by two at KSTEP sixteen
+// is a global optimum of this parameterisation and not merely a local one.
+//
+// So the tile is a hard optimum, the wall is latency rather than any
+// throughput, and what is left is not a geometry.
 
 #ifndef COLUMNS
 #define COLUMNS 32
@@ -312,6 +342,17 @@
 #else
 #define BN COLUMNS
 #endif
+#endif
+// A pass narrower than BN has one column group and not a fraction of one.
+// Left unclamped, CGROUPS is zero, the workgroup stages BN columns of which
+// only COLUMNS exist, and it writes the answer for the ones that do not — past
+// the end of y, over whatever is there. It reads as a parity failure two
+// widths away from the one at fault, which is how it was found: only the
+// thirty-two column build failed, and the geometry under test was the wide
+// one. vk/matmul.go's matmulColGroups already clamps on its side.
+#if BN > COLUMNS
+#undef BN
+#define BN COLUMNS
 #endif
 #define CGROUPS (COLUMNS / BN)
 #define COLTH  (BN / TN)
