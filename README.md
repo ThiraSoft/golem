@@ -247,12 +247,15 @@ Worth knowing before you clone it:
   a device, and the engine falls back to the CPU as it does when there is no
   Vulkan at all.
 
-  A model whose attention is on the card reads its prompt in stretches of
-  thirty-two positions, because the keys and values are the card's and the two
-  caches must not part. Thirty-two of them in one pass is what a batch was
-  always for: every matrix of the model read once for all thirty-two instead of
-  once for each, which is the whole of the difference between a prompt at the
-  memory ceiling and a prompt thirty-two times over it. Generation reads the
+  A model whose attention is on the card reads its prompt in stretches of a
+  hundred and twenty-eight positions, because the keys and values are the
+  card's and the two caches must not part. A hundred and twenty-eight of them
+  in one pass is what a batch was always for: every matrix of the model read
+  once for all of them instead of once for each, which is the whole of the
+  difference between a prompt at the memory ceiling and a prompt a hundred and
+  twenty-eight times over it. A mixture is no exception any more: its expert
+  stack is read by expert rather than by column, so the eight matrices a
+  position routes to are read once for the eight positions that wanted them. Generation reads the
   same binaries it always did: the column count is compiled into the kernel
   rather than pushed, so there are several of each and a token draws the narrowest.
 
@@ -318,21 +321,25 @@ Worth knowing before you clone it:
 - **The prompt path on Gemma is a factor of one and two thirds behind ggml's
   best**, even where it beats the default build; `gemma/README.md` says where
   the remainder sits.
-- **On a card, the prompt is a factor of one and a half to two behind, and
-  generation a tenth.** Measured against llama.cpp's own Vulkan build on the
-  same card, which is the fair comparison for a Vulkan engine and is faster
-  than its ROCm build at everything here:
+- **On a card, the prompt is between level and a factor of one and three
+  quarters behind, and generation a tenth.** Measured against llama.cpp's own
+  Vulkan build on the same card, which is the fair comparison for a Vulkan
+  engine and is faster than its ROCm build at everything here:
 
   | tokens a second | golem gen | llama gen | golem prompt | llama prompt |
   | --------------- | --------: | --------: | -----------: | -----------: |
-  | Gemma 4 26B A4B |      96.8 |     116.5 |          135 |          822 |
-  | Gemma 4 12B     |      59.3 |      63.1 |          615 |          984 |
-  | Qwen3 4B        |     158.0 |     162.6 |         1527 |         2855 |
-  | Qwen3 0.6B      |     343.0 |     352.3 |         5475 |         8135 |
+  | Gemma 4 26B A4B |      98.2 |     116.5 |         1463 |          822 |
+  | Gemma 4 12B     |      59.6 |      63.1 |          663 |          984 |
+  | Qwen3 4B        |     161.8 |     162.6 |         1646 |         2855 |
+  | Qwen3 0.6B      |     351.5 |     352.3 |         7017 |         8135 |
 
-  The 26B's row is the one that has not moved: a mixture prompt still goes one
-  position at a time, because each position routes to its own eight matrices
-  and two positions share no read.
+  The 26B's row is the one that moved: its prompt used to go a position at a
+  time, because each position routes to its own eight matrices of a hundred
+  and twenty-eight and two positions share no read. Read by expert instead —
+  for each expert, the columns that chose it — and a pass of a hundred and
+  twenty-eight columns reads the stack once where it read it a thousand and
+  twenty-four times. 173 tokens a second to 1463, which is where a mixture
+  prompt passes the dense models beside it and the reference for it.
 
   Generation is within a tenth. The prompt is not, and what is left of the gap
   has been measured rather than guessed. The cost of a tiled product is a
@@ -342,8 +349,9 @@ Worth knowing before you clone it:
   workgroups back and is bound in. What has not moved is the other shape: many
   rows over a short shared dimension, which is what every gate, up and qkv
   projection is and what two fifths of a pass is spent in. It sits at half the
-  rate of its own transpose under every tile, width, split and kernel measured,
-  cooperative or integer, on the same weights and the same multiply count.
+  rate of its own transpose under every tile, width, split, column block and
+  kernel measured, cooperative or integer, on the same weights and the same
+  multiply count.
   `vk/shaders/matmul_coop.comp` says what the matrix cores do and do not fix.
 
 ## What is here, and what is not
