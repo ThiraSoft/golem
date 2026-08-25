@@ -102,10 +102,14 @@ type moePush struct {
 // ffn is one expert's width and dense the shared branch's, which are not the
 // same number: 704 against 2112 on this checkpoint.
 func NewMixture(d *Device, dim, ffn, dense, experts, used int) (*Mixture, error) {
-	if used != expertsUsed {
+	if experts > 0 && used != expertsUsed {
 		return nil, fmt.Errorf("vk: the expert kernels are written for %d experts a token, this model uses %d", expertsUsed, used)
 	}
-	for _, n := range []int{dim, ffn, dense} {
+	shapes := []int{dim, dense}
+	if experts > 0 {
+		shapes = append(shapes, ffn)
+	}
+	for _, n := range shapes {
 		if n%nn.QuantBlock != 0 {
 			return nil, fmt.Errorf("vk: feed-forward shapes must be multiples of %d, given %d", nn.QuantBlock, n)
 		}
@@ -117,15 +121,22 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int) (*Mixture, error)
 
 	push := uint32(unsafe.Sizeof(moePush{}))
 	var err error
-	for _, spec := range []struct {
+	pipes := []struct {
 		into     **Pipeline
 		spirv    []byte
 		bindings int
 	}{
 		{&m.gateUp, moeGateUpSPIRV, 7},
-		{&m.down, moeDownSPIRV, 6},
 		{&m.denseDown, matvecSPIRV, 4},
-	} {
+	}
+	if experts > 0 {
+		pipes = append(pipes, struct {
+			into     **Pipeline
+			spirv    []byte
+			bindings int
+		}{&m.down, moeDownSPIRV, 6})
+	}
+	for _, spec := range pipes {
 		if *spec.into, err = d.NewPipeline(spec.spirv, spec.bindings, push); err != nil {
 			m.Close()
 			return nil, err
@@ -142,27 +153,32 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int) (*Mixture, error)
 	}
 
 	in := dim / nn.QuantBlock
-	mid := ffn / nn.QuantBlock
 	dmid := dense / nn.QuantBlock
-	for _, spec := range []struct {
+	type bufSpec struct {
 		into  **Buffer
 		size  int
 		local bool
-	}{
-		{&m.xq, dim, false},                      // the expert branch's input
-		{&m.xs, 2 * in * 4, false},               // its scales, then its corrections
-		{&m.ids, expertsUsed * 4, false},         // the chosen experts
-		{&m.cw, expertsUsed * 4, false},          // routing weight times expert scale
-		{&m.out, dim * 4, false},                 // that branch's output
-		{&m.aq, expertsUsed * ffn, true},         // its intermediate
-		{&m.as, 2 * expertsUsed * mid * 4, true}, // and that intermediate's scales
-
+	}
+	bufs := []bufSpec{
 		{&m.dxq, dim, false},         // the shared branch's input
 		{&m.dxs, 2 * in * 4, false},  //
 		{&m.dout, dim * 4, false},    // its output
 		{&m.daq, dense, true},        // its intermediate
 		{&m.das, 2 * dmid * 4, true}, //
-	} {
+	}
+	if experts > 0 {
+		mid := ffn / nn.QuantBlock
+		bufs = append(bufs,
+			bufSpec{&m.xq, dim, false},                      // the expert branch's input
+			bufSpec{&m.xs, 2 * in * 4, false},               // its scales, then its corrections
+			bufSpec{&m.ids, expertsUsed * 4, false},         // the chosen experts
+			bufSpec{&m.cw, expertsUsed * 4, false},          // routing weight times expert scale
+			bufSpec{&m.out, dim * 4, false},                 // that branch's output
+			bufSpec{&m.aq, expertsUsed * ffn, true},         // its intermediate
+			bufSpec{&m.as, 2 * expertsUsed * mid * 4, true}, // and that intermediate's scales
+		)
+	}
+	for _, spec := range bufs {
 		var b *Buffer
 		if spec.local {
 			b, err = d.Local(spec.size, bufferUsageStorage)
@@ -185,18 +201,35 @@ func (m *Mixture) Blocks() int { return len(m.blocks) }
 // the kernels to them. gate and up are the shared branch's two halves, which
 // are concatenated here into the one matrix of twice the width the kernel
 // reads. The blocks are read back in the order they were added.
+// A dense checkpoint has no expert stacks: gateUpExps and downExps are nil,
+// and the block is the shared branch alone.
 func (m *Mixture) AddBlock(gateUpExps, downExps, gate, up, down []byte) error {
-	for _, spec := range []struct {
+	shapes := []struct {
 		what       string
 		data       []byte
 		rows, cols int
 	}{
-		{"the gate-and-up stack", gateUpExps, m.experts * 2 * m.ffn, m.dim},
-		{"the down stack", downExps, m.experts * m.dim, m.ffn},
 		{"the shared gate", gate, m.dense, m.dim},
 		{"the shared up", up, m.dense, m.dim},
 		{"the shared down", down, m.dim, m.dense},
-	} {
+	}
+	if m.experts > 0 {
+		shapes = append(shapes,
+			struct {
+				what       string
+				data       []byte
+				rows, cols int
+			}{"the gate-and-up stack", gateUpExps, m.experts * 2 * m.ffn, m.dim},
+			struct {
+				what       string
+				data       []byte
+				rows, cols int
+			}{"the down stack", downExps, m.experts * m.dim, m.ffn},
+		)
+	} else if gateUpExps != nil || downExps != nil {
+		return fmt.Errorf("vk: this mixture was opened without experts, and the block brings %d bytes of them", len(gateUpExps)+len(downExps))
+	}
+	for _, spec := range shapes {
 		if want := spec.rows * rowBytesQ4_0(spec.cols); len(spec.data) != want {
 			return fmt.Errorf("vk: %s should be %d bytes, given %d", spec.what, want, len(spec.data))
 		}
@@ -208,11 +241,13 @@ func (m *Mixture) AddBlock(gateUpExps, downExps, gate, up, down []byte) error {
 		return err
 	}
 	var err error
-	if b.gateUp, err = m.d.Upload(splitQ4_0(gateUpExps, m.experts*2*m.ffn, m.dim)); err != nil {
-		return fail(err)
-	}
-	if b.down, err = m.d.Upload(splitQ4_0(downExps, m.experts*m.dim, m.ffn)); err != nil {
-		return fail(err)
+	if m.experts > 0 {
+		if b.gateUp, err = m.d.Upload(splitQ4_0(gateUpExps, m.experts*2*m.ffn, m.dim)); err != nil {
+			return fail(err)
+		}
+		if b.down, err = m.d.Upload(splitQ4_0(downExps, m.experts*m.dim, m.ffn)); err != nil {
+			return fail(err)
+		}
 	}
 	// The shared branch's gate and up, one after the other, which is the
 	// layout the mixture's own stack already has.
@@ -225,16 +260,22 @@ func (m *Mixture) AddBlock(gateUpExps, downExps, gate, up, down []byte) error {
 		return fail(err)
 	}
 
-	for _, spec := range []struct {
+	type setSpec struct {
 		into *(*Set)
 		pipe *Pipeline
 		bufs []*Buffer
-	}{
-		{&b.setGateUp, m.gateUp, []*Buffer{b.gateUp, m.xq, m.xs, m.ids, m.gelu, m.aq, m.as}},
-		{&b.setDown, m.down, []*Buffer{b.down, m.aq, m.as, m.ids, m.cw, m.out}},
+	}
+	sets := []setSpec{
 		{&b.setDenseUp, m.gateUp, []*Buffer{b.denseGateUp, m.dxq, m.dxs, m.zero, m.gelu, m.daq, m.das}},
 		{&b.setDenseDn, m.denseDown, []*Buffer{b.denseDown, m.daq, m.das, m.dout}},
-	} {
+	}
+	if m.experts > 0 {
+		sets = append(sets,
+			setSpec{&b.setGateUp, m.gateUp, []*Buffer{b.gateUp, m.xq, m.xs, m.ids, m.gelu, m.aq, m.as}},
+			setSpec{&b.setDown, m.down, []*Buffer{b.down, m.aq, m.as, m.ids, m.cw, m.out}},
+		)
+	}
+	for _, spec := range sets {
 		if *spec.into, err = spec.pipe.NewSet(spec.bufs); err != nil {
 			return fail(err)
 		}
@@ -252,6 +293,9 @@ func (m *Mixture) AddBlock(gateUpExps, downExps, gate, up, down []byte) error {
 // outputs are written, unnormed and unadded: the norms between here and the
 // stream are the block's business.
 func (m *Mixture) Run(block int, shared, expert *nn.Batch, ids []int32, weights []float32, sharedOut, expertOut []float32) error {
+	if m.experts == 0 {
+		return fmt.Errorf("vk: this mixture has no experts, and Run computes both branches")
+	}
 	if block < 0 || block >= len(m.blocks) {
 		return fmt.Errorf("vk: block %d of %d", block, len(m.blocks))
 	}
@@ -321,6 +365,9 @@ func (m *Mixture) Run(block int, shared, expert *nn.Batch, ids []int32, weights 
 // numbers are worth having and they are not the same number — vk/compute.go
 // says the same thing about the logit head.
 func (m *Mixture) RunTimes(block, n int) error {
+	if m.experts == 0 {
+		return fmt.Errorf("vk: this mixture has no experts, and RunTimes repeats both branches")
+	}
 	if block < 0 || block >= len(m.blocks) {
 		return fmt.Errorf("vk: block %d of %d", block, len(m.blocks))
 	}
@@ -353,11 +400,15 @@ func (m *Mixture) Record(r *Recorder, block int) {
 	b := m.blocks[block]
 	// Nothing in either branch waits on the other, so they go in without a
 	// barrier between them and the card runs them together.
-	r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
+	if m.experts > 0 {
+		r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
+	}
 	r.Dispatch(b.setDenseUp, uint32(m.dense/nn.QuantBlock), unsafe.Pointer(&shared))
 	r.Barrier()
 	m.tl.Stamp(r, "moe gate/up")
-	r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
+	if m.experts > 0 {
+		r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
+	}
 	r.Dispatch(b.setDenseDn, uint32((m.dim+matvecOuts-1)/matvecOuts), unsafe.Pointer(&shared))
 }
 

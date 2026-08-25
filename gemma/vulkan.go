@@ -65,8 +65,8 @@ func (m *Model) UseVulkanStack() error {
 		return nil
 	}
 	cfg := m.Cfg
-	if cfg.Experts == 0 {
-		return fmt.Errorf("gemma: the Vulkan stack is written for a mixture, and this checkpoint has none")
+	if cfg.PLEDim > 0 {
+		return fmt.Errorf("gemma: the Vulkan stack has no per-layer embedding branch, and this checkpoint carries one")
 	}
 	if len(m.caches) > 1 {
 		return fmt.Errorf("gemma: the device holds one cache, and this model was opened with %d slots", len(m.caches))
@@ -101,7 +101,16 @@ func (m *Model) UseVulkanStack() error {
 	if err != nil {
 		return err
 	}
-	mix, err := vk.NewMixture(d, cfg.Dim, cfg.ExpertFFN, cfg.Blocks[0].FFN, cfg.Experts, cfg.ExpertsUsed)
+	// A dense checkpoint is a mixture with no experts: the shared branch of a
+	// mixture block and an ordinary feed forward are the same three matrices
+	// under the same norm, which is what gemma/block.go says in prose.
+	dense := cfg.Blocks[0].FFN
+	for i, bc := range cfg.Blocks {
+		if bc.FFN != dense {
+			return fmt.Errorf("gemma: the feed-forward width is one buffer on the card, and block %d is %d wide against block 0's %d", i, bc.FFN, dense)
+		}
+	}
+	mix, err := vk.NewMixture(d, cfg.Dim, cfg.ExpertFFN, dense, cfg.Experts, cfg.ExpertsUsed)
 	if err != nil {
 		attn.Close()
 		return err
@@ -122,22 +131,19 @@ func (m *Model) UseVulkanStack() error {
 
 	for i := range cfg.Blocks {
 		bc, bw := cfg.Blocks[i], &m.W.Blocks[i]
-		for _, q := range []nn.Quant{
-			bw.Q.Quant, bw.O.Quant, bw.Gate.Quant, bw.Up.Quant, bw.Down.Quant,
-			bw.GateUpExps.Quant, bw.DownExps.Quant,
-		} {
+		quants := []nn.Quant{bw.Q.Quant, bw.O.Quant, bw.Gate.Quant, bw.Up.Quant, bw.Down.Quant}
+		if bc.MoE {
+			quants = append(quants, bw.GateUpExps.Quant, bw.DownExps.Quant)
+		}
+		for _, q := range quants {
 			if q != nn.Q4_0 {
 				stack.Close()
 				return fmt.Errorf("gemma: the kernels read Q4_0, block %d has a %s", i, q)
 			}
 		}
-		if bw.Router.Quant != nn.F32 {
+		if bc.MoE && bw.Router.Quant != nn.F32 {
 			stack.Close()
 			return fmt.Errorf("gemma: the router kernel reads float32, block %d has a %s", i, bw.Router.Quant)
-		}
-		if !bc.MoE {
-			stack.Close()
-			return fmt.Errorf("gemma: block %d is dense, and the stack is written for a mixture", i)
 		}
 
 		var k, v []byte
@@ -161,16 +167,21 @@ func (m *Model) UseVulkanStack() error {
 			stack.Close()
 			return err
 		}
-		if err := mix.AddBlock(bw.GateUpExps.Data, bw.DownExps.Data, bw.Gate.Data, bw.Up.Data, bw.Down.Data); err != nil {
+		var gateUpExps, downExps []byte
+		norms := vk.BlockNorms{
+			Attn: bw.AttnNorm, PostAttn: bw.PostAttnNorm, FFN: bw.FFNNorm,
+			PostFFW: bw.PostFFWNorm, OutScale: bw.OutScale, Dense: !bc.MoE,
+		}
+		if bc.MoE {
+			gateUpExps, downExps = bw.GateUpExps.Data, bw.DownExps.Data
+			norms.PreFFW2, norms.PostFFW1, norms.PostFFW2 = bw.PreFFWNorm2, bw.PostFFWNorm1, bw.PostFFWNorm2
+			norms.RouterScale, norms.DownScale, norms.Router = bw.RouterScale, bw.DownScale, routerRows(bw.Router)
+		}
+		if err := mix.AddBlock(gateUpExps, downExps, bw.Gate.Data, bw.Up.Data, bw.Down.Data); err != nil {
 			stack.Close()
 			return err
 		}
-		if err := stack.AddBlock(vk.BlockNorms{
-			Attn: bw.AttnNorm, PostAttn: bw.PostAttnNorm, FFN: bw.FFNNorm,
-			PreFFW2: bw.PreFFWNorm2, PostFFW1: bw.PostFFWNorm1, PostFFW2: bw.PostFFWNorm2,
-			PostFFW: bw.PostFFWNorm, RouterScale: bw.RouterScale, DownScale: bw.DownScale,
-			Router: routerRows(bw.Router), OutScale: bw.OutScale,
-		}); err != nil {
+		if err := stack.AddBlock(norms); err != nil {
 			stack.Close()
 			return err
 		}

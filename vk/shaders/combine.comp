@@ -30,6 +30,7 @@ layout(push_constant) uniform Push {
     uint  n;
     float eps;
     float outScale;   // the one scalar the file carries per block
+    uint  dense;      // a block with no expert branch: one post-norm, not three
 } p;
 
 const uint MAXN  = 4096u;
@@ -60,6 +61,28 @@ void reduce2(float a, float b, out float sa, out float sb) {
 
 void main() {
     uint t = gl_LocalInvocationID.x;
+
+    // A dense block has one branch and one post-norm. Running it through the
+    // path below would norm the normed vector a second time — which RMS norm
+    // very nearly forgives, and "very nearly" is not what a reference test is
+    // for — and would read an expert branch that was never written.
+    if (p.dense != 0u) {
+        float q = 0.0;
+        for (uint i = t; i < p.n; i += LANES) {
+            float a = shared_[i];
+            u[i] = a;
+            q += a * a;
+        }
+        barrier();
+        float tq, ignored;
+        reduce2(q, 0.0, tq, ignored);
+        float s = 1.0 / sqrt(tq / float(p.n) + p.eps);
+        barrier();
+        for (uint i = t; i < p.n; i += LANES) {
+            xs[i] = (resid[i] + u[i] * s * g3[i]) * p.outScale;
+        }
+        return;
+    }
 
     float qu = 0.0, qw = 0.0;
     for (uint i = t; i < p.n; i += LANES) {

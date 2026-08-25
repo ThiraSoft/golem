@@ -80,6 +80,7 @@ type combinePush struct {
 	n        uint32
 	eps      float32
 	outScale float32
+	dense    uint32
 }
 
 // A Stack is a model's blocks, their norms and their router, over an Attention
@@ -126,6 +127,7 @@ type stackBlock struct {
 	routerV  *Buffer
 	downs    *Buffer
 	outScale float32
+	dense    bool // no expert branch: no router, one post-norm
 
 	setAttnNorm *Set // the stream under the attention norm, quantized
 	setPostAttn *Set // the attention's answer under its post-norm
@@ -195,19 +197,30 @@ type BlockNorms struct {
 	DownScale   []float32 // one scalar per expert
 	Router      []float32 // the router matrix, float32, experts by dim
 	OutScale    float32
+
+	// Dense says the block has no expert branch. PreFFW2, PostFFW1, PostFFW2,
+	// RouterScale, DownScale and Router are then unread, and PostFFW is the
+	// block's one post-norm.
+	Dense bool
 }
 
 // AddBlock uploads one block's norms and router. It must be called in the
 // order the blocks run, and as many times as the Attention and the Mixture
 // were given blocks.
 func (s *Stack) AddBlock(n BlockNorms) error {
-	b := &stackBlock{outScale: n.OutScale}
+	b := &stackBlock{outScale: n.OutScale, dense: n.Dense}
 	fail := func(err error) error {
 		b.close()
 		return err
 	}
 	var err error
-	for _, gain := range [][]float32{n.Attn, n.PostAttn, n.FFN, n.PreFFW2, n.PostFFW1, n.PostFFW2, n.PostFFW} {
+	gains := [][]float32{n.Attn, n.PostAttn, n.FFN, n.PreFFW2, n.PostFFW1, n.PostFFW2, n.PostFFW}
+	if n.Dense {
+		// The four the dense path never reads still get a slot, so that the
+		// indices the sets below are written with stay the same.
+		gains = [][]float32{n.Attn, n.PostAttn, n.FFN, n.PostFFW, n.PostFFW, n.PostFFW, n.PostFFW}
+	}
+	for _, gain := range gains {
 		if len(gain) != s.dim {
 			return fail(fmt.Errorf("vk: a gain should be %d wide, given %d", s.dim, len(gain)))
 		}
@@ -217,37 +230,50 @@ func (s *Stack) AddBlock(n BlockNorms) error {
 		}
 		b.gains = append(b.gains, buf)
 	}
-	if b.routerV, err = s.d.Upload(asBytes(n.RouterScale)); err != nil {
-		return fail(err)
-	}
-	if b.routerW, err = s.d.Upload(asBytes(n.Router)); err != nil {
-		return fail(err)
-	}
-	if b.downs, err = s.d.Upload(asBytes(n.DownScale)); err != nil {
-		return fail(err)
+	if !n.Dense {
+		if b.routerV, err = s.d.Upload(asBytes(n.RouterScale)); err != nil {
+			return fail(err)
+		}
+		if b.routerW, err = s.d.Upload(asBytes(n.Router)); err != nil {
+			return fail(err)
+		}
+		if b.downs, err = s.d.Upload(asBytes(n.DownScale)); err != nil {
+			return fail(err)
+		}
 	}
 
 	attnQ, attnS := s.attn.Input()
-	expQ, expS := s.mix.ExpertInput()
 	shQ, shS := s.mix.SharedInput()
-	ids, cw := s.mix.Routing()
 	shOut, expOut := s.mix.Outputs()
+	if expOut == nil {
+		// A dense mixture writes no expert branch. The binding still wants a
+		// buffer, and the kernel never reads it.
+		expOut = s.none
+	}
 
-	for _, spec := range []struct {
+	type setSpec struct {
 		into **Set
 		pipe *Pipeline
 		bufs []*Buffer
-	}{
-		// a, b, gain, vscale, sum, y, yq, ys
+	}
+	// a, b, gain, vscale, sum, y, yq, ys
+	specs := []setSpec{
 		{&b.setAttnNorm, s.norm, []*Buffer{s.xs, s.none, b.gains[0], s.none, s.none, s.none, attnQ, attnS}},
 		{&b.setPostAttn, s.norm, []*Buffer{s.attn.Output(), s.none, b.gains[1], s.none, s.none, s.normed, s.none, s.none}},
 		{&b.setResid, s.norm, []*Buffer{s.xs, s.normed, b.gains[2], s.none, s.resid, s.none, shQ, shS}},
-		{&b.setExpert, s.norm, []*Buffer{s.resid, s.none, b.gains[3], s.none, s.none, s.none, expQ, expS}},
-		{&b.setRouterIn, s.norm, []*Buffer{s.resid, s.none, s.none, b.routerV, s.none, s.routerIn, s.none, s.none}},
-		{&b.setRouterW, s.routerW, []*Buffer{s.routerIn, b.routerW, s.routerOut}},
-		{&b.setPick, s.routerPick, []*Buffer{s.routerOut, b.downs, ids, cw}},
 		{&b.setCombine, s.combine, []*Buffer{shOut, expOut, s.resid, b.gains[4], b.gains[5], b.gains[6], s.xs}},
-	} {
+	}
+	if !n.Dense {
+		expQ, expS := s.mix.ExpertInput()
+		ids, cw := s.mix.Routing()
+		specs = append(specs,
+			setSpec{&b.setExpert, s.norm, []*Buffer{s.resid, s.none, b.gains[3], s.none, s.none, s.none, expQ, expS}},
+			setSpec{&b.setRouterIn, s.norm, []*Buffer{s.resid, s.none, s.none, b.routerV, s.none, s.routerIn, s.none, s.none}},
+			setSpec{&b.setRouterW, s.routerW, []*Buffer{s.routerIn, b.routerW, s.routerOut}},
+			setSpec{&b.setPick, s.routerPick, []*Buffer{s.routerOut, b.downs, ids, cw}},
+		)
+	}
+	for _, spec := range specs {
 		if *spec.into, err = spec.pipe.NewSet(spec.bufs); err != nil {
 			return fail(err)
 		}
@@ -259,7 +285,7 @@ func (s *Stack) AddBlock(n BlockNorms) error {
 // Experts is how many logits the router produces, which Ready needs before it
 // can size their buffer.
 func (s *Stack) Experts(n int) error {
-	if s.routerOut != nil {
+	if s.routerOut != nil || n == 0 {
 		return nil
 	}
 	// shaders/router_pick.comp gives one lane to each expert.
@@ -384,6 +410,9 @@ func (s *Stack) record(r *Recorder, experts, used int) {
 	}
 	for i, b := range s.blocks {
 		combine := combinePush{n: uint32(s.dim), eps: s.eps, outScale: b.outScale}
+		if b.dense {
+			combine.dense = 1
+		}
 
 		r.Dispatch(b.setAttnNorm, 1, unsafe.Pointer(&quant))
 		r.Barrier()
@@ -396,18 +425,20 @@ func (s *Stack) record(r *Recorder, experts, used int) {
 		r.Dispatch(b.setResid, 1, unsafe.Pointer(&resid))
 		r.Barrier()
 		tl.Stamp(r, "post+resid")
-		// The expert branch's norm and the routing both read the residual
-		// and neither reads the other.
-		r.Dispatch(b.setExpert, 1, unsafe.Pointer(&quant))
-		r.Dispatch(b.setRouterIn, 1, unsafe.Pointer(&routerIn))
-		r.Barrier()
-		tl.Stamp(r, "expert norm")
-		r.Dispatch(b.setRouterW, uint32(experts), unsafe.Pointer(&route))
-		r.Barrier()
-		tl.Stamp(r, "router")
-		r.Dispatch(b.setPick, 1, unsafe.Pointer(&route))
-		r.Barrier()
-		tl.Stamp(r, "pick")
+		if !b.dense {
+			// The expert branch's norm and the routing both read the residual
+			// and neither reads the other.
+			r.Dispatch(b.setExpert, 1, unsafe.Pointer(&quant))
+			r.Dispatch(b.setRouterIn, 1, unsafe.Pointer(&routerIn))
+			r.Barrier()
+			tl.Stamp(r, "expert norm")
+			r.Dispatch(b.setRouterW, uint32(experts), unsafe.Pointer(&route))
+			r.Barrier()
+			tl.Stamp(r, "router")
+			r.Dispatch(b.setPick, 1, unsafe.Pointer(&route))
+			r.Barrier()
+			tl.Stamp(r, "pick")
+		}
 		s.mix.Record(r, i)
 		r.Barrier()
 		tl.Stamp(r, "moe down")

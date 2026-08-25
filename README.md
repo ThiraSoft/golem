@@ -197,6 +197,13 @@ Worth knowing before you clone it:
   matrices being resident — 12.8 gibibytes, which is why a card with sixteen is
   the smallest that can do this — and about nine seconds of upload.
 
+  A dense checkpoint goes the same way, because a dense block is a mixture
+  block with one branch: the shared branch of a mixture and an ordinary feed
+  forward are the same three matrices under the same norm, and what differs is
+  the end of the block — one post-norm instead of three, and no routing. On the
+  12B, **5.0 tokens a second becomes 58.1**, against llama.cpp's 61.2 on the
+  same card.
+
   The whole of a block goes: the norms, the rotation, the keys and values in
   fp16, the scores, the softmax and the mix, the router, the experts and the
   three post-norms that make a mixture block. Thirty blocks and the logit head
