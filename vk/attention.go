@@ -22,6 +22,7 @@ package vk
 import (
 	_ "embed"
 	"fmt"
+	"math"
 	"unsafe"
 
 	"github.com/ThiraSoft/golem/nn"
@@ -29,12 +30,16 @@ import (
 
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/attn_prepare.comp -o shaders/attn_prepare.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/attn_scores.comp -o shaders/attn_scores.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/rope_table.comp -o shaders/rope_table.spv
 
 //go:embed shaders/attn_prepare.spv
 var attnPrepareSPIRV []byte
 
 //go:embed shaders/attn_scores.spv
 var attnScoresSPIRV []byte
+
+//go:embed shaders/rope_table.spv
+var ropeTableSPIRV []byte
 
 // maxColumns is how many positions of a prompt one pass carries: the widest
 // COLUMNS the wide shaders are built at, the WHERE_COLUMNS they index the
@@ -118,6 +123,9 @@ type Attention struct {
 	maxContext int
 
 	matvec, prepare, scores *Pipeline
+	// rope fills the angle tables from the position buffer, at the head of a
+	// pass. shaders/rope_table.comp says what it replaced.
+	rope *Pipeline
 	// reduce folds the slices of a split output projection. See matmulSplit:
 	// that projection is the stack's row-poorest tiled product, and the one
 	// dispatched with nothing beside it, so it is the one that can be cut.
@@ -128,6 +136,9 @@ type Attention struct {
 	// normed stream in, and the output projection's answer back.
 	xq, xs, out *Buffer
 	rcos, rsin  []*Buffer // one pair per rotation geometry
+	rinv        []*Buffer // its inverse frequencies, written once
+	ropeSets    []*Set
+	ropeHalf    []uint32 // how many entries of a column each geometry fills
 	q, k, v, qh *Buffer
 	outParts    *Buffer // the slices of a split output projection
 	reduceSet   *Set
@@ -172,6 +183,13 @@ type attnPush struct {
 	eps        float32
 }
 
+// ropePush is what the angle table kernel takes: how many entries of a column
+// the geometry fills, and how far apart two columns are.
+type ropePush struct {
+	halfDims uint32
+	stride   uint32
+}
+
 // scorePush is the second kernel's, which needs a range rather than a position.
 type scorePush struct {
 	heads    uint32
@@ -212,6 +230,7 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 		{&a.reduce, matmulReduceSPIRV, 2, unsafe.Sizeof(moePush{})},
 		{&a.prepare, attnPrepareSPIRV, 11, unsafe.Sizeof(attnPush{})},
 		{&a.scores, attnScoresSPIRV, 7, unsafe.Sizeof(scorePush{})},
+		{&a.rope, ropeTableSPIRV, 4, unsafe.Sizeof(ropePush{})},
 	} {
 		if *spec.into, err = d.NewPipeline(spec.spirv, spec.bindings, uint32(spec.push)); err != nil {
 			a.Close()
@@ -283,35 +302,84 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 	// block: the angles depend on the position and the geometry and on nothing
 	// else, which is what nn/rope.go tabulates them for.
 	for i := 0; i < rotations; i++ {
-		cos, err := d.Host(maxHeads*4*maxColumns, bufferUsageStorage)
+		cos, err := d.Local(maxHeads*4*maxColumns, bufferUsageStorage)
 		if err != nil {
 			a.Close()
 			return nil, err
 		}
-		sin, err := d.Host(maxHeads*4*maxColumns, bufferUsageStorage)
+		sin, err := d.Local(maxHeads*4*maxColumns, bufferUsageStorage)
+		if err != nil {
+			a.Close()
+			return nil, err
+		}
+		// The inverse frequencies are the only part of a table the CPU still
+		// writes, and it writes them once: half a head of floats, against the
+		// pair of tables above them, which are a megabyte and now device
+		// memory because nothing on this side touches them any more.
+		inv, err := d.Host(maxHeads*4, bufferUsageStorage)
+		if err != nil {
+			a.Close()
+			return nil, err
+		}
+		set, err := a.rope.NewSet([]*Buffer{a.where, inv, cos, sin})
 		if err != nil {
 			a.Close()
 			return nil, err
 		}
 		a.rcos = append(a.rcos, cos)
 		a.rsin = append(a.rsin, sin)
+		a.rinv = append(a.rinv, inv)
+		a.ropeSets = append(a.ropeSets, set)
+		a.ropeHalf = append(a.ropeHalf, 0)
 	}
 	return a, nil
 }
 
-// SetRotation writes one geometry's angles for one column of the pass about to
-// be recorded. A prompt writes one set per position; a token writes one.
-func (a *Attention) SetRotation(i, column int, cos, sin []float32) error {
+// SetGeometry writes one rotation geometry's inverse frequencies, which is
+// everything about it that does not depend on the position. It is called once,
+// when the stack is built; the angles themselves are made by the card at the
+// head of every pass.
+//
+// factors is the file's frequency factors, one per pair of dimensions, or nil
+// where the geometry has none.
+func (a *Attention) SetGeometry(i, dims int, base float64, factors []float32) error {
 	if i < 0 || i >= len(a.rcos) {
 		return fmt.Errorf("vk: rotation %d of %d", i, len(a.rcos))
 	}
-	if column < 0 || column >= maxColumns {
-		return fmt.Errorf("vk: column %d of the %d one pass carries", column, maxColumns)
+	if dims%2 != 0 || dims > a.maxHeads { // the frequencies take dims floats, hi and lo
+		return fmt.Errorf("vk: a rotation of %d dimensions, in heads of %d", dims, a.maxHeads)
 	}
-	at := column * a.maxHeads
-	copy(a.rcos[i].Floats()[at:at+a.maxHeads], cos)
-	copy(a.rsin[i].Floats()[at:at+a.maxHeads], sin)
+	half := dims / 2
+	if factors != nil && len(factors) != half {
+		return fmt.Errorf("vk: %d frequency factors for %d dimensions", len(factors), dims)
+	}
+	// Two floats a frequency: the nearest float32 and the remainder it lost.
+	// shaders/rope_table.comp says what the second one is for.
+	inv := a.rinv[i].Floats()[:a.maxHeads]
+	for j := 0; j < half; j++ {
+		f := math.Pow(base, -2*float64(j)/float64(dims))
+		if factors != nil {
+			f /= float64(factors[j])
+		}
+		hi := float32(f)
+		inv[j], inv[half+j] = hi, float32(f-float64(hi))
+	}
+	a.ropeHalf[i] = uint32(half)
 	return nil
+}
+
+// RecordRotations fills every geometry's angle table for the columns of the
+// pass about to be recorded. It goes at the head of a submission: the position
+// buffer is written before it and the first block's prepare reads what it
+// leaves.
+func (a *Attention) RecordRotations(r *Recorder, columns int) {
+	for i := range a.ropeSets {
+		if a.ropeHalf[i] == 0 {
+			continue
+		}
+		push := ropePush{halfDims: a.ropeHalf[i], stride: uint32(a.maxHeads)}
+		r.Dispatch(a.ropeSets[i], uint32(columns), unsafe.Pointer(&push))
+	}
 }
 
 // Input is the buffer pair a block's attention reads its normed stream from,
@@ -595,7 +663,13 @@ func (a *Attention) Close() {
 		b.close()
 	}
 	a.blocks = nil
-	for _, b := range append(append([]**Buffer{}, pointers(a.rcos)...), append(pointers(a.rsin), []**Buffer{
+	for _, set := range a.ropeSets {
+		if set != nil {
+			set.Close()
+		}
+	}
+	a.ropeSets = nil
+	for _, b := range append(append([]**Buffer{}, pointers(a.rcos)...), append(append(pointers(a.rsin), pointers(a.rinv)...), []**Buffer{
 		&a.where, &a.as, &a.aq, &a.scoreRows, &a.outParts, &a.qh, &a.v, &a.k, &a.q,
 		&a.out, &a.xs, &a.xq,
 	}...)...) {
@@ -608,7 +682,7 @@ func (a *Attention) Close() {
 		a.reduceSet.Close()
 		a.reduceSet = nil
 	}
-	for _, p := range []**Pipeline{&a.scores, &a.prepare, &a.matvec, &a.reduce} {
+	for _, p := range []**Pipeline{&a.scores, &a.prepare, &a.matvec, &a.reduce, &a.rope} {
 		if *p != nil {
 			(*p).Close()
 			*p = nil

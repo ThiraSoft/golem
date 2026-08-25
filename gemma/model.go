@@ -41,7 +41,6 @@ type Model struct {
 	head      *vk.Q6KHead
 	stack     *vk.Stack
 	rotations []rotation
-	ropeTable []nn.RoPETable
 	headDev   *vk.Device
 }
 
@@ -304,22 +303,10 @@ func (m *Model) runStack(xs [][]float32, at []Place) {
 		copy(stream[t*cfg.Dim:], xs[t])
 	}
 
-	// The angles for each position, one geometry at a time. They depend on the
-	// position and the geometry and on nothing else, so a pass computes them
-	// twice per column rather than sixty times.
-	if m.ropeTable == nil {
-		m.ropeTable = make([]nn.RoPETable, len(m.rotations))
-	}
 	// The window rule and the ring agree, so the range is worked out here and
 	// neither kernel has to check the other.
 	positions := make([]vk.Position, len(at))
 	for c, one := range at {
-		for i, r := range m.rotations {
-			m.ropeTable[i].Prepare(r.dims, one.Pos, r.base, r.freqs)
-			if err := m.stack.SetRotation(i, c, m.ropeTable[i].Cos, m.ropeTable[i].Sin); err != nil {
-				panic(fmt.Sprintf("gemma: the device refused a rotation: %v", err))
-			}
-		}
 		positions[c] = vk.Position{Pos: one.Pos}
 		for _, bc := range cfg.Blocks {
 			first, last := one.Cache.Visible(bc, one.Pos, one.Until)

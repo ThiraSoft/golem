@@ -123,6 +123,17 @@ func (m *Model) UseVulkanStack() error {
 		return err
 	}
 
+	// The inverse frequencies, once. They are all the CPU knows about the
+	// rotation now: the angles themselves are made at the head of every pass,
+	// out of the position buffer. vk/shaders/rope_table.comp says what that
+	// replaced — six percent of a wide prompt, spent in math.Pow.
+	for i, r := range m.rotations {
+		if err := stack.SetGeometry(i, r.dims, r.base, r.freqs); err != nil {
+			stack.Close()
+			return err
+		}
+	}
+
 	// The router's logits are bound into every block's sets, so their buffer
 	// has to exist before the first block is added.
 	if err := stack.Experts(cfg.Experts); err != nil {

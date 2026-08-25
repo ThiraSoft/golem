@@ -192,10 +192,11 @@ func NewStack(d *Device, dim int, eps float32, attn *Attention, mix *Mixture) (*
 	return s, nil
 }
 
-// SetRotation writes one geometry's angles for one column of the pass about to
-// be run.
-func (s *Stack) SetRotation(i, column int, cos, sin []float32) error {
-	return s.attn.SetRotation(i, column, cos, sin)
+// SetGeometry writes one rotation geometry's inverse frequencies. It is called
+// once, when the stack is built: the angles themselves are made by the card at
+// the head of every pass, out of the position buffer.
+func (s *Stack) SetGeometry(i, dims int, base float64, factors []float32) error {
+	return s.attn.SetGeometry(i, dims, base, factors)
 }
 
 // Columns is how many positions one pass may carry.
@@ -407,7 +408,7 @@ type Position struct {
 //
 // The recording is made on the first token and submitted again on every one
 // after it. What a token changes is in the buffers: the embedding in Stream,
-// the angles SetRotation wrote, and the position and cache range this writes
+// the angles the card makes from it, and the position and cache range this writes
 // into the attention's own. vk/compute.go says what that is worth.
 func (s *Stack) Run(at []Position, experts, used int) error {
 	if len(at) == 0 || len(at) > maxColumns {
@@ -459,6 +460,12 @@ func (s *Stack) record(r *Recorder, experts, used, columns int) {
 		tl.Reset(r)
 		tl.Stamp(r, "start")
 	}
+	// The angles first: every block reads them and nothing writes them but
+	// this, so one dispatch a geometry at the head of the pass serves the
+	// whole of it.
+	s.attn.RecordRotations(r, columns)
+	r.Barrier()
+	tl.Stamp(r, "rotations")
 	for i, b := range s.blocks {
 		combine := combinePush{n: uint32(s.dim), eps: s.eps, outScale: b.outScale, layout: uint32(b.layout)}
 

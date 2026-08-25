@@ -109,6 +109,15 @@ func (m *Model) UseVulkanStack() error {
 		return err
 	}
 
+	// The inverse frequencies, once. The angles are made by the card at the
+	// head of every pass; see vk/shaders/rope_table.comp.
+	for i, r := range m.rotations {
+		if err := stack.SetGeometry(i, r.dims, r.base, nil); err != nil {
+			stack.Close()
+			return err
+		}
+	}
+
 	for i := range cfg.Blocks {
 		bc, bw := cfg.Blocks[i], &m.W.Blocks[i]
 		for _, q := range []nn.Quant{bw.Q.Quant, bw.K.Quant, bw.V.Quant, bw.O.Quant, bw.Gate.Quant, bw.Up.Quant, bw.Down.Quant} {
@@ -241,17 +250,8 @@ func (m *Model) runStack(xs [][]float32, at []Place) {
 		copy(stream[t*cfg.Dim:], xs[t])
 	}
 
-	if m.ropeTable == nil {
-		m.ropeTable = make([]nn.RoPETable, len(m.rotations))
-	}
 	positions := make([]vk.Position, len(at))
 	for c, one := range at {
-		for i, r := range m.rotations {
-			m.ropeTable[i].Prepare(r.dims, one.Pos, r.base, nil)
-			if err := m.stack.SetRotation(i, c, m.ropeTable[i].Cos, m.ropeTable[i].Sin); err != nil {
-				panic(fmt.Sprintf("qwen: the device refused a rotation: %v", err))
-			}
-		}
 		positions[c] = vk.Position{Pos: one.Pos}
 		for _, bc := range cfg.Blocks {
 			first, last := one.Cache.Visible(bc, one.Pos)

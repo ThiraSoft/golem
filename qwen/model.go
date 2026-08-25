@@ -40,7 +40,6 @@ type Model struct {
 	stack     *vk.Stack
 	head      *vk.Q40Head
 	rotations []rotation
-	ropeTable []nn.RoPETable
 }
 
 // Open maps a GGUF file and binds it. maxContext caps the cache; the file

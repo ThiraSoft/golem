@@ -1,0 +1,101 @@
+#version 450
+
+// The rotation angles for a whole pass, on the card.
+//
+// They depend on the position and the geometry and on nothing else, so they
+// were tabulated on the CPU and copied into a host-visible buffer: one
+// math.Pow, one Cos and one Sin per half-head, per column, per geometry. At
+// two hundred and fifty-six columns and two geometries that is thirty-two
+// thousand transcendentals a pass, and it measured 9.4 milliseconds of the
+// 150 a prompt of that width costs — six percent of the pass, spent making a
+// table the card could make in microseconds out of a buffer it already has.
+//
+// The inverse frequencies are still computed once, on the CPU, in float64:
+// base^(-2i/dims) divided by the file's frequency factor. They do not depend
+// on the position, so there is one vector of them per geometry and it is
+// written when the stack is built. What is left here is a multiply and a pair
+// of transcendentals — which is what llama.cpp's rope_funcs.glsl does too,
+// and in float32 like this.
+//
+// Each frequency is carried as two floats rather than one, the second being
+// what the first rounded away, and the angle is brought into one turn before
+// it is rounded at all. Neither is fussiness. A float32 simply cannot hold an
+// angle of four thousand radians to better than a quarter of a milliradian,
+// so the first geometry of a deep context loses three decimal places in the
+// argument before any sine is taken — a thousand times the CPU table's error,
+// and enough to move the argmax of a degenerate continuation. Reducing modulo
+// two pi in the pair fixes the argument first, and then float32 has room for
+// what is left. llama.cpp does none of this and lives with it.
+//
+// The position comes out of the attention's own where buffer, block zero:
+// every block of a column carries the same position, and only the visible
+// range differs between them.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer WH { uvec4 where_[]; };
+layout(std430, binding = 1) readonly  buffer IV { float inv[];    }; // hi, then lo
+layout(std430, binding = 2) writeonly buffer CO { float rcos[];   };
+layout(std430, binding = 3) writeonly buffer SI { float rsin[];   };
+
+layout(push_constant) uniform Push {
+    uint halfDims; // dims / 2, the entries one column holds
+    uint stride;   // maxHeads, the distance from one column to the next
+} p;
+
+// A quarter turn, and what a float32 rounds off it.
+const float quarterHi = 1.57079637050628662109;
+const float quarterLo = -4.37113900018624283e-8;
+
+// sin and cos on a quarter turn either side of zero. The built-ins are not
+// good enough: the GLSL specification asks only that they be within 2^-11 of
+// the answer, which is five ten-thousandths, and RADV takes it. That is three
+// decimal places on an angle the rest of this engine holds to seven, and it
+// showed up as a moved argmax three tokens into a degenerate continuation.
+// Eleven terms of the series cost nothing here — the table is made once for a
+// whole pass — and land a hundred times inside float32.
+float sinQuarter(float x) {
+    float x2 = x * x;
+    return x * fma(x2, fma(x2, fma(x2, fma(x2, 2.75573192e-6, -1.98412698e-4), 8.33333333e-3), -1.66666667e-1), 1.0);
+}
+
+float cosQuarter(float x) {
+    float x2 = x * x;
+    return fma(x2, fma(x2, fma(x2, fma(x2, 2.48015873e-5, -1.38888889e-3), 4.16666667e-2), -5.0e-1), 1.0);
+}
+
+void main() {
+    uint c   = gl_WorkGroupID.x;
+    float at = float(where_[c].x);
+    for (uint j = gl_LocalInvocationID.x; j < p.halfDims; j += 64u) {
+        // The angle as a pair: the rounded product, and everything the
+        // rounding and the frequency's own second half left behind.
+        // precise, or the optimizer contracts the product and its own
+        // residual into each other and the second half of the frequency
+        // silently stops mattering.
+        precise float hi = at * inv[j];
+        precise float lo = fma(at, inv[j], -hi) + at * inv[p.halfDims + j];
+
+        // Into a quarter turn either side of zero, subtracting the quarters
+        // from the pair rather than from the sum — which is the whole point of
+        // carrying a pair, since a float32 cannot hold four thousand radians
+        // to better than a quarter of a milliradian in the first place.
+        float q = floor(fma(hi, 0.636619772367581343, 0.5));
+        // The second subtraction is spelled out rather than given to fma:
+        // written as one, glslc folds it into the first and the low half of
+        // the quarter turn stops arriving. It is worth a hundred and thirteen
+        // microradians at the far end of the context, which is the whole gap
+        // this was written to close.
+        precise float x = fma(-q, quarterHi, hi);
+        x = x - (q * quarterLo) + lo;
+
+        float sn = sinQuarter(x), cs = cosQuarter(x);
+        uint n = uint(int(q) & 3);
+        if (n == 1u)      { float t = sn; sn = cs;  cs = -t; }
+        else if (n == 2u) {                sn = -sn; cs = -cs; }
+        else if (n == 3u) { float t = sn; sn = -cs; cs = t;  }
+
+        rcos[c * p.stride + j] = cs;
+        rsin[c * p.stride + j] = sn;
+    }
+}
