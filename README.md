@@ -253,8 +253,8 @@ Worth knowing before you clone it:
   always for: every matrix of the model read once for all thirty-two instead of
   once for each, which is the whole of the difference between a prompt at the
   memory ceiling and a prompt thirty-two times over it. Generation reads the
-  same binaries it always did: the column count is compiled into the kernel rather
-  than pushed, so there are several of each and a token draws the narrowest.
+  same binaries it always did: the column count is compiled into the kernel
+  rather than pushed, so there are several of each and a token draws the narrowest.
 
   Which kernel a pass runs is the width's business. A token and a short
   stretch draw the mat-vec, one row of the answer to a team of eight lanes; a
