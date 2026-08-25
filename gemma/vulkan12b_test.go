@@ -116,16 +116,27 @@ func Benchmark12BPrefillVulkan(b *testing.B) {
 	if err := m.UseVulkanStack(); err != nil {
 		b.Skipf("no Vulkan stack: %v", err)
 	}
+	if err := m.UseVulkanHead(); err != nil {
+		b.Skipf("no Vulkan head: %v", err)
+	}
 	for _, n := range []int{64, 256} {
 		b.Run(itoa(n), func(b *testing.B) {
 			tokens := make([]int32, n)
 			for i := range tokens {
 				tokens[i] = int32(100 + i)
 			}
+			out := make([]float32, m.Cfg.Vocab)
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				m.Reset()
-				m.ForwardBatch(tokens, 0)
+				hidden := m.ForwardBatch(tokens, 0)
+				// One head for the whole stretch, which is what llama.cpp
+				// computes: a batch handed to llama_decode with a null logits
+				// pointer asks for the last token's output and no other, and
+				// llama-bench's test_prompt hands it the whole prompt in one
+				// call. Without this the two sides are not reading the same
+				// prompt — ours would be a prompt nobody drew a token from.
+				m.Logits(hidden[len(hidden)-1], out)
 			}
 			b.StopTimer()
 			b.ReportMetric(float64(n)*float64(b.N)/b.Elapsed().Seconds(), "tok/s")

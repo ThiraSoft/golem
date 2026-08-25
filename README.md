@@ -192,9 +192,9 @@ Worth knowing before you clone it:
   ceiling is about 43.
 
   `-vulkan` moves all four, and then everything between them. On the 26B A4B,
-  **13.4 tokens a second becomes 98.3** — llama.cpp's Vulkan build is at 124.5
+  **13.4 tokens a second becomes 98.6** — llama.cpp's Vulkan build is at 124.6
   and its ROCm build at 98.6 on the same card — and the prompt goes from 40 a
-  second to 1474. It costs those
+  second to 1459. It costs those
   matrices being resident — 12.8 gibibytes, which is why a card with sixteen is
   the smallest that can do this — and about nine seconds of upload.
 
@@ -202,7 +202,7 @@ Worth knowing before you clone it:
   block with one branch: the shared branch of a mixture and an ordinary feed
   forward are the same three matrices under the same norm, and what differs is
   the end of the block — one post-norm instead of three, and no routing. On the
-  12B, **5.0 tokens a second becomes 58.1**, against llama.cpp's 63.1 in Vulkan
+  12B, **5.0 tokens a second becomes 59.8**, against llama.cpp's 64.5 in Vulkan
   and 61.2 in ROCm on the same card.
 
   Qwen3 runs on the same stack. Four things differ and they are all the file
@@ -213,7 +213,7 @@ Worth knowing before you clone it:
   holds them in range; and a value handed to the attention unnormed, which
   Gemma norms. On the 4B, **14.6 tokens a second becomes 154.8**, against
   llama.cpp's 162.6 in Vulkan and 142.7 in ROCm; on the 0.6B, 83.4 becomes
-  312.5 against 352.3 and 244.1. The head is
+  293.4 against 407.4 and 244.1. The head is
   Q4_0 on those checkpoints rather than Q6_K, and reads through
   `shaders/matvec.comp` — the kernel the attention's projections already use.
 
@@ -322,8 +322,9 @@ Worth knowing before you clone it:
 - **The prompt path on Gemma is a factor of one and two thirds behind ggml's
   best**, even where it beats the default build; `gemma/README.md` says where
   the remainder sits.
-- **On a card, generation is a tenth to a fifth behind and the prompt is a
-  factor of two to three behind, widening with the length of the prompt.**
+- **On a card, generation is a tenth to a quarter behind and the prompt is a
+  factor of one and three quarters to three and a half behind, widening with
+  the length of the prompt.**
   Measured against llama.cpp's own Vulkan build on the same card, which is the
   fair comparison for a Vulkan engine: its ROCm build generates a fifth slower
   on the 26B and answers a short prompt a third faster, so it is neither a
@@ -333,32 +334,42 @@ Worth knowing before you clone it:
 
   | tokens a second | golem gen | llama gen | golem pp64 | llama pp64 | golem pp256 | llama pp256 |
   | --------------- | --------: | --------: | ---------: | ---------: | ----------: | ----------: |
-  | Gemma 4 26B A4B |      98.3 |     124.5 |       1474 |       1052 |        1524 |        2877 |
-  | Gemma 4 12B     |      58.7 |      64.6 |        661 |       1206 |         693 |        2577 |
-  | Qwen3 0.6B      |     296.4 |     353.3 |       6504 |      10339 |        7008 |       19460 |
+  | Gemma 4 26B A4B |      98.6 |     124.6 |       1459 |       1051 |        1764 |        3110 |
+  | Gemma 4 12B     |      59.8 |      64.5 |        672 |       1284 |         707 |        2578 |
+  | Qwen3 0.6B      |     293.4 |     407.4 |       6640 |      10265 |        6948 |      20636 |
+
+  **Both sides draw a token from the prompt they read.** llama.cpp's
+  `test_prompt` hands the whole prompt to one `llama_decode` with a null
+  logits pointer, which computes the last token's logit head and no other, so
+  golem's prompt benchmarks compute one head too — the whole vocabulary, on
+  the card, once for the stretch. Without it the comparison was a prompt
+  nobody drew a token from against a prompt somebody did, and the gap read
+  smaller than it is. It costs the 26B 3.4 milliseconds a pass of sixty-four
+  and the 12B 2.8, which is why the numbers here are a shade under the ones
+  the same code gave before the head was added.
 
   A benchmark of three iterations reads a third low on the largest model: the
   card is at its idle clocks for the first of them and a prompt of sixty-four
   positions is over before it has left them. Every golem number above was
   taken with enough iterations for that to stop mattering, which on the 26B is
-  where 1053 becomes 1474.
+  where 1053 becomes 1459.
 
   **The shape of the gap is the story.** golem's prompt is flat in the length
   of the prompt and llama.cpp's is not: from sixty-four positions to two
   hundred and fifty-six it gains a factor of two and a half on every model and
-  golem gains a few per cent. On the 26B that is enough for golem to be ahead
-  by two fifths at sixty-four and a factor of one and nine tenths behind at
-  two hundred and fifty-six, off the same kernels. Further out llama.cpp
-  reaches 4055 at five hundred and twelve positions and flattens there against
-  its own micro-batch; golem reaches 1486 and then falls back to 1319 at a
-  thousand and twenty-four, where a pass is cut into chunks of two hundred and
+  golem gains a fifth. On the 26B that is enough for golem to be ahead by two
+  fifths at sixty-four and a factor of one and three quarters behind at two
+  hundred and fifty-six, off the same kernels. Further out llama.cpp reaches
+  4033 at five hundred and twelve positions and flattens there against its own
+  micro-batch; golem reaches 1645 and then falls back to 1426 at a thousand
+  and twenty-four, where a pass is cut into chunks of two hundred and
   fifty-six and the expert stack is read once for each chunk.
 
   The 26B's row is the one that moved this far at all. Its prompt used to go a
   position at a time, because each position routes to its own eight matrices
   of a hundred and twenty-eight and two positions share no read; read by
   expert instead — for each expert, the columns that chose it — it went from
-  173 tokens a second to 1474, and it is the one row here where golem leads.
+  173 tokens a second to 1459, and it is the one row here where golem leads.
 
   **The by-expert down projection is now the tiled product itself**, built
   with BYID over an expert's list rather than the batch's columns, and its own
