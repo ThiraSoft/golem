@@ -186,6 +186,43 @@
 // engine does not see. What it measures honestly is the arithmetic, and the
 // arithmetic says this shape is a local optimum on this card in every
 // direction tried.
+//
+// **The caveat is now closed and it changed nothing.** BenchmarkMatMulCold
+// uploads the matrix twenty-four times over and walks the copies in turn, so
+// no re-read is free and every byte is cold. The correction at two hundred and
+// fifty-six columns is a quarter — ffn_down 4.67 to 6.93 microseconds a
+// column, ffn_gate 8.90 to 9.16 — and the whole geometry was then swept again
+// through it, every point checked against TestMatMulMatchesCPU first:
+//
+//   - **BN loses cold too**, which is what the caveat existed to doubt. Sixty
+//     four halves the weight re-reads and costs 7.10 on ffn_down against
+//     32's 6.93; a hundred and twenty-eight quarters them and costs 7.96. It
+//     is not the LDS either: swept with KSTEP halved to hold the staged tile
+//     flat — the combination that used not to compile, see CEILDIV below —
+//     sixty-four at KSTEP four is 7.19 and still behind.
+//   - **BM and KSTEP lose cold too.** 64/8, 64/16, 64/4, 128/8 and 128/4 are
+//     all behind 32/16 at every shape. BM sixteen and eight look like a 3.3x
+//     win and are not: they are matmulRows left at thirty-two, the trap named
+//     below, answering a quarter of the rows. Every number in this paragraph
+//     was taken with matmulRows moved in step.
+//
+// **So the asymmetry gets its name, and it is not the tile.** Swept over
+// shapes of one constant size — BenchmarkMatMulShape, microseconds a column at
+// two hundred and fifty-six columns: 1920x30720 is 8.43, 3840x15360 is 7.48,
+// 7680x7680 is 7.58, 15360x3840 is 9.34, 30720x1920 is 17.71. It is a shallow
+// U in the shared dimension with a long tail, and both ends are traffic rather
+// than arithmetic. Counted as bytes actually moved — BN thirty-two over two
+// hundred and fifty-six columns reads the weights eight times, and the answer
+// is written once — ffn_down's shape moves 269 megabytes at 140 gigabytes a
+// second and ffn_gate's moves 281 at 117. The 1.25x between their microseconds
+// is that 4x in the answer's size and a fifth of bandwidth, and nothing else.
+//
+// Which leaves the real number in plain sight and it is not this kernel's: the
+// card gives 640 gigabytes a second and the best shape here reaches 140, while
+// halving the traffic makes it *slower*. A kernel whose speed does not answer
+// to its traffic is not short of bandwidth — this file said that once already,
+// of the shape it replaced. What it is short of, at BN thirty-two, is the same
+// eighty per cent shaders/matmul_coop.comp measured and named: the staging.
 
 #ifndef COLUMNS
 #define COLUMNS 32
@@ -227,9 +264,20 @@
 
 // How many of each operand one thread fetches per step. The staging is issued
 // a whole step ahead into these, so they have to be a fixed count.
-#define WLOADS (BM * KSTEP / THREADS)
-#define ALOADS (BN * KSTEP * 2 / THREADS)
-#define ADLOADS (BN * KSTEP / THREADS)
+// Rounded up, not down. A geometry where an operand has fewer items to stage
+// than the workgroup has threads used to divide to zero here, and a kernel
+// that stages nothing reads whatever the shared arrays held: at BM sixty-four
+// over a step of eight blocks the activation's scales are BN*KSTEP items to
+// five hundred and twelve threads, and that geometry would not compile at all.
+// It is the geometry a short shared dimension wants — see the header — so the
+// counts round up and the loops carry the bound.
+#define CEILDIV(a, b) (((a) + (b) - 1) / (b))
+#define WITEMS  (BM * KSTEP)
+#define AITEMS  (BN * KSTEP * 2)
+#define ADITEMS (BN * KSTEP)
+#define WLOADS  CEILDIV(WITEMS, THREADS)
+#define ALOADS  CEILDIV(AITEMS, THREADS)
+#define ADLOADS CEILDIV(ADITEMS, THREADS)
 
 // The strides of the staged operands, padded by one.
 //
@@ -383,7 +431,7 @@ void main() {
         uint idx = t + i * uint(THREADS); \
         uint r = idx / KSTEP, k = idx & (KSTEP - 1u); \
         uint row = row0 + r, b = (kb) + k; \
-        if (row < p.dim && b < nb) { \
+        if (idx < uint(WITEMS) && row < p.dim && b < nb) { \
             uint at = wbase + row * rowBytes + 2u * nb + 16u * b; \
             wq[i] = wide ? w4[at >> 4] \
                          : uvec4(w[(at >> 2)], w[(at >> 2) + 1u], w[(at >> 2) + 2u], w[(at >> 2) + 3u]); \
@@ -397,20 +445,21 @@ void main() {
         uint rest = idx & (KSTEP * 2u - 1u); \
         uint c = idx / (KSTEP * 2u), k = rest >> 1, h = rest & 1u; \
         uint b = (kb) + k; \
-        av[i] = (b < nb) ? aq4[ACOL(c) * aw4 + b * 2u + h] : uvec4(0u); \
+        av[i] = (idx < uint(AITEMS) && b < nb) ? aq4[ACOL(c) * aw4 + b * 2u + h] : uvec4(0u); \
     } \
     [[unroll]] for (uint i = 0u; i < uint(ADLOADS); i++) { \
         uint idx = t + i * uint(THREADS); \
         uint c = idx / KSTEP, k = idx & (KSTEP - 1u); \
         uint b = (kb) + k; \
-        ad[i] = (b < nb) ? ASCALE(c, b) : 0.0; \
-        ac[i] = (b < nb) ? ACORR(c, b) : 0.0; \
+        ad[i] = (idx < uint(ADITEMS) && b < nb) ? ASCALE(c, b) : 0.0; \
+        ac[i] = (idx < uint(ADITEMS) && b < nb) ? ACORR(c, b) : 0.0; \
     }
 
 #define STAGE() \
     [[unroll]] for (uint i = 0u; i < uint(WLOADS); i++) { \
         uint idx = t + i * uint(THREADS); \
         uint r = idx / KSTEP, k = idx & (KSTEP - 1u); \
+        if (idx >= uint(WITEMS)) continue; \
         uint o = r * uint(SA_STRIDE) + k * 4u; \
         sa[o] = wq[i].x; sa[o + 1u] = wq[i].y; sa[o + 2u] = wq[i].z; sa[o + 3u] = wq[i].w; \
         sad[r * uint(SD_STRIDE) + k] = wd[i]; \
@@ -419,12 +468,14 @@ void main() {
         uint idx = t + i * uint(THREADS); \
         uint rest = idx & (KSTEP * 2u - 1u); \
         uint c = idx / (KSTEP * 2u), k = rest >> 1, h = rest & 1u; \
+        if (idx >= uint(AITEMS)) continue; \
         uint o = c * uint(SB_STRIDE) + k * 8u + h * 4u; \
         sb[o] = av[i].x; sb[o + 1u] = av[i].y; sb[o + 2u] = av[i].z; sb[o + 3u] = av[i].w; \
     } \
     [[unroll]] for (uint i = 0u; i < uint(ADLOADS); i++) { \
         uint idx = t + i * uint(THREADS); \
         uint c = idx / KSTEP, k = idx & (KSTEP - 1u); \
+        if (idx >= uint(ADITEMS)) continue; \
         sbd[c * uint(SD_STRIDE) + k] = ad[i]; \
         sbc[c * uint(SD_STRIDE) + k] = ac[i]; \
     }

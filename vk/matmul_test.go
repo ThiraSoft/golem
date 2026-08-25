@@ -293,3 +293,69 @@ func BenchmarkMatMulCold(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkMatMulShape is the tiled product over shapes of a constant size, to
+// name the asymmetry shaders/matmul_coop.comp ends on: ffn_down's shape, few
+// rows over a long shared dimension, reaches half the microseconds a column of
+// ffn_gate's, many rows over a short one, on the same bytes and the same
+// multiply count. Nothing in the arithmetic distinguishes them, so what is
+// wanted is the curve between them rather than the two ends.
+//
+// The matrices here are synthetic, which vk/q6k_test.go argues against for a
+// parity test and which is fine for a clock: an unpacking bug would be as slow
+// as a correct unpacking. Cold, twenty-four copies, as BenchmarkMatMulCold.
+func BenchmarkMatMulShape(b *testing.B) {
+	const columns = 256
+	const copies = 12
+	for _, shape := range []struct{ rows, cols int }{
+		{1920, 30720}, {3840, 15360}, {7680, 7680}, {15360, 3840}, {30720, 1920},
+	} {
+		rows, cols := shape.rows, shape.cols
+		b.Run(itoa(rows)+"x"+itoa(cols), func(b *testing.B) {
+			d := open(b)
+			defer d.Close()
+			data := make([]byte, rows*rowBytesQ4_0(cols))
+			for i := range data {
+				data[i] = byte(i*31 + i/17)
+			}
+			batch := columnsOf(cols, columns)
+			mms := make([]*MatMul, copies)
+			for k := range mms {
+				mm, err := NewMatMul(d, data, rows, cols, columns, false)
+				if err != nil {
+					b.Fatal(err)
+				}
+				defer mm.Close()
+				for c := 0; c < columns; c++ {
+					if err := mm.SetColumn(c, oneColumn(batch, c)); err != nil {
+						b.Fatal(err)
+					}
+				}
+				mms[k] = mm
+			}
+			for _, mm := range mms {
+				if err := d.Submit(func(r *Recorder) { mm.upload(r) }); err != nil {
+					b.Fatal(err)
+				}
+			}
+			bytes := rows * rowBytesQ4_0(cols)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := d.Submit(func(r *Recorder) {
+					for k, mm := range mms {
+						if k > 0 {
+							r.Barrier()
+						}
+						mm.pass(r)
+					}
+				}); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			seconds := b.Elapsed().Seconds() / float64(b.N) / copies
+			b.ReportMetric(float64(bytes)/seconds/1e9, "GB/s")
+			b.ReportMetric(seconds*1e6/float64(columns), "us/column")
+		})
+	}
+}

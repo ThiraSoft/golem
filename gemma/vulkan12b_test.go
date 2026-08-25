@@ -11,6 +11,7 @@ package gemma
 
 import (
 	"testing"
+	"time"
 )
 
 func load12BStack(t *testing.T) (*fixture, *Model) {
@@ -142,4 +143,35 @@ func Benchmark12BPrefillVulkan(b *testing.B) {
 			b.ReportMetric(float64(n)*float64(b.N)/b.Elapsed().Seconds(), "tok/s")
 		})
 	}
+}
+
+// TestVulkan12BPromptProfile is TestVulkanPromptProfile on the dense 12B,
+// which is where the prompt sits furthest behind llama.cpp.
+func TestVulkan12BPromptProfile(t *testing.T) {
+	_, m := load12BStack(t)
+	tl, err := m.NewStackTimeline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tl.Close()
+
+	width := m.stackColumns()
+	tokens := make([]int32, width)
+	for i := range tokens {
+		tokens[i] = int32(100 + i)
+	}
+	m.Reset()
+	m.ForwardBatch(tokens, 0)
+	m.Reset()
+	m.ProfileStack(tl)
+	start := time.Now()
+	m.ForwardBatch(tokens, 0)
+	took := time.Since(start)
+	m.ProfileStack(nil)
+
+	report, err := tl.Report(took)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("%d columns\n%s", width, report)
 }
