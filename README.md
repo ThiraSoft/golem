@@ -192,8 +192,8 @@ Worth knowing before you clone it:
   ceiling is about 43.
 
   `-vulkan` moves all four, and then everything between them. On the 26B A4B,
-  **13.4 tokens a second becomes 96.8** — llama.cpp's ROCm build is at 99.8 on
-  the same card — and the prompt goes from 40 a second to 135. It costs those
+  **13.4 tokens a second becomes 96.8** — llama.cpp's Vulkan build is at 116.5
+  and its ROCm build at 99.8 on the same card — and the prompt goes from 40 a second to 135. It costs those
   matrices being resident — 12.8 gibibytes, which is why a card with sixteen is
   the smallest that can do this — and about nine seconds of upload.
 
@@ -201,8 +201,8 @@ Worth knowing before you clone it:
   block with one branch: the shared branch of a mixture and an ordinary feed
   forward are the same three matrices under the same norm, and what differs is
   the end of the block — one post-norm instead of three, and no routing. On the
-  12B, **5.0 tokens a second becomes 58.1**, against llama.cpp's 61.2 on the
-  same card.
+  12B, **5.0 tokens a second becomes 58.1**, against llama.cpp's 63.1 in Vulkan
+  and 61.2 in ROCm on the same card.
 
   Qwen3 runs on the same stack. Four things differ and they are all the file
   being read rather than a second path: an ordinary pre-norm block, where
@@ -211,7 +211,8 @@ Worth knowing before you clone it:
   square root of the head, which Gemma leaves at one because its query norm
   holds them in range; and a value handed to the attention unnormed, which
   Gemma norms. On the 4B, **14.6 tokens a second becomes 154.8**, against
-  llama.cpp's 142.7; on the 0.6B, 83.4 becomes 312.5 against 244.1. The head is
+  llama.cpp's 162.6 in Vulkan and 142.7 in ROCm; on the 0.6B, 83.4 becomes
+  312.5 against 352.3 and 244.1. The head is
   Q4_0 on those checkpoints rather than Q6_K, and reads through
   `shaders/matvec.comp` — the kernel the attention's projections already use.
 
@@ -288,13 +289,25 @@ Worth knowing before you clone it:
 - **The prompt path on Gemma is a factor of one and two thirds behind ggml's
   best**, even where it beats the default build; `gemma/README.md` says where
   the remainder sits.
-- **On a card, the prompt is still behind.** Generation reaches or passes
-  llama.cpp's ROCm build; the prompt does not — 568 tokens a second against
-  1906 on the Qwen3 4B. What is left is not the weights, which are now read
-  once for eight positions and at the card's memory ceiling doing it, but the
-  activation: every workgroup reads all eight columns of it for the sixteen
-  rows it owns, and that traffic grows with the batch where the weight traffic
-  does not. It is the largest thing left on this path.
+- **On a card, the prompt is a factor of four to six behind, and generation a
+  tenth.** Measured against llama.cpp's own Vulkan build on the same card,
+  which is the fair comparison for a Vulkan engine and is faster than its ROCm
+  build at everything here:
+
+  | tokens a second | golem gen | llama gen | golem prompt | llama prompt |
+  | --------------- | --------: | --------: | -----------: | -----------: |
+  | Gemma 4 26B A4B |      96.8 |     116.5 |          135 |          822 |
+  | Gemma 4 12B     |      58.1 |      63.1 |          245 |          984 |
+  | Qwen3 4B        |     154.8 |     162.6 |          568 |         2855 |
+  | Qwen3 0.6B      |     312.5 |     352.3 |         1793 |         8135 |
+
+  Generation is within a tenth. The prompt is not, and the gap is reachable —
+  the same API on the same card does it. What is left is the shape of the
+  product: a prompt here reads its weights once for eight positions through a
+  mat-vec kernel, and llama.cpp caps that same kernel at eight columns and
+  hands anything wider to a tiled product. `vk/shaders/matmul.comp` is a first
+  attempt at one and is not bound in; its header says what it measures and
+  what has been ruled out.
 
 ## What is here, and what is not
 
