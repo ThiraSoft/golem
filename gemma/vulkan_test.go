@@ -305,7 +305,7 @@ func TestVulkanBatchGreedyMatchesTheReference(t *testing.T) {
 // once for a pass rather than once for each of its columns, so what this
 // reports should rise with the width of the pass and not stay flat.
 func BenchmarkMoEPrefillVulkan(b *testing.B) {
-	for _, n := range []int{64, 128, 256} {
+	for _, n := range []int{64, 128, 256, 512, 1024} {
 		b.Run(itoa(n), func(b *testing.B) {
 			m := open26BEngine(b)
 			if err := m.UseVulkanStack(); err != nil {
@@ -324,4 +324,36 @@ func BenchmarkMoEPrefillVulkan(b *testing.B) {
 			b.ReportMetric(float64(n)*float64(b.N)/b.Elapsed().Seconds(), "tok/s")
 		})
 	}
+}
+
+// TestVulkanPromptProfile is TestVulkanStackProfile on a stretch of prompt
+// rather than a token: which stage of a mixture block a batch is spent in.
+// Run it with -v.
+func TestVulkanPromptProfile(t *testing.T) {
+	_, m := load26BStack(t)
+	tl, err := m.NewStackTimeline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tl.Close()
+
+	width := m.stackColumns()
+	tokens := make([]int32, width)
+	for i := range tokens {
+		tokens[i] = int32(100 + i)
+	}
+	m.Reset()
+	m.ForwardBatch(tokens, 0) // warm the clocks and the recording
+	m.Reset()
+	m.ProfileStack(tl)
+	start := time.Now()
+	m.ForwardBatch(tokens, 0)
+	took := time.Since(start)
+	m.ProfileStack(nil)
+
+	report, err := tl.Report(took)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("%d columns\n%s", width, report)
 }

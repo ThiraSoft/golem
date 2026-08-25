@@ -231,6 +231,7 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 		{smallColumns, matvecWideSPIRV},
 		{tiledColumns, matmulWide32SPIRV},
 		{64, matmulWide64SPIRV},
+		{128, matmulWidest128SPIRV},
 		{wideColumns, matmulWide()},
 	} {
 		if err := a.matvec.Wide(spec.columns, spec.spirv); err != nil {

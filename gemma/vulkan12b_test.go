@@ -116,16 +116,19 @@ func Benchmark12BPrefillVulkan(b *testing.B) {
 	if err := m.UseVulkanStack(); err != nil {
 		b.Skipf("no Vulkan stack: %v", err)
 	}
-	const n = 64
-	tokens := make([]int32, n)
-	for i := range tokens {
-		tokens[i] = int32(100 + i)
+	for _, n := range []int{64, 256} {
+		b.Run(itoa(n), func(b *testing.B) {
+			tokens := make([]int32, n)
+			for i := range tokens {
+				tokens[i] = int32(100 + i)
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				m.Reset()
+				m.ForwardBatch(tokens, 0)
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(n)*float64(b.N)/b.Elapsed().Seconds(), "tok/s")
+		})
 	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		m.Reset()
-		m.ForwardBatch(tokens, 0)
-	}
-	b.StopTimer()
-	b.ReportMetric(float64(n)*float64(b.N)/b.Elapsed().Seconds(), "tok/s")
 }

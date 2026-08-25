@@ -25,9 +25,22 @@
 // One row per pair is a hundred and twenty-eight columns by eight slots by the
 // width of the stream, ten megabytes, which is a tenth of what the pass saves.
 //
-// Sixty-four outputs to a workgroup and eight lanes to each of them, striding
-// the blocks: neighbouring lanes read neighbouring bytes of one row, which is
+// LANES threads to an output row, striding the blocks, and 512/LANES rows to a
+// workgroup: neighbouring lanes read neighbouring bytes of one row, which is
 // what shaders/moe_gateup.comp's header says the alternative cost.
+//
+// **What this kernel does not reach, and what was tried.** It runs at about
+// ninety gigabytes a second on a card that does two hundred and sixty-seven in
+// the tiled product beside it, and nothing parameteric moves it: holding
+// sixteen, thirty-two or sixty-four columns per weight read instead of eight
+// is monotonically *worse* (1561, 1504, 1384, 1226 tokens a second on the 26B
+// at 256 columns), even though it halves and quarters the weight traffic, and
+// the lane count is flat between four and eight. A kernel whose bandwidth does
+// not answer to its traffic is not short of bandwidth. The shape is a mat-vec
+// with a few columns bolted on — one output row to a team of lanes, no shared
+// staging, no register tile — and what it is short of is the tiled product's
+// arithmetic per load. That rewrite is the work left, and it is why llama.cpp
+// reads the same stack two and a half times faster at 256 positions.
 
 #ifndef CCOL
 #define CCOL 8
@@ -55,8 +68,11 @@ layout(push_constant) uniform Push {
     uint cap;   // room in one expert's list
 } p;
 
-const uint LANES = 8u;
-const uint OUTS  = 64u;
+#ifndef LANES_
+#define LANES_ 8
+#endif
+const uint LANES = uint(LANES_);
+const uint OUTS  = 512u / LANES;
 
 shared uint spair[CCOL];
 shared bool sactive[CCOL];

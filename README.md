@@ -247,17 +247,17 @@ Worth knowing before you clone it:
   a device, and the engine falls back to the CPU as it does when there is no
   Vulkan at all.
 
-  A model whose attention is on the card reads its prompt in stretches of a
-  hundred and twenty-eight positions, because the keys and values are the
-  card's and the two caches must not part. A hundred and twenty-eight of them
-  in one pass is what a batch was always for: every matrix of the model read
-  once for all of them instead of once for each, which is the whole of the
-  difference between a prompt at the memory ceiling and a prompt a hundred and
-  twenty-eight times over it. A mixture is no exception any more: its expert
-  stack is read by expert rather than by column, so the eight matrices a
-  position routes to are read once for the eight positions that wanted them. Generation reads the
-  same binaries it always did: the column count is compiled into the kernel
-  rather than pushed, so there are several of each and a token draws the narrowest.
+  A model whose attention is on the card reads its prompt in stretches of two
+  hundred and fifty-six positions, because the keys and values are the card's
+  and the two caches must not part. Two hundred and fifty-six of them in one
+  pass is what a batch was always for: every matrix of the model read once for
+  all of them instead of once for each, which is the whole of the difference
+  between a prompt at the memory ceiling and a prompt two hundred and fifty-six
+  times over it. A mixture is no exception any more: its expert stack is read
+  by expert rather than by column, so the eight matrices a position routes to
+  are read once for the positions that wanted them. Generation reads the same
+  binaries it always did: the column count is compiled into the kernel rather
+  than pushed, so there are several of each and a token draws the narrowest.
 
   Which kernel a pass runs is the width's business. A token and a short
   stretch draw the mat-vec, one row of the answer to a team of eight lanes; a
@@ -321,25 +321,39 @@ Worth knowing before you clone it:
 - **The prompt path on Gemma is a factor of one and two thirds behind ggml's
   best**, even where it beats the default build; `gemma/README.md` says where
   the remainder sits.
-- **On a card, the prompt is between level and a factor of one and three
-  quarters behind, and generation a tenth.** Measured against llama.cpp's own
-  Vulkan build on the same card, which is the fair comparison for a Vulkan
-  engine and is faster than its ROCm build at everything here:
+- **On a card, generation is within a tenth and the prompt is a factor of two
+  to three behind, widening with the length of the prompt.** Measured against
+  llama.cpp's own Vulkan build on the same card, which is the fair comparison
+  for a Vulkan engine and is faster than its ROCm build at everything here.
+  Both columns of each pair were measured the same evening; a prompt is given
+  at two lengths because the two engines answer them differently:
 
-  | tokens a second | golem gen | llama gen | golem prompt | llama prompt |
-  | --------------- | --------: | --------: | -----------: | -----------: |
-  | Gemma 4 26B A4B |      98.2 |     116.5 |         1463 |          822 |
-  | Gemma 4 12B     |      59.6 |      63.1 |          663 |          984 |
-  | Qwen3 4B        |     161.8 |     162.6 |         1646 |         2855 |
-  | Qwen3 0.6B      |     351.5 |     352.3 |         7017 |         8135 |
+  | tokens a second | golem gen | llama gen | golem pp64 | llama pp64 | golem pp256 | llama pp256 |
+  | --------------- | --------: | --------: | ---------: | ---------: | ----------: | ----------: |
+  | Gemma 4 26B A4B |      98.0 |     116.5 |       1436 |       1049 |        1566 |        3107 |
+  | Gemma 4 12B     |      59.3 |      64.2 |        686 |       1211 |         694 |        2548 |
+  | Qwen3 4B        |     158.5 |     165.9 |       1622 |       3144 |        1472 |        5688 |
+  | Qwen3 0.6B      |     337.7 |     353.1 |       7047 |       9816 |        6612 |       19566 |
 
-  The 26B's row is the one that moved: its prompt used to go a position at a
-  time, because each position routes to its own eight matrices of a hundred
-  and twenty-eight and two positions share no read. Read by expert instead —
-  for each expert, the columns that chose it — and a pass of a hundred and
-  twenty-eight columns reads the stack once where it read it a thousand and
-  twenty-four times. 173 tokens a second to 1463, which is where a mixture
-  prompt passes the dense models beside it and the reference for it.
+  **The shape of the gap is the story.** golem's prompt is flat in the length
+  of the prompt and llama.cpp's is not: from sixty-four positions to two
+  hundred and fifty-six it gains a factor of two and a half on every model and
+  golem gains nothing. On the 26B that is enough for golem to be ahead at
+  sixty-four and a factor of two behind at two hundred and fifty-six, off the
+  same kernels.
+
+  The 26B's row is the one that moved this far at all. Its prompt used to go a
+  position at a time, because each position routes to its own eight matrices
+  of a hundred and twenty-eight and two positions share no read; read by
+  expert instead — for each expert, the columns that chose it — it went from
+  173 tokens a second to 1436. What the by-expert kernels do not yet have is
+  the tiled product's shape. They run at about ninety gigabytes a second where
+  the tiled product beside them reaches two hundred and sixty-seven, and
+  nothing parametric moves them: holding sixteen, thirty-two or sixty-four
+  columns to a weight read instead of eight is monotonically worse even though
+  it halves and quarters the traffic, and the lane count is flat. A kernel
+  whose speed does not answer to its traffic is not short of bandwidth, and
+  `vk/shaders/moe_id_down.comp` says what it is short of.
 
   Generation is within a tenth. The prompt is not, and what is left of the gap
   has been measured rather than guessed. The cost of a tiled product is a

@@ -37,7 +37,7 @@ import (
 // rather than by column. shaders/moe_scatter.comp says why.
 //
 //go:generate glslc -O -DCOLUMNS=8 -DBYID --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_id8.spv
-//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_id_down.comp -o shaders/moe_id_down.spv
+//go:generate glslc -O -DLANES_=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_id_down.comp -o shaders/moe_id_down.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_scatter.comp -o shaders/moe_scatter.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_id_combine.comp -o shaders/moe_id_combine.spv
 
@@ -106,6 +106,9 @@ var matmulWide64SPIRV []byte
 
 //go:embed shaders/matmul128.spv
 var matmulWidest128SPIRV []byte
+
+//go:embed shaders/matmul256.spv
+var matmulWidest256SPIRV []byte
 
 //go:embed shaders/matmul_reduce.spv
 var matmulReduceSPIRV []byte
@@ -222,7 +225,15 @@ type moePush struct {
 
 // idDownOuts is shaders/moe_id_down.comp's OUTS: how many outputs one of its
 // workgroups writes.
-const idDownOuts = 64
+const idDownOuts = 512 / idDownLanes
+
+// idDownLanes is that kernel's LANES: how many threads share one output row.
+// It is compiled into the shader and multiplied out here, and the two have to
+// agree. Swept on the 26B at 256 columns: one lane 1254 tokens a second, two
+// 1429, four 1567, eight 1558. Four and eight are the same number and the
+// choice between them is noise; below that a lane walks the whole of a row
+// twenty-two blocks long and there are too few of them to fill the card.
+const idDownLanes = 4
 
 // scatterPush is shaders/moe_scatter.comp's, which counts rather than
 // multiplies and takes none of the shapes the others do.
@@ -333,6 +344,7 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		{&m.denseDown, smallColumns, matvecWideSPIRV},
 		{&m.denseDown, tiledColumns, matmulWide32SPIRV},
 		{&m.denseDown, 64, matmulWide64SPIRV},
+		{&m.denseDown, 128, matmulWidest128SPIRV},
 		{&m.denseDown, wideColumns, matmulWide()},
 	} {
 		if err := (*spec.pipe).Wide(spec.columns, spec.spirv); err != nil {
