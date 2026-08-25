@@ -35,12 +35,14 @@ layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly  buffer ID { int  ids[];    };  // the chosen experts, by column
 layout(std430, binding = 1)           buffer CN { uint counts[]; };  // how many columns chose each
 layout(std430, binding = 2) writeonly buffer PR { uint pairs[];  };  // and which, per expert
+layout(std430, binding = 3) writeonly buffer PL { uint plan[];   };  // the workgroups that will read them
 
 layout(push_constant) uniform Push {
     uint columns;  // the width of the pass
     uint used;     // experts to a column
     uint experts;  // experts in the model
     uint cap;      // room in one expert's list, which is maxColumns
+    uint bn;       // columns of a list one workgroup of the product answers
 } p;
 
 void main() {
@@ -54,5 +56,32 @@ void main() {
         uint e = uint(ids[i]);
         uint slot = atomicAdd(counts[e], 1u);
         if (slot < p.cap) pairs[e * p.cap + slot] = i;
+    }
+    memoryBarrierBuffer();
+    barrier();
+
+    // The plan the tiled product is dispatched against.
+    //
+    // A workgroup of shaders/matmul.comp built with BYID answers BN entries of
+    // one expert's list, and how many such workgroups there are is a number
+    // only the card knows: it is the sum over the experts of the length of
+    // their list rounded up. A dispatch cannot wait for it — Vulkan has an
+    // indirect dispatch and llama.cpp does not use it either — so the grid is
+    // this plan's worst case, one entry an expert plus one per BN pairs, and
+    // the entries past plan[0] return on their first load.
+    //
+    // Serial, by one thread, because a hundred and twenty-eight experts is a
+    // hundred and twenty-eight iterations of an add and a compare and the
+    // dispatch that carries this kernel costs more.
+    if (t == 0u) {
+        uint g = 0u;
+        for (uint e = 0u; e < p.experts; e++) {
+            for (uint c = 0u; c < counts[e]; c += p.bn) {
+                plan[1u + 2u * g] = e;
+                plan[2u + 2u * g] = c;
+                g++;
+            }
+        }
+        plan[0] = g;
     }
 }

@@ -109,6 +109,51 @@
 // uncounted the kernel answers a fraction of the batch and leaves the rest
 // zero — the same trap BM and matmulRows are, one matrix further on, and it
 // measured as a speed-up until a parity test at a width above BN caught it.
+//
+// **Built with BYID this is the same product read by expert**, which is what a
+// mixture's down projection wants for a prompt.
+//
+// That projection's first shape was a kernel of its own, a mat-vec with a few
+// columns bolted on: one output row to a team of lanes, no shared staging, no
+// register tile. It ran the 26B's expert stack at about ninety gigabytes a
+// second and nothing parametric moved it — sixteen, thirty-two or sixty-four
+// columns per weight read instead of eight were monotonically *worse* (1561,
+// 1504, 1384, 1226 tokens a second at two hundred and fifty-six columns) even
+// though each halving quarters the weight traffic, and the lane count was flat
+// between four and eight. A kernel whose speed does not answer to its traffic
+// is not short of bandwidth; it is short of arithmetic per load, which is what
+// the tile below is. Brought here the same stage measures **34.4 milliseconds
+// against 43.5 over thirty blocks**, a fifth off, and one kernel is gone.
+//
+// It is a fifth and not a third, and the reason is worth keeping: the whole
+// pass moved 243 milliseconds to 240. The mixture's prompt is not spent where
+// this rewrite was aimed. Two hundred and fifty-six columns cost 240
+// milliseconds and sixty-four cost 70, which is a straight line of about nine
+// tenths of a millisecond a column over an intercept of eleven — the stack is
+// read once either way, so what the extra columns buy is arithmetic, and it is
+// the arithmetic and not the stream that the pass is made of. The gate and up
+// half is thirty-six per cent of it and still the old shape.
+//
+// Read by expert, only three things change and none of them is the walk. A
+// workgroup answers BN entries of one expert's list rather than BN columns of
+// the batch: the weights start at that expert's slab, the activation column is
+// pairs[] rather than the column index, and the answer is written to the
+// pair's own row for shaders/moe_id_combine.comp to add. The list is short —
+// a hundred and twenty-eight experts share eight choices from each of the
+// pass's columns, so an expert holds sixteen of them at two hundred and
+// fifty-six columns — and a workgroup grid cannot be built from a count the
+// card computes. So shaders/moe_scatter.comp writes a plan beside the counts:
+// one entry per (expert, stretch of BN) that has work, and the dispatch is
+// that plan's worst case with the entries past its end returning at once.
+//
+// **KSTEP is eight here and sixteen everywhere else.** An expert's shared
+// dimension is seven hundred and four, which is twenty-two blocks: at sixteen
+// the walk is two steps of which the second is ten blocks of padding, and that
+// padding was the whole of the shape's early loss. At eight it is three steps
+// and two blocks of padding — 34.4 milliseconds against 47.7. The tile itself
+// was swept again for this shape and did not move: two rows by two columns
+// beats one by four, two by four, four by two and four by four, as it does at
+// every width above.
 
 #ifndef COLUMNS
 #define COLUMNS 32
@@ -187,6 +232,16 @@ layout(std430, binding = 1) readonly  buffer AQ4 { uvec4 aq4[]; };
 layout(std430, binding = 2) readonly  buffer AS { float as_[]; };  // its scales, then its corrections
 layout(std430, binding = 3) writeonly buffer Y  { float y[];   };
 
+#ifdef BYID
+// The counts shaders/moe_scatter.comp wrote, and the plan it wrote after them:
+// plan[0] is how many entries the plan has, and each entry after it is an
+// expert and the first of its BN list entries. A workgroup past the plan's end
+// reads one uint and returns.
+layout(std430, binding = 4) readonly buffer CN { uint counts[]; };
+layout(std430, binding = 5) readonly buffer PR { uint pairs[];  };
+layout(std430, binding = 6) readonly buffer PL { uint plan[];   };
+#endif
+
 layout(push_constant) uniform Push {
     uint dim;   // outputs
     uint ffn;   // inputs
@@ -194,6 +249,7 @@ layout(push_constant) uniform Push {
     uint act;   // the activation, which is spent before this kernel runs
     uint col;   // the gate kernel's, and not read here
     uint split; // slices of the shared dimension, one for the whole of it
+    uint cap;   // room in one expert's list, which only BYID reads
 } p;
 
 // The staged operands. Ten kilobytes, which leaves a compute unit several
@@ -203,6 +259,23 @@ shared float sad[BM * SD_STRIDE];       // the weight scales
 shared uint  sb[BN * SB_STRIDE];   // the magnitudes, eight uints a block
 shared float sbd[BN * SD_STRIDE];  // the activation scales
 shared float sbc[BN * SD_STRIDE];  // its corrections, the scale times the sum, eight times over
+
+#ifdef BYID
+// This workgroup's BN entries of the list, read once. A stretch that runs past
+// the end of the list repeats its first entry rather than reading nothing: the
+// answer is dropped at the write, and an entry that exists keeps every load in
+// range.
+shared uint spair[BN];
+shared bool salive[BN];
+#define SCBASE(pair) (((pair) / p.used) * 2u * p.used * nb + ((pair) % p.used) * nb)
+#define ACOL(c)      spair[(c)]
+#define ASCALE(c, b) as_[SCBASE(spair[(c)]) + (b)]
+#define ACORR(c, b)  as_[SCBASE(spair[(c)]) + p.used * nb + (b)]
+#else
+#define ACOL(c)      (col0 + (c))
+#define ASCALE(c, b) as_[(col0 + (c)) * 2u * nb + (b)]
+#define ACORR(c, b)  as_[(col0 + (c)) * 2u * nb + nb + (b)]
+#endif
 
 void main() {
     uint t   = gl_LocalInvocationID.x;
@@ -220,9 +293,20 @@ void main() {
     // costs one pass of shaders/matmul_reduce.comp over the answer.
     uint groups = (p.dim + uint(BM) - 1u) / uint(BM);
     uint ir  = gl_WorkGroupID.x % groups;
+#ifdef BYID
+    // The plan's entry this workgroup answers, and the expert's slab of the
+    // stack the weights come out of.
+    uint gi = gl_WorkGroupID.x / groups;
+    if (gi >= plan[0]) return;
+    uint e    = plan[1u + 2u * gi];
+    uint col0 = plan[2u + 2u * gi];
+    uint n    = counts[e];
+    uint ik   = 0u;
+#else
     uint ic  = (gl_WorkGroupID.x / groups) % uint(CGROUPS);
     uint ik  = gl_WorkGroupID.x / (groups * uint(CGROUPS));
     uint col0 = ic * uint(BN);
+#endif
     uint per = ((nb + p.split - 1u) / p.split + uint(KSTEP) - 1u) & ~(uint(KSTEP) - 1u);
     uint kb0 = ik * per;
     uint kbn = min(nb, kb0 + per);
@@ -230,6 +314,11 @@ void main() {
     uint aw  = p.ffn >> 2;           // one column of the activation, in uints
     uint aw4 = aw >> 2;              // the same, in uvec4
     uint rowBytes = nb * 18u;
+#ifdef BYID
+    uint wbase = e * p.dim * rowBytes;   // this expert's slab of the stack
+#else
+    const uint wbase = 0u;
+#endif
     // Sixteen-byte alignment of the nibbles, which is what lets the weights be
     // read as uvec4 as well.
     bool wide = (nb & 7u) == 0u;
@@ -263,10 +352,10 @@ void main() {
         uint r = idx / KSTEP, k = idx & (KSTEP - 1u); \
         uint row = row0 + r, b = (kb) + k; \
         if (row < p.dim && b < nb) { \
-            uint at = row * rowBytes + 2u * nb + 16u * b; \
+            uint at = wbase + row * rowBytes + 2u * nb + 16u * b; \
             wq[i] = wide ? w4[at >> 4] \
                          : uvec4(w[(at >> 2)], w[(at >> 2) + 1u], w[(at >> 2) + 2u], w[(at >> 2) + 3u]); \
-            wd[i] = unpackHalf2x16(w[(row * rowBytes + 2u * b) >> 2])[b & 1u]; \
+            wd[i] = unpackHalf2x16(w[(wbase + row * rowBytes + 2u * b) >> 2])[b & 1u]; \
         } else { \
             wq[i] = uvec4(0u); wd[i] = 0.0; \
         } \
@@ -276,14 +365,14 @@ void main() {
         uint rest = idx & (KSTEP * 2u - 1u); \
         uint c = idx / (KSTEP * 2u), k = rest >> 1, h = rest & 1u; \
         uint b = (kb) + k; \
-        av[i] = (b < nb) ? aq4[(col0 + c) * aw4 + b * 2u + h] : uvec4(0u); \
+        av[i] = (b < nb) ? aq4[ACOL(c) * aw4 + b * 2u + h] : uvec4(0u); \
     } \
     [[unroll]] for (uint i = 0u; i < uint(ADLOADS); i++) { \
         uint idx = t + i * uint(THREADS); \
         uint c = idx / KSTEP, k = idx & (KSTEP - 1u); \
         uint b = (kb) + k; \
-        ad[i] = (b < nb) ? as_[(col0 + c) * 2u * nb + b] : 0.0; \
-        ac[i] = (b < nb) ? as_[(col0 + c) * 2u * nb + nb + b] : 0.0; \
+        ad[i] = (b < nb) ? ASCALE(c, b) : 0.0; \
+        ac[i] = (b < nb) ? ACORR(c, b) : 0.0; \
     }
 
 #define STAGE() \
@@ -307,6 +396,15 @@ void main() {
         sbd[c * uint(SD_STRIDE) + k] = ad[i]; \
         sbc[c * uint(SD_STRIDE) + k] = ac[i]; \
     }
+
+#ifdef BYID
+    for (uint k = t; k < uint(BN); k += uint(THREADS)) {
+        bool live  = col0 + k < n;
+        spair[k]   = pairs[e * p.cap + (live ? col0 + k : col0)];
+        salive[k]  = live;
+    }
+    barrier();
+#endif
 
     FETCH(kb0)
     for (uint kb = kb0; kb < kbn; kb += uint(KSTEP)) {
@@ -362,7 +460,13 @@ void main() {
         uint row = row0 + tr * TM + r;
         if (row >= p.dim) continue;
         [[unroll]] for (uint c = 0u; c < TN; c++) {
+#ifdef BYID
+            uint col = tc * uint(TN) + c;
+            if (!salive[col]) continue;
+            y[spair[col] * p.dim + row] = acc[r][c];
+#else
             y[(ik * COLUMNS + col0 + tc * TN + c) * p.dim + row] = acc[r][c];
+#endif
         }
     }
 }

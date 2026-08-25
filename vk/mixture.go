@@ -37,15 +37,19 @@ import (
 // rather than by column. shaders/moe_scatter.comp says why.
 //
 //go:generate glslc -O -DCOLUMNS=8 -DBYID --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_id8.spv
-//go:generate glslc -O -DLANES_=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_id_down.comp -o shaders/moe_id_down.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_scatter.comp -o shaders/moe_scatter.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_id_combine.comp -o shaders/moe_id_combine.spv
 
+// The down projection of that path, which is the tiled product itself read by
+// expert. shaders/matmul.comp's BYID section says what it replaced.
+//
+//go:generate glslc -O -DCOLUMNS=16 -DBYID -DKSTEP=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul_id16.spv
+
+//go:embed shaders/matmul_id16.spv
+var matmulByIDSPIRV []byte
+
 //go:embed shaders/moe_gateup_id8.spv
 var moeGateUpByIDSPIRV []byte
-
-//go:embed shaders/moe_id_down.spv
-var moeDownByIDSPIRV []byte
 
 //go:embed shaders/moe_scatter.spv
 var moeScatterSPIRV []byte
@@ -161,12 +165,19 @@ type Mixture struct {
 	// belong to an expert where gateUp and down belong to a column, scatter
 	// builds the lists they walk, and idCombine adds a column's eight slots
 	// back together. shaders/moe_scatter.comp says why a prompt wants this.
+	// idDown is not its own kernel: it is shaders/matmul.comp built with
+	// BYID, which is the tiled product reading the same lists.
 	idGateUp, idDown   *Pipeline
 	scatter, idCombine *Pipeline
 	scatterSet         *Set
 	combineSet         *Set
 	counts, pairs      *Buffer
-	dpart              *Buffer
+	// plan is the grid the by-expert product is dispatched against: one entry
+	// per expert and stretch of idProductBN that has work, written by the
+	// scatter beside the counts because only the card knows how many there
+	// are. See shaders/moe_scatter.comp.
+	plan  *Buffer
+	dpart *Buffer
 	// reduce folds the slices of a split shared-branch down projection, and
 	// splitDown is how many there are. matmulSplit says which matrices want
 	// it: this one has the stack's fewest rows and the most weight behind
@@ -223,17 +234,19 @@ type moePush struct {
 	cap uint32
 }
 
-// idDownOuts is shaders/moe_id_down.comp's OUTS: how many outputs one of its
-// workgroups writes.
-const idDownOuts = 512 / idDownLanes
+// idProductBN is the BN shaders/matmul.comp is built at for the by-expert
+// down projection, and the stretch of one expert's list a workgroup answers.
+// It is not the pass's width: a hundred and twenty-eight experts share eight
+// choices from each column, so an expert's list holds columns*used/experts
+// entries — sixteen at a pass of two hundred and fifty-six.
+const idProductBN = 16
 
-// idDownLanes is that kernel's LANES: how many threads share one output row.
-// It is compiled into the shader and multiplied out here, and the two have to
-// agree. Swept on the 26B at 256 columns: one lane 1254 tokens a second, two
-// 1429, four 1567, eight 1558. Four and eight are the same number and the
-// choice between them is noise; below that a lane walks the whole of a row
-// twenty-two blocks long and there are too few of them to fill the card.
-const idDownLanes = 4
+// idPlanMax is how many entries that plan can hold for a pass of that width,
+// which is what the dispatch has to be sized for: one entry per BN pairs, plus
+// one an expert for the stretch that does not fill.
+func idPlanMax(experts, columns int) int {
+	return experts + columns*expertsUsed/idProductBN
+}
 
 // scatterPush is shaders/moe_scatter.comp's, which counts rather than
 // multiplies and takes none of the shapes the others do.
@@ -245,7 +258,8 @@ type scatterPush struct {
 	used    uint32
 	experts uint32
 	cap     uint32
-	_       [3]uint32
+	bn      uint32
+	_       [2]uint32
 }
 
 // combinePairsPush is shaders/moe_id_combine.comp's.
@@ -308,8 +322,8 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		}{
 			{&m.down, moeDownSPIRV, 6},
 			{&m.idGateUp, moeGateUpByIDSPIRV, 9},
-			{&m.idDown, moeDownByIDSPIRV, 6},
-			{&m.scatter, moeScatterSPIRV, 3},
+			{&m.idDown, matmulByIDSPIRV, 7},
+			{&m.scatter, moeScatterSPIRV, 4},
 			{&m.idCombine, moeIDCombineSPIRV, 3},
 		} {
 			pipes = append(pipes, spec)
@@ -397,7 +411,8 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 			bufSpec{&m.as, 2 * pairs * mid * 4, true},         // and that intermediate's scales
 			bufSpec{&m.counts, experts * 4, true},             // columns that chose each expert
 			bufSpec{&m.pairs, experts * maxColumns * 4, true}, // and which
-			bufSpec{&m.dpart, pairs * dim * 4, true},          // the down projection, a row per pair
+			bufSpec{&m.plan, (1 + 2*idPlanMax(experts, maxColumns)) * 4, true},
+			bufSpec{&m.dpart, pairs * dim * 4, true}, // the down projection, a row per pair
 		)
 	}
 	for _, spec := range bufs {
@@ -421,7 +436,7 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 	}
 	if experts > 0 {
 		// Neither of these reads a weight, so one set serves every block.
-		if m.scatterSet, err = m.scatter.NewSet([]*Buffer{m.ids, m.counts, m.pairs}); err != nil {
+		if m.scatterSet, err = m.scatter.NewSet([]*Buffer{m.ids, m.counts, m.pairs, m.plan}); err != nil {
 			m.Close()
 			return nil, err
 		}
@@ -519,7 +534,7 @@ func (m *Mixture) AddBlock(gateUpExps, downExps, gate, up, down []byte) error {
 			setSpec{&b.setIDGateUp, m.idGateUp,
 				[]*Buffer{b.gateUp, m.xq, m.xs, m.ids, m.gelu, m.aq, m.as, m.counts, m.pairs}},
 			setSpec{&b.setIDDown, m.idDown,
-				[]*Buffer{b.down, m.aq, m.as, m.counts, m.pairs, m.dpart}},
+				[]*Buffer{b.down, m.aq, m.as, m.dpart, m.counts, m.pairs, m.plan}},
 		)
 	}
 	for _, spec := range sets {
@@ -542,8 +557,8 @@ func (m *Mixture) Profile(t *Timeline) { m.tl = t }
 // shared branch can take it — see the note beside the wide pipelines above.
 func (m *Mixture) Record(r *Recorder, block, columns int) {
 	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed, act: uint32(m.act),
-		cap: uint32(maxColumns)}
-	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act)}
+		cap: uint32(maxColumns), split: 1}
+	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act), split: 1}
 	b := m.blocks[block]
 	width := passWidth(columns)
 	up, down := uint32(m.dense/nn.QuantBlock), productGroups(width, m.dim)
@@ -558,7 +573,7 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 	byExpert := m.experts > 0 && columns > 1
 	if byExpert {
 		scat := scatterPush{columns: uint32(columns), used: expertsUsed,
-			experts: uint32(m.experts), cap: uint32(maxColumns)}
+			experts: uint32(m.experts), cap: uint32(maxColumns), bn: idProductBN}
 		r.Dispatch(m.scatterSet, 1, unsafe.Pointer(&scat))
 		r.Barrier()
 		r.Dispatch(b.setIDGateUp, uint32(m.experts*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
@@ -581,8 +596,8 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 	r.Barrier()
 	m.tl.Stamp(r, "moe gate/up")
 	if byExpert {
-		perExpert := (m.dim + idDownOuts - 1) / idDownOuts
-		r.Dispatch(b.setIDDown, uint32(m.experts*perExpert), unsafe.Pointer(&experts))
+		rows := uint32((m.dim + matmulRows - 1) / matmulRows)
+		r.Dispatch(b.setIDDown, rows*uint32(idPlanMax(m.experts, columns)), unsafe.Pointer(&experts))
 	} else if m.experts > 0 {
 		r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
 	}
@@ -632,7 +647,7 @@ func (m *Mixture) Close() {
 	for _, b := range []**Buffer{
 		&m.das, &m.daq, &m.doutParts, &m.dout, &m.dxs, &m.dxq,
 		&m.as, &m.aq, &m.out, &m.cw, &m.ids, &m.xs, &m.xq,
-		&m.dpart, &m.pairs, &m.counts,
+		&m.dpart, &m.plan, &m.pairs, &m.counts,
 		&m.zero, &m.gelu,
 	} {
 		if *b != nil {
