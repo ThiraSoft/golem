@@ -155,6 +155,38 @@
 // beats one by four, two by four, four by two and four by four, as it does at
 // every width above.
 
+// **llama.cpp's own tile geometry was then transplanted whole, and it loses.**
+// Their l_warptile is 128 rows by 256 columns over a shared step of sixty-four
+// values; this kernel is 32 by 32 over five hundred and twelve. Per element
+// staged, theirs does sixty-four multiply-accumulates and ours sixteen — four
+// times the arithmetic for the same shared traffic, which is exactly the ratio
+// this file and shaders/matmul_coop.comp both name as the missing eighty per
+// cent. Measured on the 12B at two hundred and fifty-six columns, microseconds
+// a column, ffn_down then ffn_gate:
+//
+//   32/32   TM 2 TN 2 KSTEP 16   4.67   8.90   (this kernel)
+//   64/64   TM 4 TN 4 KSTEP  4   5.45   9.26
+//   128/64  TM 8 TN 4 KSTEP  4   6.07  10.53
+//   128/128 TM 8 TN 8 KSTEP  2   5.66  13.21
+//
+// **And widening BN alone loses too**, which kills the obvious reading of the
+// number above. At BN thirty-two a pass of two hundred and fifty-six columns
+// reads the weight matrix eight times over, and at 4.67 microseconds a column
+// that is two hundred and sixty-five megabytes in 1.19 milliseconds — two
+// hundred and twenty-two gigabytes a second, which looks like a kernel pinned
+// at the card's ceiling doing eight times the reading it needs to. Cutting the
+// re-reads to four and to two makes it *worse*: 4.96 at BN sixty-four, 5.39 at
+// a hundred and twenty-eight.
+//
+// The reason is a caveat this benchmark carries and did not say out loud:
+// vk/matmul_test.go reads one matrix sixty-four times inside a submission, and
+// thirty-three megabytes on a card with sixty-four of last-level cache is
+// resident after the first pass. So its gigabytes a second are the cache's,
+// its re-reads are free, and its microseconds a column are a lower bound the
+// engine does not see. What it measures honestly is the arithmetic, and the
+// arithmetic says this shape is a local optimum on this card in every
+// direction tried.
+
 #ifndef COLUMNS
 #define COLUMNS 32
 #endif

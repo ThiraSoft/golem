@@ -79,6 +79,17 @@
 // marginally behind, which is what this file's own analysis predicted — eighty
 // per cent of the pass is the staging, and the staging is the same.
 //
+// **Its own geometry was then swept again through the fixed harness**, since
+// every earlier sweep of it went through the broken one. On the 12B at two
+// hundred and fifty-six columns, microseconds a column, ffn_down then
+// ffn_gate: 64/32/32 gives 4.76 and 9.03, 64/64/32 gives **4.40** and 9.24,
+// 128/64/32 gives 4.74 and 9.55, 64/32/64 gives 4.84 and 9.08, 128/32/32
+// gives 4.52 and 9.40, 64/64/64 gives 4.87 and 9.73, 128/128/32 gives 5.85
+// and 9.71. The best of them is six per cent ahead of the integer product on
+// ffn_down and four per cent behind it on ffn_gate. Six per cent is not the
+// 1.93 that turning coopmat off costs llama.cpp, and no geometry here finds
+// it.
+//
 // It is still not bound in, and now for one reason rather than two. It wanted
 // a pass of at least a hundred and twenty-eight columns, and the stack carries
 // two hundred and fifty-six now, so that objection is gone; what remains is
