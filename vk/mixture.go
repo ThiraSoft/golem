@@ -117,6 +117,11 @@ type moePush struct {
 	ffn  uint32
 	used uint32
 	act  uint32
+	// col is the first column of the pass a dispatch answers, which only the
+	// gate kernel reads: it is the one kernel that cannot be built at the full
+	// width of a pass, so a wide pass runs it more than once at an offset.
+	// Every other kernel declares four uints and ignores this one.
+	col uint32
 }
 
 // An Activation is what a gated feed forward puts on its gate. Gemma 4 looks
@@ -179,14 +184,24 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 	// The shared branch reads its weights once for a whole batch of positions
 	// when there is one. An expert branch never does: each position routes to
 	// its own eight matrices, so there is nothing between two of them to share.
+	//
+	// The down projection has two wide forms and the gate has one: above eight
+	// columns the down projection is the tiled product of shaders/matmul.comp,
+	// which takes the same bindings and the same push block as the mat-vec, so
+	// one Set reaches both. The gate is its own kernel — it fuses two matrices
+	// and an activation — and stops at eight, because its shared memory grows
+	// with the width and eight already spends sixteen kilobytes of the
+	// thirty-two a workgroup has. A wider pass runs it repeatedly at an offset.
 	for _, spec := range []struct {
-		pipe  **Pipeline
-		spirv []byte
+		pipe    **Pipeline
+		columns int
+		spirv   []byte
 	}{
-		{&m.gateUp, moeGateUpWideSPIRV},
-		{&m.denseDown, matvecWideSPIRV},
+		{&m.gateUp, smallColumns, moeGateUpWideSPIRV},
+		{&m.denseDown, smallColumns, matvecWideSPIRV},
+		{&m.denseDown, wideColumns, matmulWideSPIRV},
 	} {
-		if err := (*spec.pipe).Wide(spec.spirv); err != nil {
+		if err := (*spec.pipe).Wide(spec.columns, spec.spirv); err != nil {
 			m.Close()
 			return nil, err
 		}
@@ -450,14 +465,20 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed, act: uint32(m.act)}
 	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act)}
 	b := m.blocks[block]
-	up, down := uint32(m.dense/nn.QuantBlock), uint32((m.dim+matvecOuts-1)/matvecOuts)
+	width := passWidth(columns)
+	up, down := uint32(m.dense/nn.QuantBlock), productGroups(width, m.dim)
 	// Nothing in either branch waits on the other, so they go in without a
 	// barrier between them and the card runs them together.
 	if m.experts > 0 {
 		r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
 	}
-	if columns > 1 {
-		r.DispatchWide(b.setDenseUp, up, unsafe.Pointer(&shared))
+	if width > 1 {
+		// The gate at eight columns at a time, however wide the pass is.
+		for c := 0; c < width; c += smallColumns {
+			at := shared
+			at.col = uint32(c)
+			r.DispatchWide(b.setDenseUp, smallColumns, up, unsafe.Pointer(&at))
+		}
 	} else {
 		r.Dispatch(b.setDenseUp, up, unsafe.Pointer(&shared))
 	}
@@ -466,8 +487,8 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 	if m.experts > 0 {
 		r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
 	}
-	if columns > 1 {
-		r.DispatchWide(b.setDenseDn, down, unsafe.Pointer(&shared))
+	if width > 1 {
+		r.DispatchWide(b.setDenseDn, width, down, unsafe.Pointer(&shared))
 	} else {
 		r.Dispatch(b.setDenseDn, down, unsafe.Pointer(&shared))
 	}

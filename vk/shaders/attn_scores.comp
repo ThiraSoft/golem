@@ -39,7 +39,7 @@ layout(push_constant) uniform Push {
 } p;
 
 // WHERE_COLUMNS is vk/attention.go's maxColumns, and the two have to agree.
-const uint WHERE_COLUMNS = 8u;
+const uint WHERE_COLUMNS = 32u;
 
 // The column this workgroup carries. A prompt dispatches one per position, and
 // each of them sees its own stretch of the cache: shaders/attn_prepare.comp has

@@ -32,11 +32,14 @@ type Pipeline struct {
 	pushBytes uint32
 	bindings  int
 
-	// The wide form of the same kernel, built from a second SPIR-V over the
-	// same layout, so that one Set serves both. Wide says what that means:
-	// a kernel that answers several columns in one pass rather than one.
-	wideModule uint64
-	wide       uint64
+	// The wide forms of the same kernel, built from further SPIR-V over the
+	// same layout, so that one Set serves all of them. Wide says what that
+	// means: a kernel that answers several columns in one pass rather than
+	// one. They are keyed by how many columns each answers, because a prompt
+	// wants the widest that fits and there is more than one width now — the
+	// mat-vec carries eight, the tiled product thirty-two.
+	wideModules map[int]uint64
+	wide        map[int]uint64
 }
 
 // NewPipeline compiles one SPIR-V compute shader that reads the given number
@@ -105,45 +108,56 @@ func (d *Device) NewPipeline(spirv []byte, bindings int, pushBytes uint32) (*Pip
 	return p, nil
 }
 
-// Wide compiles a second binary of the same kernel over this pipeline's own
-// layout — same bindings, same push block, different code. The sets already
-// made for the pipeline reach it without being made again, which is the point:
-// there are sixty-five of them on a deep model and they name the same buffers.
+// Wide compiles a further binary of the same kernel over this pipeline's own
+// layout — same bindings, same push block, different code — for a pass of that
+// many columns. The sets already made for the pipeline reach it without being
+// made again, which is the point: there are sixty-five of them on a deep model
+// and they name the same buffers.
 //
-// What differs in the binary is the number of columns it answers, which is a
-// compile-time constant there because the accumulators have to stay in
-// registers. shaders/matvec.comp says why.
-func (p *Pipeline) Wide(spirv []byte) error {
+// What differs between the binaries is the number of columns each answers,
+// which is a compile-time constant there because the accumulators have to stay
+// in registers. shaders/matvec.comp says why.
+func (p *Pipeline) Wide(columns int, spirv []byte) error {
 	smci := shaderModuleCreateInfo{
 		sType:    structShaderModuleCreateInfo,
 		codeSize: uint64(len(spirv)),
 		pCode:    uintptr(unsafe.Pointer(&spirv[0])),
 	}
-	if err := check("vkCreateShaderModule", vkCreateShaderModule(p.d.dev, &smci, 0, &p.wideModule)); err != nil {
+	var module uint64
+	if err := check("vkCreateShaderModule", vkCreateShaderModule(p.d.dev, &smci, 0, &module)); err != nil {
 		return err
 	}
+	if p.wideModules == nil {
+		p.wideModules, p.wide = map[int]uint64{}, map[int]uint64{}
+	}
+	p.wideModules[columns] = module
 	name := append([]byte("main"), 0)
 	cpci := computePipelineCreateInfo{
 		sType: structComputePipelineCreateInfo,
 		stage: pipelineShaderStageCreateInfo{
 			sType:  structPipelineShaderStageInfo,
 			stage:  shaderStageCompute,
-			module: p.wideModule,
+			module: module,
 			pName:  uintptr(unsafe.Pointer(&name[0])),
 		},
 		layout: p.layout,
 	}
-	return check("vkCreateComputePipelines", vkCreateComputePipelines(p.d.dev, 0, 1, &cpci, 0, &p.wide))
+	var pipeline uint64
+	if err := check("vkCreateComputePipelines", vkCreateComputePipelines(p.d.dev, 0, 1, &cpci, 0, &pipeline)); err != nil {
+		return err
+	}
+	p.wide[columns] = pipeline
+	return nil
 }
 
 func (p *Pipeline) Close() {
-	if p.wide != 0 {
-		vkDestroyPipeline(p.d.dev, p.wide, 0)
-		p.wide = 0
+	for columns, pipeline := range p.wide {
+		vkDestroyPipeline(p.d.dev, pipeline, 0)
+		delete(p.wide, columns)
 	}
-	if p.wideModule != 0 {
-		vkDestroyShaderModule(p.d.dev, p.wideModule, 0)
-		p.wideModule = 0
+	for columns, module := range p.wideModules {
+		vkDestroyShaderModule(p.d.dev, module, 0)
+		delete(p.wideModules, columns)
 	}
 	if p.pipeline != 0 {
 		vkDestroyPipeline(p.d.dev, p.pipeline, 0)
@@ -240,12 +254,14 @@ func (r *Recorder) DispatchColumns(s *Set, groups, columns uint32, push unsafe.P
 	r.dispatch(s, s.p.pipeline, groups, columns, push)
 }
 
-// DispatchWide runs the binary Pipeline.Wide compiled. Its columns are inside
-// the kernel rather than on an axis — that is the whole difference between a
-// prompt that reads the weights once for eight positions and one that reads
-// them eight times — so the grid is the same as the narrow form's.
-func (r *Recorder) DispatchWide(s *Set, groups uint32, push unsafe.Pointer) {
-	r.dispatch(s, s.p.wide, groups, 1, push)
+// DispatchWide runs the binary Pipeline.Wide compiled for that many columns.
+// They are inside the kernel rather than on an axis — that is the whole
+// difference between a prompt that reads the weights once for eight positions
+// and one that reads them eight times — so the grid stays one-dimensional,
+// though how many workgroups it takes is the kernel's own business and the
+// caller passes it.
+func (r *Recorder) DispatchWide(s *Set, columns int, groups uint32, push unsafe.Pointer) {
+	r.dispatch(s, s.p.wide[columns], groups, 1, push)
 }
 
 func (r *Recorder) dispatch(s *Set, pipeline uint64, groups, columns uint32, push unsafe.Pointer) {

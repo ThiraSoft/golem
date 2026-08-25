@@ -36,11 +36,30 @@ var attnPrepareSPIRV []byte
 //go:embed shaders/attn_scores.spv
 var attnScoresSPIRV []byte
 
-// maxColumns is how many positions of a prompt one pass carries: the COLUMNS
-// the wide shaders are built at, the WHERE_COLUMNS they index the position
-// buffer by, and the width every per-column buffer here is allocated for. The
-// three have to agree, and nothing checks it but this comment.
-const maxColumns = 8
+// maxColumns is how many positions of a prompt one pass carries: the widest
+// COLUMNS the wide shaders are built at, the WHERE_COLUMNS they index the
+// position buffer by, and the width every per-column buffer here is allocated
+// for. The three have to agree, and nothing checks it but this comment.
+//
+// passWidth says which binary a pass of a given length actually runs.
+const maxColumns = wideColumns
+
+// passWidth is the widest binary that answers a pass of that many columns.
+// There are three: the tiled product at thirty-two, the mat-vec at eight, and
+// the mat-vec at one, which is a token. A pass shorter than the binary it runs
+// computes the columns above it too, out of buffers that are allocated for
+// them and out of positions the per-column kernels never dispatch — so the
+// answer is right and the cost is the binary's, which is why the callers cut a
+// prompt into stretches of maxColumns and not into whatever is left.
+func passWidth(columns int) int {
+	switch {
+	case columns > smallColumns:
+		return wideColumns
+	case columns > 1:
+		return smallColumns
+	}
+	return 1
+}
 
 // A BlockShape is what one block's attention is, as the kernels need to know
 // it. It is the block answering for itself rather than a branch on its number.
@@ -149,7 +168,12 @@ type scorePush struct {
 
 // NewAttention builds the kernels and the shared buffers, which are sized for
 // the widest block and the deepest context.
-func NewAttention(d *Device, dim, maxHeads, maxKV, maxContext, rotations int) (*Attention, error) {
+//
+// maxQueryHeads is the head count rather than a width: the scores are one
+// float per head per position per column, and sizing that buffer off
+// maxHeads — which is heads times the head dimension — is a hundred and
+// twenty-eight times more memory than it needs at thirty-two columns.
+func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, rotations int) (*Attention, error) {
 	for _, n := range []int{dim, maxHeads, maxKV} {
 		if n%nn.QuantBlock != 0 {
 			return nil, fmt.Errorf("vk: attention shapes must be multiples of %d, given %d", nn.QuantBlock, n)
@@ -174,10 +198,22 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxContext, rotations int) (*
 		}
 	}
 	// The four projections read their weights once for a whole batch of
-	// positions when there is one. shaders/matvec.comp says what that is worth.
-	if err := a.matvec.Wide(matvecWideSPIRV); err != nil {
-		a.Close()
-		return nil, err
+	// positions when there is one. shaders/matvec.comp says what that is worth
+	// at eight columns, and shaders/matmul.comp what a tiled product is worth
+	// above that: on the Qwen3 4B's widest matrix, 5.9 microseconds a column
+	// against the mat-vec's 14. The two kernels take the same four bindings
+	// and the same push block, so one Set reaches both.
+	for _, spec := range []struct {
+		columns int
+		spirv   []byte
+	}{
+		{smallColumns, matvecWideSPIRV},
+		{wideColumns, matmulWideSPIRV},
+	} {
+		if err := a.matvec.Wide(spec.columns, spec.spirv); err != nil {
+			a.Close()
+			return nil, err
+		}
 	}
 
 	for _, spec := range []struct {
@@ -192,7 +228,7 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxContext, rotations int) (*
 		{&a.k, maxKV * 4 * maxColumns, true},                     //
 		{&a.v, maxKV * 4 * maxColumns, true},                     //
 		{&a.qh, maxHeads * 4 * maxColumns, true},                 // the queries, rounded through fp16
-		{&a.scoreRows, maxHeads * maxContext * maxColumns, true}, // one row of scores per head per column
+		{&a.scoreRows, maxQueryHeads * maxContext * 4 * maxColumns, true}, // one row of scores per head per column
 		{&a.aq, maxHeads * maxColumns, true},                     // the mixed values, Q8_0
 		{&a.as, 2 * maxHeads / nn.QuantBlock * 4 * maxColumns, true},
 		{&a.where, maxBlocks * maxColumns * 16, false}, // per block and column: position, first, last
@@ -476,13 +512,16 @@ func (a *Attention) Record(r *Recorder, block, columns int) {
 		units += uint32(s.KVHeads)
 	}
 
-	wide := columns > 1
+	// Which product answers this pass, and over how many workgroups: the
+	// mat-vec writes sixteen rows to a workgroup and the tiled product
+	// thirty-two, so the grid is the kernel's business and not the caller's.
+	width := passWidth(columns)
 	product := func(set *Set, outs int, push unsafe.Pointer) {
-		if wide {
-			r.DispatchWide(set, groups(outs), push)
+		if width == 1 {
+			r.Dispatch(set, groups(outs), push)
 			return
 		}
-		r.Dispatch(set, groups(outs), push)
+		r.DispatchWide(set, width, productGroups(width, outs), push)
 	}
 
 	product(b.setQ, heads, unsafe.Pointer(&project))
@@ -521,6 +560,15 @@ func boolTo(b bool) uint32 {
 
 // groups is how many workgroups the matvec kernel needs for that many outputs.
 func groups(outputs int) uint32 { return uint32((outputs + matvecOuts - 1) / matvecOuts) }
+
+// productGroups is the same for whichever product a pass of that width runs.
+func productGroups(width, outputs int) uint32 {
+	rows := matvecOuts
+	if width == wideColumns {
+		rows = matmulRows
+	}
+	return uint32((outputs + rows - 1) / rows)
+}
 
 func (a *Attention) Close() {
 	for _, b := range a.blocks {

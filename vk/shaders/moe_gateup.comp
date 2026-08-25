@@ -51,7 +51,20 @@ layout(push_constant) uniform Push {
     uint ffn;   // outputs of it, per half
     uint used;  // how many experts this dispatch is for; one, for a shared branch
     uint act;   // 0: ggml's tabulated GELU; 1: SiLU, which is a swiglu's half
+    uint col;   // the first column of the pass this dispatch answers
 } p;
+
+// COLUMNS columns starting at p.col.
+//
+// The kernel's shared memory is 512 floats a column and the card gives a
+// workgroup thirty-two kilobytes, so eight columns is the widest this shape
+// can be built — a thirty-two-column build asks for sixty-four kilobytes and
+// the driver dies on the module rather than refusing it. A pass wider than
+// eight therefore runs this kernel more than once, at eight columns and an
+// offset, which is what p.col is for. The weights are read once per dispatch
+// either way; what the wider pass buys is in the products around it, not here.
+// vk/shaders/matmul.comp is the kernel that does not have this problem, and
+// giving this one its tile is the work that is left.
 
 const uint LANES = 8u;
 
@@ -146,13 +159,13 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
         // input carries is 8 x scale x sum(q) — the same for every row it
         // meets, which is why it is not in this loop's arithmetic.
         for (uint k = 0u; k < COLUMNS; k++) {
-            uint xc = k * xw + ab;
+            uint xc = (p.col + k) * xw + ab;
             int acc = 0;
             for (uint u = 0u; u < 4u; u++) {
                 acc = dotPacked4x8AccSatEXT(lo[u], int(xq[xc + u]),      acc);
                 acc = dotPacked4x8AccSatEXT(hi[u], int(xq[xc + u + 4u]), acc);
             }
-            uint sc = k * 2u * nb;
+            uint sc = (p.col + k) * 2u * nb;
             s[k] += float(acc) * ws * xs[sc + b];
             c[k] += ws * xs[sc + nb + b];
         }
@@ -243,7 +256,7 @@ void main() {
             for (uint i = 0u; i < 32u; i++) q32[qb + i] = 0;
         }
 
-        uint at = (k * p.used * p.ffn + e * p.ffn + blk * 32u) >> 2;
+        uint at = ((p.col + k) * p.used * p.ffn + e * p.ffn + blk * 32u) >> 2;
         for (uint u = 0u; u < 8u; u++) {
             uint word = 0u;
             for (uint m = 0u; m < 4u; m++) {
@@ -251,7 +264,7 @@ void main() {
             }
             aq[at + u] = word;
         }
-        uint slot = k * 2u * p.used * blocks + e * blocks + blk;
+        uint slot = (p.col + k) * 2u * p.used * blocks + e * blocks + blk;
         as_[slot] = scale;
         as_[p.used * blocks + slot] = 8.0 * scale * float(total);
     }

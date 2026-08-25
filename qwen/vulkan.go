@@ -81,16 +81,17 @@ func (m *Model) UseVulkanStack() error {
 		m.rotations = append(m.rotations, rotation{base: bc.RoPEBase, dims: bc.RoPEDims})
 	}
 
-	var maxHeads, maxKV int
+	var maxHeads, maxKV, maxQueryHeads int
 	ffn := cfg.Blocks[0].FFN
 	for i, bc := range cfg.Blocks {
 		maxHeads = max(maxHeads, bc.Heads*bc.HeadDim)
+		maxQueryHeads = max(maxQueryHeads, bc.Heads)
 		maxKV = max(maxKV, bc.KVHeads*bc.HeadDim)
 		if bc.FFN != ffn {
 			return fmt.Errorf("qwen: the feed-forward width is one buffer on the card, and block %d is %d wide against block 0's %d", i, bc.FFN, ffn)
 		}
 	}
-	attn, err := vk.NewAttention(d, cfg.Dim, maxHeads, maxKV, cfg.MaxContext, len(m.rotations))
+	attn, err := vk.NewAttention(d, cfg.Dim, maxHeads, maxKV, maxQueryHeads, cfg.MaxContext, len(m.rotations))
 	if err != nil {
 		return err
 	}

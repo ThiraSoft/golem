@@ -92,12 +92,13 @@ func (m *Model) UseVulkanStack() error {
 		m.rotations = append(m.rotations, rotation{base: bc.RoPEBase, dims: cfg.Blocks[i].RoPEDims, freqs: freqs})
 	}
 
-	var maxHeads, maxKV int
+	var maxHeads, maxKV, maxQueryHeads int
 	for _, bc := range cfg.Blocks {
 		maxHeads = max(maxHeads, bc.Heads*bc.HeadDim)
+		maxQueryHeads = max(maxQueryHeads, bc.Heads)
 		maxKV = max(maxKV, bc.KVHeads*bc.HeadDim)
 	}
-	attn, err := vk.NewAttention(d, cfg.Dim, maxHeads, maxKV, cfg.MaxContext, len(m.rotations))
+	attn, err := vk.NewAttention(d, cfg.Dim, maxHeads, maxKV, maxQueryHeads, cfg.MaxContext, len(m.rotations))
 	if err != nil {
 		return err
 	}
