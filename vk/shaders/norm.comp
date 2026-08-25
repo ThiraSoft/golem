@@ -19,6 +19,48 @@
 // A workgroup takes one column, and a prompt dispatches one per position. The
 // norm of a position depends on that position alone, so there is nothing to
 // share between them and nothing to say about the batch beyond the offset.
+//
+// **And it is forty times slower than llama.cpp's, which is the largest thing
+// in golem's prompt that is not a matrix product.** Their Vulkan build under
+// GGML_VK_PERF_LOGGER, on the 12B at two hundred and fifty-six columns, says
+// RMS_NORM_MUL of 3840 by 256 costs 13.5 microseconds. This kernel costs 563
+// on the same shape, and there are three of these to a block: the profile of
+// the pass gives 30 milliseconds to the attention norm, 31 to the post-norm
+// and residual and 28 to the combine, which is eighty-nine of four hundred and
+// two. Deleting the attention norm's dispatch outright takes the benchmark
+// from 378 milliseconds to 351, so the profile is not lying about it.
+//
+// What that cost is not, each ruled out by measurement:
+//
+//   - **Not the arithmetic.** The sum of squares run four times over costs
+//     exactly what it costs run once.
+//   - **Not the reduction.** Replaced by a bare multiply, no change.
+//   - **Not the quantised half.** With QUANT off the kernel still costs 30
+//     milliseconds of the 33; the Q8_0 loop is the other three.
+//   - **Not the residual's second operand.** The ternary in raw() reads b[]
+//     for the norms that have no b, which is a small dummy buffer, and a
+//     driver that turned it into a select rather than a branch would be
+//     reading out of bounds on every load. Read unconditionally from a[], no
+//     change.
+//   - **Not the walk's memory-level parallelism.** p.n is a push constant so
+//     the driver cannot unroll the loop, and llama.cpp's own rms_norm.comp
+//     instantiates itself per dimension class precisely to get the unrolling.
+//     Unrolled here by eight into registers, no change.
+//   - **Not the workgroup size.** A thousand and twenty-four threads with a
+//     sixteen-kilobyte staging array against two hundred and fifty-six with
+//     none: the same, and the staging is what the second one gives up.
+//   - **Not the shape of the grid.** Two hundred and fifty-six workgroups on
+//     the y axis and one on x, which some schedulers walk badly. Swapped, no
+//     change.
+//   - **Not the barriers.** Three hundred and thirty-six extra ones added to
+//     the pass cost nothing measurable.
+//
+// What it is, in every configuration measured, is a kernel moving memory at
+// five to seven gigabytes a second on a card that gives six hundred and forty
+// — and one whose cost scales with the columns, so it is work and not an
+// overhead. Two hundred and fifty-six workgroups may simply be too small a
+// dispatch to have enough loads outstanding, but the unrolling that should
+// have tested that did not move it either. This is the open question.
 
 layout(local_size_x = 1024) in;
 
