@@ -256,7 +256,9 @@
 //     trading one for the other at par.
 //   - **The weights read straight from memory into registers**, no shared stop
 //     at all, which is what the fused gate kernel does at 319 gigabytes a
-//     second. Compiled behind WDIRECT and swept over ten geometries, now that
+//     second. Written behind a WDIRECT define, swept over ten geometries and
+//     then taken back out — the file keeps the measurement, not the branch,
+//     because a second staging path is a second thing to keep correct. Now that
 //     dropping the weight tile leaves the LDS free for a much larger one: the
 //     best is 7.44 on ffn_down and 14.69 on ffn_gate, against 6.93 and 9.19.
 //     Every one of them loses. The BN/TN threads that share a row each issue
