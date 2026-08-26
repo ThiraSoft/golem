@@ -29,6 +29,7 @@ import (
 
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/norm.comp -o shaders/norm.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/router_logits.comp -o shaders/router_logits.spv
+//go:generate glslc -O -DPICK --target-env=vulkan1.1 -fshader-stage=compute shaders/router_logits.comp -o shaders/router_logits_pick.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/router_pick.comp -o shaders/router_pick.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/combine.comp -o shaders/combine.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_q6k.comp -o shaders/embed_q6k.spv
@@ -38,6 +39,9 @@ var normSPIRV []byte
 
 //go:embed shaders/router_logits.spv
 var routerLogitsSPIRV []byte
+
+//go:embed shaders/router_logits_pick.spv
+var routerLogitsPickSPIRV []byte
 
 //go:embed shaders/router_pick.spv
 var routerPickSPIRV []byte
@@ -123,7 +127,7 @@ type Stack struct {
 	attn *Attention
 	mix  *Mixture
 
-	norm, routerW, routerPick, combine *Pipeline
+	norm, routerW, routerWPick, routerPick, combine *Pipeline
 	// embed reads one row of the token embedding into the stream, when the
 	// caller gave the stack a table to read it from.
 	embed    *Pipeline
@@ -133,6 +137,11 @@ type Stack struct {
 
 	routerIn  *Buffer // the residual under the router's own norm and scale
 	routerOut *Buffer // one logit per expert
+
+	// routerCount is the atomic the fused router counts itself down with. It
+	// starts at zero and the workgroup that picks leaves it at zero, so one
+	// four-byte buffer serves every block of the stack.
+	routerCount *Buffer
 
 	// outGain is the model's final norm, when the caller gave it one. The
 	// last thing a pass does is then the same kernel as every other norm,
@@ -192,6 +201,7 @@ type stackBlock struct {
 	setExpert   *Set // the expert branch's input
 	setRouterIn *Set // the router's input, which is the residual under its own norm
 	setRouterW  *Set
+	setRouterWP *Set // the logits and the pick in one dispatch, for one column
 	setPick     *Set
 	setCombine  *Set
 }
@@ -210,6 +220,7 @@ func NewStack(d *Device, dim int, eps float32, attn *Attention, mix *Mixture) (*
 	}{
 		{&s.norm, normSPIRV, 8, unsafe.Sizeof(normPush{})},
 		{&s.routerW, routerLogitsSPIRV, 3, unsafe.Sizeof(routerPush{})},
+		{&s.routerWPick, routerLogitsPickSPIRV, 7, unsafe.Sizeof(routerPush{})},
 		{&s.routerPick, routerPickSPIRV, 4, unsafe.Sizeof(routerPush{})},
 		{&s.combine, combineSPIRV, 7, unsafe.Sizeof(combinePush{})},
 		{&s.embed, embedQ6KSPIRV, 3, unsafe.Sizeof(embedPush{})},
@@ -429,6 +440,7 @@ func (s *Stack) AddBlock(n BlockNorms) error {
 			setSpec{&b.setExpert, s.norm, []*Buffer{s.resid, s.none, b.gains[3], s.none, s.none, s.none, expQ, expS}},
 			setSpec{&b.setRouterIn, s.norm, []*Buffer{s.resid, s.none, s.none, b.routerV, s.none, s.routerIn, s.none, s.none}},
 			setSpec{&b.setRouterW, s.routerW, []*Buffer{s.routerIn, b.routerW, s.routerOut}},
+			setSpec{&b.setRouterWP, s.routerWPick, []*Buffer{s.routerIn, b.routerW, s.routerOut, b.downs, ids, cw, s.routerCount}},
 			setSpec{&b.setPick, s.routerPick, []*Buffer{s.routerOut, b.downs, ids, cw}},
 		)
 	}
@@ -458,6 +470,12 @@ func (s *Stack) Experts(n int) error {
 		return err
 	}
 	s.routerOut = b
+	// The fused router's counter, uploaded rather than allocated so that it
+	// starts at zero: the workgroup that picks leaves it at zero behind it,
+	// and every block's dispatch finds it there.
+	if s.routerCount, err = s.d.Upload(make([]byte, 4)); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -630,11 +648,21 @@ func (s *Stack) record(r *Recorder, experts, used, columns int) {
 			r.Barrier()
 			tl.Stamp(r, "expert norm")
 			sharedDown = s.mix.RecordSharedDown(r, i, columns)
-			r.DispatchColumns(b.setRouterW, uint32(experts), uint32((columns+routerBN-1)/routerBN), unsafe.Pointer(&route))
+			// One column takes the router that picks for itself: the last of
+			// its hundred and twenty-eight workgroups reads the logits back
+			// and chooses, which is a whole phase that stops being spent.
+			fused := columns == 1
+			set := b.setRouterW
+			if fused {
+				set = b.setRouterWP
+			}
+			r.DispatchColumns(set, uint32(experts), uint32((columns+routerBN-1)/routerBN), unsafe.Pointer(&route))
 			r.Barrier()
 			tl.Stamp(r, "router")
-			r.DispatchColumns(b.setPick, 1, cols, unsafe.Pointer(&route))
-			r.Barrier()
+			if !fused {
+				r.DispatchColumns(b.setPick, 1, cols, unsafe.Pointer(&route))
+				r.Barrier()
+			}
 			tl.Stamp(r, "pick")
 		}
 		s.mix.Record(r, i, columns, sharedUp, sharedDown)
@@ -699,13 +727,13 @@ func (s *Stack) Close() {
 		b.close()
 	}
 	s.blocks = nil
-	for _, b := range []**Buffer{&s.traces, &s.routerOut, &s.routerIn, &s.none, &s.normed, &s.resid, &s.stage, &s.xs} {
+	for _, b := range []**Buffer{&s.traces, &s.routerCount, &s.routerOut, &s.routerIn, &s.none, &s.normed, &s.resid, &s.stage, &s.xs} {
 		if *b != nil {
 			(*b).Close()
 			*b = nil
 		}
 	}
-	for _, p := range []**Pipeline{&s.embed, &s.combine, &s.routerPick, &s.routerW, &s.norm} {
+	for _, p := range []**Pipeline{&s.embed, &s.combine, &s.routerPick, &s.routerWPick, &s.routerW, &s.norm} {
 		if *p != nil {
 			(*p).Close()
 			*p = nil

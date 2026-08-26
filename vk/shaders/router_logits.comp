@@ -4,6 +4,19 @@
 
 // One expert's routing logit to a workgroup, staged across BN columns.
 //
+// Built twice. With PICK the last workgroup to finish also chooses the eight
+// experts, which shaders/router_pick.comp does in a dispatch of its own — and a
+// dispatch of one workgroup costs six and a half microseconds to serialize
+// whatever is inside it, measured, which is most of what that pick was worth.
+// The counter is an atomic on a coherent buffer: every workgroup publishes its
+// logit, adds one, and the one that finds it added the last reads all hundred
+// and twenty-eight back and picks. It resets the counter on its way out, so
+// the next block's dispatch starts from zero.
+//
+// PICK is for a single column alone. A prompt picks per column, and one
+// workgroup doing that for every column of a pass in series is the opposite of
+// what the pick is cheap for.
+//
 // The router matrix is float32 — the only one in this model that is — and a
 // hundred and twenty-eight rows of it is 1.4 megabytes a block. For a wide
 // pass of several hundred columns, evaluating it one column per workgroup read
@@ -19,7 +32,15 @@ layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly  buffer X { float x[];      };  // the router's normed input
 layout(std430, binding = 1) readonly  buffer W { float w[];      };  // experts by dim, float32
+#ifdef PICK
+layout(std430, binding = 2) coherent  buffer L  { float logits[]; };
+layout(std430, binding = 3) readonly  buffer DS { float dscale[]; };  // one scalar per expert
+layout(std430, binding = 4) writeonly buffer ID { int   ids[];    };
+layout(std430, binding = 5) writeonly buffer CW { float cw[];     };
+layout(std430, binding = 6) coherent  buffer CN { uint  counter[]; };
+#else
 layout(std430, binding = 2) writeonly buffer L { float logits[]; };
+#endif
 
 layout(push_constant) uniform Push {
     uint n;
@@ -31,6 +52,13 @@ layout(push_constant) uniform Push {
 } p;
 
 shared float partial[BN * 8];
+
+#ifdef PICK
+shared uint  last;      // one, in the workgroup that added the hundred and twenty-eighth
+shared float sl[256];   // the logits, read back
+shared int   chosen[32];
+shared float se[32];
+#endif
 
 void main() {
     uint e    = gl_WorkGroupID.x;
@@ -69,4 +97,51 @@ void main() {
             }
         }
     }
+
+#ifdef PICK
+    // Publish this workgroup's logit, then count. The one that counts last
+    // has every logit of the column visible to it and does the choosing.
+    memoryBarrierBuffer();
+    barrier();
+    if (t == 0u) {
+        uint prev = atomicAdd(counter[0], 1u);
+        last = (prev + 1u == p.experts) ? 1u : 0u;
+        // The next block's dispatch wants it at zero, and nothing else is
+        // still adding: this workgroup is the hundred and twenty-eighth.
+        if (last == 1u) counter[0] = 0u;
+    }
+    barrier();
+    if (last == 0u) return;
+    memoryBarrierBuffer();
+
+    // What follows is shaders/router_pick.comp, which is the other copy: by
+    // rank rather than by rounds, a tie to the lower index so that two runs of
+    // the same model choose the same experts, and the softmax over the chosen
+    // few on eight lanes rather than one.
+    if (t < p.experts) sl[t] = logits[t];
+    barrier();
+
+    if (t < p.experts) {
+        float mine = sl[t];
+        uint rank = 0u;
+        for (uint x = 0u; x < p.experts; x++) {
+            if (sl[x] > mine || (sl[x] == mine && x < t)) rank++;
+        }
+        if (rank < p.used) {
+            chosen[rank] = int(t);
+            ids[rank] = int(t);
+        }
+    }
+    barrier();
+
+    if (t < p.used) {
+        se[t] = exp(sl[chosen[t]] - sl[chosen[0]]);
+    }
+    barrier();
+    if (t < p.used) {
+        float total = 0.0;
+        for (uint k = 0u; k < p.used; k++) total += se[k];
+        cw[t] = (se[t] / total) * dscale[chosen[t]];
+    }
+#endif
 }
