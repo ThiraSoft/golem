@@ -402,8 +402,8 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		mid := ffn / nn.QuantBlock
 		pairs := maxColumns * expertsUsed
 		bufs = append(bufs,
-			bufSpec{&m.xq, dim * maxColumns, true},            // the expert branch's input
-			bufSpec{&m.xs, 2 * in * 4 * maxColumns, true},     // its scales, then its corrections
+			bufSpec{&m.xq, dim * maxColumns, true},        // the expert branch's input
+			bufSpec{&m.xs, 2 * in * 4 * maxColumns, true}, // its scales, then its corrections
 			// The router picks these and the two expert kernels read them,
 			// so they are device memory like everything else between two
 			// kernels: they were host-visible from the days the CPU did the

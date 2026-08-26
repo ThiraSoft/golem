@@ -55,7 +55,7 @@ const maxColumns = wideColumns
 // workgroup to every column and this said how many columns' scores fit in a
 // scratch buffer at a time. The scratch is gone with the online softmax, and
 // what is left is the tiling that divides the cache traffic.
-const scoreColumns = 16
+const scoreColumns = 32
 
 // passWidth is the widest binary that answers a pass of that many columns.
 // There are four: the tiled product at a hundred and twenty-eight and at
@@ -265,16 +265,16 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 		// Everything here is device memory: the CPU writes none of it, and a
 		// shader reading system memory reaches across the bus. vk/device.go's
 		// Host says what that was worth.
-		{&a.xq, dim * maxColumns, true},                                     // the normed stream, Q8_0
-		{&a.xs, 2 * dim / nn.QuantBlock * 4 * maxColumns, true},             //
-		{&a.out, dim * 4 * maxColumns, true},                                // what the output projection makes
-		{&a.q, maxHeads * 4 * maxColumns, true},                             // the three projections, which never leave
-		{&a.k, maxKV * 4 * maxColumns, true},                                //
-		{&a.v, maxKV * 4 * maxColumns, true},                                //
-		{&a.qh, maxHeads * 4 * maxColumns, true},                            // the queries, rounded through fp16
-		{&a.outParts, dim * 4 * maxColumns * matmulSplit(dim), true},        // its slices, when it is split
-		{&a.scoreRows, 4, true},                                             // nothing: the scores never leave the workgroup, and the binding stays for the layout
-		{&a.aq, maxHeads * maxColumns, true},                                // the mixed values, Q8_0
+		{&a.xq, dim * maxColumns, true},                              // the normed stream, Q8_0
+		{&a.xs, 2 * dim / nn.QuantBlock * 4 * maxColumns, true},      //
+		{&a.out, dim * 4 * maxColumns, true},                         // what the output projection makes
+		{&a.q, maxHeads * 4 * maxColumns, true},                      // the three projections, which never leave
+		{&a.k, maxKV * 4 * maxColumns, true},                         //
+		{&a.v, maxKV * 4 * maxColumns, true},                         //
+		{&a.qh, maxHeads * 4 * maxColumns, true},                     // the queries, rounded through fp16
+		{&a.outParts, dim * 4 * maxColumns * matmulSplit(dim), true}, // its slices, when it is split
+		{&a.scoreRows, 4, true},                                      // nothing: the scores never leave the workgroup, and the binding stays for the layout
+		{&a.aq, maxHeads * maxColumns, true},                         // the mixed values, Q8_0
 		{&a.as, 2 * maxHeads / nn.QuantBlock * 4 * maxColumns, true},
 		{&a.where, maxBlocks * maxColumns * 16, false}, // per block and column: position, first, last
 	} {

@@ -86,14 +86,19 @@ layout(push_constant) uniform Push {
 // WHERE_COLUMNS is vk/attention.go's maxColumns, and the two have to agree.
 const uint WHERE_COLUMNS = 256u;
 
-// BR columns to a workgroup against BC positions at a time. Both sixteen, and
-// they are the same number for one reason: the score phase wants a square so
-// that 256 threads cover it exactly, and it wants the side to be sixteen so
-// that a row lies inside a cluster of sixteen lanes. Raising BR divides the
-// cache traffic further but multiplies the accumulator registers, which are
-// BR deep in every thread; sixteen is where that stops being free.
-const uint BR = 16u;
-const uint BC = 16u;
+// BR columns to a workgroup against BC positions at a time, both thirty-two,
+// answered by a sixteen by sixteen grid of threads — so a thread carries a two
+// by two block of scores rather than one. That is register tiling and it is
+// the whole of why the tile is not sixteen: the score loop is bound by its
+// shared reads, and the same two query reads and two key reads answer four
+// scores instead of one. Four times the work for twice the reads.
+//
+// The grid stays sixteen wide because a row has to lie inside one cluster of
+// sixteen lanes for the softmax to fold there. A thread answers rows sr and
+// sr + 16 against positions sc and sc + 16, and the two rows fold as two
+// clustered reduces over the same cluster.
+const uint BR = 32u;
+const uint BC = 32u;
 
 // MAXD is the widest head this kernel is built for, and DPT is how many
 // dimensions of it a thread carries. Gemma 4 is why this is not one: its
@@ -125,8 +130,18 @@ const uint DPT  = MAXD / 256u;
 #define QST (QW + 1u)
 const uint MAXQ = MAXD / 8u;
 
-shared uvec4 ks[BC * (MAXQ + 1u)];  // a tile of keys, four halves to an element
-shared uvec4 qs[BR * (MAXQ + 1u)];  // the queries of this tile's columns, likewise
+// The keys are held a chunk of dimensions at a time and the queries whole.
+// Thirty-two rows of a five-hundred-and-twelve-wide head is thirty-three
+// kilobytes; two of those do not fit in a workgroup's shared memory at all, so
+// one of the two has to be chunked. It is the keys, because they are the ones
+// read once — chunking the queries instead would mean reading them from the
+// card for every tile of the cache, which is more traffic than the whole
+// kernel otherwise moves.
+const uint CW  = 32u;               // dimensions of a chunk, in uvec4: 128 of them
+#define CST (CW + 1u)
+
+shared uvec4 ks[BC * CST];          // a chunk of a tile of keys, four halves to an element
+shared uvec4 qs[BR * (MAXQ + 1u)];  // the queries of this tile's columns, whole
 // The probabilities, the only thing the two phases share. The mix reads each
 // of them once per dimension under a geometry where the address is
 // wave-uniform, and packing four to a vec4 to make that one read per four
@@ -194,10 +209,13 @@ void main() {
     }
     uint total = hi - lo + 1u;
 
-    // My row and my position within the score grid, and my own row's range.
+    // My rows and my positions within the score grid. A thread answers the
+    // two rows sr and sr + 16 against the two positions sc and sc + 16.
     uint sr = t >> 4, sc = t & 15u;
-    uvec4 mine = where_[p.block * WHERE_COLUMNS + base + min(sr, rows - 1u)];
-    bool live = sr < rows;
+    uint r0 = sr, r1 = sr + 16u;
+    uvec4 mine0 = where_[p.block * WHERE_COLUMNS + base + min(r0, rows - 1u)];
+    uvec4 mine1 = where_[p.block * WHERE_COLUMNS + base + min(r1, rows - 1u)];
+    bool live0 = r0 < rows, live1 = r1 < rows;
 
     // The queries of this tile, as halves. They are fp16-exact already, so the
     // packing costs nothing but the space it saves.
@@ -215,56 +233,79 @@ void main() {
     float acc[BR][DPT];
     for (uint r = 0u; r < BR; r++)
         for (uint u = 0u; u < DPT; u++) acc[r][u] = 0.0;
-    float rowMax = -1.0 / 0.0, rowSum = 0.0;
+    float rowMax0 = -1.0 / 0.0, rowSum0 = 0.0;
+    float rowMax1 = -1.0 / 0.0, rowSum1 = 0.0;
+
+    uint chunk = min(CW, QW);       // a whole head at a time when it is narrow enough
+    uint csh   = findMSB(chunk);
 
     for (uint start = 0u; start < total; start += BC) {
-        barrier();
-        // The tile of keys and values. Consecutive threads read consecutive
-        // words of one position, and a position is a whole number of words.
         uint got = min(BC, total - start);
-        for (uint idx = t; idx < got * QW; idx += 256u) {
-            uint c = idx >> sh, j = idx & (QW - 1u);
-            uint o = (entry(lo + start + c, kv) >> 1) + (j << 2);
-            ks[c * QST + j] = uvec4(ck[o], ck[o + 1u], ck[o + 2u], ck[o + 3u]);
-        }
-        barrier();
 
-        // The scores, a thread to a (row, position) pair.
-        uint pos = lo + start + sc;
-        float s = -1.0 / 0.0;
-        if (live && sc < got && pos >= mine.y && pos <= mine.z) {
-            float d = 0.0;
-            for (uint j = 0u; j < QW; j++) {
-                uvec4 q = qs[sr * QST + j];
-                uvec4 k = ks[sc * QST + j];
-                d += dot(unpackHalf2x16(q.x), unpackHalf2x16(k.x))
-                   + dot(unpackHalf2x16(q.y), unpackHalf2x16(k.y))
-                   + dot(unpackHalf2x16(q.z), unpackHalf2x16(k.z))
-                   + dot(unpackHalf2x16(q.w), unpackHalf2x16(k.w));
+        // The four scores this thread carries, accumulated a chunk of
+        // dimensions at a time because that is all of the keys that fits.
+        float d00 = 0.0, d01 = 0.0, d10 = 0.0, d11 = 0.0;
+        for (uint off = 0u; off < QW; off += chunk) {
+            barrier();
+            for (uint idx = t; idx < got * chunk; idx += 256u) {
+                uint c = idx >> csh, j = idx & (chunk - 1u);
+                uint o = (entry(lo + start + c, kv) >> 1) + ((off + j) << 2);
+                ks[c * CST + j] = uvec4(ck[o], ck[o + 1u], ck[o + 2u], ck[o + 3u]);
             }
-            s = d * p.scale;
+            barrier();
+            for (uint j = 0u; j < chunk; j++) {
+                uvec4 q0 = qs[r0 * QST + off + j];
+                uvec4 q1 = qs[r1 * QST + off + j];
+                uvec4 k0 = ks[sc * CST + j];
+                uvec4 k1 = ks[(sc + 16u) * CST + j];
+                // Component by component rather than all sixteen halves
+                // unpacked at once: the four scores want four live pairs, not
+                // sixteen, and the wider form spills.
+                for (uint w = 0u; w < 4u; w++) {
+                    vec2 a0 = unpackHalf2x16(q0[w]), a1 = unpackHalf2x16(q1[w]);
+                    vec2 b0 = unpackHalf2x16(k0[w]), b1 = unpackHalf2x16(k1[w]);
+                    d00 += dot(a0, b0);
+                    d01 += dot(a0, b1);
+                    d10 += dot(a1, b0);
+                    d11 += dot(a1, b1);
+                }
+            }
         }
 
-        // The online softmax. A row is sixteen consecutive lanes, so its
-        // maximum and its sum fold inside one cluster and never reach shared
-        // memory; only the rescale does, because the mix phase reads it under
-        // a different thread geometry.
-        float tileMax = subgroupClusteredMax(s, 16u);
-        float newMax  = max(rowMax, tileMax);
-        float prob    = isinf(newMax) ? 0.0 : exp(s - newMax);
-        float tileSum = subgroupClusteredAdd(prob, 16u);
-        float rescale = (rowMax == newMax) ? 1.0 : exp(rowMax - newMax);
+        // Which of the four the row's own range admits.
+        uint pos0 = lo + start + sc, pos1 = pos0 + 16u;
+        float inf = 1.0 / 0.0;
+        float s00 = (live0 && sc        < got && pos0 >= mine0.y && pos0 <= mine0.z) ? d00 * p.scale : -inf;
+        float s01 = (live0 && sc + 16u  < got && pos1 >= mine0.y && pos1 <= mine0.z) ? d01 * p.scale : -inf;
+        float s10 = (live1 && sc        < got && pos0 >= mine1.y && pos0 <= mine1.z) ? d10 * p.scale : -inf;
+        float s11 = (live1 && sc + 16u  < got && pos1 >= mine1.y && pos1 <= mine1.z) ? d11 * p.scale : -inf;
 
-        pr[t] = prob;
-        if (sc == 0u) corr[sr] = rescale;
-        rowSum = rowSum * rescale + tileSum;
-        rowMax = newMax;
+        // The online softmax, one clustered fold per row. The two rows a
+        // thread carries fold over the same sixteen lanes, one after the other.
+        float tileMax0 = subgroupClusteredMax(max(s00, s01), 16u);
+        float tileMax1 = subgroupClusteredMax(max(s10, s11), 16u);
+        float newMax0  = max(rowMax0, tileMax0);
+        float newMax1  = max(rowMax1, tileMax1);
+        float p00 = isinf(newMax0) ? 0.0 : exp(s00 - newMax0);
+        float p01 = isinf(newMax0) ? 0.0 : exp(s01 - newMax0);
+        float p10 = isinf(newMax1) ? 0.0 : exp(s10 - newMax1);
+        float p11 = isinf(newMax1) ? 0.0 : exp(s11 - newMax1);
+        float tileSum0 = subgroupClusteredAdd(p00 + p01, 16u);
+        float tileSum1 = subgroupClusteredAdd(p10 + p11, 16u);
+        float rescale0 = (rowMax0 == newMax0) ? 1.0 : exp(rowMax0 - newMax0);
+        float rescale1 = (rowMax1 == newMax1) ? 1.0 : exp(rowMax1 - newMax1);
+
         barrier();
-
-        // Where each of the tile's positions sits in the ring, once for the
-        // whole mix rather than once for every dimension of it.
-        uint at[BC];
-        for (uint c = 0u; c < got; c++) at[c] = entry(lo + start + c, kv) >> 1;
+        pr[r0 * BC + sc]        = p00;
+        pr[r0 * BC + sc + 16u]  = p01;
+        pr[r1 * BC + sc]        = p10;
+        pr[r1 * BC + sc + 16u]  = p11;
+        if (sc == 0u) { corr[r0] = rescale0; corr[r1] = rescale1; }
+        rowSum0 = rowSum0 * rescale0 + tileSum0;
+        rowSum1 = rowSum1 * rescale1 + tileSum1;
+        rowMax0 = newMax0;
+        rowMax1 = newMax1;
+        barrier();
 
         // The mix, a thread to a dimension. One value read serves all BR rows,
         // which is the other half of what the tiling bought.
@@ -275,7 +316,7 @@ void main() {
             uint half_ = d >> 1;
             bool lowHalf = (d & 1u) == 0u;
             for (uint c = 0u; c < got; c++) {
-                vec2 v = unpackHalf2x16(cv[at[c] + half_]);
+                vec2 v = unpackHalf2x16(cv[(entry(lo + start + c, kv) >> 1) + half_]);
                 float val = lowHalf ? v.x : v.y;
                 for (uint r = 0u; r < BR; r++) acc[r][u] += pr[r * BC + c] * val;
             }
@@ -286,7 +327,10 @@ void main() {
     // mix runs under the other geometry, so they cross through shared memory
     // once — the only row-wide number of the whole kernel that has to.
     barrier();
-    if (sc == 0u && live) sums[sr] = rowSum;
+    if (sc == 0u) {
+        if (live0) sums[r0] = rowSum0;
+        if (live1) sums[r1] = rowSum1;
+    }
     barrier();
 
     // The Q8_0 form the output projection reads, a block of thirty-two to
