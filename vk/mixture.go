@@ -49,6 +49,9 @@ import (
 //go:embed shaders/matmul_id16.spv
 var matmulByIDSPIRV []byte
 
+//go:embed shaders/matmul_coop_id.spv
+var matmulCoopByIDSPIRV []byte
+
 //go:embed shaders/moe_gateup_id8.spv
 var moeGateUpByIDSPIRV []byte
 
@@ -264,7 +267,11 @@ type moePush struct {
 // It is not the pass's width: a hundred and twenty-eight experts share eight
 // choices from each column, so an expert's list holds columns*used/experts
 // entries — sixteen at a pass of two hundred and fifty-six.
-const idProductBN = 16
+const (
+	idProductBN     = 16
+	idProductCoopBN = 32
+	idProductCoopBM = 128
+)
 
 // idPlanMax is how many entries that plan can hold for a pass of that width,
 // which is what the dispatch has to be sized for: one entry per BN pairs, plus
@@ -342,18 +349,26 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		{&m.reduce, matmulReduceSPIRV, 2},
 	}
 	if experts > 0 {
+		idDownSPIRV, idDownWave := matmulByIDSPIRV, uint32(0)
+		if coop {
+			idDownSPIRV, idDownWave = matmulCoopByIDSPIRV, coopmatWave
+		}
 		for _, spec := range []struct {
 			into     **Pipeline
 			spirv    []byte
 			bindings int
+			wave     uint32
 		}{
-			{&m.down, moeDownSPIRV, 6},
-			{&m.idGateUp, moeGateUpByIDSPIRV, 9},
-			{&m.idDown, matmulByIDSPIRV, 7},
-			{&m.scatter, moeScatterSPIRV, 4},
-			{&m.idCombine, moeIDCombineSPIRV, 3},
+			{&m.down, moeDownSPIRV, 6, 0},
+			{&m.idGateUp, moeGateUpByIDSPIRV, 9, 0},
+			{&m.idDown, idDownSPIRV, 7, idDownWave},
+			{&m.scatter, moeScatterSPIRV, 4, 0},
+			{&m.idCombine, moeIDCombineSPIRV, 3, 0},
 		} {
-			pipes = append(pipes, spec)
+			if *spec.into, err = d.newPipeline(spec.spirv, spec.bindings, push, spec.wave); err != nil {
+				m.Close()
+				return nil, err
+			}
 		}
 	}
 	for _, spec := range pipes {
@@ -644,9 +659,13 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 	// than one column's list of experts. Same answer, and the stack read once
 	// for a pass instead of once for each of its columns.
 	byExpert := m.experts > 0 && columns > 1
+	bn := uint32(idProductBN)
+	if m.coop {
+		bn = idProductCoopBN
+	}
 	if byExpert {
 		scat := scatterPush{columns: uint32(columns), used: expertsUsed,
-			experts: uint32(m.experts), cap: uint32(maxColumns), bn: idProductBN}
+			experts: uint32(m.experts), cap: uint32(maxColumns), bn: bn}
 		r.Dispatch(m.scatterSet, 1, unsafe.Pointer(&scat))
 		r.Barrier()
 		r.Dispatch(b.setIDGateUp, uint32(m.experts*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
@@ -682,6 +701,9 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 	m.tl.Stamp(r, "moe gate/up")
 	if byExpert {
 		rows := uint32((m.dim + matmulRows - 1) / matmulRows)
+		if m.coop {
+			rows = uint32((m.dim + idProductCoopBM - 1) / idProductCoopBM)
+		}
 		r.Dispatch(b.setIDDown, rows*uint32(idPlanMax(m.experts, columns)), unsafe.Pointer(&experts))
 	} else if m.experts > 0 {
 		r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))

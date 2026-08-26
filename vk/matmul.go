@@ -19,6 +19,7 @@ import (
 //go:generate glslc -O -DCOLUMNS=128 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop128.spv
 //go:generate glslc -O -DCOLUMNS=256 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop256.spv
 //go:generate glslc -O -DCOLUMNS=512 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop512.spv
+//go:generate glslc -O -DCOLUMNS=32 -DBN=32 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 -DBYID --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_id.spv
 //go:generate glslc -O -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul32.spv
 //go:generate glslc -O -DCOLUMNS=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul64.spv
 //go:generate glslc -O -DCOLUMNS=128 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul128.spv
@@ -176,6 +177,11 @@ type MatMul struct {
 	coop           bool
 	pipe           *Pipeline
 	set            *Set
+
+	byID                               bool
+	experts                            int
+	counts, pairs, plan                *Buffer
+	stageCounts, stagePairs, stagePlan *Buffer
 }
 
 // NewMatMul uploads a Q4_0 matrix in the file's own layout and binds the tiled
@@ -270,6 +276,131 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int, coop bool) (*Mat
 		return nil, err
 	}
 	return m, nil
+}
+
+// NewMatMulByID is NewMatMul reading shaders/moe_scatter.comp's lists: the
+// weights are a stack of `experts` slabs and a workgroup answers the entries
+// of one expert's list. Bindings 4, 5 and 6 are counts, pairs and plan, in
+// that order, which is the order shaders/matmul.comp's BYID build already
+// takes and the order vk/mixture.go binds.
+func NewMatMulByID(d *Device, stack []byte, rows, cols, experts, columns int) (*MatMul, error) {
+	if cols%nn.QuantBlock != 0 {
+		return nil, fmt.Errorf("vk: a Q4_0 row needs a multiple of %d columns, given %d", nn.QuantBlock, cols)
+	}
+	want := experts * rows * rowBytesQ4_0(cols)
+	if len(stack) != want {
+		return nil, fmt.Errorf("vk: %d experts of %d rows by %d columns need %d bytes, given %d", experts, rows, cols, want, len(stack))
+	}
+	coop := d.Coopmat()
+	spirv, wave, perGroup := matmulByIDSPIRV, uint32(0), matmulRows
+	if coop {
+		spirv, wave, perGroup = matmulCoopByIDSPIRV, coopmatWave, idProductCoopBM
+	}
+	m := &MatMul{d: d, rows: rows, cols: cols, columns: columns, experts: experts, perGroup: perGroup, coop: coop, byID: true}
+	layout := splitQ4_0(stack, experts*rows, cols)
+	var err error
+	if m.weights, err = d.Upload(layout); err != nil {
+		return nil, err
+	}
+	nb := cols / nn.QuantBlock
+	pairsMax := columns * expertsUsed
+	for _, spec := range []struct {
+		into **Buffer
+		size int
+		back bool
+	}{
+		{&m.stageQ, cols * pairsMax, false},
+		{&m.stageS, 2 * nb * 4 * pairsMax, false},
+		{&m.stageCounts, experts * 4, false},
+		{&m.stagePairs, experts * columns * 4, false},
+		{&m.stagePlan, (1 + 2*idPlanMax(experts, columns)) * 4, false},
+		{&m.aq, cols * pairsMax, false},
+		{&m.as, 2 * nb * 4 * pairsMax, false},
+		{&m.out, rows * 4 * pairsMax, false},
+		{&m.back, rows * 4 * pairsMax, true},
+		{&m.counts, experts * 4, false},
+		{&m.pairs, experts * columns * 4, false},
+		{&m.plan, (1 + 2*idPlanMax(experts, columns)) * 4, false},
+	} {
+		var b *Buffer
+		switch {
+		case spec.back:
+			b, err = d.Readback(spec.size, bufferUsageTransferDst)
+		case spec.into == &m.stageQ || spec.into == &m.stageS || spec.into == &m.stageCounts || spec.into == &m.stagePairs || spec.into == &m.stagePlan:
+			b, err = d.Host(spec.size, bufferUsageTransferSrc)
+		case spec.into == &m.out:
+			b, err = d.Local(spec.size, bufferUsageStorage|bufferUsageTransferSrc)
+		default:
+			b, err = d.Local(spec.size, bufferUsageStorage|bufferUsageTransferDst)
+		}
+		if err != nil {
+			m.Close()
+			return nil, err
+		}
+		*spec.into = b
+	}
+	buffers := []*Buffer{m.weights, m.aq, m.as, m.out, m.counts, m.pairs, m.plan}
+	push := uint32(unsafe.Sizeof(moePush{}))
+	if m.pipe, err = d.newPipeline(spirv, len(buffers), push, wave); err != nil {
+		m.Close()
+		return nil, err
+	}
+	if m.set, err = m.pipe.NewSet(buffers); err != nil {
+		m.Close()
+		return nil, err
+	}
+	return m, nil
+}
+
+func (m *MatMul) SetCounts(counts []uint32) {
+	copy(m.stageCounts.Bytes(), asBytesUint32(counts))
+}
+
+func (m *MatMul) SetPairs(pairs []uint32) {
+	copy(m.stagePairs.Bytes(), asBytesUint32(pairs))
+}
+
+func (m *MatMul) SetPlan(plan []uint32) {
+	copy(m.stagePlan.Bytes(), asBytesUint32(plan))
+}
+
+func (m *MatMul) SetIDPairColumn(pair int, b *nn.Batch, used int) error {
+	if b.Q == nil {
+		return fmt.Errorf("vk: a Q4_0 product needs the activation in its Q8_0 form")
+	}
+	nb := m.cols / nn.QuantBlock
+	dst := m.stageQ.Bytes()[pair*m.cols:]
+	for i, v := range b.Q[:m.cols] {
+		dst[i] = byte(v)
+	}
+	scbase := (pair/used)*2*used*nb + (pair%used)*nb
+	scales := m.stageS.Floats()[scbase:]
+	copy(scales[:nb], b.Scales[:nb])
+	corr := m.stageS.Floats()[scbase+used*nb:]
+	copy(corr[:nb], b.Corr[:nb])
+	return nil
+}
+
+func (m *MatMul) RunByID(out [][]float32, used int) error {
+	if err := m.d.Submit(func(r *Recorder) {
+		m.upload(r)
+		push := moePush{dim: uint32(m.rows), ffn: uint32(m.cols), used: uint32(used), cap: uint32(m.columns), split: 1}
+		rows := uint32((m.rows + m.perGroup - 1) / m.perGroup)
+		r.Dispatch(m.set, rows*uint32(idPlanMax(m.experts, m.columns)), unsafe.Pointer(&push))
+		r.Barrier()
+		r.CopyFrom(m.back, 0, m.out, 0, len(m.back.Bytes()))
+	}); err != nil {
+		return err
+	}
+	answer := m.back.Floats()
+	for p := range out {
+		copy(out[p], answer[p*m.rows:(p+1)*m.rows])
+	}
+	return nil
+}
+
+func asBytesUint32(u []uint32) []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(&u[0])), len(u)*4)
 }
 
 // matmulWide is the tiled product built at the width of a pass, which is a
@@ -410,6 +541,11 @@ func (m *MatMul) pass(r *Recorder) {
 func (m *MatMul) upload(r *Recorder) {
 	r.CopyFrom(m.aq, 0, m.stageQ, 0, len(m.stageQ.Bytes()))
 	r.CopyFrom(m.as, 0, m.stageS, 0, len(m.stageS.Bytes()))
+	if m.byID {
+		r.CopyFrom(m.counts, 0, m.stageCounts, 0, len(m.stageCounts.Bytes()))
+		r.CopyFrom(m.pairs, 0, m.stagePairs, 0, len(m.stagePairs.Bytes()))
+		r.CopyFrom(m.plan, 0, m.stagePlan, 0, len(m.stagePlan.Bytes()))
+	}
 	r.Barrier()
 }
 
@@ -430,7 +566,7 @@ func (m *MatMul) Close() {
 		m.reducePipe.Close()
 		m.reducePipe = nil
 	}
-	for _, b := range []**Buffer{&m.parts, &m.back, &m.out, &m.as, &m.aq, &m.stageS, &m.stageQ, &m.weights} {
+	for _, b := range []**Buffer{&m.parts, &m.back, &m.out, &m.as, &m.aq, &m.stageS, &m.stageQ, &m.weights, &m.counts, &m.pairs, &m.plan, &m.stageCounts, &m.stagePairs, &m.stagePlan} {
 		if *b != nil {
 			(*b).Close()
 			*b = nil

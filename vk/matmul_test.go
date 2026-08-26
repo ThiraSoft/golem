@@ -148,6 +148,100 @@ func matMulMatchesCPU(t *testing.T, cols int, coop bool) {
 	t.Logf("%d rows by %d columns, worst gap %g of a peak of %g", m.Rows, cols, worst, scale)
 }
 
+// TestMatMulCoopByIDMatchesCPU is the cooperative product reading a list of
+// columns rather than a range of them.
+//
+// The trap this guards is not the arithmetic, which TestMatMulMatchesCPU
+// already covers: it is the indirection. A pair is a column and a slot packed
+// together, the answer belongs in the pair's own row of the output, and the
+// activation's scales live at a stride that has the slot in it. Any of the
+// three read as a plain column index gives an answer that is the right size,
+// the right shape, and wrong.
+func TestMatMulCoopByIDMatchesCPU(t *testing.T) {
+	d := open(t)
+	defer d.Close()
+	if !d.Coopmat() {
+		t.Skip("no cooperative matrices on this device")
+	}
+
+	// Two experts, and a list that sends the odd columns to the second one so
+	// that a kernel ignoring the list gets a different answer rather than a
+	// lucky one.
+	const experts, cols, used = 2, 64, 8
+	g, m := aQ4_0(t) // rows by cols, one expert's slab
+	defer g.Close()
+
+	pairs := make([]uint32, experts*cols)
+	counts := []uint32{0, 0}
+	for c := 0; c < cols; c++ {
+		e, slot := c%experts, c%used
+		pair := uint32(c*used + slot)
+		pairs[e*cols+int(counts[e])] = pair
+		counts[e]++
+	}
+
+	const bn = idProductCoopBN
+	plan := []uint32{0}
+	for e := 0; e < experts; e++ {
+		for c := uint32(0); c < counts[e]; c += bn {
+			plan = append(plan, uint32(e), c)
+		}
+	}
+	plan[0] = uint32(len(plan)-1) / 2
+
+	stack := append(append([]byte(nil), m.Data...), m.Data...)
+
+	mm, err := NewMatMulByID(d, stack, m.Rows, m.Cols, experts, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mm.Close()
+
+	mm.SetCounts(counts)
+	mm.SetPairs(pairs)
+	mm.SetPlan(plan)
+
+	batch := columnsOf(m.Cols, cols)
+	for c := 0; c < cols; c++ {
+		slot := c % used
+		pair := c*used + slot
+		if err := mm.SetIDPairColumn(pair, oneColumn(batch, c), used); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	want := make([][]float32, cols)
+	for c := range want {
+		want[c] = make([]float32, m.Rows)
+	}
+	m.MatVecBatch(batch, want)
+
+	got := make([][]float32, cols*used)
+	for p := range got {
+		got[p] = make([]float32, m.Rows)
+	}
+	if err := mm.RunByID(got, used); err != nil {
+		t.Fatal(err)
+	}
+
+	var worst float64
+	var scale float64
+	for c := 0; c < cols; c++ {
+		slot := c % used
+		pair := c*used + slot
+		for i := 0; i < m.Rows; i++ {
+			scale = math.Max(scale, math.Abs(float64(want[c][i])))
+			if gap := math.Abs(float64(got[pair][i] - want[c][i])); gap > worst {
+				worst = gap
+			}
+		}
+	}
+	if worst > 1e-3*scale {
+		t.Fatalf("worst gap %g of peak %g", worst, scale)
+	}
+	t.Logf("TestMatMulCoopByIDMatchesCPU passed: %d rows by %d columns, worst gap %g of peak %g", m.Rows, cols, worst, scale)
+}
+
 // BenchmarkMatMul is the tiled product on one matrix, a pass at a time, with
 // nothing else in the submission. What it says is the bandwidth the kernel
 // reaches: the matrix is read once whatever the width of the pass, so a pass

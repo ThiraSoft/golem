@@ -303,13 +303,39 @@ layout(std430, binding = 1) readonly  buffer AQ { uint  aq[];  };  // the activa
 layout(std430, binding = 2) readonly  buffer AS { float as_[]; };  // its scales, then its corrections
 layout(std430, binding = 3) writeonly buffer Y  { float y[];   };
 
+#ifdef BYID
+// The counts shaders/moe_scatter.comp wrote and the plan it wrote after them:
+// plan[0] is how many entries the plan has, and each entry after it is an
+// expert and the first of its BN list entries. A workgroup past the plan's
+// end reads one uint and returns.
+layout(std430, binding = 4) readonly buffer CN { uint counts[]; };
+layout(std430, binding = 5) readonly buffer PR { uint pairs[];  };
+layout(std430, binding = 6) readonly buffer PL { uint plan[];   };
+
+// This workgroup's BN entries of the list, read once. A stretch that runs past
+// the end repeats its first entry rather than reading nothing: the answer is
+// dropped at the store, and an entry that exists keeps every load in range.
+shared uint spair[BN];
+shared bool salive[BN];
+shared float stage[WAVE_M * WAVE_N * TILE * TILE];
+#define SCBASE(pair) (((pair) / p.used) * 2u * p.used * nb + ((pair) % p.used) * nb)
+#define ACOL(c)      spair[(c)]
+#define ASCALE(c, b) as_[SCBASE(spair[(c)]) + (b)]
+#define ACORR(c, b)  as_[SCBASE(spair[(c)]) + p.used * nb + (b)]
+#else
+#define ACOL(c)      (col0 + (c))
+#define ASCALE(c, b) as_[(col0 + (c)) * 2u * nb + (b)]
+#define ACORR(c, b)  as_[(col0 + (c)) * 2u * nb + nb + (b)]
+#endif
+
 layout(push_constant) uniform Push {
     uint dim;   // outputs
     uint ffn;   // inputs
-    uint used;  // one, and only here so that every kernel takes the same block
+    uint used;  // experts to a column, read by BYID
     uint act;   // the activation, which is spent before this kernel runs
     uint col;   // the gate kernel's, and not read here
     uint split; // slices of the shared dimension, one for the whole of it
+    uint cap;   // room in one expert's list, which only BYID reads
 } p;
 
 shared float16_t sa[BM * SA_STRIDE];
@@ -325,10 +351,27 @@ shared float16_t sb[BN * SB_STRIDE];
 void main() {
     uint t    = gl_LocalInvocationID.x;
     uint nb   = p.ffn >> 5;          // blocks of the shared dimension
-    // The slice of the shared dimension this workgroup answers. A tile this
-    // wide leaves a row-poor matrix few workgroups against the card's compute
-    // units; p.split is what puts them back.
     uint wgs  = (p.dim + uint(BM) - 1u) / uint(BM);
+
+#ifdef BYID
+    // The plan's entry this workgroup answers, and the expert's slab of the
+    // stack its weights come out of.
+    uint gi = gl_WorkGroupID.x / wgs;
+    if (gi >= plan[0]) return;
+    uint e    = plan[1u + 2u * gi];
+    uint col0 = plan[2u + 2u * gi];
+    uint n    = counts[e];
+    uint ir   = gl_WorkGroupID.x % wgs;
+    uint ik   = 0u;             // no split: the lists are short already
+    uint rowBytes = nb * 18u;
+    uint wbase = e * p.dim * rowBytes;
+    for (uint k = t; k < uint(BN); k += uint(THREADS)) {
+        bool live = col0 + k < n;
+        spair[k]  = pairs[e * p.cap + (live ? col0 + k : col0)];
+        salive[k] = live;
+    }
+    barrier();
+#else
     const uint CGROUPS = uint(COLUMNS) / uint(BN);
     // The column group is the fast index and the row group the slow one, and
     // that ordering is worth a factor on the shapes with many rows.
@@ -344,10 +387,12 @@ void main() {
     uint ic   = gl_WorkGroupID.x % CGROUPS;
     uint ir   = (gl_WorkGroupID.x / CGROUPS) % wgs;
     uint ik   = gl_WorkGroupID.x / (wgs * CGROUPS);
-    uint row0 = ir * uint(BM);
     uint col0 = ic * uint(BN);
-    uint aw   = p.ffn >> 2;          // one column of the activation, in uints
     uint rowBytes = nb * 18u;
+    uint wbase = 0u;
+#endif
+    uint row0 = ir * uint(BM);
+    uint aw   = p.ffn >> 2;          // one column of the activation, in uints
     const uint KB = uint(BK) >> 5;   // Q4_0 blocks in one step
     uint per  = ((nb + p.split - 1u) / p.split + KB - 1u) & ~(KB - 1u);
     uint kb0  = ik * per;
@@ -395,7 +440,7 @@ void main() {
             uvec4 words = uvec4(0u);
             float ws = 0.0;
             if (row0 + r < p.dim && b < nb) {
-                uint base = (row0 + r) * rowBytes;
+                uint base = wbase + (row0 + r) * rowBytes;
                 uint at4  = (base + 2u * nb + 16u * b) >> 2;
                 words = uvec4(w[at4], w[at4 + 1u], w[at4 + 2u], w[at4 + 3u]);
                 ws    = unpackHalf2x16(w[(base + 2u * b) >> 2])[b & 1u];
@@ -434,10 +479,10 @@ void main() {
             uvec4 lo = uvec4(0u), hi = uvec4(0u);
             float as = 0.0;
             if (b < nb) {
-                uint at8 = (col0 + c) * aw + b * 8u;
+                uint at8 = ACOL(c) * aw + b * 8u;
                 lo = uvec4(aq[at8],      aq[at8 + 1u], aq[at8 + 2u], aq[at8 + 3u]);
                 hi = uvec4(aq[at8 + 4u], aq[at8 + 5u], aq[at8 + 6u], aq[at8 + 7u]);
-                as = as_[(col0 + c) * 2u * nb + b];
+                as = ASCALE(c, b);
             }
             uint base = c * uint(SB_STRIDE) + k * 32u;
             [[unroll]] for (uint u = 0u; u < 8u; u++) {
@@ -483,6 +528,29 @@ void main() {
         }
     }
 
+#ifdef BYID
+    // A tile's sixteen columns are sixteen unrelated rows of the answer, so
+    // this cannot be one store at a stride. coopMatStore goes to shared and
+    // the threads copy out the live rows.
+    uint wave_offset = wave_id * uint(TILE * TILE);
+    uint lane = gl_SubgroupInvocationID;
+    [[unroll]] for (uint r = 0u; r < RSUB; r++) {
+        uint row = row0 + (rbase + r) * uint(TILE);
+        if (row >= p.dim) continue;
+        [[unroll]] for (uint c = 0u; c < CSUB; c++) {
+            coopMatStore(acc[r][c], stage, wave_offset, uint(TILE), gl_CooperativeMatrixLayoutColumnMajor);
+            barrier();
+            for (uint i = lane; i < uint(TILE * TILE); i += 64u) {
+                uint lc = i / uint(TILE), lr = i % uint(TILE);
+                uint slot = (cbase + c) * uint(TILE) + lc;
+                if (row + lr < p.dim && col0 + slot < n && salive[slot]) {
+                    y[spair[slot] * p.dim + row + lr] = stage[wave_offset + i];
+                }
+            }
+            barrier();
+        }
+    }
+#else
     [[unroll]] for (uint r = 0u; r < RSUB; r++) {
         uint row = row0 + (rbase + r) * uint(TILE);
         if (row >= p.dim) continue;
@@ -491,4 +559,6 @@ void main() {
                          p.dim, gl_CooperativeMatrixLayoutColumnMajor);
         }
     }
+#endif
 }
+
