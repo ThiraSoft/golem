@@ -4,6 +4,10 @@
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#ifdef COOP
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#endif
 
 // The attention itself: one query head against everything it can see, the
 // softmax over that, and the values mixed by it. FlashAttention, which here
@@ -142,9 +146,22 @@ const uint MAXQ = MAXD / 8u;
 const uint CW  = 32u;               // dimensions of a chunk, in uvec4: 128 of them
 #define CST (CW + 1u)
 
+#ifdef COOP
+// The same two tiles, as halves rather than as packed pairs, because that is
+// what a cooperative load reads. The strides are the same — a row is its
+// dimensions and then eight of slack — so the shared memory is unchanged; only
+// the element type is.
+shared float16_t ks[BC * CST * 8u];
+shared float16_t qs[BR * (MAXQ + 1u) * 8u];
+#else
 shared uvec4 ks[BC * CST];          // a chunk of a tile of keys, four halves to an element
 shared uvec4 qs[BR * (MAXQ + 1u)];  // the queries of this tile's columns, whole
-// The probabilities, the only thing the two phases share. The mix reads each
+#endif
+// The probabilities, the only thing the two phases share. Under COOP the
+// cores' answer lands here first: a thread reads the four scores it owns out
+// of this array, masks them, and writes the four probabilities back over them.
+// Same index, same thread, so the two uses need no barrier between them and no
+// second tile. The mix reads each
 // of them once per dimension under a geometry where the address is
 // wave-uniform, and packing four to a vec4 to make that one read per four
 // multiplies was tried and measured slower — the driver spends more on
@@ -211,6 +228,17 @@ void main() {
     }
     uint total = hi - lo + 1u;
 
+#ifdef COOP
+    // My row within the score grid. The cores answer the whole thirty-two by
+    // thirty-two block, so what is left for a thread is masking four of its
+    // cells and folding its row: eight lanes to a row, which keeps the fold
+    // inside one cluster and is the widest cluster that gives every thread
+    // work.
+    uint r0 = t >> 3, cl = t & 7u;
+    uvec4 mine = where_[p.block * WHERE_COLUMNS + base + min(r0, rows - 1u)];
+    bool live = r0 < rows;
+    uint qst = hd + 8u;   // a query row and its slack, in halves
+#else
     // My rows and my positions within the score grid. A thread answers the
     // two rows sr and sr + 16 against the two positions sc and sc + 16.
     uint sr = t >> 4, sc = t & 15u;
@@ -218,16 +246,22 @@ void main() {
     uvec4 mine0 = where_[p.block * WHERE_COLUMNS + base + min(r0, rows - 1u)];
     uvec4 mine1 = where_[p.block * WHERE_COLUMNS + base + min(r1, rows - 1u)];
     bool live0 = r0 < rows, live1 = r1 < rows;
+#endif
 
     // The queries of this tile, as halves. They are fp16-exact already, so the
     // packing costs nothing but the space it saves.
     for (uint idx = t; idx < rows * QW; idx += 256u) {
         uint r = idx >> sh, j = idx & (QW - 1u);
         uint qb = (base + r) * p.heads * hd + h * hd + (j << 3);
+#ifdef COOP
+        uint qat = r * qst + (j << 3);
+        [[unroll]] for (uint u = 0u; u < 8u; u++) qs[qat + u] = float16_t(qh[qb + u]);
+#else
         qs[r * QST + j] = uvec4(packHalf2x16(vec2(qh[qb],      qh[qb + 1u])),
                                 packHalf2x16(vec2(qh[qb + 2u], qh[qb + 3u])),
                                 packHalf2x16(vec2(qh[qb + 4u], qh[qb + 5u])),
                                 packHalf2x16(vec2(qh[qb + 6u], qh[qb + 7u])));
+#endif
     }
 
     // The accumulator: thread t carries dimension t of every row, from the
@@ -235,12 +269,93 @@ void main() {
     float acc[BR][DPT];
     for (uint r = 0u; r < BR; r++)
         for (uint u = 0u; u < DPT; u++) acc[r][u] = 0.0;
+#ifdef COOP
+    float rowMax = -1.0 / 0.0, rowSum = 0.0;
+#else
     float rowMax0 = -1.0 / 0.0, rowSum0 = 0.0;
     float rowMax1 = -1.0 / 0.0, rowSum1 = 0.0;
+#endif
 
     uint chunk = min(CW, QW);       // a whole head at a time when it is narrow enough
     uint csh   = findMSB(chunk);
+#ifdef COOP
+    uint kst  = (chunk + 1u) << 3;  // a key row of one chunk, in halves
+    // The four sixteen-by-sixteen tiles of the block, one to a wave.
+    uint wave = gl_SubgroupID;
+    uint wtr  = wave & 1u, wtc = wave >> 1;
+#endif
 
+#ifdef COOP
+    for (uint start = 0u; start < total; start += BC) {
+        uint got = min(BC, total - start);
+
+        // Q against the keys, on the matrix cores. A wave owns one sixteen by
+        // sixteen tile of the block and meets every chunk of the head in it,
+        // which is one cooperative multiply for what the scalar form spent a
+        // hundred and twenty-eight shared reads on. The keys are staged one
+        // row of the cache after another, which is K; the multiply wants K
+        // transposed, and a column-major read of the same rows is that.
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> S =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        for (uint off = 0u; off < QW; off += chunk) {
+            barrier();
+            for (uint idx = t; idx < got * chunk; idx += 256u) {
+                uint c = idx >> csh, j = idx & (chunk - 1u);
+                uint o = (entry(lo + start + c, kv) >> 1) + ((off + j) << 2);
+                uvec4 raw = uvec4(ck[o], ck[o + 1u], ck[o + 2u], ck[o + 3u]);
+                uint at = c * kst + (j << 3);
+                [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                    vec2 hv = unpackHalf2x16(raw[u]);
+                    ks[at + (u << 1)]      = float16_t(hv.x);
+                    ks[at + (u << 1) + 1u] = float16_t(hv.y);
+                }
+            }
+            barrier();
+            for (uint kk = 0u; kk < (chunk >> 1); kk++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                coopMatLoad(A, qs, (wtr << 4) * qst + (off << 3) + (kk << 4), qst,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B, ks, (wtc << 4) * kst + (kk << 4), kst,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                S = coopMatMulAdd(A, B, S);
+            }
+        }
+
+        // The scores land in pr, which the mix of the tile before is still
+        // reading. A thread then owns four cells of one row — its own, and no
+        // other thread's — so it can read them, mask them and write the
+        // probabilities back over them without a barrier in between.
+        barrier();
+        coopMatStore(S, pr, (wtr << 4) * BC + (wtc << 4), BC,
+                     gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+
+        float sv[4];
+        float peak = -1.0 / 0.0;
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            uint c   = cl + (i << 3);
+            uint pos = lo + start + c;
+            float v  = (live && c < got && pos >= mine.y && pos <= mine.z)
+                        ? pr[r0 * BC + c] * p.scale : -1.0 / 0.0;
+            sv[i] = v;
+            peak  = max(peak, v);
+        }
+        float newMax = max(rowMax, subgroupClusteredMax(peak, 8u));
+        float mine_  = 0.0;
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            float pv = isinf(newMax) ? 0.0 : exp(sv[i] - newMax);
+            pr[r0 * BC + cl + (i << 3)] = pv;
+            mine_ += pv;
+        }
+        float tileSum = subgroupClusteredAdd(mine_, 8u);
+        float rescale = (rowMax == newMax) ? 1.0 : exp(rowMax - newMax);
+        if (cl == 0u) corr[r0] = rescale;
+        rowSum = rowSum * rescale + tileSum;
+        rowMax = newMax;
+        barrier();
+
+#else
     for (uint start = 0u; start < total; start += BC) {
         uint got = min(BC, total - start);
 
@@ -306,6 +421,7 @@ void main() {
         rowMax1 = newMax1;
         barrier();
 
+#endif
         // The mix, a thread to a dimension. One value read serves all BR rows,
         // which is the other half of what the tiling bought.
         for (uint u = 0u; u < DPT; u++) {
@@ -326,10 +442,14 @@ void main() {
     // mix runs under the other geometry, so they cross through shared memory
     // once — the only row-wide number of the whole kernel that has to.
     barrier();
+#ifdef COOP
+    if (cl == 0u && live) sums[r0] = rowSum;
+#else
     if (sc == 0u) {
         if (live0) sums[r0] = rowSum0;
         if (live1) sums[r1] = rowSum1;
     }
+#endif
     barrier();
 
     // The Q8_0 form the output projection reads, a block of thirty-two to

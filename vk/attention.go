@@ -30,6 +30,7 @@ import (
 
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/attn_prepare.comp -o shaders/attn_prepare.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/attn_scores.comp -o shaders/attn_scores.spv
+//go:generate glslc -O -DCOOP --target-env=vulkan1.1 -fshader-stage=compute shaders/attn_scores.comp -o shaders/attn_scores_coop.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/rope_table.comp -o shaders/rope_table.spv
 
 //go:embed shaders/attn_prepare.spv
@@ -37,6 +38,13 @@ var attnPrepareSPIRV []byte
 
 //go:embed shaders/attn_scores.spv
 var attnScoresSPIRV []byte
+
+// The same kernel with the query-against-key block on the matrix cores. It is
+// a second binary rather than a branch because a card without them cannot
+// load a module that names them at all.
+//
+//go:embed shaders/attn_scores_coop.spv
+var attnScoresCoopSPIRV []byte
 
 //go:embed shaders/rope_table.spv
 var ropeTableSPIRV []byte
@@ -224,19 +232,27 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 	a := &Attention{d: d, dim: dim, maxHeads: maxHeads, maxKV: maxKV, maxContext: maxContext, splitOut: splitOut, coop: coop}
 
 	var err error
+	// The scores kernel wants a wave of sixty-four where it uses the cores,
+	// and the pipelines below are built at whatever the driver picks
+	// otherwise; the wave is asked for per pipeline further down.
+	scoresWave := uint32(0)
+	if coop {
+		scoresWave = coopmatWave
+	}
 	for _, spec := range []struct {
 		into     **Pipeline
 		spirv    []byte
 		bindings int
 		push     uintptr
+		wave     uint32
 	}{
-		{&a.matvec, matvecSPIRV, 4, unsafe.Sizeof(moePush{})},
-		{&a.reduce, matmulReduceSPIRV, 2, unsafe.Sizeof(moePush{})},
-		{&a.prepare, attnPrepareSPIRV, 11, unsafe.Sizeof(attnPush{})},
-		{&a.scores, attnScoresSPIRV, 7, unsafe.Sizeof(scorePush{})},
-		{&a.rope, ropeTableSPIRV, 4, unsafe.Sizeof(ropePush{})},
+		{&a.matvec, matvecSPIRV, 4, unsafe.Sizeof(moePush{}), 0},
+		{&a.reduce, matmulReduceSPIRV, 2, unsafe.Sizeof(moePush{}), 0},
+		{&a.prepare, attnPrepareSPIRV, 11, unsafe.Sizeof(attnPush{}), 0},
+		{&a.scores, scoresSPIRV(coop), 7, unsafe.Sizeof(scorePush{}), scoresWave},
+		{&a.rope, ropeTableSPIRV, 4, unsafe.Sizeof(ropePush{}), 0},
 	} {
-		if *spec.into, err = d.NewPipeline(spec.spirv, spec.bindings, uint32(spec.push)); err != nil {
+		if *spec.into, err = d.newPipeline(spec.spirv, spec.bindings, uint32(spec.push), spec.wave); err != nil {
 			a.Close()
 			return nil, err
 		}
@@ -724,4 +740,14 @@ func (b *attentionBlock) close() {
 			*x = nil
 		}
 	}
+}
+
+// scoresSPIRV is the scores kernel built for this card: the block of scores on
+// the matrix cores where there are any, and the scalar dot products where
+// there are not.
+func scoresSPIRV(coop bool) []byte {
+	if coop {
+		return attnScoresCoopSPIRV
+	}
+	return attnScoresSPIRV
 }
