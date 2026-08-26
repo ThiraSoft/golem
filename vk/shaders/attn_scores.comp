@@ -316,7 +316,7 @@ void main() {
             [[unroll]] for (uint r = 0u; r < BR; r++) acc[r][u] *= corr[r];
             uint half_ = d >> 1;
             bool lowHalf = (d & 1u) == 0u;
-            for (uint c = 0u; c < got; c++) {
+            [[unroll]] for (uint c = 0u; c < got; c++) {
                 vec2 v = unpackHalf2x16(cv[(entry(lo + start + c, kv) >> 1) + half_]);
                 float val = lowHalf ? v.x : v.y;
                 [[unroll]] for (uint r = 0u; r < BR; r++) acc[r][u] += pr[r * BC + c] * val;
