@@ -112,6 +112,14 @@ type MatMul struct {
 	perGroup int
 
 	weights, aq, as, out *Buffer
+	// back is where Run copies the answer to read it, and out is device
+	// memory. A shader that writes its answer straight into a host-visible
+	// buffer writes it across the bus: about twelve gigabytes a second on this
+	// card against the hundreds VRAM gives. The benchmark used to allocate out
+	// that way and so measured PCIe rather than the kernel — and it measured
+	// it against llama.cpp's twin, which has always written to device memory
+	// and copied afterwards. See the header of shaders/matmul_coop.comp.
+	back *Buffer
 	// split is how many slices of the shared dimension the product is cut
 	// into, parts is where the slices land, and reduce adds them into out.
 	split      int
@@ -179,14 +187,17 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int, coop bool) (*Mat
 		{&m.stageS, 2 * nb * 4 * columns, false},
 		{&m.aq, cols * columns, false},
 		{&m.as, 2 * nb * 4 * columns, false},
-		{&m.out, rows * 4 * columns, true},
+		{&m.out, rows * 4 * columns, false},
+		{&m.back, rows * 4 * columns, true},
 	} {
 		var b *Buffer
 		switch {
 		case spec.back:
-			b, err = d.Readback(spec.size, bufferUsageStorage)
+			b, err = d.Readback(spec.size, bufferUsageTransferDst)
 		case spec.into == &m.stageQ || spec.into == &m.stageS:
 			b, err = d.Host(spec.size, bufferUsageTransferSrc)
+		case spec.into == &m.out:
+			b, err = d.Local(spec.size, bufferUsageStorage|bufferUsageTransferSrc)
 		default:
 			b, err = d.Local(spec.size, bufferUsageStorage|bufferUsageTransferDst)
 		}
@@ -307,10 +318,12 @@ func (m *MatMul) Run(out [][]float32) error {
 	if err := m.d.Submit(func(r *Recorder) {
 		m.upload(r)
 		m.pass(r)
+		r.Barrier()
+		r.CopyFrom(m.back, 0, m.out, 0, m.rows*4*m.columns)
 	}); err != nil {
 		return err
 	}
-	answer := m.out.Floats()
+	answer := m.back.Floats()
 	for c := range out {
 		copy(out[c], answer[c*m.rows:])
 	}
@@ -377,7 +390,7 @@ func (m *MatMul) Close() {
 		m.reducePipe.Close()
 		m.reducePipe = nil
 	}
-	for _, b := range []**Buffer{&m.parts, &m.out, &m.as, &m.aq, &m.stageS, &m.stageQ, &m.weights} {
+	for _, b := range []**Buffer{&m.parts, &m.back, &m.out, &m.as, &m.aq, &m.stageS, &m.stageQ, &m.weights} {
 		if *b != nil {
 			(*b).Close()
 			*b = nil
