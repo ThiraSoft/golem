@@ -167,6 +167,7 @@ type Mixture struct {
 
 	dim, ffn, dense, experts int
 	act                      Activation
+	coop                     bool
 
 	gateUp, down, denseDown *Pipeline
 	// The same two halves read by expert, for a prompt: idGateUp and idDown
@@ -319,7 +320,8 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 	if dim%downOuts != 0 {
 		return nil, fmt.Errorf("vk: the down kernel writes %d outputs at a time, and %d is not a multiple of it", downOuts, dim)
 	}
-	m := &Mixture{d: d, dim: dim, ffn: ffn, dense: dense, experts: experts, act: act}
+	coop := d.Coopmat()
+	m := &Mixture{d: d, dim: dim, ffn: ffn, dense: dense, experts: experts, act: act, coop: coop}
 
 	push := uint32(unsafe.Sizeof(moePush{}))
 	var err error
@@ -356,16 +358,7 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 	}
 
 	// The shared branch reads its weights once for a whole batch of positions
-	// when there is one. An expert branch never does: each position routes to
-	// its own eight matrices, so there is nothing between two of them to share.
-	//
-	// Both projections are built at both widths. Above eight columns the down
-	// projection is the tiled product of shaders/matmul.comp, which takes the
-	// same bindings and the same push block as the mat-vec, so one Set reaches
-	// both; the gate is its own kernel, fusing two matrices and an activation,
-	// and is simply built wider. It could not be until its reduction stopped
-	// folding through shared memory — shaders/moe_gateup.comp says what that
-	// array cost and why a wide pass used to run the kernel four times.
+	// when there is one.
 	for _, spec := range []struct {
 		pipe    **Pipeline
 		columns int
@@ -374,19 +367,53 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		{&m.gateUp, smallColumns, moeGateUpWideSPIRV},
 		{&m.gateUp, 16, moeGateUpMidSPIRV},
 		{&m.gateUp, 32, moeGateUpWidestSPIRV},
-		{&m.denseDown, smallColumns, matvecWideSPIRV},
-		{&m.denseDown, tiledColumns, matmulWide32SPIRV},
-		{&m.denseDown, 64, matmulWide64SPIRV},
-		{&m.denseDown, 128, matmulWidest128SPIRV},
-		{&m.denseDown, wideColumns, matmulWide()},
 	} {
 		if err := (*spec.pipe).Wide(spec.columns, spec.spirv); err != nil {
 			m.Close()
 			return nil, err
 		}
 	}
+	if coop {
+		if err := m.denseDown.Wide(smallColumns, matvecWideSPIRV); err != nil {
+			m.Close()
+			return nil, err
+		}
+		for _, spec := range []struct {
+			columns int
+			spirv   []byte
+		}{
+			{tiledColumns, matmulCoop32SPIRV},
+			{64, matmulCoop64SPIRV},
+			{128, matmulCoop128SPIRV},
+			{wideColumns, matmulCoop256SPIRV},
+		} {
+			if err := m.denseDown.WideWave(spec.columns, spec.spirv, coopmatWave); err != nil {
+				m.Close()
+				return nil, err
+			}
+		}
+	} else {
+		for _, spec := range []struct {
+			columns int
+			spirv   []byte
+		}{
+			{smallColumns, matvecWideSPIRV},
+			{tiledColumns, matmulWide32SPIRV},
+			{64, matmulWide64SPIRV},
+			{128, matmulWidest128SPIRV},
+			{wideColumns, matmulWide()},
+		} {
+			if err := m.denseDown.Wide(spec.columns, spec.spirv); err != nil {
+				m.Close()
+				return nil, err
+			}
+		}
+	}
 
 	m.splitDown = matmulSplit(dim)
+	if coop && dim/64 > 96 {
+		m.splitDown = 1
+	}
 	if m.gelu, err = d.Upload(asBytes(nn.GELUTableData())); err != nil {
 		m.Close()
 		return nil, err
@@ -600,7 +627,7 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act), split: 1}
 	b := m.blocks[block]
 	width := passWidth(columns)
-	up, down := uint32(m.dense/nn.QuantBlock), productGroups(width, m.dim)
+	up, down := uint32(m.dense/nn.QuantBlock), m.productGroups(width, m.dim)
 	// Nothing in either branch waits on the other, so they go in without a
 	// barrier between them and the card runs them together.
 	// A token reads the expert stack a column at a time — eight matrices for
@@ -627,7 +654,7 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 		// holds, so a pass of two hundred and fifty-six ran it thirty-two
 		// times and read the gate and up matrices thirty-two times with it.
 		product := moePush{dim: uint32(2 * m.dense), ffn: uint32(m.dim), used: 1, split: 1}
-		r.DispatchWide(b.setDenseProd, width, productGroups(width, 2*m.dense), unsafe.Pointer(&product))
+		r.DispatchWide(b.setDenseProd, width, m.productGroups(width, 2*m.dense), unsafe.Pointer(&product))
 		r.Barrier()
 		gelu := moePush{dim: uint32(2 * m.dense), ffn: uint32(m.dense), used: 1, act: uint32(m.act)}
 		r.DispatchColumns(m.actSet, uint32((m.dense+255)/256), uint32(width), unsafe.Pointer(&gelu))
@@ -808,4 +835,17 @@ func tileQ4_0(src []byte, rows, cols, bm int) []byte {
 // asBytes views a float slice as the bytes behind it, for an upload.
 func asBytes(f []float32) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(&f[0])), len(f)*4)
+}
+
+func (m *Mixture) productGroups(width, outputs int) uint32 {
+	rows := matvecOuts
+	if width >= tiledColumns {
+		if m.coop {
+			rows = matmulCoopRows(width)
+			return uint32((outputs+rows-1)/rows) * uint32(matmulCoopColGroups(width))
+		}
+		rows = matmulRows
+		return uint32((outputs+rows-1)/rows) * uint32(matmulColGroups(width))
+	}
+	return uint32((outputs + rows - 1) / rows)
 }

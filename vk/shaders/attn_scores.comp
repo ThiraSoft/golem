@@ -2,6 +2,7 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
 
 // The attention itself: one query head against everything it can see, the
 // softmax over that, and the values mixed by it. FlashAttention, which here
@@ -261,7 +262,7 @@ void main() {
                 // Component by component rather than all sixteen halves
                 // unpacked at once: the four scores want four live pairs, not
                 // sixteen, and the wider form spills.
-                for (uint w = 0u; w < 4u; w++) {
+                [[unroll]] for (uint w = 0u; w < 4u; w++) {
                     vec2 a0 = unpackHalf2x16(q0[w]), a1 = unpackHalf2x16(q1[w]);
                     vec2 b0 = unpackHalf2x16(k0[w]), b1 = unpackHalf2x16(k1[w]);
                     d00 += dot(a0, b0);
@@ -312,13 +313,13 @@ void main() {
         for (uint u = 0u; u < DPT; u++) {
             uint d = t + u * 256u;
             if (d >= hd) break;
-            for (uint r = 0u; r < BR; r++) acc[r][u] *= corr[r];
+            [[unroll]] for (uint r = 0u; r < BR; r++) acc[r][u] *= corr[r];
             uint half_ = d >> 1;
             bool lowHalf = (d & 1u) == 0u;
             for (uint c = 0u; c < got; c++) {
                 vec2 v = unpackHalf2x16(cv[(entry(lo + start + c, kv) >> 1) + half_]);
                 float val = lowHalf ? v.x : v.y;
-                for (uint r = 0u; r < BR; r++) acc[r][u] += pr[r * BC + c] * val;
+                [[unroll]] for (uint r = 0u; r < BR; r++) acc[r][u] += pr[r * BC + c] * val;
             }
         }
     }

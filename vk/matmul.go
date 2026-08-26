@@ -14,10 +14,10 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 )
 
-//go:generate glslc -O -DCOLUMNS=32 -DBN=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop32.spv
-//go:generate glslc -O -DCOLUMNS=64 -DBN=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop64.spv
-//go:generate glslc -O -DCOLUMNS=128 -DBN=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop128.spv
-//go:generate glslc -O -DCOLUMNS=256 -DBN=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop256.spv
+//go:generate glslc -O -DCOLUMNS=32 -DBN=32 -DBM=64 -DBK=128 -DWAVE_M=4 -DWAVE_N=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop32.spv
+//go:generate glslc -O -DCOLUMNS=64 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop64.spv
+//go:generate glslc -O -DCOLUMNS=128 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop128.spv
+//go:generate glslc -O -DCOLUMNS=256 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop256.spv
 //go:generate glslc -O -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul32.spv
 //go:generate glslc -O -DCOLUMNS=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul64.spv
 //go:generate glslc -O -DCOLUMNS=128 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul128.spv
@@ -84,22 +84,30 @@ func matmulSplit(rows int) int {
 // the same and five is worse.
 const matmulSlices = 4
 
-// matmulCoopRows is shaders/matmul_coop.comp's BM, which is its own number:
-// the cooperative product works in sixteen-row blocks and takes four of them.
-const matmulCoopRows = 64
+// matmulCoopRows is shaders/matmul_coop.comp's BM.
+func matmulCoopRows(width int) int {
+	if width <= tiledColumns {
+		return 64
+	}
+	return 128
+}
 
 // matmulCoopColBlock is that kernel's BN, and has to agree with the -DBN the
-// generate lines above pass it. Left disagreeing, the dispatch covers a
-// fraction of the batch and the rest of the answer stays zero — the same trap
-// matmulRows is, and it reads as a speed-up.
-const matmulCoopColBlock = 32
+// generate lines above pass it.
+func matmulCoopColBlock(width int) int {
+	if width <= tiledColumns {
+		return 32
+	}
+	return 64
+}
 
 // matmulCoopColGroups is how many of those a pass of that width makes.
 func matmulCoopColGroups(width int) int {
-	if width <= matmulCoopColBlock {
+	block := matmulCoopColBlock(width)
+	if width <= block {
 		return 1
 	}
-	return width / matmulCoopColBlock
+	return width / block
 }
 
 // A MatMul is one Q4_0 matrix resident on a device with the buffers a batch
@@ -158,7 +166,7 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int, coop bool) (*Mat
 		if spirv, err = matmulCoopSPIRV(columns); err != nil {
 			return nil, err
 		}
-		perGroup = matmulCoopRows
+		perGroup = matmulCoopRows(columns)
 	}
 
 	// The cooperative product takes the same split as the integer one: its
@@ -166,14 +174,11 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int, coop bool) (*Mat
 	// shaders/matmul.comp's, and its own header says the split and the column
 	// blocking together are what first put it ahead of the dot products.
 	split := matmulSplit(rows)
-	if coop && rows/matmulCoopRows > 96 {
+	if coop && rows/matmulCoopRows(columns) > 96 {
 		split = 1
 	}
 	m := &MatMul{d: d, rows: rows, cols: cols, columns: columns, perGroup: perGroup, split: split, coop: coop && d.Coopmat()}
 	layout := splitQ4_0(data, rows, cols)
-	if coop && d.Coopmat() {
-		layout = tileQ4_0(data, rows, cols, perGroup)
-	}
 	if m.weights, err = d.Upload(layout); err != nil {
 		return nil, err
 	}

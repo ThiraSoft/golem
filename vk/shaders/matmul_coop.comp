@@ -237,19 +237,17 @@
 // is not in registers at all. It is in scratch memory, and a cooperative
 // matrix in scratch memory is the difference between a kernel that runs at the
 // cores' speed and one that runs at a fifth of it.
-#ifndef WAVE
-#define WAVE 64
+#ifndef WAVE_M
+#define WAVE_M 4
 #endif
-#define WAVES (THREADS / WAVE)
+#ifndef WAVE_N
+#define WAVE_N 1
+#endif
 
-// The cooperative matrix is sixteen by sixteen by sixteen, which is the only
-// shape this driver offers. RDNA has others in hardware; the extension does
-// not expose them.
 #define TILE 16
+#define RSUB ((BM / TILE) / WAVE_M)
+#define CSUB ((BN / TILE) / WAVE_N)
 
-// The staged operands, padded so that a wave's lanes do not land on one bank.
-// Shared memory is thirty-two banks of four bytes and these are two-byte
-// values, so the padding is eight of them.
 #define SA_STRIDE (BK + 8)
 #define SB_STRIDE (BK + 8)
 
@@ -259,7 +257,6 @@ layout(std430, binding = 0) readonly  buffer W  { uint  w[];   };
 layout(std430, binding = 1) readonly  buffer AQ { uint  aq[];  };  // the activation, Q8_0
 layout(std430, binding = 2) readonly  buffer AS { float as_[]; };  // its scales, then its corrections
 layout(std430, binding = 3) writeonly buffer Y  { float y[];   };
-
 
 layout(push_constant) uniform Push {
     uint dim;   // outputs
@@ -273,32 +270,11 @@ layout(push_constant) uniform Push {
 shared float16_t sa[BM * SA_STRIDE];
 shared float16_t sb[BN * SB_STRIDE];
 
-// The answer goes straight out. A cooperative matrix is stored to a stride the
-// whole sixteen-row tile has to exist for, which is why vk/matmul.go refuses a
-// matrix whose row count is not a multiple of sixteen: with that, a row block
-// is either wholly inside the matrix or wholly outside it, and the one below
-// skips the outside ones.
-
 void main() {
     uint t    = gl_LocalInvocationID.x;
     uint nb   = p.ffn >> 5;          // blocks of the shared dimension
-    // The slice of the shared dimension this workgroup answers. A tile this
-    // wide leaves ffn_down twenty workgroups, which is a third of the compute
-    // units; the split is what puts them back.
     uint wgs  = (p.dim + uint(BM) - 1u) / uint(BM);
     const uint CGROUPS = uint(COLUMNS) / uint(BN);
-    // The column group is the fast index and the row group the slow one, and
-    // that ordering is worth a factor on the shapes with many rows.
-    //
-    // The CGROUPS workgroups that answer different columns of the same rows
-    // read the same weight tile. Whether that tile is read once from memory
-    // or CGROUPS times depends entirely on whether those workgroups are in
-    // flight together, which depends on how far apart they are in dispatch
-    // order. With the row group fast they are wgs apart: sixty on ffn_down,
-    // which is inside what the card runs at once, and two hundred and forty
-    // on ffn_gate, which is not — so ffn_down was reading its matrix out of
-    // cache and ffn_gate was reading it eight times out of DRAM. That is the
-    // shape asymmetry, and it was never in the arithmetic.
     uint ic   = gl_WorkGroupID.x % CGROUPS;
     uint ir   = (gl_WorkGroupID.x / CGROUPS) % wgs;
     uint ik   = gl_WorkGroupID.x / (wgs * CGROUPS);
@@ -311,16 +287,15 @@ void main() {
     uint kb0  = ik * per;
     uint kbn  = min(nb, kb0 + per);
 
-    // The tile this wave owns: RSUB row blocks by every column block, which
-    // are static counts, so the accumulators stay in registers.
-    const uint RB = uint(BM) / uint(TILE);
-    const uint CB = uint(BN) / uint(TILE);
-    const uint RSUB = RB / uint(WAVES);
-    uint rbase = gl_SubgroupID * RSUB;
+    uint wave_id = gl_SubgroupID;
+    uint wave_r  = wave_id % uint(WAVE_M);
+    uint wave_c  = wave_id / uint(WAVE_M);
+    uint rbase   = wave_r * uint(RSUB);
+    uint cbase   = wave_c * uint(CSUB);
 
-    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc[RSUB][CB];
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc[RSUB][CSUB];
     [[unroll]] for (uint r = 0u; r < RSUB; r++) {
-        [[unroll]] for (uint c = 0u; c < CB; c++) {
+        [[unroll]] for (uint c = 0u; c < CSUB; c++) {
             acc[r][c] = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
         }
     }
@@ -353,19 +328,27 @@ void main() {
             uvec4 words = uvec4(0u);
             float ws = 0.0;
             if (row0 + r < p.dim && b < nb) {
-                uint base = (ir * nb + b) * uint(BM) * 18u;
-                uint at4  = (base + uint(BM) * 2u + r * 16u) >> 2;
+                uint base = (row0 + r) * rowBytes;
+                uint at4  = (base + 2u * nb + 16u * b) >> 2;
                 words = uvec4(w[at4], w[at4 + 1u], w[at4 + 2u], w[at4 + 3u]);
-                ws    = unpackHalf2x16(w[(base + 2u * r) >> 2])[r & 1u];
+                ws    = unpackHalf2x16(w[(base + 2u * b) >> 2])[b & 1u];
             }
             uint at = r * uint(SA_STRIDE) + k * 32u;
             [[unroll]] for (uint u = 0u; u < 4u; u++) {
-                uint word = words[u];
-                [[unroll]] for (uint m = 0u; m < 4u; m++) {
-                    uint byte = (word >> (8u * m)) & 0xFFu;
-                    sa[at + u * 4u + m]       = float16_t((float(byte & 0x0Fu) - 8.0) * ws);
-                    sa[at + 16u + u * 4u + m] = float16_t((float(byte >> 4)    - 8.0) * ws);
-                }
+                uint w0 = words[u] & 0x0F0F0F0Fu;
+                uint w1 = (words[u] >> 4u) & 0x0F0F0F0Fu;
+                vec4 v0 = (unpackUnorm4x8(w0) * 255.0 - 8.0) * ws;
+                vec4 v1 = (unpackUnorm4x8(w1) * 255.0 - 8.0) * ws;
+
+                sa[at + u * 4u     ] = float16_t(v0.x);
+                sa[at + u * 4u + 1u] = float16_t(v0.y);
+                sa[at + u * 4u + 2u] = float16_t(v0.z);
+                sa[at + u * 4u + 3u] = float16_t(v0.w);
+
+                sa[at + 16u + u * 4u     ] = float16_t(v1.x);
+                sa[at + 16u + u * 4u + 1u] = float16_t(v1.y);
+                sa[at + 16u + u * 4u + 2u] = float16_t(v1.z);
+                sa[at + 16u + u * 4u + 3u] = float16_t(v1.w);
             }
         }
 
@@ -392,14 +375,14 @@ void main() {
             uint base = c * uint(SB_STRIDE) + k * 32u;
             [[unroll]] for (uint u = 0u; u < 8u; u++) {
                 uint word = (u < 4u) ? lo[u] : hi[u - 4u];
-                [[unroll]] for (uint m = 0u; m < 4u; m++) {
-                    // bitfieldExtract on a signed word is one v_bfe_i32. The
-                    // arithmetic form -- extract the byte, compare, subtract
-                    // 256 -- is three instructions a magnitude, and there are
-                    // thirty-two magnitudes a thread a step.
-                    int q = bitfieldExtract(int(word), int(8u * m), 8);
-                    sb[base + u * 4u + m] = float16_t(float(q) * as);
-                }
+                int q0 = bitfieldExtract(int(word), 0, 8);
+                int q1 = bitfieldExtract(int(word), 8, 8);
+                int q2 = bitfieldExtract(int(word), 16, 8);
+                int q3 = bitfieldExtract(int(word), 24, 8);
+                sb[base + u * 4u     ] = float16_t(float(q0) * as);
+                sb[base + u * 4u + 1u] = float16_t(float(q1) * as);
+                sb[base + u * 4u + 2u] = float16_t(float(q2) * as);
+                sb[base + u * 4u + 3u] = float16_t(float(q3) * as);
             }
         }
 
@@ -415,18 +398,18 @@ void main() {
         // each row block loads its own fragment once and meets all of them.
         // That is CB + RB loads for RB * CB multiplies instead of two for one.
         [[unroll]] for (uint kk = 0u; kk < uint(BK) / uint(TILE); kk++) {
-            coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> B[CB];
-            [[unroll]] for (uint c = 0u; c < CB; c++) {
+            coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> B[CSUB];
+            [[unroll]] for (uint c = 0u; c < CSUB; c++) {
                 // The activation is one column after another, so a K by N
                 // block of it is column major.
-                coopMatLoad(B[c], sb, c * uint(TILE) * uint(SB_STRIDE) + kk * uint(TILE),
+                coopMatLoad(B[c], sb, (cbase + c) * uint(TILE) * uint(SB_STRIDE) + kk * uint(TILE),
                             uint(SB_STRIDE), gl_CooperativeMatrixLayoutColumnMajor);
             }
             [[unroll]] for (uint r = 0u; r < RSUB; r++) {
                 coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> A;
                 coopMatLoad(A, sa, (rbase + r) * uint(TILE) * uint(SA_STRIDE) + kk * uint(TILE),
                             uint(SA_STRIDE), gl_CooperativeMatrixLayoutRowMajor);
-                [[unroll]] for (uint c = 0u; c < CB; c++) {
+                [[unroll]] for (uint c = 0u; c < CSUB; c++) {
                     acc[r][c] = coopMatMulAdd(A, B[c], acc[r][c]);
                 }
             }
@@ -436,8 +419,8 @@ void main() {
     [[unroll]] for (uint r = 0u; r < RSUB; r++) {
         uint row = row0 + (rbase + r) * uint(TILE);
         if (row >= p.dim) continue;
-        [[unroll]] for (uint c = 0u; c < CB; c++) {
-            coopMatStore(acc[r][c], y, (ik * uint(COLUMNS) + col0 + c * uint(TILE)) * p.dim + row,
+        [[unroll]] for (uint c = 0u; c < CSUB; c++) {
+            coopMatStore(acc[r][c], y, (ik * uint(COLUMNS) + col0 + (cbase + c) * uint(TILE)) * p.dim + row,
                          p.dim, gl_CooperativeMatrixLayoutColumnMajor);
         }
     }

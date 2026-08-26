@@ -129,6 +129,7 @@ type Attention struct {
 	// dispatched with nothing beside it, so it is the one that can be cut.
 	reduce   *Pipeline
 	splitOut int
+	coop     bool
 
 	// One position's traffic. Only the two ends of it cross the bus: the
 	// normed stream in, and the output projection's answer back.
@@ -215,7 +216,12 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 			return nil, fmt.Errorf("vk: attention shapes must be multiples of %d, given %d", nn.QuantBlock, n)
 		}
 	}
-	a := &Attention{d: d, dim: dim, maxHeads: maxHeads, maxKV: maxKV, maxContext: maxContext, splitOut: matmulSplit(dim)}
+	coop := d.Coopmat()
+	splitOut := matmulSplit(dim)
+	if coop && dim/64 > 96 {
+		splitOut = 1
+	}
+	a := &Attention{d: d, dim: dim, maxHeads: maxHeads, maxKV: maxKV, maxContext: maxContext, splitOut: splitOut, coop: coop}
 
 	var err error
 	for _, spec := range []struct {
@@ -236,24 +242,41 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 		}
 	}
 	// The four projections read their weights once for a whole batch of
-	// positions when there is one. shaders/matvec.comp says what that is worth
-	// at eight columns, and shaders/matmul.comp what a tiled product is worth
-	// above that: on the Qwen3 4B's widest matrix, 5.9 microseconds a column
-	// against the mat-vec's 14. The two kernels take the same four bindings
-	// and the same push block, so one Set reaches both.
-	for _, spec := range []struct {
-		columns int
-		spirv   []byte
-	}{
-		{smallColumns, matvecWideSPIRV},
-		{tiledColumns, matmulWide32SPIRV},
-		{64, matmulWide64SPIRV},
-		{128, matmulWidest128SPIRV},
-		{wideColumns, matmulWide()},
-	} {
-		if err := a.matvec.Wide(spec.columns, spec.spirv); err != nil {
+	// positions when there is one.
+	if coop {
+		if err := a.matvec.Wide(smallColumns, matvecWideSPIRV); err != nil {
 			a.Close()
 			return nil, err
+		}
+		for _, spec := range []struct {
+			columns int
+			spirv   []byte
+		}{
+			{tiledColumns, matmulCoop32SPIRV},
+			{64, matmulCoop64SPIRV},
+			{128, matmulCoop128SPIRV},
+			{wideColumns, matmulCoop256SPIRV},
+		} {
+			if err := a.matvec.WideWave(spec.columns, spec.spirv, coopmatWave); err != nil {
+				a.Close()
+				return nil, err
+			}
+		}
+	} else {
+		for _, spec := range []struct {
+			columns int
+			spirv   []byte
+		}{
+			{smallColumns, matvecWideSPIRV},
+			{tiledColumns, matmulWide32SPIRV},
+			{64, matmulWide64SPIRV},
+			{128, matmulWidest128SPIRV},
+			{wideColumns, matmulWide()},
+		} {
+			if err := a.matvec.Wide(spec.columns, spec.spirv); err != nil {
+				a.Close()
+				return nil, err
+			}
 		}
 	}
 
@@ -578,7 +601,7 @@ func (a *Attention) Record(r *Recorder, block, columns int) {
 			r.Dispatch(set, groups(outs), push)
 			return
 		}
-		r.DispatchWide(set, width, productGroups(width, outs), push)
+		r.DispatchWide(set, width, a.productGroups(width, outs), push)
 	}
 
 	product(b.setQ, heads, unsafe.Pointer(&project))
@@ -607,7 +630,7 @@ func (a *Attention) Record(r *Recorder, block, columns int) {
 		// matmulSplit: this matrix is the stack's row-poorest, and eighty
 		// workgroups do not fill the card.
 		outProject.split = uint32(a.splitOut)
-		r.DispatchWide(b.setOParts, width, productGroups(width, a.dim)*uint32(a.splitOut), unsafe.Pointer(&outProject))
+		r.DispatchWide(b.setOParts, width, a.productGroups(width, a.dim)*uint32(a.splitOut), unsafe.Pointer(&outProject))
 		r.Barrier()
 		// The slices are as wide as the binary, not as the pass: a stretch
 		// shorter than the width still writes its unasked-for columns, and
@@ -641,9 +664,13 @@ func groups(outputs int) uint32 { return uint32((outputs + matvecOuts - 1) / mat
 // productGroups is the same for whichever product a pass of that width runs.
 // A tiled product is cut across its columns as well as its rows above BN of
 // them, so the grid is rows over BM by columns over BN.
-func productGroups(width, outputs int) uint32 {
+func (a *Attention) productGroups(width, outputs int) uint32 {
 	rows := matvecOuts
 	if width >= tiledColumns {
+		if a.coop {
+			rows = matmulCoopRows(width)
+			return uint32((outputs+rows-1)/rows) * uint32(matmulCoopColGroups(width))
+		}
 		rows = matmulRows
 		return uint32((outputs+rows-1)/rows) * uint32(matmulColGroups(width))
 	}
