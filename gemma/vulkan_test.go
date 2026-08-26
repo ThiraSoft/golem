@@ -378,3 +378,44 @@ func TestVulkanPromptProfile(t *testing.T) {
 	}
 	t.Logf("%d columns\n%s", width, report)
 }
+
+// TestVulkanBatchMatchesTokenPath is the by-expert prompt path against the
+// by-column one, on the same engine and the same prompt.
+//
+// These are two kernels for one answer: a pass of one column reads eight
+// matrices for that column, and a wider pass reads each expert once for the
+// columns that chose it. Every other test of the wide path compares it to a
+// recording at 5e-2, which is loose enough to hide a kernel that is wrong in
+// the third digit; this pins the two paths to each other instead, and it is
+// the net under any rewrite of either.
+//
+// The tolerance is the drift load26BStack documents between them — the two
+// fold the same products in different orders and the intermediate is Q8_0, so
+// a value a hair from an integer boundary goes to the other side of it. Two
+// per cent of peak over thirty blocks is what was measured; 3e-2 is that with
+// room, and it is a ceiling, not a target. If a change here needs it raised,
+// the change is wrong.
+func TestVulkanBatchMatchesTokenPath(t *testing.T) {
+	f, m := load26BStack(t)
+	m.TraceBlocks()
+
+	// The wide path: the whole prompt in one pass.
+	m.Reset()
+	m.ForwardBatch(f.Tokens, 0)
+	batch := map[int][]float32{}
+	for _, il := range moeBlocks {
+		out := m.BlockOutput(il)
+		batch[il] = append([]float32(nil), out...)
+	}
+
+	// The narrow one: the same prompt a position at a time, which is the
+	// by-column kernels.
+	m.Reset()
+	for pos, tok := range f.Tokens {
+		m.Forward(tok, pos)
+	}
+	for _, il := range moeBlocks {
+		compareRelative(t, "l_out-"+itoa(il)+" batch against token", batch[il], m.BlockOutput(il), 3e-2)
+	}
+}
+
