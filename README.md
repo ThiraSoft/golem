@@ -2,7 +2,7 @@
   <img src="assets/logo.svg" alt="golem" width="420">
 
 **Gemma, Qwen and Pocket TTS in a single static Go binary.**  
-_No Python. No cgo. No GPU required — but with `-vulkan` it outreads llama.cpp's own Vulkan build._
+_No Python. No cgo. No GPU required — but with `-vulkan` it outruns llama.cpp's own Vulkan build, reading prompts and generating both._
 
 [![test](https://github.com/ThiraSoft/golem/actions/workflows/test.yml/badge.svg)](https://github.com/ThiraSoft/golem/actions/workflows/test.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/ThiraSoft/golem.svg)](https://pkg.go.dev/github.com/ThiraSoft/golem)
@@ -24,7 +24,7 @@ A golem is inert matter given a voice. That is what these engines do to a file o
 - **Multimodal**: Text, Vision (images) and Audio (WAV/MP3/FLAC) via Gemma 4.
 - **Verified, not asserted**: no layer is deemed correct until its intermediate activations match llama.cpp or PyTorch, waypoint by waypoint.
 - **Fast on CPU**: keeps pace with `llama.cpp` on tuned AVX2 kernels — ahead reading prompts, level generating.
-- **Vulkan GPU**: reads prompts _faster_ than `llama.cpp`'s Vulkan build, bound through `purego` rather than cgo.
+- **Vulkan GPU**: _faster_ than `llama.cpp`'s Vulkan build on Gemma — reading prompts and generating — bound through `purego` rather than cgo.
 
 ## 🚀 Quickstart
 
@@ -54,14 +54,14 @@ One model answers one request at a time; a second request waits. `-parallel N` c
 
 | tokens a second | golem gen | llama gen | golem pp64 | llama pp64 | golem pp256 | llama pp256 | golem pp512 | llama pp512 |
 | --------------- | --------: | --------: | ---------: | ---------: | ----------: | ----------: | ----------: | ----------: |
-| Gemma 4 26B A4B |     103.7 |     124.8 |   **2061** |        833 |    **3951** |        2918 |    **4541** |        4038 |
-| Gemma 4 12B     |      60.0 |      64.6 |   **1499** |        983 |    **2611** |        2471 |        2858 |        2976 |
+| Gemma 4 26B A4B | **133.5** |     124.8 |   **2061** |        833 |    **3951** |        2918 |    **4541** |        4038 |
+| Gemma 4 12B     |  **65.4** |      64.6 |   **1499** |        983 |    **2611** |        2471 |        2858 |        2976 |
 | Qwen3 4B        |     167.0 |     169.7 |   **3950** |       2952 |    **5854** |        4545 |        5895 |        6125 |
 | Qwen3 0.6B      |     359.4 |     365.4 |  **13915** |       9966 |   **23787** |       19159 |   **23995** |       22306 |
 
 **Reading a prompt, golem is ahead on all four models at 64 and 256 positions**, and on the 26B A4B and the 0.6B at 512 as well. On the 26B A4B that is a factor of two and a half at sixty-four positions.
 
-**Generating, it is still behind** — 0.83 of llama.cpp on the 26B A4B, 0.93 on the 12B, 0.98 on both Qwen3 models. A token is bound by reading the weights; what is left there is the order they are read in and how the dispatches are scheduled around them.
+**Generating, golem is ahead on both Gemma models** and within two per cent on both Qwen3 ones. That is new, and what closed it was not a kernel: Gemma caps its logits at thirty, and taking a hyperbolic tangent of a quarter of a million of them on one core cost a third of every token, after the card had already finished. It happens on the card now, at the end of the product that made the number. The Qwen3 models have no softcap, which is why they had no gap to close.
 
 The card holds the whole model: 12.8 GiB for the 26B A4B, which is why sixteen is the smallest card that can run it, and about nine seconds of upload. `-vulkan` is all or nothing and says so: a card without `VK_KHR_shader_integer_dot_product`, a machine with no Vulkan loader, a model too large for the card — each is an error at startup rather than a silent half-move. Without the flag, everything runs on the CPU as before.
 

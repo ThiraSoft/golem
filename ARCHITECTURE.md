@@ -38,9 +38,9 @@ Worth knowing before diving into the code:
 
 **Most of a token runs on a GPU, if you ask.** This began as a CPU engine and the CPU path is still the one every test is written against. But a token of the 26B A4B reads about 2.3 gigabytes and almost all of it is four kinds of matrix: the logit head, 0.6 gigabytes, which is the input embedding read the other way round; the expert stacks, 0.8, eight matrices at a time out of a hundred and twenty-eight; the shared branch beside them, 0.3; and the attention's four projections, 0.5. None of it shortens with CPU work, because the bytes are the cost — the kernels already run at 37 GB/s on a bus whose ceiling is about 43.
 
-`-vulkan` moves all four, and then everything between them. On the 26B A4B, **13.4 tokens a second becomes 103.7**, against llama.cpp's Vulkan build at 124.8 on the same card, and **the prompt goes from 40 a second to 4541** — against their 4038. It costs those matrices being resident — 12.8 gibibytes, which is why a card with sixteen is the smallest that can do this — and about nine seconds of upload.
+`-vulkan` moves all four, and then everything between them. On the 26B A4B, **13.4 tokens a second becomes 133.5**, against llama.cpp's Vulkan build at 124.8 on the same card, and **the prompt goes from 40 a second to 4541** — against their 4038. It costs those matrices being resident — 12.8 gibibytes, which is why a card with sixteen is the smallest that can do this — and about nine seconds of upload.
 
-A dense checkpoint goes the same way, because a dense block is a mixture block with one branch: the shared branch of a mixture and an ordinary feed forward are the same three matrices under the same norm, and what differs is the end of the block — one post-norm instead of three, and no routing. On the 12B, **5.0 tokens a second becomes 60.0**, against llama.cpp's 64.6 on the same card.
+A dense checkpoint goes the same way, because a dense block is a mixture block with one branch: the shared branch of a mixture and an ordinary feed forward are the same three matrices under the same norm, and what differs is the end of the block — one post-norm instead of three, and no routing. On the 12B, **5.0 tokens a second becomes 65.4**, against llama.cpp's 64.6 on the same card.
 
 Qwen3 runs on the same stack. Four things differ and they are all the file being read rather than a second path: an ordinary pre-norm block, where neither half is normed on its way back into the stream; a SiLU on the gate where Gemma looks ggml's GELU up in a table; scores scaled by one over the square root of the head, which Gemma leaves at one because its query norm holds them in range; and a value handed to the attention unnormed, which Gemma norms. On the 4B, **14.6 tokens a second becomes 167.0**, against llama.cpp's 169.7; on the 0.6B, 83.4 becomes 359.4 against 365.4. The head is Q4_0 on those checkpoints rather than Q6_K, and reads through `shaders/matvec.comp` — the kernel the attention's projections already use.
 
@@ -48,7 +48,7 @@ The whole of a block goes: the norms, the rotation, the keys and values in fp16,
 
 ### Vulkan Kernel Tuning
 
-The kernels are written against the card's four-byte integer dot product, which is one instruction for what the unpacked loop spends eight on. A Q4_0 word holds eight weights as nibbles and a single mask puts four of them in the four bytes the instruction reads; the accumulator is integer, so the answer does not move. It is what took the product kernels from about 250 gigabytes a second to between 360 and 530, and the logit head to 609. A card without `VK_KHR_shader_integer_dot_product` gets an error where it would get a device, and `-vulkan` fails on it rather than falling back — a model half on a card the caller believed it was wholly on is a model whose speed nobody can explain.
+The kernels are written against the card's four-byte integer dot product, which is one instruction for what the unpacked loop spends eight on. A Q4_0 word holds eight weights as nibbles and a single mask puts four of them in the four bytes the instruction reads; the accumulator is integer, so the answer does not move. It is what took the product kernels from about 250 gigabytes a second to between 360 and 530, and the logit head to 355. Those figures for the block kernels were taken before the benchmark read cold weights, and a matrix reread inside one submission on a card with 64 MB of last-level cache flatters itself; read them as the size of a change rather than as a rate. The head's 355 is a cold measurement of the whole tensor. A card without `VK_KHR_shader_integer_dot_product` gets an error where it would get a device, and `-vulkan` fails on it rather than falling back — a model half on a card the caller believed it was wholly on is a model whose speed nobody can explain.
 
 A model whose attention is on the card reads its prompt in stretches of five hundred and twelve positions, because the keys and values are the card's and the two caches must not part. Five hundred and twelve of them in one pass is what a batch was always for: every matrix of the model read once for all of them instead of once for each, which is the whole of the difference between a prompt at the memory ceiling and a prompt five hundred times over it. A mixture is no exception any more: its expert stack is read by expert rather than by column, so the eight matrices a position routes to are read once for the positions that wanted them. Generation reads the same binaries it always did: the column count is compiled into the kernel rather than pushed, so there are several of each and a token draws the narrowest.
 
@@ -64,15 +64,23 @@ There is no cgo: `vk/` opens `libvulkan.so.1` through `purego`, and `CGO_ENABLED
 
 ### Generation Speed vs Prompt Speed
 
-On a card, generation is still slightly behind llama.cpp (two hundredths to a sixth, depending on the model). The prompt is not.
+On a card, golem is ahead of llama.cpp on both Gemma models, generating and reading, and within two hundredths of it generating on both Qwen3 ones.
 
 | tokens a second | golem gen | llama gen | golem pp64 | llama pp64 | golem pp256 | llama pp256 | golem pp512 | llama pp512 |
 | --------------- | --------: | --------: | ---------: | ---------: | ----------: | ----------: | ----------: | ----------: |
-| Gemma 4 26B A4B |     103.7 |     124.8 |   **2061** |        833 |    **3951** |        2918 |    **4541** |        4038 |
-| Gemma 4 12B     |      60.0 |      64.6 |   **1499** |        983 |    **2611** |        2471 |        2858 |        2976 |
+| Gemma 4 26B A4B | **133.5** |     124.8 |   **2061** |        833 |    **3951** |        2918 |    **4541** |        4038 |
+| Gemma 4 12B     |  **65.4** |      64.6 |   **1499** |        983 |    **2611** |        2471 |        2858 |        2976 |
 | Qwen3 4B        |     167.0 |     169.7 |   **3950** |       2952 |    **5854** |        4545 |        5895 |        6125 |
 | Qwen3 0.6B      |     359.4 |     365.4 |  **13915** |       9966 |   **23787** |       19159 |   **23995** |       22306 |
 
 golem reads a prompt faster than llama.cpp does on every model here at 64 and 256 positions, and on the 26B A4B and the 0.6B at 512 as well.
 
-Generation is the side that is left. It is 0.83 of llama.cpp on the 26B A4B, 0.93 on the 12B, 0.98 on the 4B and 0.98 on the 0.6B — a gap that closes as the model gets smaller, which is the opposite shape from the one the prompt used to have, and it says where the work is. A token is bound by reading the weights, so what is left there is the order the weights are read in and how the dispatches are scheduled around them, not a kernel to rewrite.
+Generation was the side that was left, at 0.83 of llama.cpp on the 26B A4B and 0.93 on the 12B against 0.98 on both Qwen3 models, and the shape of that table was the answer: **the models with a gap were exactly the models with a logit softcap.**
+
+Gemma caps its logits at thirty. `Logits` did it after the product, on the CPU, in float64, one entry at a time — two hundred and sixty-two thousand hyperbolic tangents, 3.25 ms on an i7-9700K, a third of a token spent with the card already idle. Qwen3 has no softcap and returns straight from its product, which is why it had no gap. llama.cpp does the same cap as a graph node on the GPU, and its own profiler puts that node at 6.16 microseconds.
+
+It is a push constant on the head's shader now: the last line of the product writes `limit*tanh(total/limit)` instead of `total`, and `Logits` does not walk the vocabulary again. `nn.Softcap` still exists for the CPU path and takes the worker pool. On the 26B A4B the token went from 9.897 milliseconds to 7.489 — **101 tokens a second to 133.5**.
+
+Two things are worth keeping from how it was found, because no profile showed it. A GPU timeline cannot see a CPU loop, and the loop was in the seam between them: `Forward` alone measured 6.322 ms, `Forward` and `Logits` together 9.897, and the head's own benchmark 1.72. The 1.85 that belonged to neither was the whole of it. And llama.cpp's own `GGML_VK_PERF_LOGGER`, run on generation rather than on a prompt, put their every operation beside ours in one pass; nothing else in their table was more than a few per cent from ours.
+
+What is left is Qwen3, at 0.98 on both sizes, where the difference is small and is in the kernels rather than beside them.
