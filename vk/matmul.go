@@ -313,14 +313,14 @@ func NewMatMulByID(d *Device, stack []byte, rows, cols, experts, columns int) (*
 		{&m.stageS, 2 * nb * 4 * pairsMax, false},
 		{&m.stageCounts, experts * 4, false},
 		{&m.stagePairs, experts * columns * 4, false},
-		{&m.stagePlan, (1 + 2*idPlanMax(experts, columns)) * 4, false},
+		{&m.stagePlan, (1 + 2*idPlanMax(experts, columns, idProductBN)) * 4, false},
 		{&m.aq, cols * pairsMax, false},
 		{&m.as, 2 * nb * 4 * pairsMax, false},
 		{&m.out, rows * 4 * pairsMax, false},
 		{&m.back, rows * 4 * pairsMax, true},
 		{&m.counts, experts * 4, false},
 		{&m.pairs, experts * columns * 4, false},
-		{&m.plan, (1 + 2*idPlanMax(experts, columns)) * 4, false},
+		{&m.plan, (1 + 2*idPlanMax(experts, columns, idProductBN)) * 4, false},
 	} {
 		var b *Buffer
 		switch {
@@ -386,7 +386,7 @@ func (m *MatMul) RunByID(out [][]float32, used int) error {
 		m.upload(r)
 		push := moePush{dim: uint32(m.rows), ffn: uint32(m.cols), used: uint32(used), cap: uint32(m.columns), split: 1}
 		rows := uint32((m.rows + m.perGroup - 1) / m.perGroup)
-		r.Dispatch(m.set, rows*uint32(idPlanMax(m.experts, m.columns)), unsafe.Pointer(&push))
+		r.Dispatch(m.set, rows*uint32(idPlanMax(m.experts, m.columns, idBN(m.coop))), unsafe.Pointer(&push))
 		r.Barrier()
 		r.CopyFrom(m.back, 0, m.out, 0, len(m.back.Bytes()))
 	}); err != nil {

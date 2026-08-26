@@ -276,10 +276,28 @@ const (
 )
 
 // idPlanMax is how many entries that plan can hold for a pass of that width,
-// which is what the dispatch has to be sized for: one entry per BN pairs, plus
+// which is what the dispatch has to be sized for: one entry per bn pairs, plus
 // one an expert for the stretch that does not fill.
-func idPlanMax(experts, columns int) int {
-	return experts + columns*expertsUsed/idProductBN
+//
+// bn is the caller's, not a constant, because the two products have different
+// ones: shaders/matmul.comp's BYID build answers idProductBN entries and
+// shaders/matmul_coop.comp's answers idProductCoopBN. Sized with the smaller
+// where the larger is dispatched, the grid is twice what the plan can hold and
+// half the workgroups read one uint and return — which is safe, and was
+// measurably there. Sized the other way round it would drop the tail of every
+// expert's list, which is not.
+func idPlanMax(experts, columns, bn int) int {
+	return experts + columns*expertsUsed/bn
+}
+
+// idBN is the entries of a list one workgroup of the by-expert product
+// answers, which is the kernel's own BN and has to reach the scatter, the plan
+// and the dispatch as one number.
+func idBN(coop bool) int {
+	if coop {
+		return idProductCoopBN
+	}
+	return idProductBN
 }
 
 // scatterPush is shaders/moe_scatter.comp's, which counts rather than
@@ -492,7 +510,7 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 			bufSpec{&m.as, 2 * pairs * mid * 4, true},         // and that intermediate's scales
 			bufSpec{&m.counts, experts * 4, true},             // columns that chose each expert
 			bufSpec{&m.pairs, experts * maxColumns * 4, true}, // and which
-			bufSpec{&m.plan, (1 + 2*idPlanMax(experts, maxColumns)) * 4, true},
+			bufSpec{&m.plan, (1 + 2*idPlanMax(experts, maxColumns, idProductBN)) * 4, true},
 			bufSpec{&m.dpart, pairs * dim * 4, true}, // the down projection, a row per pair
 		)
 	}
@@ -669,10 +687,7 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 	// than one column's list of experts. Same answer, and the stack read once
 	// for a pass instead of once for each of its columns.
 	byExpert := m.experts > 0 && columns > 1
-	bn := uint32(idProductBN)
-	if m.coop {
-		bn = idProductCoopBN
-	}
+	bn := uint32(idBN(m.coop))
 	if byExpert {
 		scat := scatterPush{columns: uint32(columns), used: expertsUsed,
 			experts: uint32(m.experts), cap: uint32(maxColumns), bn: bn}
@@ -690,7 +705,7 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 		if m.coop {
 			prodRows = uint32((2*m.ffn + idProductCoopBM - 1) / idProductCoopBM)
 		}
-		r.Dispatch(b.setIDProd, prodRows*uint32(idPlanMax(m.experts, columns)), unsafe.Pointer(&prod))
+		r.Dispatch(b.setIDProd, prodRows*uint32(idPlanMax(m.experts, columns, idBN(m.coop))), unsafe.Pointer(&prod))
 		r.Barrier()
 
 		act := moePush{dim: uint32(2 * m.ffn), ffn: uint32(m.ffn), used: expertsUsed,
@@ -733,7 +748,7 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 		if m.coop {
 			rows = uint32((m.dim + idProductCoopBM - 1) / idProductCoopBM)
 		}
-		r.Dispatch(b.setIDDown, rows*uint32(idPlanMax(m.experts, columns)), unsafe.Pointer(&downPush))
+		r.Dispatch(b.setIDDown, rows*uint32(idPlanMax(m.experts, columns, idBN(m.coop))), unsafe.Pointer(&downPush))
 	} else if m.experts > 0 {
 		r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
 	}
