@@ -1,19 +1,61 @@
 #version 450
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
 
 // The attention itself: one query head against everything it can see, the
-// softmax over that, and the values mixed by it.
+// softmax over that, and the values mixed by it. FlashAttention, which here
+// means one thing above all the others — a workgroup answers BR columns at
+// once rather than one.
 //
-// One workgroup to a head, and the head's whole output lives in shared memory
-// until it is quantized — two kilobytes at the widest, which is what lets the
-// mixing and the quantization happen in the same dispatch as the scores.
+// The kernel this replaces gave a workgroup to every (head, column) pair, so
+// every column read the whole key and value cache for itself: twenty-five
+// gigabytes over a forty-eight block pass at the 12B's geometry, which on a
+// card that gives six hundred and forty a second is about the twenty-seven
+// milliseconds it measured. That arithmetic is what this rewrite was started
+// on and it is not what the rewrite found. Sixteen columns to a workgroup
+// divides the traffic by sixteen and, on its own, measured twenty-eight —
+// slower. The wall was never the cache; it is the shared-memory reads of the
+// score loop, and every millisecond since has come from removing one:
 //
-// Two roundings to fp16, both deliberate. The keys and values are held as
-// halves because llama.cpp holds them that way, and the probabilities reach
-// its kernel as halves too. gemma/attention.go rounds in the same two places
-// and says why: keeping more precision than the reference is not an
-// improvement, it is a divergence.
+//   tiling alone, values staged in shared memory   28.1 ms
+//   values read straight from the cache instead    (frees sixteen kilobytes)
+//   two dimensions to a shared read, padded rows   17.9
+//   eight dimensions to a shared read              14.2
+//
+// The ablation is flat: strike either of the loop's two reads and the kernel
+// runs at half the time, strike both and it runs at the mix alone. It is
+// bound by how many shared-memory instructions it issues and by nothing else
+// — not bandwidth, since sixteen lanes of every wave read the same address,
+// and not arithmetic, which the conversions and the multiplies together do
+// not fill. What is left to take is register tiling: give a thread a two by
+// two block of scores and the same four reads answer four times the work.
+// That wants more shared memory than the 12B's global blocks leave, whose
+// heads are twice as wide as its window blocks', so it wants a binary per
+// head width — which is where this stops for now.
+//
+// Everything else follows from the tiling. The scores of sixteen columns
+// against a tile of sixteen positions do not fit anywhere but in the
+// workgroup, so the softmax has to run online — a running maximum and a
+// running sum per row, the accumulator rescaled whenever the maximum moves —
+// and once it does, the scratch buffer the old kernel wrote its scores to and
+// read back four times is not needed at all. The row of output lives in
+// registers from the first tile to the last: thread t owns dimension t of all
+// BR rows.
+//
+// Two thread geometries, one per phase. The scores are a sixteen by sixteen
+// grid, thread t answering row t/16 against position t%16, which puts a row
+// inside one cluster of sixteen lanes and lets the row's maximum and sum fold
+// with a clustered subgroup reduce instead of shared memory and a barrier.
+// The mix is one thread to a dimension, and it is the cheap half precisely
+// because one value read serves all sixteen rows. The two geometries meet
+// through pr, which is the only array either writes.
+//
+// One rounding to fp16 that used to be two. The keys and values are halves
+// because llama.cpp holds its cache that way. The probabilities are not
+// rounded any more: the old kernel handed the mix halves because it had
+// materialised them, and an online softmax never materialises a probability
+// outside a register.
 //
 // No 1/sqrt(head_dim) anywhere. Gemma 4 scales by one, and the query norm is
 // what keeps the scores in range.
@@ -23,7 +65,7 @@ layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly  buffer QH { float qh[];     };  // the queries, fp16-exact
 layout(std430, binding = 1) readonly  buffer CK { uint  ck[];     };  // the key cache
 layout(std430, binding = 2) readonly  buffer CV { uint  cv[];     };  // the value cache
-layout(std430, binding = 3) buffer          SC { float scores[];  };  // scratch, one row per head
+layout(std430, binding = 3) buffer          SC { float scores[];  };  // unused; the online softmax has no scratch
 layout(std430, binding = 4) writeonly buffer AQ { uint  aq[];     };  // the mixed values, Q8_0
 layout(std430, binding = 5) writeonly buffer AS { float as_[];    };  // their scales, then corrections
 layout(std430, binding = 6) readonly  buffer WH { uvec4 where_[]; };  // one per block: position, first, last
@@ -36,40 +78,63 @@ layout(push_constant) uniform Push {
     uint block;     // which entry of where_ holds the visible range
     uint capacity;
     uint mask;      // capacity - 1 when that is a mask, and zero otherwise
-    uint stride;   // scores kept per head
-    float scale;   // 1/sqrt(head_dim), or one where a query norm holds the range
-    uint col0;     // the first column of the pass this dispatch answers
+    uint columns;   // how many columns the pass carries, so the last tile can mask
+    float scale;    // 1/sqrt(head_dim), or one where a query norm holds the range
+    uint col0;      // the first column of the pass this dispatch answers
 } p;
 
 // WHERE_COLUMNS is vk/attention.go's maxColumns, and the two have to agree.
 const uint WHERE_COLUMNS = 256u;
 
-// The column this workgroup carries. A prompt dispatches one per position, and
-// each of them sees its own stretch of the cache: shaders/attn_prepare.comp has
-// already written every position of the batch, so a query reads the keys of
-// the positions before it in the same batch as well as those before the batch.
-// That is the whole of what makes a batched prompt equal to the same tokens
-// read one at a time.
-#define COL (gl_WorkGroupID.y + p.col0)
+// BR columns to a workgroup against BC positions at a time. Both sixteen, and
+// they are the same number for one reason: the score phase wants a square so
+// that 256 threads cover it exactly, and it wants the side to be sixteen so
+// that a row lies inside a cluster of sixteen lanes. Raising BR divides the
+// cache traffic further but multiplies the accumulator registers, which are
+// BR deep in every thread; sixteen is where that stops being free.
+const uint BR = 16u;
+const uint BC = 16u;
 
-// The scratch is not sized for the width of a pass.
+// MAXD is the widest head this kernel is built for, and DPT is how many
+// dimensions of it a thread carries. Gemma 4 is why this is not one: its
+// window blocks have heads of two hundred and fifty-six and its global blocks
+// have heads of five hundred and twelve, and a kernel that assumed the
+// workgroup was as wide as a head answered every sixth block with the first
+// half of it. Narrower heads idle threads in the mix phase and not in the
+// scores.
+const uint MAXD = 512u;
+const uint DPT  = MAXD / 256u;
+
+// QW is a row of one head in units of uvec4 — eight halves, eight dimensions,
+// one shared-memory instruction. The score loop is what asks for that width:
+// read a dimension at a time and it issues one LDS instruction per multiply,
+// which is a ratio no amount of occupancy hides.
 //
-// A row of scores is one float per head per column per position it can see,
-// and the stride is the deepest context the model has: at a hundred and
-// twenty-eight columns of a thirty-two head model over forty thousand
-// positions that is six hundred and seventy megabytes, on a card that is
-// already holding the weights. So the scratch is sized for
-// vk/attention.go's scoreColumns and a wide pass dispatches this kernel once
-// per stretch of that many, with p.col0 saying which. Everything else the
-// kernel touches — the queries in, the mixed values out — is indexed by the
-// column of the whole pass and needs no chunking.
-#define SCRATCH_COL (gl_WorkGroupID.y)
+// The stride is QW + 1 and the extra element is not padding for alignment, it
+// is the whole of what makes the score loop fast. Sixteen threads of a wave
+// read sixteen different rows of ks at the same offset; at a stride of QW
+// those sixteen addresses are a multiple of thirty-two words apart and land in
+// one bank, and the read serialises sixteen ways. One element of slack turns
+// the sixteen into sixteen different banks.
+//
+// Values are not staged here at all. Every element of a value is read by
+// exactly one thread of the mix — the geometry gives a thread a dimension —
+// so putting it through shared memory buys no reuse and costs the occupancy
+// that the sixteen kilobytes would have taken.
+#define QW  (hd >> 3u)
+#define QST (QW + 1u)
+const uint MAXQ = MAXD / 8u;
 
-shared float partial[256];
-shared float acc[512];
-// top and total used to be shared, written by one thread and read by all after
-// a barrier. They are ordinary locals now: every thread folds the same sixteen
-// numbers and arrives at the same answer, which is cheaper than a barrier.
+shared uvec4 ks[BC * (MAXQ + 1u)];  // a tile of keys, four halves to an element
+shared uvec4 qs[BR * (MAXQ + 1u)];  // the queries of this tile's columns, likewise
+// The probabilities, the only thing the two phases share. The mix reads each
+// of them once per dimension under a geometry where the address is
+// wave-uniform, and packing four to a vec4 to make that one read per four
+// multiplies was tried and measured slower — the driver spends more on
+// gathering the four values than the shared reads cost.
+shared float pr[BR * BC];
+shared float corr[BR];              // and the rescale the maximum's move asks of the accumulator
+shared float sums[BR];              // the softmax denominators, handed from one geometry to the other
 
 uint floatToHalf(float f) {
     uint bits     = floatBitsToUint(f);
@@ -98,8 +163,6 @@ uint floatToHalf(float f) {
     return sign | value;
 }
 
-float roundHalf(float f) { return unpackHalf2x16(floatToHalf(f)).x; }
-
 int nearestInt(float f) {
     return (floatBitsToInt(f + 12582912.0) & 0x007fffff) - 0x00400000;
 }
@@ -111,108 +174,157 @@ uint entry(uint pos, uint head) {
 }
 
 void main() {
-    uint h  = gl_WorkGroupID.x;
-    uint t  = gl_LocalInvocationID.x;
-    uint hd = p.headDim;
-    uvec4 where = where_[p.block * WHERE_COLUMNS + COL];
-    uint first = where.y;
-    uint n  = where.z - first + 1u;
-    uint kv = h / p.perKV;
-    uint qb = COL * p.heads * hd + h * hd;
-    uint sb = (SCRATCH_COL * p.heads + h) * p.stride;
+    uint h    = gl_WorkGroupID.x;
+    uint t    = gl_LocalInvocationID.x;
+    uint hd   = p.headDim;
+    uint sh   = findMSB(QW);        // hd is a power of two, so this divides by QW
+    uint kv   = h / p.perKV;
+    uint base = p.col0 + gl_WorkGroupID.y * BR;
 
-    // The scores.
-    for (uint m = t; m < n; m += 256u) {
-        uint o = entry(first + m, kv) >> 1;
-        float s = 0.0;
-        for (uint pair = 0u; pair < (hd >> 1); pair++) {
-            vec2 key = unpackHalf2x16(ck[o + pair]);
-            uint i = pair << 1;
-            s += qh[qb + i] * key.x + qh[qb + i + 1u] * key.y;
+    // This tile's rows, and the stretch of the cache they see between them.
+    // Every column of a batch sees a different range — its own position is the
+    // last of them, and a sliding window moves the first — so the tile walks
+    // the union and masks each row against its own.
+    uint rows = min(BR, p.columns - base);
+    uint lo = 0xFFFFFFFFu, hi = 0u;
+    for (uint r = 0u; r < rows; r++) {
+        uvec4 w = where_[p.block * WHERE_COLUMNS + base + r];
+        lo = min(lo, w.y);
+        hi = max(hi, w.z);
+    }
+    uint total = hi - lo + 1u;
+
+    // My row and my position within the score grid, and my own row's range.
+    uint sr = t >> 4, sc = t & 15u;
+    uvec4 mine = where_[p.block * WHERE_COLUMNS + base + min(sr, rows - 1u)];
+    bool live = sr < rows;
+
+    // The queries of this tile, as halves. They are fp16-exact already, so the
+    // packing costs nothing but the space it saves.
+    for (uint idx = t; idx < rows * QW; idx += 256u) {
+        uint r = idx >> sh, j = idx & (QW - 1u);
+        uint qb = (base + r) * p.heads * hd + h * hd + (j << 3);
+        qs[r * QST + j] = uvec4(packHalf2x16(vec2(qh[qb],      qh[qb + 1u])),
+                                packHalf2x16(vec2(qh[qb + 2u], qh[qb + 3u])),
+                                packHalf2x16(vec2(qh[qb + 4u], qh[qb + 5u])),
+                                packHalf2x16(vec2(qh[qb + 6u], qh[qb + 7u])));
+    }
+
+    // The accumulator: thread t carries dimension t of every row, from the
+    // first tile to the last, and never writes it to memory in between.
+    float acc[BR][DPT];
+    for (uint r = 0u; r < BR; r++)
+        for (uint u = 0u; u < DPT; u++) acc[r][u] = 0.0;
+    float rowMax = -1.0 / 0.0, rowSum = 0.0;
+
+    for (uint start = 0u; start < total; start += BC) {
+        barrier();
+        // The tile of keys and values. Consecutive threads read consecutive
+        // words of one position, and a position is a whole number of words.
+        uint got = min(BC, total - start);
+        for (uint idx = t; idx < got * QW; idx += 256u) {
+            uint c = idx >> sh, j = idx & (QW - 1u);
+            uint o = (entry(lo + start + c, kv) >> 1) + (j << 2);
+            ks[c * QST + j] = uvec4(ck[o], ck[o + 1u], ck[o + 2u], ck[o + 3u]);
         }
-        scores[sb + m] = s * p.scale;
-    }
-    barrier();
+        barrier();
 
-    // The softmax, over however many positions there are.
-    float best = -1.0 / 0.0;
-    for (uint m = t; m < n; m += 256u) best = max(best, scores[sb + m]);
-    // The wave folds its own, and the four of them meet once. The tree this
-    // replaces was eight steps and eight barriers, twice over.
-    float foldedBest = subgroupMax(best);
-    if (subgroupElect()) partial[gl_SubgroupID] = foldedBest;
-    barrier();
-    float top = partial[0];
-    for (uint i = 1u; i < gl_NumSubgroups; i++) top = max(top, partial[i]);
-
-    float sum = 0.0;
-    for (uint m = t; m < n; m += 256u) {
-        float e = exp(scores[sb + m] - top);
-        scores[sb + m] = e;
-        sum += e;
-    }
-    float foldedSum = subgroupAdd(sum);
-    barrier();
-    if (subgroupElect()) partial[gl_SubgroupID] = foldedSum;
-    barrier();
-    float total = 0.0;
-    for (uint i = 0u; i < gl_NumSubgroups; i++) total += partial[i];
-
-    // And the probabilities reach the value product as halves.
-    for (uint m = t; m < n; m += 256u) scores[sb + m] = roundHalf(scores[sb + m] / total);
-    barrier();
-
-    // The mix. A position at a time, so that the threads of a step read
-    // consecutive halves of one value.
-    for (uint i = t; i < hd; i += 256u) acc[i] = 0.0;
-    barrier();
-    for (uint m = 0u; m < n; m++) {
-        float weight = scores[sb + m];
-        uint o = entry(first + m, kv) >> 1;
-        for (uint pair = t; pair < (hd >> 1); pair += 256u) {
-            vec2 value = unpackHalf2x16(cv[o + pair]);
-            uint i = pair << 1;
-            acc[i]      += value.x * weight;
-            acc[i + 1u] += value.y * weight;
-        }
-    }
-    barrier();
-
-    // The Q8_0 form the output projection reads, one block of thirty-two to a
-    // thread. A head is a whole number of blocks, so no block spans two heads.
-    uint blocks = hd >> 5;
-    for (uint b = t; b < blocks; b += 256u) {
-        uint at = b << 5;
-        float peak = 0.0;
-        for (uint i = 0u; i < 32u; i++) peak = max(peak, abs(acc[at + i]));
-
-        float scale = 0.0;
-        int   count = 0;
-        uint  dest  = ((qb + at) >> 2);
-        if (peak > 0.0) {
-            scale = unpackHalf2x16(floatToHalf(peak / 127.0)).x;
-            float inverse = 127.0 / peak;
-            for (uint u = 0u; u < 8u; u++) {
-                uint word = 0u;
-                for (uint j = 0u; j < 4u; j++) {
-                    precise float scaled = acc[at + u * 4u + j] * inverse;
-                    int q = clamp(nearestInt(scaled), -128, 127);
-                    count += q;
-                    word |= (uint(q) & 0xFFu) << (j * 8u);
-                }
-                aq[dest + u] = word;
+        // The scores, a thread to a (row, position) pair.
+        uint pos = lo + start + sc;
+        float s = -1.0 / 0.0;
+        if (live && sc < got && pos >= mine.y && pos <= mine.z) {
+            float d = 0.0;
+            for (uint j = 0u; j < QW; j++) {
+                uvec4 q = qs[sr * QST + j];
+                uvec4 k = ks[sc * QST + j];
+                d += dot(unpackHalf2x16(q.x), unpackHalf2x16(k.x))
+                   + dot(unpackHalf2x16(q.y), unpackHalf2x16(k.y))
+                   + dot(unpackHalf2x16(q.z), unpackHalf2x16(k.z))
+                   + dot(unpackHalf2x16(q.w), unpackHalf2x16(k.w));
             }
-        } else {
-            for (uint u = 0u; u < 8u; u++) aq[dest + u] = 0u;
+            s = d * p.scale;
         }
-        // Scales first, then corrections, which is the layout every kernel
-        // here reads an activation in.
-        // The scales of a column come before its corrections, and one column
-        // after another — the layout every activation here is read in.
-        uint blocks = (p.heads * hd) >> 5;
-        uint base   = COL * 2u * blocks;
-        uint slot   = ((h * hd) >> 5) + b;
-        as_[base + slot]          = scale;
-        as_[base + blocks + slot] = 8.0 * scale * float(count);
+
+        // The online softmax. A row is sixteen consecutive lanes, so its
+        // maximum and its sum fold inside one cluster and never reach shared
+        // memory; only the rescale does, because the mix phase reads it under
+        // a different thread geometry.
+        float tileMax = subgroupClusteredMax(s, 16u);
+        float newMax  = max(rowMax, tileMax);
+        float prob    = isinf(newMax) ? 0.0 : exp(s - newMax);
+        float tileSum = subgroupClusteredAdd(prob, 16u);
+        float rescale = (rowMax == newMax) ? 1.0 : exp(rowMax - newMax);
+
+        pr[t] = prob;
+        if (sc == 0u) corr[sr] = rescale;
+        rowSum = rowSum * rescale + tileSum;
+        rowMax = newMax;
+        barrier();
+
+        // Where each of the tile's positions sits in the ring, once for the
+        // whole mix rather than once for every dimension of it.
+        uint at[BC];
+        for (uint c = 0u; c < got; c++) at[c] = entry(lo + start + c, kv) >> 1;
+
+        // The mix, a thread to a dimension. One value read serves all BR rows,
+        // which is the other half of what the tiling bought.
+        for (uint u = 0u; u < DPT; u++) {
+            uint d = t + u * 256u;
+            if (d >= hd) break;
+            for (uint r = 0u; r < BR; r++) acc[r][u] *= corr[r];
+            uint half_ = d >> 1;
+            bool lowHalf = (d & 1u) == 0u;
+            for (uint c = 0u; c < got; c++) {
+                vec2 v = unpackHalf2x16(cv[at[c] + half_]);
+                float val = lowHalf ? v.x : v.y;
+                for (uint r = 0u; r < BR; r++) acc[r][u] += pr[r * BC + c] * val;
+            }
+        }
+    }
+
+    // The denominators belong to the threads that computed the rows, and the
+    // mix runs under the other geometry, so they cross through shared memory
+    // once — the only row-wide number of the whole kernel that has to.
+    barrier();
+    if (sc == 0u && live) sums[sr] = rowSum;
+    barrier();
+
+    // The Q8_0 form the output projection reads, a block of thirty-two to
+    // thirty-two threads. A head is a whole number of blocks, so no block
+    // spans two heads, and the fold and the packing are both clustered
+    // subgroup reduces — nothing here touches shared memory or takes a
+    // barrier. A head wider than the workgroup takes two passes of this, and
+    // whether it does is uniform across the workgroup, which is what lets the
+    // clustered reduces stand inside the branch.
+    uint blocks = (p.heads * hd) >> 5;
+    for (uint u = 0u; u < DPT; u++) {
+        uint d = t + u * 256u;
+        if (d >= hd) break;
+        uint slot = ((h * hd) >> 5) + (d >> 5);
+        for (uint r = 0u; r < rows; r++) {
+            float value = (sums[r] > 0.0) ? acc[r][u] / sums[r] : 0.0;
+
+            float peak = subgroupClusteredMax(abs(value), 32u);
+            float scale = 0.0;
+            int   q = 0;
+            if (peak > 0.0) {
+                scale = unpackHalf2x16(floatToHalf(peak / 127.0)).x;
+                precise float scaled = value * (127.0 / peak);
+                q = clamp(nearestInt(scaled), -128, 127);
+            }
+            int count = subgroupClusteredAdd(q, 32u);
+
+            uint word = subgroupClusteredOr(uint(q & 0xFF) << ((d & 3u) * 8u), 4u);
+            uint dest = (((base + r) * p.heads * hd + h * hd) >> 2) + (d >> 2);
+            if ((d & 3u) == 0u) aq[dest] = word;
+
+            if ((d & 31u) == 0u) {
+                // Scales first, then corrections, which is the layout every
+                // kernel here reads an activation in.
+                uint cbase = (base + r) * 2u * blocks;
+                as_[cbase + slot]          = scale;
+                as_[cbase + blocks + slot] = 8.0 * scale * float(count);
+            }
+        }
     }
 }

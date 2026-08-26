@@ -49,15 +49,13 @@ var ropeTableSPIRV []byte
 // passWidth says which binary a pass of a given length actually runs.
 const maxColumns = wideColumns
 
-// scoreColumns is how many columns of a pass the scores kernel answers at
-// once. Its scratch is one float per head per column per visible position,
-// and the deepest context makes that the largest buffer in the stack by a
-// wide margin: sizing it for the whole width of a pass would be hundreds of
-// megabytes on a card that is already holding the weights. So a wide pass
-// runs shaders/attn_scores.comp once per stretch of this many, at an offset
-// it pushes. Four dispatches a block rather than one, which measured under a
-// percent of a pass — see the header of that shader.
-const scoreColumns = 32
+// scoreColumns is how many columns of a pass one workgroup of the scores
+// kernel answers at once, and it is the BR of shaders/attn_scores.comp — the
+// two have to agree. It used to mean the opposite thing: the kernel gave a
+// workgroup to every column and this said how many columns' scores fit in a
+// scratch buffer at a time. The scratch is gone with the online softmax, and
+// what is left is the tiling that divides the cache traffic.
+const scoreColumns = 16
 
 // passWidth is the widest binary that answers a pass of that many columns.
 // There are four: the tiled product at a hundred and twenty-eight and at
@@ -199,7 +197,7 @@ type scorePush struct {
 	block    uint32
 	capacity uint32
 	mask     uint32
-	stride   uint32
+	columns  uint32
 	scale    float32
 	col0     uint32
 }
@@ -275,7 +273,7 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 		{&a.v, maxKV * 4 * maxColumns, true},                                //
 		{&a.qh, maxHeads * 4 * maxColumns, true},                            // the queries, rounded through fp16
 		{&a.outParts, dim * 4 * maxColumns * matmulSplit(dim), true},        // its slices, when it is split
-		{&a.scoreRows, maxQueryHeads * maxContext * 4 * scoreColumns, true}, // one row of scores per head per column of a stretch
+		{&a.scoreRows, 4, true},                                             // nothing: the scores never leave the workgroup, and the binding stays for the layout
 		{&a.aq, maxHeads * maxColumns, true},                                // the mixed values, Q8_0
 		{&a.as, 2 * maxHeads / nn.QuantBlock * 4 * maxColumns, true},
 		{&a.where, maxBlocks * maxColumns * 16, false}, // per block and column: position, first, last
@@ -564,7 +562,7 @@ func (a *Attention) Record(r *Recorder, block, columns int) {
 		heads: uint32(s.Heads), kvHeads: uint32(s.KVHeads), headDim: uint32(s.HeadDim),
 		perKV: uint32(s.Heads / s.KVHeads), block: uint32(block),
 		capacity: uint32(s.Capacity), mask: uint32(ringMask(s.Capacity)),
-		stride: uint32(a.maxContext), scale: s.Scale,
+		columns: uint32(columns), scale: s.Scale,
 	}
 	units := uint32(s.Heads)
 	if s.OwnsKV {
@@ -595,19 +593,13 @@ func (a *Attention) Record(r *Recorder, block, columns int) {
 	r.DispatchColumns(b.setPrepare, units, uint32(columns), unsafe.Pointer(&prepare))
 	r.Barrier()
 	a.tl.Stamp(r, "attn cache")
-	for c := 0; c < columns; c += scoreColumns {
-		n := columns - c
-		if n > scoreColumns {
-			n = scoreColumns
-		}
-		if c > 0 {
-			// One stretch at a time through the same scratch, so the next
-			// may not start before the last has read its own rows back.
-			r.Barrier()
-		}
-		score.col0 = uint32(c)
-		r.DispatchColumns(b.setScores, uint32(s.Heads), uint32(n), unsafe.Pointer(&score))
-	}
+	// One workgroup to a head and a tile of scoreColumns columns. The kernel
+	// keeps everything it needs in registers and shared memory, so the
+	// stretches this used to be cut into — one at a time through a scratch
+	// buffer the size of the deepest context — are gone with the scratch.
+	score.col0 = 0
+	tiles := uint32((columns + scoreColumns - 1) / scoreColumns)
+	r.DispatchColumns(b.setScores, uint32(s.Heads), tiles, unsafe.Pointer(&score))
 	r.Barrier()
 	a.tl.Stamp(r, "attn scores")
 	if b.setOParts != nil && width >= tiledColumns {
