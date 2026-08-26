@@ -314,7 +314,7 @@ type scatterPush struct {
 	experts uint32
 	cap     uint32
 	bn      uint32
-	_       [2]uint32
+	_       [3]uint32
 }
 
 // combinePairsPush is shaders/moe_id_combine.comp's.
@@ -322,8 +322,20 @@ type combinePairsPush struct {
 	dim     uint32
 	used    uint32
 	columns uint32
-	_       [4]uint32
+	_       [5]uint32
 }
+
+// The padding above is not decoration, and these say so at compile time: a
+// pipeline here declares moePush's size as its push range and a recorder
+// copies the range, not the struct, so a shorter struct is read past its end.
+// Either subtraction goes negative — and an untyped constant may not — the
+// moment the three sizes stop agreeing.
+const (
+	_ = unsafe.Sizeof(moePush{}) - unsafe.Sizeof(scatterPush{})
+	_ = unsafe.Sizeof(scatterPush{}) - unsafe.Sizeof(moePush{})
+	_ = unsafe.Sizeof(moePush{}) - unsafe.Sizeof(combinePairsPush{})
+	_ = unsafe.Sizeof(combinePairsPush{}) - unsafe.Sizeof(moePush{})
+)
 
 // An Activation is what a gated feed forward puts on its gate. Gemma 4 looks
 // ggml's GELU up in a table; Qwen3 evaluates a SiLU. There is no third.
