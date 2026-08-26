@@ -220,10 +220,26 @@ func Softcap(x []float32, limit float32) {
 		return
 	}
 	inv := 1 / float64(limit)
-	for i, v := range x {
-		x[i] = float32(float64(limit) * math.Tanh(float64(v)*inv))
-	}
+	// A quarter of a million float64 hyperbolic tangents, which is what the
+	// logit head of a Gemma hands over, is three and a quarter milliseconds on
+	// eight cores' worth of one core — a third of a token, spent after the
+	// card has finished and while it waits. The entries do not depend on one
+	// another, so the pool takes them; llama.cpp does the same work on the GPU
+	// in six microseconds, and that is the other way to fix this.
+	//
+	// The arithmetic per entry is untouched, so the answer is the same float32
+	// it was: math.Tanh of the same double, times the same limit.
+	InParallel(len(x), len(x)*softcapWork, func(start, end int) {
+		for i, v := range x[start:end] {
+			x[start+i] = float32(float64(limit) * math.Tanh(float64(v)*inv))
+		}
+	})
 }
+
+// softcapWork weights one entry against parallelThreshold. A tanh in float64
+// is some tens of nanoseconds, which is worth a hundred of the multiply-adds
+// that threshold was written for.
+const softcapWork = 100
 
 // LayerNormGGML is the other normalization ggml performs — ggml_norm, which
 // the vision embedder of the 12B's projector uses where everything else in

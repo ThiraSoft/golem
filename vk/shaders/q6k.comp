@@ -1,5 +1,6 @@
 #version 450
 #extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_clustered : require
 
 // y = W * x for a Q6_K matrix against a Q8_K activation.
 //
@@ -47,7 +48,6 @@ layout(push_constant) uniform Push {
 const uint BYTES = 212u;   // one padded superblock
 const uint TEAMS = 4u;     // teams to a workgroup
 
-shared int partial[64];
 
 // wsbyte reads one signed byte of the weights, which is what a group scale is.
 int wsbyte(uint b) { return bitfieldExtract(int(w[b >> 2]), int((b & 3u) * 8u), 8); }
@@ -108,18 +108,26 @@ void main() {
             // them while the other fifteen wait.
             sum -= 32 * wsbyte(base + 192u + lane) * bsum[sb * 16u + lane];
 
-            partial[t] = sum;
-            barrier();
-            for (uint stride = 8u; stride > 0u; stride >>= 1) {
-                if (lane < stride) partial[t] += partial[t + stride];
-                barrier();
-            }
+            // The team's sixteen partials, folded in the wave rather than
+            // through shared memory. What was here was partial[t] = sum and a
+            // tree of four strides, each with a barrier, and a fifth barrier
+            // after lane zero had read the result: five barriers a superblock,
+            // fifty-five a row. And a barrier syncs the whole workgroup, so
+            // every one of them stopped the other three teams, which are
+            // walking different rows and have nothing to say to this one.
+            //
+            // The fold may move because the thing folded is an integer. The
+            // dot products, the group scales and the recentring are all
+            // integer arithmetic; addition over them is associative and exact,
+            // so a cluster reduction lands on the same int the tree did. The
+            // float that follows is unchanged: the same product, in the same
+            // order, of the same int by the same two scales.
+            int folded = subgroupClusteredAdd(sum, 16u);
 
             if (lane == 0u) {
                 float d = unpackHalf2x16(w[(base >> 2) + 52u]).x;
-                total += float(partial[t]) * d * asc[sb];
+                total += float(folded) * d * asc[sb];
             }
-            barrier();
         }
 
         if (lane == 0u) y[row] = total;
