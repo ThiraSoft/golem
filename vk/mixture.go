@@ -37,7 +37,6 @@ import (
 // The prompt path of the expert branch, which reads the stack by expert
 // rather than by column. shaders/moe_scatter.comp says why.
 //
-//go:generate glslc -O -DCOLUMNS=8 -DBYID --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_id8.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_scatter.comp -o shaders/moe_scatter.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_id_combine.comp -o shaders/moe_id_combine.spv
 
@@ -51,9 +50,6 @@ var matmulByIDSPIRV []byte
 
 //go:embed shaders/matmul_coop_id.spv
 var matmulCoopByIDSPIRV []byte
-
-//go:embed shaders/moe_gateup_id8.spv
-var moeGateUpByIDSPIRV []byte
 
 //go:embed shaders/moe_scatter.spv
 var moeScatterSPIRV []byte
@@ -183,13 +179,13 @@ type Mixture struct {
 	coop                     bool
 
 	gateUp, down, denseDown *Pipeline
-	// The same two halves read by expert, for a prompt: idGateUp and idDown
-	// belong to an expert where gateUp and down belong to a column, scatter
+	// The prompt path of the expert branch, which reads the stack by expert
+	// rather than by column: idProduct serves both gate/up and down projections,
+	// idActivate runs the activation over the first half's output, scatter
 	// builds the lists they walk, and idCombine adds a column's eight slots
 	// back together. shaders/moe_scatter.comp says why a prompt wants this.
-	// idDown is not its own kernel: it is shaders/matmul.comp built with
-	// BYID, which is the tiled product reading the same lists.
-	idGateUp, idDown   *Pipeline
+	// idProduct is shaders/matmul.comp (or matmul_coop.comp) built with BYID.
+	idProduct          *Pipeline
 	scatter, idCombine *Pipeline
 	scatterSet         *Set
 	combineSet         *Set
@@ -241,7 +237,7 @@ type mixtureBlock struct {
 	setDenseUp, setDenseDn *Set
 	setDenseProd           *Set // the gate and up through the tiled product, for a wide pass
 	setDenseDnParts        *Set // the same, writing the slices of a split product
-	setIDGateUp, setIDDown *Set // the expert branch read by expert, for a prompt
+	setIDProd, setIDDown   *Set // the expert branch read by expert, for a prompt
 }
 
 // moePush is what all three kernels take. matvec.comp reads the first three
@@ -355,9 +351,9 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		{&m.reduce, matmulReduceSPIRV, 2},
 	}
 	if experts > 0 {
-		idDownSPIRV, idDownWave := matmulByIDSPIRV, uint32(0)
+		idProductSPIRV, idProductWave := matmulByIDSPIRV, uint32(0)
 		if coop {
-			idDownSPIRV, idDownWave = matmulCoopByIDSPIRV, coopmatWave
+			idProductSPIRV, idProductWave = matmulCoopByIDSPIRV, coopmatWave
 		}
 		for _, spec := range []struct {
 			into     **Pipeline
@@ -366,8 +362,7 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 			wave     uint32
 		}{
 			{&m.down, moeDownSPIRV, 6, 0},
-			{&m.idGateUp, moeGateUpByIDSPIRV, 9, 0},
-			{&m.idDown, idDownSPIRV, 7, idDownWave},
+			{&m.idProduct, idProductSPIRV, 7, idProductWave},
 			{&m.scatter, moeScatterSPIRV, 4, 0},
 			{&m.idCombine, moeIDCombineSPIRV, 3, 0},
 		} {
@@ -634,9 +629,9 @@ func (m *Mixture) AddBlock(gateUpExps, downExps, gate, up, down []byte) error {
 		sets = append(sets,
 			setSpec{&b.setGateUp, m.gateUp, []*Buffer{b.gateUp, m.xq, m.xs, m.ids, m.gelu, m.aq, m.as}},
 			setSpec{&b.setDown, m.down, []*Buffer{b.down, m.aq, m.as, m.ids, m.cw, m.out}},
-			setSpec{&b.setIDGateUp, m.idGateUp,
-				[]*Buffer{b.gateUp, m.xq, m.xs, m.ids, m.gelu, m.aq, m.as, m.counts, m.pairs}},
-			setSpec{&b.setIDDown, m.idDown,
+			setSpec{&b.setIDProd, m.idProduct,
+				[]*Buffer{b.gateUp, m.xq, m.xs, m.gateOut, m.counts, m.pairs, m.plan}},
+			setSpec{&b.setIDDown, m.idProduct,
 				[]*Buffer{b.down, m.aq, m.as, m.dpart, m.counts, m.pairs, m.plan}},
 		)
 	}
@@ -683,7 +678,24 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 			experts: uint32(m.experts), cap: uint32(maxColumns), bn: bn}
 		r.Dispatch(m.scatterSet, 1, unsafe.Pointer(&scat))
 		r.Barrier()
-		r.Dispatch(b.setIDGateUp, uint32(m.experts*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
+
+		// The gate and up halves as one product of 2*ffn rows, then the
+		// activation over what it wrote. Two kernels where there was one, and
+		// shaders/moe_act.comp's header says what that trade buys: the fused
+		// kernel kept an accumulator a column in registers, so it carried eight
+		// columns and read the expert stack once per eight rather than once.
+		prod := moePush{dim: uint32(2 * m.ffn), ffn: uint32(m.dim), used: expertsUsed,
+			act: uint32(m.act), col: 1, cap: uint32(maxColumns), split: 1}
+		prodRows := uint32((2*m.ffn + matmulRows - 1) / matmulRows)
+		if m.coop {
+			prodRows = uint32((2*m.ffn + idProductCoopBM - 1) / idProductCoopBM)
+		}
+		r.Dispatch(b.setIDProd, prodRows*uint32(idPlanMax(m.experts, columns)), unsafe.Pointer(&prod))
+		r.Barrier()
+
+		act := moePush{dim: uint32(2 * m.ffn), ffn: uint32(m.ffn), used: expertsUsed,
+			act: uint32(m.act), cap: uint32(maxColumns)}
+		r.DispatchColumns(m.idActSet, uint32((m.ffn+255)/256), uint32(columns*expertsUsed), unsafe.Pointer(&act))
 	} else if m.experts > 0 {
 		r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
 	}
@@ -715,11 +727,13 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 	r.Barrier()
 	m.tl.Stamp(r, "moe gate/up")
 	if byExpert {
+		downPush := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed,
+			act: uint32(m.act), col: 0, cap: uint32(maxColumns), split: 1}
 		rows := uint32((m.dim + matmulRows - 1) / matmulRows)
 		if m.coop {
 			rows = uint32((m.dim + idProductCoopBM - 1) / idProductCoopBM)
 		}
-		r.Dispatch(b.setIDDown, rows*uint32(idPlanMax(m.experts, columns)), unsafe.Pointer(&experts))
+		r.Dispatch(b.setIDDown, rows*uint32(idPlanMax(m.experts, columns)), unsafe.Pointer(&downPush))
 	} else if m.experts > 0 {
 		r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
 	}
@@ -785,7 +799,7 @@ func (m *Mixture) Close() {
 	}
 	for _, p := range []**Pipeline{
 		&m.denseDown, &m.down, &m.gateUp, &m.activate, &m.idActivate, &m.reduce,
-		&m.idGateUp, &m.idDown, &m.scatter, &m.idCombine,
+		&m.idProduct, &m.scatter, &m.idCombine,
 	} {
 		if *p != nil {
 			(*p).Close()
@@ -797,7 +811,7 @@ func (m *Mixture) Close() {
 func (b *mixtureBlock) close() {
 	for _, s := range []**Set{
 		&b.setDenseDn, &b.setDenseDnParts, &b.setDenseUp, &b.setDenseProd,
-		&b.setDown, &b.setGateUp, &b.setIDGateUp, &b.setIDDown,
+		&b.setDown, &b.setGateUp, &b.setIDProd, &b.setIDDown,
 	} {
 		if *s != nil {
 			(*s).Close()

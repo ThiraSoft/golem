@@ -445,10 +445,10 @@ shared float sbc[BN * SD_STRIDE];  // its corrections, the scale times the sum, 
 // range.
 shared uint spair[BN];
 shared bool salive[BN];
-#define SCBASE(pair) (((pair) / p.used) * 2u * p.used * nb + ((pair) % p.used) * nb)
-#define ACOL(c)      spair[(c)]
+#define SCBASE(pair) (p.col != 0u ? ((pair) / p.used) * 2u * nb : (((pair) / p.used) * 2u * p.used * nb + ((pair) % p.used) * nb))
+#define ACOL(c)      (p.col != 0u ? (spair[(c)] / p.used) : spair[(c)])
 #define ASCALE(c, b) as_[SCBASE(spair[(c)]) + (b)]
-#define ACORR(c, b)  as_[SCBASE(spair[(c)]) + p.used * nb + (b)]
+#define ACORR(c, b)  as_[SCBASE(spair[(c)]) + (p.col != 0u ? nb : (p.used * nb)) + (b)]
 #else
 #define ACOL(c)      (col0 + (c))
 #define ASCALE(c, b) as_[(col0 + (c)) * 2u * nb + (b)]
