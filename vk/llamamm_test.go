@@ -55,6 +55,14 @@ var llamaMulMMSPIRV []byte
 //go:embed shaders/llama_mul_mm_q4_0_m.spv
 var llamaMulMMMediumSPIRV []byte
 
+// And the same shader with a float accumulator instead of an fp16 one, which
+// is the variant ggml-vulkan uses when a caller asks for precision. It is
+// here because it is the one golem could adopt: two per cent of relative
+// error on a product is not something this engine's parity tests survive.
+//
+//go:embed shaders/llama_mul_mm_q4_0_f32acc.spv
+var llamaMulMMF32AccSPIRV []byte
+
 // A llamaTile is one of ggml-vulkan's warptiles: the binary with its
 // specialisation constants baked in, and the workgroup denominators that go
 // with them.
@@ -67,6 +75,7 @@ type llamaTile struct {
 var llamaTiles = []llamaTile{
 	{"l", llamaMulMMSPIRV, 128, 128},
 	{"m", llamaMulMMMediumSPIRV, 64, 64},
+	{"f32acc", llamaMulMMF32AccSPIRV, 128, 128},
 }
 
 // llamaMMPush is vk_mat_mat_push_constants. The shader reads sixteen of the
@@ -251,6 +260,10 @@ func TestLlamaMulMMRuns(t *testing.T) {
 }
 
 func llamaMulMMRuns(t *testing.T, d *Device, m nn.Matrix, tile llamaTile) {
+	tolerance := 2e-2
+	if tile.name == "f32acc" {
+		tolerance = 1e-3
+	}
 	const columns = 256
 	bh := llamaColumns(m.Cols, columns)
 	l, err := newLlamaMM(d, tile, m.Data, m.Rows, m.Cols, columns, bh)
@@ -296,7 +309,7 @@ func llamaMulMMRuns(t *testing.T, d *Device, m nn.Matrix, tile llamaTile) {
 	// accumulator and lands a hundredth of it — see the header of
 	// shaders/matmul_coop.comp, where the narrow accumulator was tried and
 	// rejected for exactly this.
-	if worst > 2e-2*scale {
+	if worst > tolerance*scale {
 		t.Fatalf("their kernel is off by %g of a peak of %g", worst, scale)
 	}
 	t.Logf("%d rows by %d columns, worst gap %g of a peak of %g", m.Rows, columns, worst, scale)
