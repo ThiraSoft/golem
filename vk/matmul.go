@@ -18,10 +18,12 @@ import (
 //go:generate glslc -O -DCOLUMNS=64 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop64.spv
 //go:generate glslc -O -DCOLUMNS=128 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop128.spv
 //go:generate glslc -O -DCOLUMNS=256 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop256.spv
+//go:generate glslc -O -DCOLUMNS=512 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop512.spv
 //go:generate glslc -O -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul32.spv
 //go:generate glslc -O -DCOLUMNS=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul64.spv
 //go:generate glslc -O -DCOLUMNS=128 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul128.spv
 //go:generate glslc -O -DCOLUMNS=256 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul256.spv
+//go:generate glslc -O -DCOLUMNS=512 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul512.spv
 //go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul.comp -o shaders/matmul8.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_reduce.comp -o shaders/matmul_reduce.spv
 
@@ -33,7 +35,7 @@ import (
 // four rows by four columns, so a pass narrower than four columns has nothing
 // to tile and the mat-vec kernel is the right shape for it.
 const (
-	wideColumns  = 256
+	wideColumns  = 512
 	tiledColumns = 32
 	smallColumns = 8
 )
@@ -43,7 +45,7 @@ const (
 // hundred-and-twenty-eight column binary computes sixty-four columns nobody
 // asked for, and measured that is a third of the rate the right binary gives
 // it.
-var matmulWidths = []int{1, smallColumns, tiledColumns, 64, 128, wideColumns}
+var matmulWidths = []int{1, smallColumns, tiledColumns, 64, 128, 256, wideColumns}
 
 // matmulRows is shaders/matmul.comp's BM: how many rows one workgroup writes.
 const matmulRows = 32
@@ -263,13 +265,17 @@ func matmulCoopSPIRV(columns int) ([]byte, error) {
 		return matmulCoop128SPIRV, nil
 	case 256:
 		return matmulCoop256SPIRV, nil
+	case 512:
+		return matmulCoop512SPIRV, nil
 	}
-	return nil, fmt.Errorf("vk: the cooperative product is built at 32, 64 and 128 columns, not %d", columns)
+	return nil, fmt.Errorf("vk: the cooperative product is built at 32, 64, 128, 256, 512 columns, not %d", columns)
 }
 
 // matmulSPIRV is the binary built for that many columns.
 func matmulSPIRV(columns int) ([]byte, error) {
 	switch columns {
+	case 512:
+		return matmulWidest512SPIRV, nil
 	case 256:
 		return matmulWidest256SPIRV, nil
 	case 128:
@@ -281,7 +287,7 @@ func matmulSPIRV(columns int) ([]byte, error) {
 	case smallColumns:
 		return matmulSmallSPIRV, nil
 	}
-	return nil, fmt.Errorf("vk: the tiled product is built at %d, 32, 64 and 128 columns, not %d",
+	return nil, fmt.Errorf("vk: the tiled product is built at %d, 32, 64, 128, 256, 512 columns, not %d",
 		smallColumns, columns)
 }
 

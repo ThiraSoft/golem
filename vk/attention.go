@@ -255,7 +255,8 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 			{tiledColumns, matmulCoop32SPIRV},
 			{64, matmulCoop64SPIRV},
 			{128, matmulCoop128SPIRV},
-			{wideColumns, matmulCoop256SPIRV},
+			{256, matmulCoop256SPIRV},
+			{wideColumns, matmulCoop512SPIRV},
 		} {
 			if err := a.matvec.WideWave(spec.columns, spec.spirv, coopmatWave); err != nil {
 				a.Close()
@@ -271,6 +272,7 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 			{tiledColumns, matmulWide32SPIRV},
 			{64, matmulWide64SPIRV},
 			{128, matmulWidest128SPIRV},
+			{256, matmulWidest256SPIRV},
 			{wideColumns, matmulWide()},
 		} {
 			if err := a.matvec.Wide(spec.columns, spec.spirv); err != nil {

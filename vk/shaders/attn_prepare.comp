@@ -44,7 +44,7 @@ layout(push_constant) uniform Push {
 
 // WHERE_COLUMNS is how many columns the position buffer holds per block. It is
 // vk/attention.go's maxColumns, and the two have to agree.
-const uint WHERE_COLUMNS = 256u;
+const uint WHERE_COLUMNS = 512u;
 
 // The column this workgroup carries. A prompt dispatches one per position and
 // a token dispatches one; nothing else about the two differs here, because a

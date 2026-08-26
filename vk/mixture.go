@@ -122,6 +122,9 @@ var matmulWidest128SPIRV []byte
 //go:embed shaders/matmul256.spv
 var matmulWidest256SPIRV []byte
 
+//go:embed shaders/matmul512.spv
+var matmulWidest512SPIRV []byte
+
 //go:embed shaders/matmul_reduce.spv
 var matmulReduceSPIRV []byte
 
@@ -141,6 +144,9 @@ var matmulCoop128SPIRV []byte
 
 //go:embed shaders/matmul_coop256.spv
 var matmulCoop256SPIRV []byte
+
+//go:embed shaders/matmul_coop512.spv
+var matmulCoop512SPIRV []byte
 
 // coopTile is the cooperative matrix's own size, and the granularity a
 // workgroup of shaders/matmul_coop.comp can be trusted with: a matrix whose
@@ -385,7 +391,8 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 			{tiledColumns, matmulCoop32SPIRV},
 			{64, matmulCoop64SPIRV},
 			{128, matmulCoop128SPIRV},
-			{wideColumns, matmulCoop256SPIRV},
+			{256, matmulCoop256SPIRV},
+			{wideColumns, matmulCoop512SPIRV},
 		} {
 			if err := m.denseDown.WideWave(spec.columns, spec.spirv, coopmatWave); err != nil {
 				m.Close()
@@ -401,6 +408,7 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 			{tiledColumns, matmulWide32SPIRV},
 			{64, matmulWide64SPIRV},
 			{128, matmulWidest128SPIRV},
+			{256, matmulWidest256SPIRV},
 			{wideColumns, matmulWide()},
 		} {
 			if err := m.denseDown.Wide(spec.columns, spec.spirv); err != nil {
