@@ -37,6 +37,13 @@ const (
 // A Q6KHead is one Q6_K matrix resident in device memory, with the small
 // per-token buffers around it.
 type Q6KHead struct {
+	// softcap is the limit the shader caps its logits at, zero where the model
+	// has none. Setting it moves the whole vocabulary's hyperbolic tangent off
+	// the CPU, where it costs a fifth of a generated token, and onto the end of
+	// the product that produced the value. Callers that set it must not also
+	// call nn.Softcap on the answer.
+	softcap float32
+
 	d           *Device
 	rows, cols  int
 	superblocks int
@@ -56,6 +63,7 @@ type Q6KHead struct {
 type q6kPush struct {
 	rows        uint32
 	superblocks uint32
+	softcap     float32
 }
 
 // NewQ6KHead uploads a Q6_K matrix. data is the tensor exactly as the file
@@ -124,6 +132,14 @@ func NewQ6KHead(d *Device, data []byte, rows, cols int) (*Q6KHead, error) {
 // same tensor, and uploading it twice would be 577 mebibytes for nothing.
 func (h *Q6KHead) Table() (*Buffer, int) { return h.weights, h.cols }
 
+// Softcap tells the head to cap its logits itself. Zero, the default, leaves
+// them raw and the caller to do it.
+func (h *Q6KHead) Softcap(limit float32) { h.softcap = limit }
+
+// Capped says whether the head caps its own logits, so that a caller does not
+// do it twice.
+func (h *Q6KHead) Capped() bool { return h.softcap != 0 }
+
 func (h *Q6KHead) MatVec(b *nn.Batch, column int, out []float32) error {
 	if b.QK == nil {
 		return fmt.Errorf("vk: a Q6_K product needs the activation in its Q8_K form")
@@ -147,7 +163,7 @@ func (h *Q6KHead) MatVec(b *nn.Batch, column int, out []float32) error {
 		sums[i] = int32(v)
 	}
 
-	push := q6kPush{rows: uint32(h.rows), superblocks: uint32(h.superblocks)}
+	push := q6kPush{rows: uint32(h.rows), superblocks: uint32(h.superblocks), softcap: h.softcap}
 	if err := h.set.Dispatch(h.groups, unsafe.Pointer(&push)); err != nil {
 		return err
 	}

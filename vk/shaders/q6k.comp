@@ -41,8 +41,14 @@ layout(std430, binding = 3) readonly  buffer BS { int   bsum[]; };
 layout(std430, binding = 4) writeonly buffer Y  { float y[];   };
 
 layout(push_constant) uniform Push {
-    uint rows;
-    uint superblocks;
+    uint  rows;
+    uint  superblocks;
+    // The logit softcap, or zero where the model has none. Gemma caps its
+    // logits at thirty, and a quarter of a million hyperbolic tangents is
+    // three milliseconds of one core and six microseconds of this card. It
+    // belongs at the end of the product that made the number, where the value
+    // is already in a register and nothing has to read it back to find it.
+    float softcap;
 } p;
 
 const uint BYTES = 212u;   // one padded superblock
@@ -130,6 +136,8 @@ void main() {
             }
         }
 
-        if (lane == 0u) y[row] = total;
+        if (lane == 0u) {
+            y[row] = (p.softcap != 0.0) ? p.softcap * tanh(total / p.softcap) : total;
+        }
     }
 }

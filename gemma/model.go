@@ -374,6 +374,12 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 		if err := m.head.MatVec(v, 0, out); err != nil {
 			panic(fmt.Sprintf("gemma: the Vulkan head failed: %v", err))
 		}
+		if m.head.Capped() {
+			// The shader capped every logit as it wrote it. Doing it again
+			// here would cap the cap.
+			m.suppress(out, nil)
+			return
+		}
 	} else {
 		m.W.TokenEmbd.MatVec(v, out)
 	}

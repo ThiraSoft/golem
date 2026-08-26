@@ -45,6 +45,10 @@ func (m *Model) UseVulkanHead() error {
 	if err != nil {
 		return err
 	}
+	// The cap goes with the product rather than after it: the shader writes a
+	// logit that is already capped, and Logits does not walk the vocabulary
+	// again to do it. gemma/model.go's Logits asks the head whether it did.
+	h.Softcap(m.Cfg.LogitSoftcap)
 	m.head = h
 	// The head is the embedding read the other way round, so a stack built
 	// before it can now read its rows too rather than being handed them.
