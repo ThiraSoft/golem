@@ -127,6 +127,53 @@
 // their side, so it is a property of this kernel and not of the shape, and
 // nothing in the geometry, the accumulator width, the shared-store width or
 // the load width has found it.
+//
+// **The final disassembly, at last, and what it says.** RADV_DEBUG=shaders
+// does print the post-register-allocation code -- it is under `disasm:`, after
+// the ACO IR. Nothing in it is called `s_waitcnt`: GFX12 splits the counter
+// into `s_wait_dscnt`, `s_wait_loadcnt`, `s_wait_kmcnt` and `s_wait_alu`, so a
+// search for the old name finds nothing and the wrong conclusion follows.
+//
+// The hot block, read side by side with llama.cpp's, settles two things and
+// opens one.
+//
+//   - **The wave tile.** At BM 64, BN 32 the inner block is sixteen
+//     `v_wmma_f32_16x16x16_f16` fed by twenty-four `ds_load_b64`: one and a
+//     half shared loads per multiply, because a wave owns two accumulator
+//     fragments and every pair of multiplies needs a fresh operand. Theirs is
+//     thirty-two multiplies on sixteen loads -- half a load per multiply, a
+//     four-by-four accumulator grid. Ours reaches that ratio exactly at BM
+//     256, BN 64: sixteen loads, thirty-two multiplies, no scratch. ffn_gate
+//     measures 9.96 there against 9.26 at the wasteful geometry. The wave tile
+//     is not it either.
+//
+//   - **The staging never overlaps the multiplying.** Their loop is one basic
+//     block: the global loads, the dequantisation, the shared stores and the
+//     thirty-two matrix multiplies, with four `s_wait_loadcnt` sitting among
+//     the multiplies. Memory for the next step is in flight while the cores
+//     work. Ours is three blocks with barriers between them -- stage, barrier,
+//     multiply -- and the multiply block contains no load of any kind. This is
+//     a real difference and it is worth fixing, but it is not the wall: see
+//     below.
+//
+// The activation's sign extension was three instructions a magnitude (extract,
+// compare, subtract) and there are thirty-two magnitudes a thread a step. As
+// one `v_bfe_i32` it is now one. ffn_down went 5.46 to 4.95 microseconds a
+// column. **ffn_gate went 9.26 to 9.20**, which is noise.
+//
+// That is the shape of every result on this shape. Doubling BM halves how
+// often the activation is re-staged: 9.36. Their exact wave tile: 9.96. Their
+// exact instruction budget per multiply: unchanged. Removing sixty-four VALU a
+// thread a step: unchanged. **ffn_gate does not respond to work removed**,
+// which means it is not spending its time working.
+//
+// What it is spending it on is legible in the throughput the benchmark already
+// prints. Cold, streaming thirty-three megabytes of weights: ffn_down reads at
+// 26.2 GB/s and ffn_gate at 14.1, on a card that does about 640. llama.cpp on
+// the same shape is near 49. The wall is on the way to memory -- the order the
+// weight tile is walked in, and what the caches make of it -- and the ISA now
+// says the arithmetic side is at parity, so that is the only place left for it
+// to be.
 
 #ifndef COLUMNS
 #define COLUMNS 32
@@ -318,8 +365,11 @@ void main() {
             [[unroll]] for (uint u = 0u; u < 8u; u++) {
                 uint word = (u < 4u) ? lo[u] : hi[u - 4u];
                 [[unroll]] for (uint m = 0u; m < 4u; m++) {
-                    int q = int((word >> (8u * m)) & 0xFFu);
-                    if (q > 127) q -= 256;
+                    // bitfieldExtract on a signed word is one v_bfe_i32. The
+                    // arithmetic form -- extract the byte, compare, subtract
+                    // 256 -- is three instructions a magnitude, and there are
+                    // thirty-two magnitudes a thread a step.
+                    int q = bitfieldExtract(int(word), int(8u * m), 8);
                     sb[base + u * 4u + m] = float16_t(float(q) * as);
                 }
             }
