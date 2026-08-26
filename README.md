@@ -4,14 +4,25 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/ThiraSoft/golem.svg)](https://pkg.go.dev/github.com/ThiraSoft/golem)
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**CPU inference engines in pure Go.** No Python, no cgo, no GPU, no runtime to
-install: `go build`, one static binary, a GGUF file, an answer. Three
+**CPU inference engines in pure Go.** No Python, no cgo, no GPU required, no
+runtime to install: `go build`, one static binary, a GGUF file, an answer. Three
 dependencies outside the standard library, each a file format the standard
 library does not read: `golang.org/x/image` for a WebP, `hajimehoshi/go-mp3`
 for an MP3 and `mewkiz/flac` for a FLAC. On an eight-core
 desktop CPU that binary keeps pace with llama.cpp — ahead on the models large
 enough for memory bandwidth to be the limit, behind on the smallest, and every
 number below is a benchmark in this repository rather than an estimate.
+
+**And there is a GPU path when you want one.** `-vulkan` is the whole model on
+the card, bound through `purego` rather than cgo, so `CGO_ENABLED=0 go build
+./...` still passes. On an RX 9070 XT it **reads a prompt faster than
+llama.cpp's own Vulkan build does** — on all four models tested up to two
+hundred and fifty-six positions, and on the largest and the smallest beyond
+that. On the Gemma 4 26B A4B the margin is a factor of two and a half at
+sixty-four positions and an eighth at five hundred and twelve. Generation is
+the side still behind, at 0.83 to 0.98 of their rate. [The table is
+below](#what-it-does-not-do), with both sides measured the same evening on the
+same card and the same files.
 
 A golem is inert matter given a voice. That is what these engines do to a file
 of weights.
@@ -192,18 +203,18 @@ Worth knowing before you clone it:
   ceiling is about 43.
 
   `-vulkan` moves all four, and then everything between them. On the 26B A4B,
-  **13.4 tokens a second becomes 98.6** — llama.cpp's Vulkan build is at 124.6
-  and its ROCm build at 98.6 on the same card — and the prompt goes from 40 a
-  second to 1459. It costs those
-  matrices being resident — 12.8 gibibytes, which is why a card with sixteen is
-  the smallest that can do this — and about nine seconds of upload.
+  **13.4 tokens a second becomes 103.7**, against llama.cpp's Vulkan build at
+  124.8 on the same card, and **the prompt goes from 40 a second to 4541** —
+  against their 4038. It costs those matrices being resident — 12.8 gibibytes,
+  which is why a card with sixteen is the smallest that can do this — and about
+  nine seconds of upload.
 
   A dense checkpoint goes the same way, because a dense block is a mixture
   block with one branch: the shared branch of a mixture and an ordinary feed
   forward are the same three matrices under the same norm, and what differs is
   the end of the block — one post-norm instead of three, and no routing. On the
-  12B, **5.0 tokens a second becomes 59.8**, against llama.cpp's 64.5 in Vulkan
-  and 61.2 in ROCm on the same card.
+  12B, **5.0 tokens a second becomes 60.0**, against llama.cpp's 64.6 on the
+  same card.
 
   Qwen3 runs on the same stack. Four things differ and they are all the file
   being read rather than a second path: an ordinary pre-norm block, where
@@ -211,9 +222,8 @@ Worth knowing before you clone it:
   where Gemma looks ggml's GELU up in a table; scores scaled by one over the
   square root of the head, which Gemma leaves at one because its query norm
   holds them in range; and a value handed to the attention unnormed, which
-  Gemma norms. On the 4B, **14.6 tokens a second becomes 154.8**, against
-  llama.cpp's 162.6 in Vulkan and 142.7 in ROCm; on the 0.6B, 83.4 becomes
-  293.4 against 407.4 and 244.1. The head is
+  Gemma norms. On the 4B, **14.6 tokens a second becomes 167.0**, against
+  llama.cpp's 169.7; on the 0.6B, 83.4 becomes 359.4 against 365.4. The head is
   Q4_0 on those checkpoints rather than Q6_K, and reads through
   `shaders/matvec.comp` — the kernel the attention's projections already use.
 
@@ -248,15 +258,15 @@ Worth knowing before you clone it:
   a device, and the engine falls back to the CPU as it does when there is no
   Vulkan at all.
 
-  A model whose attention is on the card reads its prompt in stretches of two
-  hundred and fifty-six positions, because the keys and values are the card's
-  and the two caches must not part. Two hundred and fifty-six of them in one
-  pass is what a batch was always for: every matrix of the model read once for
-  all of them instead of once for each, which is the whole of the difference
-  between a prompt at the memory ceiling and a prompt two hundred and fifty-six
-  times over it. A mixture is no exception any more: its expert stack is read
-  by expert rather than by column, so the eight matrices a position routes to
-  are read once for the positions that wanted them. Generation reads the same
+  A model whose attention is on the card reads its prompt in stretches of five
+  hundred and twelve positions, because the keys and values are the card's and
+  the two caches must not part. Five hundred and twelve of them in one pass is
+  what a batch was always for: every matrix of the model read once for all of
+  them instead of once for each, which is the whole of the difference between a
+  prompt at the memory ceiling and a prompt five hundred times over it. A
+  mixture is no exception any more: its expert stack is read by expert rather
+  than by column, so the eight matrices a position routes to are read once for
+  the positions that wanted them. Generation reads the same
   binaries it always did: the column count is compiled into the kernel rather
   than pushed, so there are several of each and a token draws the narrowest.
 
@@ -277,16 +287,26 @@ Worth knowing before you clone it:
   the down projection of a Qwen3 4B block from 6.36 milliseconds over
   thirty-six blocks to 4.40, and the output projection from 2.78 to 2.07.
 
-  On the 12B that took the prompt from 71 tokens a second to 615, on the Qwen3
-  4B from 179 to 1527, and on the 0.6B from 420 to 5475. llama.cpp's own
-  Vulkan build, same card and same files, reads them at 984, 2855 and 8135.
-  What is left of the gap is one shape — many rows over a short shared
-  dimension, which every gate, up and qkv projection has — and
-  vk/shaders/matmul_coop.comp says what the matrix cores did and did not fix
-  about it.
+  On the 12B that took the prompt from 71 tokens a second to 2858, on the
+  Qwen3 4B from 179 to 5895, and on the 0.6B from 420 to 23995. llama.cpp's own
+  Vulkan build, same card and same files, reads them at 2976, 6125 and 22306.
 
-  The largest single thing was not a kernel. Six buffers carrying the stream
-  from one kernel to the next were allocated host-visible, left over from a
+  Four things closed that gap, and each of them is written up where it lives.
+  The expert branch of a mixture reads its stack by expert rather than by
+  column, so the eight matrices a position routes to are read once for every
+  position that wanted them. The tiled product runs on the matrix cores, at a
+  tile the waves divide in both directions — `vk/shaders/matmul_coop.comp`
+  carries that whole measurement, including the shapes it could not reach. Its
+  staging is double-buffered: the reads of step k+1 are issued before the
+  multiplies of step k, so the card waits for memory with thirty-two matrix
+  multiplies in hand. And the block of attention scores is a cooperative
+  multiply rather than a hundred and twenty-eight shared reads — a wave to each
+  sixteen by sixteen tile, the keys read column-major so that nothing is
+  transposed anywhere.
+
+  Before any of those, the largest single thing was not a kernel. Six buffers
+  carrying the stream from one kernel to the next were allocated
+  host-visible, left over from a
   per-block API the stack replaced, so every workgroup of every projection was
   reaching across the bus for its operand. In device memory the same prompt
   runs half again as fast.
@@ -322,81 +342,54 @@ Worth knowing before you clone it:
 - **The prompt path on Gemma is a factor of one and two thirds behind ggml's
   best**, even where it beats the default build; `gemma/README.md` says where
   the remainder sits.
-- **On a card, generation is a tenth to a quarter behind and the prompt is a
-  factor of one and three quarters to three and a half behind, widening with
-  the length of the prompt.**
-  Measured against llama.cpp's own Vulkan build on the same card, which is the
-  fair comparison for a Vulkan engine: its ROCm build generates a fifth slower
-  on the 26B and answers a short prompt a third faster, so it is neither a
-  ceiling nor a floor. Both columns of each pair were measured the same
-  evening, one benchmark at a time; a prompt is given at two lengths because
-  the two engines answer them differently:
+- **On a card, generation is still behind: two hundredths to a sixth,
+  depending on the model.** The prompt is not — see the table below and the
+  paragraph after it.
 
-  | tokens a second | golem gen | llama gen | golem pp64 | llama pp64 | golem pp256 | llama pp256 |
-  | --------------- | --------: | --------: | ---------: | ---------: | ----------: | ----------: |
-  | Gemma 4 26B A4B |      98.6 |     124.6 |       1459 |       1051 |        1764 |        3110 |
-  | Gemma 4 12B     |      59.8 |      64.5 |        672 |       1284 |         707 |        2578 |
-  | Qwen3 0.6B      |     293.4 |     407.4 |       6640 |      10265 |        6948 |      20636 |
+  Measured against llama.cpp's own Vulkan build on the same card, which is the
+  fair comparison for a Vulkan engine. Both columns of every pair were taken
+  the same evening, one benchmark at a time, on an RX 9070 XT against
+  llama.cpp `ba1df050f`:
+
+  | tokens a second | golem gen | llama gen | golem pp64 | llama pp64 | golem pp256 | llama pp256 | golem pp512 | llama pp512 |
+  | --------------- | --------: | --------: | ---------: | ---------: | ----------: | ----------: | ----------: | ----------: |
+  | Gemma 4 26B A4B |     103.7 |     124.8 |   **2061** |        833 |    **3951** |        2918 |    **4541** |        4038 |
+  | Gemma 4 12B     |      60.0 |      64.6 |   **1499** |        983 |    **2611** |        2471 |        2858 |        2976 |
+  | Qwen3 4B        |     167.0 |     169.7 |   **3950** |       2952 |    **5854** |        4545 |        5895 |        6125 |
+  | Qwen3 0.6B      |     359.4 |     365.4 |  **13915** |       9966 |   **23787** |       19159 |   **23995** |       22306 |
+
+  **golem reads a prompt faster than llama.cpp does on every model here at
+  sixty-four, a hundred and twenty-eight and two hundred and fifty-six
+  positions**, and on the 26B A4B and the 0.6B at five hundred and twelve as
+  well; on the 12B and the 4B it is within a twenty-fifth there. On the 26B the
+  margin is a factor of two and a half at sixty-four positions and an eighth at
+  five hundred and twelve, and it holds at a thousand and twenty-four: 4247
+  against 4013.
+
+  Generation is the side that is left. It is 0.83 of llama.cpp on the 26B A4B,
+  0.93 on the 12B, 0.98 on the 4B and 0.98 on the 0.6B — a gap that closes as
+  the model gets smaller, which is the opposite shape from the one the prompt
+  used to have, and it says where the work is. A token is bound by reading the
+  weights, so what is left there is the order the weights are read in and how
+  the dispatches are scheduled around them, not a kernel to rewrite.
 
   **Both sides draw a token from the prompt they read.** llama.cpp's
   `test_prompt` hands the whole prompt to one `llama_decode` with a null
   logits pointer, which computes the last token's logit head and no other, so
   golem's prompt benchmarks compute one head too — the whole vocabulary, on
   the card, once for the stretch. Without it the comparison was a prompt
-  nobody drew a token from against a prompt somebody did, and the gap read
-  smaller than it is. It costs the 26B 3.4 milliseconds a pass of sixty-four
-  and the 12B 2.8, which is why the numbers here are a shade under the ones
-  the same code gave before the head was added.
+  nobody drew a token from against a prompt somebody did.
 
   A benchmark of three iterations reads a third low on the largest model: the
   card is at its idle clocks for the first of them and a prompt of sixty-four
   positions is over before it has left them. Every golem number above was
-  taken with enough iterations for that to stop mattering, which on the 26B is
-  where 1053 becomes 1459.
+  taken with enough iterations for that to stop mattering.
 
-  **The shape of the gap is the story.** golem's prompt is flat in the length
-  of the prompt and llama.cpp's is not: from sixty-four positions to two
-  hundred and fifty-six it gains a factor of two and a half on every model and
-  golem gains a fifth. On the 26B that is enough for golem to be ahead by two
-  fifths at sixty-four and a factor of one and three quarters behind at two
-  hundred and fifty-six, off the same kernels. Further out llama.cpp reaches
-  4033 at five hundred and twelve positions and flattens there against its own
-  micro-batch; golem reaches 1645 and then falls back to 1426 at a thousand
-  and twenty-four, where a pass is cut into chunks of two hundred and
-  fifty-six and the expert stack is read once for each chunk.
-
-  The 26B's row is the one that moved this far at all. Its prompt used to go a
-  position at a time, because each position routes to its own eight matrices
-  of a hundred and twenty-eight and two positions share no read; read by
-  expert instead — for each expert, the columns that chose it — it went from
-  173 tokens a second to 1459, and it is the one row here where golem leads.
-
-  **The by-expert down projection is now the tiled product itself**, built
-  with BYID over an expert's list rather than the batch's columns, and its own
-  kernel is gone. That stage went from 43.5 milliseconds to 34.4 over thirty
-  blocks. The whole pass went from 243 to 240, which is the more useful
-  number: the rewrite was aimed at bandwidth and the pass is not made of
-  bandwidth. Two hundred and fifty-six columns cost 240 milliseconds and
-  sixty-four cost 70 — a straight line of nine tenths of a millisecond a
-  column over an intercept of eleven. The expert stack is read once either
-  way, so what the extra columns buy is arithmetic. Nothing is spilling
-  either: 13.6 gibibytes of video memory in use against sixteen, and 340
-  mebibytes of system memory. `vk/shaders/matmul.comp` carries the whole
-  measurement, including what the shape it replaced could not reach.
-
-  Generation is a tenth behind on the small models and a fifth on the 26B. The
-  prompt is further, and what is left of the gap
-  has been measured rather than guessed. The cost of a tiled product is a
-  straight line — the weights, which are already read at two hundred and
-  twenty-five gigabytes a second, plus a term per column that is instructions
-  and not memory. Cutting the shared dimension gave the row-poor matrices their
-  workgroups back and is bound in. What has not moved is the other shape: many
-  rows over a short shared dimension, which is what every gate, up and qkv
-  projection is and what two fifths of a pass is spent in. It sits at half the
-  rate of its own transpose under every tile, width, split, column block and
-  kernel measured, cooperative or integer, on the same weights and the same
-  multiply count.
-  `vk/shaders/matmul_coop.comp` says what the matrix cores do and do not fix.
+  Where a pass of five hundred and twelve columns of the 26B A4B now goes,
+  from `go test ./gemma -run TestVulkanPromptProfile -v`: the experts' gate and
+  up projection 29.5 per cent, the attention scores 15.4, the experts' down
+  projection 14.7, the attention's four projections 8.7, and the router 7.7.
+  Nothing else is above three.
 
 ## What is here, and what is not
 

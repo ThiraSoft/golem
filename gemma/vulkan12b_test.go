@@ -120,7 +120,7 @@ func Benchmark12BPrefillVulkan(b *testing.B) {
 	if err := m.UseVulkanHead(); err != nil {
 		b.Skipf("no Vulkan head: %v", err)
 	}
-	for _, n := range []int{64, 256} {
+	for _, n := range []int{64, 128, 256, 512} {
 		b.Run(itoa(n), func(b *testing.B) {
 			tokens := make([]int32, n)
 			for i := range tokens {
