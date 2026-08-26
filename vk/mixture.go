@@ -68,8 +68,12 @@ var moeGateUpSPIRV []byte
 // its gate and up products from the tiled kernel instead. See
 // shaders/moe_act.comp.
 //
+//go:generate glslc -O -DBYID --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_act.comp -o shaders/moe_act_id.spv
 //go:embed shaders/moe_act.spv
 var moeActSPIRV []byte
+
+//go:embed shaders/moe_act_id.spv
+var moeActByIDSPIRV []byte
 
 //go:embed shaders/moe_down.spv
 var moeDownSPIRV []byte
@@ -211,9 +215,11 @@ type Mixture struct {
 	// reads them back, and actSet is its one set for the whole mixture — the
 	// weights are the only thing in that stage that belongs to a block.
 	// Record says at what width this path takes over.
-	activate *Pipeline
-	gateOut  *Buffer
-	actSet   *Set
+	activate   *Pipeline
+	idActivate *Pipeline
+	gateOut    *Buffer
+	actSet     *Set
+	idActSet   *Set
 
 	// The expert branch's traffic, reused by every block.
 	xq, xs, ids, cw, out *Buffer
@@ -452,6 +458,10 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		size  int
 		local bool
 	}
+	gateOutSize := 2 * dense * 4 * maxColumns
+	if experts > 0 && 2*ffn*4*maxColumns*used > gateOutSize {
+		gateOutSize = 2 * ffn * 4 * maxColumns * used
+	}
 	bufs := []bufSpec{
 		{&m.dxq, dim * maxColumns, true},        // the shared branch's input
 		{&m.dxs, 2 * in * 4 * maxColumns, true}, //
@@ -459,12 +469,9 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		{&m.doutParts, dim * 4 * maxColumns * matmulSplit(dim), true},
 		{&m.daq, dense * maxColumns, true},        // its intermediate
 		{&m.das, 2 * dmid * 4 * maxColumns, true}, //
-		// Both halves of the shared branch's first projection, in float,
-		// which is the price of giving that projection a tile: the fused
-		// kernel never wrote them down. Thirty-one megabytes on the 12B, and
-		// what it buys is the gate and up matrices read once a block instead
-		// of thirty-two times.
-		{&m.gateOut, 2 * dense * 4 * maxColumns, true},
+		// Both halves of the shared branch's or expert branch's first projection,
+		// in float, taking the larger of the two sizes.
+		{&m.gateOut, gateOutSize, true},
 	}
 	if experts > 0 {
 		// Every column of a pass routes for itself, and the buffers between
@@ -519,6 +526,14 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		return nil, err
 	}
 	if experts > 0 {
+		if m.idActivate, err = d.NewPipeline(moeActByIDSPIRV, 4, push); err != nil {
+			m.Close()
+			return nil, err
+		}
+		if m.idActSet, err = m.idActivate.NewSet([]*Buffer{m.gateOut, m.gelu, m.aq, m.as}); err != nil {
+			m.Close()
+			return nil, err
+		}
 		// Neither of these reads a weight, so one set serves every block.
 		if m.scatterSet, err = m.scatter.NewSet([]*Buffer{m.ids, m.counts, m.pairs, m.plan}); err != nil {
 			m.Close()
@@ -762,14 +777,14 @@ func (m *Mixture) Close() {
 			*b = nil
 		}
 	}
-	for _, s := range []**Set{&m.reduceSet, &m.actSet, &m.scatterSet, &m.combineSet} {
+	for _, s := range []**Set{&m.reduceSet, &m.actSet, &m.idActSet, &m.scatterSet, &m.combineSet} {
 		if *s != nil {
 			(*s).Close()
 			*s = nil
 		}
 	}
 	for _, p := range []**Pipeline{
-		&m.denseDown, &m.down, &m.gateUp, &m.activate, &m.reduce,
+		&m.denseDown, &m.down, &m.gateUp, &m.activate, &m.idActivate, &m.reduce,
 		&m.idGateUp, &m.idDown, &m.scatter, &m.idCombine,
 	} {
 		if *p != nil {

@@ -82,11 +82,17 @@ int nearestInt(float f) {
 void main() {
     uint t   = gl_LocalInvocationID.x;
     uint j   = gl_WorkGroupID.x * 256u + t;   // which value of the feed-forward
-    uint col = p.col + gl_WorkGroupID.y;
+#ifdef BYID
+    uint pair    = gl_WorkGroupID.y;
+    uint outRow  = pair;
+#else
+    uint col     = p.col + gl_WorkGroupID.y;
+    uint outRow  = col;
+#endif
     if (j >= p.ffn) return;   // the width is a whole number of blocks, so a
                               // cluster is never half in and half out
 
-    uint base = col * p.dim;
+    uint base = outRow * p.dim;
     float g = y[base + j];
     float a;
     if (p.act == 1u) {
@@ -121,11 +127,18 @@ void main() {
     int total = subgroupClusteredAdd(q, 32u);
     uint word = subgroupClusteredOr(uint(q & 0xFF) << ((t & 3u) * 8u), 4u);
 
-    if ((j & 3u) == 0u) aq[(col * p.ffn + j) >> 2] = word;
+    if ((j & 3u) == 0u) aq[(outRow * p.ffn + j) >> 2] = word;
     if ((j & 31u) == 0u) {
         uint blocks = p.ffn >> 5;
         uint blk    = j >> 5;
-        as_[col * 2u * blocks + blk]          = scale;
-        as_[col * 2u * blocks + blocks + blk] = 8.0 * scale * float(total);
+#ifdef BYID
+        uint outBase = (pair / p.used) * 2u * p.used * blocks + (pair % p.used) * blocks;
+        as_[outBase + blk]                 = scale;
+        as_[outBase + p.used * blocks + blk] = 8.0 * scale * float(total);
+#else
+        uint outBase = outRow * 2u * blocks;
+        as_[outBase + blk]          = scale;
+        as_[outBase + blocks + blk] = 8.0 * scale * float(total);
+#endif
     }
 }
