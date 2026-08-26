@@ -100,6 +100,33 @@
 // goes to 2.66. Nothing in the arithmetic of the two is different: the same
 // weights, the same activations, the same multiply count, the same staging.
 // Naming that asymmetry is what the next pass at this is for.
+//
+// **Three things landed against that, 2026-08-26, and they are worth 15% on
+// ffn_down and 3% on ffn_gate.** On the 12B at two hundred and fifty-six
+// columns: ffn_down 7.04 microseconds a column to **5.99**, ffn_gate 9.62 to
+// **9.41**.
+//
+//   - **A whole block a thread.** The staging read four bytes of nibbles a
+//     thread and read the same scale word four times over. It now reads one
+//     Q4_0 block — a dwordx4 — and one scale, and the same for the Q8_0
+//     activation. On its own, at BK 32, this *loses* (8.38 and 9.98): only BM
+//     of the threads have anything to stage.
+//   - **BK 128, which now wins where it used to lose.** Wide loads and a deep
+//     step are one change, not two: the step is what gives every thread a
+//     block of its own to read. 6.33 at BK 128 against 7.04 at 32.
+//   - **The column group as the fast dispatch index.** The CGROUPS
+//     workgroups that answer different columns of the same rows read the same
+//     weight tile, and whether that tile is read once or CGROUPS times
+//     depends on whether they are in flight together. See the comment in
+//     main().
+//
+// **And ffn_gate still does not move.** 9.4 to 10.9 microseconds a column
+// under every one of the twenty-odd combinations measured since, against
+// llama.cpp's 1.99 on that exact shape — which is *their* fastest, 59.4
+// TFLOP/s, where their transpose is 46.8. The asymmetry is upside down on
+// their side, so it is a property of this kernel and not of the shape, and
+// nothing in the geometry, the accumulator width, the shared-store width or
+// the load width has found it.
 
 #ifndef COLUMNS
 #define COLUMNS 32
@@ -112,7 +139,7 @@
 #define BM 64
 #endif
 #ifndef BK
-#define BK 32
+#define BK 128
 #endif
 #ifndef THREADS
 #define THREADS 256
@@ -185,8 +212,20 @@ void main() {
     // units; the split is what puts them back.
     uint wgs  = (p.dim + uint(BM) - 1u) / uint(BM);
     const uint CGROUPS = uint(COLUMNS) / uint(BN);
-    uint ir   = gl_WorkGroupID.x % wgs;
-    uint ic   = (gl_WorkGroupID.x / wgs) % CGROUPS;
+    // The column group is the fast index and the row group the slow one, and
+    // that ordering is worth a factor on the shapes with many rows.
+    //
+    // The CGROUPS workgroups that answer different columns of the same rows
+    // read the same weight tile. Whether that tile is read once from memory
+    // or CGROUPS times depends entirely on whether those workgroups are in
+    // flight together, which depends on how far apart they are in dispatch
+    // order. With the row group fast they are wgs apart: sixty on ffn_down,
+    // which is inside what the card runs at once, and two hundred and forty
+    // on ffn_gate, which is not — so ffn_down was reading its matrix out of
+    // cache and ffn_gate was reading it eight times out of DRAM. That is the
+    // shape asymmetry, and it was never in the arithmetic.
+    uint ic   = gl_WorkGroupID.x % CGROUPS;
+    uint ir   = (gl_WorkGroupID.x / CGROUPS) % wgs;
     uint ik   = gl_WorkGroupID.x / (wgs * CGROUPS);
     uint row0 = ir * uint(BM);
     uint col0 = ic * uint(BN);
@@ -225,24 +264,33 @@ void main() {
         // A thread takes one uint of nibbles, which is eight weights: four in
         // the low nibbles at k, four in the high nibbles sixteen further on.
         // That is the Q4_0 layout, not a choice.
-        for (uint idx = t; idx < BM * KB * 4u; idx += uint(THREADS)) {
-            uint u    = idx & 3u;
-            uint rest = idx >> 2;
-            uint r    = rest & (uint(BM) - 1u);
-            uint k    = rest / uint(BM);
+        // A thread takes a whole Q4_0 block — sixteen bytes of nibbles, one
+        // scale — rather than a quarter of one. The narrow form issued four
+        // four-byte loads for the same sixteen bytes and four loads of the
+        // same scale word, and the count of loads in flight is what a kernel
+        // that is eighty per cent staging is made of. Sixteen bytes is one
+        // dwordx4 and the run is aligned: BM * 18 is a multiple of sixteen
+        // for every BM this kernel is built at, and so is BM * 2.
+        for (uint idx = t; idx < BM * KB; idx += uint(THREADS)) {
+            uint r    = idx & (uint(BM) - 1u);
+            uint k    = idx / uint(BM);
             uint b    = kb + k;
-            uint word = 0u;
+            uvec4 words = uvec4(0u);
             float ws = 0.0;
             if (row0 + r < p.dim && b < nb) {
                 uint base = (ir * nb + b) * uint(BM) * 18u;
-                word = w[((base + uint(BM) * 2u + r * 16u) >> 2) + u];
-                ws   = unpackHalf2x16(w[(base + 2u * r) >> 2])[r & 1u];
+                uint at4  = (base + uint(BM) * 2u + r * 16u) >> 2;
+                words = uvec4(w[at4], w[at4 + 1u], w[at4 + 2u], w[at4 + 3u]);
+                ws    = unpackHalf2x16(w[(base + 2u * r) >> 2])[r & 1u];
             }
-            uint at = r * uint(SA_STRIDE) + k * 32u + u * 4u;
-            [[unroll]] for (uint m = 0u; m < 4u; m++) {
-                uint byte = (word >> (8u * m)) & 0xFFu;
-                sa[at + m]       = float16_t((float(byte & 0x0Fu) - 8.0) * ws);
-                sa[at + 16u + m] = float16_t((float(byte >> 4)    - 8.0) * ws);
+            uint at = r * uint(SA_STRIDE) + k * 32u;
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                uint word = words[u];
+                [[unroll]] for (uint m = 0u; m < 4u; m++) {
+                    uint byte = (word >> (8u * m)) & 0xFFu;
+                    sa[at + u * 4u + m]       = float16_t((float(byte & 0x0Fu) - 8.0) * ws);
+                    sa[at + 16u + u * 4u + m] = float16_t((float(byte >> 4)    - 8.0) * ws);
+                }
             }
         }
 
@@ -251,23 +299,29 @@ void main() {
         // straight from a buffer instead, as fp16 written once by the kernel
         // upstream, a thirty-two column pass measured worse and only a
         // hundred-and-twenty-eight column pass measured better.
-        for (uint idx = t; idx < BN * KB * 8u; idx += uint(THREADS)) {
-            uint u    = idx & 7u;
-            uint rest = idx >> 3;
-            uint k    = rest % KB;
-            uint c    = rest / KB;
+        // The same for the activation: one Q8_0 block a thread, thirty-two
+        // magnitudes read as two dwordx4 rather than eight dwords, and one
+        // scale read once instead of eight times.
+        for (uint idx = t; idx < BN * KB; idx += uint(THREADS)) {
+            uint k    = idx % KB;
+            uint c    = idx / KB;
             uint b    = kb + k;
-            uint word = 0u;
+            uvec4 lo = uvec4(0u), hi = uvec4(0u);
             float as = 0.0;
             if (b < nb) {
-                word = aq[(col0 + c) * aw + b * 8u + u];
-                as   = as_[(col0 + c) * 2u * nb + b];
+                uint at8 = (col0 + c) * aw + b * 8u;
+                lo = uvec4(aq[at8],      aq[at8 + 1u], aq[at8 + 2u], aq[at8 + 3u]);
+                hi = uvec4(aq[at8 + 4u], aq[at8 + 5u], aq[at8 + 6u], aq[at8 + 7u]);
+                as = as_[(col0 + c) * 2u * nb + b];
             }
-            uint base = c * uint(SB_STRIDE) + k * 32u + u * 4u;
-            [[unroll]] for (uint m = 0u; m < 4u; m++) {
-                int q = int((word >> (8u * m)) & 0xFFu);
-                if (q > 127) q -= 256;
-                sb[base + m] = float16_t(float(q) * as);
+            uint base = c * uint(SB_STRIDE) + k * 32u;
+            [[unroll]] for (uint u = 0u; u < 8u; u++) {
+                uint word = (u < 4u) ? lo[u] : hi[u - 4u];
+                [[unroll]] for (uint m = 0u; m < 4u; m++) {
+                    int q = int((word >> (8u * m)) & 0xFFu);
+                    if (q > 127) q -= 256;
+                    sb[base + u * 4u + m] = float16_t(float(q) * as);
+                }
             }
         }
 
