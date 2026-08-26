@@ -133,27 +133,27 @@ the noise it drew, the Go test reads it back, and both integrate the same flow.
 
 ## What the engine does not do
 
-**It does not clone voices.** Cloning requires encoding a reference WAV with the
-Mimi encoder — half the model, for work that happens only once per voice. The
-Python daemon already does it and caches the result on disk, in safetensors
-format: the K/V caches of the 24 layers, exactly as the transformer left them
-after listening to the reference. The Go engine reads that file and starts with
-the voice already in memory.
+**It does not train, and it does not batch.** One synthesis at a time, one
+voice at a time, no quantization and no GPU: the engine is a decoder and
+nothing else.
 
-This choice halves the work and costs one dependency: adding a voice requires a
-trip through Python. Adding a voice is rare, synthesizing is constant.
+Cloning used to be out of scope and is not any more. It cost the Mimi encoder —
+half the model, for work that happens once per voice — and that half is in Go
+now: `VoiceFromWAV` reads a mono 24 kHz recording, encodes it, and hands back
+the K/V caches of the transformer that listened to it, which is what a voice
+file holds. `SaveVoice` writes one out in the same safetensors format the
+Python daemon caches, so a voice encoded here and a voice downloaded from
+upstream are the same file. No trip through Python is required for anything.
 
 No voice ships with this repository — the voice states published with Pocket TTS
 belong to Kyutai, and redistributing them is not this project's call to make.
-Put one under `testdata/voices/<language>/`, or encode your own with the Python
-daemon; every test that needs a voice skips when there is none.
-
-Also out of scope: training, batch greater than one, quantization, the GPU.
+Put one under `testdata/voices/<language>/`, or encode your own; every test that
+needs a voice skips when there is none.
 
 ## Languages
 
-The twelve models Kyutai ships are all supported. Pass `-language`; the default
-is `french_24l`.
+The thirteen models Kyutai ships — six languages, at six or twenty-four
+layers — are all supported. Pass `-language`; the default is `french_24l`.
 
 ```bash
 ./pocket-tts -language english_2026-01 -voice voice.safetensors "Hello world."
