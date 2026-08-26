@@ -1,12 +1,17 @@
 #version 450
 
-// One expert's routing logit to a workgroup.
+// One expert's routing logit to a workgroup, staged across BN columns.
 //
 // The router matrix is float32 — the only one in this model that is — and a
-// hundred and twenty-eight rows of it is 1.4 megabytes a block, 43 a token.
-// The first version of this read all of that in a single workgroup, on one
-// compute unit of sixty-four, and it cost more than the submissions the whole
-// design was written to save. A row to a workgroup instead.
+// hundred and twenty-eight rows of it is 1.4 megabytes a block. For a wide
+// pass of several hundred columns, evaluating it one column per workgroup read
+// the weight hundreds of times over. Staging BN columns in registers inside one
+// workgroup reads each element of the weight once for all BN columns, while
+// preserving the exact scalar accumulation order and binary reduction tree.
+
+#ifndef BN
+#define BN 8
+#endif
 
 layout(local_size_x = 256) in;
 
@@ -18,30 +23,40 @@ layout(push_constant) uniform Push {
     uint n;
     uint experts;
     uint used;
+    uint columns;
     float eps;
     float scalar;
 } p;
 
 shared float partial[256];
 
-// The column of the pass this workgroup routes. A prompt routes every one of
-// its positions, and each has its own eight experts: the second axis of the
-// dispatch is which.
-#define COL (gl_WorkGroupID.y)
-
 void main() {
-    uint e = gl_WorkGroupID.x;
-    uint t = gl_LocalInvocationID.x;
-    uint at = e * p.n;
-    uint xb = COL * p.n;
+    uint e    = gl_WorkGroupID.x;
+    uint col0 = gl_WorkGroupID.y * BN;
+    uint t    = gl_LocalInvocationID.x;
+    uint at   = e * p.n;
 
-    precise float sum = 0.0;
-    for (uint i = t; i < p.n; i += 256u) sum += w[at + i] * x[xb + i];
-    partial[t] = sum;
-    barrier();
-    for (uint stride = 128u; stride > 0u; stride >>= 1) {
-        if (t < stride) partial[t] += partial[t + stride];
+    precise float sum[BN];
+    for (uint c = 0u; c < BN; c++) sum[c] = 0.0;
+
+    for (uint i = t; i < p.n; i += 256u) {
+        float wi = w[at + i];
+        for (uint c = 0u; c < BN; c++) {
+            if (col0 + c < p.columns) {
+                sum[c] += wi * x[(col0 + c) * p.n + i];
+            }
+        }
+    }
+
+    for (uint c = 0u; c < BN; c++) {
+        if (col0 + c >= p.columns) break;
+        partial[t] = sum[c];
+        barrier();
+        for (uint stride = 128u; stride > 0u; stride >>= 1) {
+            if (t < stride) partial[t] += partial[t + stride];
+            barrier();
+        }
+        if (t == 0u) logits[(col0 + c) * p.experts + e] = partial[0];
         barrier();
     }
-    if (t == 0u) logits[COL * p.experts + e] = partial[0];
 }

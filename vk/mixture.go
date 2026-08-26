@@ -262,6 +262,9 @@ type moePush struct {
 	// that read those lists index by. Every other kernel declares fewer uints
 	// and ignores it.
 	cap uint32
+	// bycol is 1 when the input activation is indexed by column (the gate/up
+	// projection) and 0 when indexed by pair (the down projection).
+	bycol uint32
 }
 
 // idProductBN is the BN shaders/matmul.comp is built at for the by-expert
@@ -700,7 +703,7 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 		// kernel kept an accumulator a column in registers, so it carried eight
 		// columns and read the expert stack once per eight rather than once.
 		prod := moePush{dim: uint32(2 * m.ffn), ffn: uint32(m.dim), used: expertsUsed,
-			act: uint32(m.act), col: 1, cap: uint32(maxColumns), split: 1}
+			act: uint32(m.act), bycol: 1, cap: uint32(maxColumns), split: 1}
 		prodRows := uint32((2*m.ffn + matmulRows - 1) / matmulRows)
 		if m.coop {
 			prodRows = uint32((2*m.ffn + idProductCoopBM - 1) / idProductCoopBM)
@@ -743,7 +746,7 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 	m.tl.Stamp(r, "moe gate/up")
 	if byExpert {
 		downPush := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed,
-			act: uint32(m.act), col: 0, cap: uint32(maxColumns), split: 1}
+			act: uint32(m.act), bycol: 0, cap: uint32(maxColumns), split: 1}
 		rows := uint32((m.dim + matmulRows - 1) / matmulRows)
 		if m.coop {
 			rows = uint32((m.dim + idProductCoopBM - 1) / idProductCoopBM)

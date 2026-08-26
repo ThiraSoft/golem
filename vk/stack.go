@@ -70,11 +70,15 @@ type normPush struct {
 // expert and so also the most experts it can choose among.
 const pickLanes = 256
 
+// routerBN is how many columns shaders/router_logits.comp stages in one workgroup.
+const routerBN = 8
+
 // routerPush is shaders/router.comp's.
 type routerPush struct {
 	n       uint32
 	experts uint32
 	used    uint32
+	columns uint32
 	eps     float32
 	scalar  float32
 }
@@ -562,7 +566,7 @@ func (s *Stack) record(r *Recorder, experts, used, columns int) {
 	post := normPush{n: uint32(s.dim), flags: normGain | normFloat, eps: s.eps, scalar: 1}
 	resid := normPush{n: uint32(s.dim), flags: normAdd | normSum | normGain | normQuant, eps: s.eps, scalar: 1}
 	route := routerPush{
-		n: uint32(s.dim), experts: uint32(experts), used: uint32(used),
+		n: uint32(s.dim), experts: uint32(experts), used: uint32(used), columns: uint32(columns),
 		eps: s.eps, scalar: float32(1 / sqrtOf(s.dim)),
 	}
 	// The router reads the residual normed without a gain, scaled by one over
@@ -618,7 +622,7 @@ func (s *Stack) record(r *Recorder, experts, used, columns int) {
 			r.DispatchColumns(b.setRouterIn, 1, cols, unsafe.Pointer(&routerIn))
 			r.Barrier()
 			tl.Stamp(r, "expert norm")
-			r.DispatchColumns(b.setRouterW, uint32(experts), cols, unsafe.Pointer(&route))
+			r.DispatchColumns(b.setRouterW, uint32(experts), uint32((columns+routerBN-1)/routerBN), unsafe.Pointer(&route))
 			r.Barrier()
 			tl.Stamp(r, "router")
 			r.DispatchColumns(b.setPick, 1, cols, unsafe.Pointer(&route))

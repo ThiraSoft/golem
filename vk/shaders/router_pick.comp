@@ -29,6 +29,7 @@ layout(push_constant) uniform Push {
     uint n;
     uint experts;
     uint used;
+    uint columns;
     float eps;
     float scalar;
 } p;

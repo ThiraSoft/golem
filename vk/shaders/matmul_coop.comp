@@ -318,10 +318,10 @@ layout(std430, binding = 6) readonly buffer PL { uint plan[];   };
 shared uint spair[BN];
 shared bool salive[BN];
 shared float stage[WAVE_M * WAVE_N * TILE * TILE];
-#define SCBASE(pair) (p.col != 0u ? ((pair) / p.used) * 2u * nb : (((pair) / p.used) * 2u * p.used * nb + ((pair) % p.used) * nb))
-#define ACOL(c)      (p.col != 0u ? (spair[(c)] / p.used) : spair[(c)])
+#define SCBASE(pair) (p.bycol != 0u ? ((pair) / p.used) * 2u * nb : (((pair) / p.used) * 2u * p.used * nb + ((pair) % p.used) * nb))
+#define ACOL(c)      (p.bycol != 0u ? (spair[(c)] / p.used) : spair[(c)])
 #define ASCALE(c, b) as_[SCBASE(spair[(c)]) + (b)]
-#define ACORR(c, b)  as_[SCBASE(spair[(c)]) + (p.col != 0u ? nb : (p.used * nb)) + (b)]
+#define ACORR(c, b)  as_[SCBASE(spair[(c)]) + (p.bycol != 0u ? nb : (p.used * nb)) + (b)]
 #else
 #define ACOL(c)      (col0 + (c))
 #define ASCALE(c, b) as_[(col0 + (c)) * 2u * nb + (b)]
@@ -336,6 +336,7 @@ layout(push_constant) uniform Push {
     uint col;   // the gate kernel's, and not read here
     uint split; // slices of the shared dimension, one for the whole of it
     uint cap;   // room in one expert's list, which only BYID reads
+    uint bycol; // 1: input activation is indexed by column (gate/up); 0: by pair (down)
 } p;
 
 shared float16_t sa[BM * SA_STRIDE];
@@ -532,22 +533,28 @@ void main() {
     // A tile's sixteen columns are sixteen unrelated rows of the answer, so
     // this cannot be one store at a stride. coopMatStore goes to shared and
     // the threads copy out the live rows.
+    // Each wave writes exclusively to its own slice of stage, so subgroupBarrier
+    // is all that is needed to synchronize within the wave without workgroup-wide
+    // stalls or latent barrier divergence.
     uint wave_offset = wave_id * uint(TILE * TILE);
     uint lane = gl_SubgroupInvocationID;
     [[unroll]] for (uint r = 0u; r < RSUB; r++) {
         uint row = row0 + (rbase + r) * uint(TILE);
-        if (row >= p.dim) continue;
-        [[unroll]] for (uint c = 0u; c < CSUB; c++) {
-            coopMatStore(acc[r][c], stage, wave_offset, uint(TILE), gl_CooperativeMatrixLayoutColumnMajor);
-            barrier();
-            for (uint i = lane; i < uint(TILE * TILE); i += 64u) {
-                uint lc = i / uint(TILE), lr = i % uint(TILE);
-                uint slot = (cbase + c) * uint(TILE) + lc;
-                if (row + lr < p.dim && col0 + slot < n && salive[slot]) {
-                    y[spair[slot] * p.dim + row + lr] = stage[wave_offset + i];
+        if (row < p.dim) {
+            [[unroll]] for (uint c = 0u; c < CSUB; c++) {
+                coopMatStore(acc[r][c], stage, wave_offset, uint(TILE), gl_CooperativeMatrixLayoutColumnMajor);
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
+                for (uint i = lane; i < uint(TILE * TILE); i += gl_SubgroupSize) {
+                    uint lc = i / uint(TILE), lr = i % uint(TILE);
+                    uint slot = (cbase + c) * uint(TILE) + lc;
+                    if (row + lr < p.dim && col0 + slot < n && salive[slot]) {
+                        y[spair[slot] * p.dim + row + lr] = stage[wave_offset + i];
+                    }
                 }
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
             }
-            barrier();
         }
     }
 #else
