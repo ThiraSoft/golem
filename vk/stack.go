@@ -138,7 +138,18 @@ type Stack struct {
 	outGain  *Buffer
 	setFinal *Set
 
-	xs     *Buffer // the stream, seeded by the caller and read back at the end
+	// xs is the stream the blocks read and write, and it lives in device
+	// memory. It was allocated host-visible for years because the caller
+	// seeds it and reads it back, and that put the single hottest buffer in
+	// the model across the bus: three of a block's stages touch it — the
+	// attention norm reads it, the residual norm reads it again, the combine
+	// writes it — and all three measured six to seven gigabytes a second on a
+	// card that gives six hundred and forty, whatever was done to their
+	// kernels. That is the forty-times figure the norm's header records, and
+	// it was never the norm. stage is the host's copy of it, moved in and out
+	// by two DMA copies at the ends of the recording.
+	xs     *Buffer
+	stage  *Buffer // the host side of xs, one copy in and one copy out a pass
 	resid  *Buffer // between the two halves of a block
 	normed *Buffer // the attention's output under its post-norm
 	none   *Buffer // bound where a shader's optional input is unused
@@ -205,7 +216,11 @@ func NewStack(d *Device, dim int, eps float32, attn *Attention, mix *Mixture) (*
 		}
 	}
 
-	if s.xs, err = d.Readback(dim*4*maxColumns, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
+	if s.xs, err = d.Local(dim*4*maxColumns, bufferUsageStorage|bufferUsageTransferSrc|bufferUsageTransferDst); err != nil {
+		s.Close()
+		return nil, err
+	}
+	if s.stage, err = d.Readback(dim*4*maxColumns, bufferUsageTransferSrc|bufferUsageTransferDst); err != nil {
 		s.Close()
 		return nil, err
 	}
@@ -305,7 +320,7 @@ func (s *Stack) Columns() int { return maxColumns }
 
 // Stream is the buffer the caller seeds with the embeddings and reads the last
 // hidden states back from, one column after another, dim floats each.
-func (s *Stack) Stream() *Buffer { return s.xs }
+func (s *Stack) Stream() *Buffer { return s.stage }
 
 // BlockNorms is one block's seven gain vectors, in the order the block uses
 // them. Naming them in a structure rather than in seven arguments is the
@@ -561,6 +576,12 @@ func (s *Stack) record(r *Recorder, experts, used, columns int) {
 		tl.Reset(r)
 		tl.Stamp(r, "start")
 	}
+	// What the caller wrote into the stream this pass. A picture's rows reach
+	// the model this way, and so does a model whose embedding is not on the
+	// card; the copy is four megabytes at the widest and costs a fraction of
+	// a millisecond against the eighty it saves.
+	r.CopyFrom(s.xs, 0, s.stage, 0, columns*s.dim*4)
+	r.Barrier()
 	if s.embedSet != nil {
 		// The embedding before anything, since the stream is what the first
 		// block norms.
@@ -627,6 +648,8 @@ func (s *Stack) record(r *Recorder, experts, used, columns int) {
 		r.Barrier()
 		tl.Stamp(r, "final norm")
 	}
+	r.CopyFrom(s.stage, 0, s.xs, 0, columns*s.dim*4)
+	r.Barrier()
 }
 
 // sqrtOf is math.Sqrt on an int, kept here so that this file imports no more
@@ -665,7 +688,7 @@ func (s *Stack) Close() {
 		b.close()
 	}
 	s.blocks = nil
-	for _, b := range []**Buffer{&s.traces, &s.routerOut, &s.routerIn, &s.none, &s.normed, &s.resid, &s.xs} {
+	for _, b := range []**Buffer{&s.traces, &s.routerOut, &s.routerIn, &s.none, &s.normed, &s.resid, &s.stage, &s.xs} {
 		if *b != nil {
 			(*b).Close()
 			*b = nil

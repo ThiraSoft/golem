@@ -404,8 +404,13 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		bufs = append(bufs,
 			bufSpec{&m.xq, dim * maxColumns, true},            // the expert branch's input
 			bufSpec{&m.xs, 2 * in * 4 * maxColumns, true},     // its scales, then its corrections
-			bufSpec{&m.ids, pairs * 4, false},                 // the chosen experts, a column at a time
-			bufSpec{&m.cw, pairs * 4, false},                  // routing weight times expert scale
+			// The router picks these and the two expert kernels read them,
+			// so they are device memory like everything else between two
+			// kernels: they were host-visible from the days the CPU did the
+			// routing, and a shader reading system memory reaches across the
+			// bus. See vk/device.go's Host, and s.xs in vk/stack.go.
+			bufSpec{&m.ids, pairs * 4, true},                  // the chosen experts, a column at a time
+			bufSpec{&m.cw, pairs * 4, true},                   // routing weight times expert scale
 			bufSpec{&m.out, dim * 4 * maxColumns, true},       // that branch's output
 			bufSpec{&m.aq, pairs * ffn, true},                 // its intermediate, a row per pair
 			bufSpec{&m.as, 2 * pairs * mid * 4, true},         // and that intermediate's scales
