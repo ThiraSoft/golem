@@ -1,0 +1,131 @@
+#version 450
+#extension GL_KHR_shader_subgroup_clustered : require
+
+// The second half of a feed-forward, once the first half is a product.
+//
+// shaders/moe_gateup.comp does the gate product, the up product, the
+// activation, the elementwise product and the Q8_0 quantization in one
+// kernel, and that fusion is what bounds it: it keeps an accumulator a column
+// in registers across its whole walk of the shared dimension, so eight columns
+// is what a wave holds and a prompt of two hundred and fifty-six runs it
+// thirty-two times over, reading the gate and up matrices thirty-two times
+// each. Its own header says what the answer is — give the product a tile —
+// and a tiled product cannot carry the rest, because a tile of rows does not
+// hold both halves of a value and a Q8_0 block is thirty-two values of one.
+//
+// So the rest lives here. shaders/matmul.comp writes both halves to a buffer,
+// this reads them back, and what it costs is one write and one read of that
+// buffer: for the 12B at two hundred and fifty-six columns, thirty-one
+// megabytes a block against the hundred that the thirty-two re-reads of the
+// weights were costing.
+//
+// A thread to a value and no shared memory at all. Thirty-two consecutive
+// threads carry one Q8_0 block, so the peak, the sum of the quantized values
+// and the packing into words are three clustered subgroup reduces — the same
+// shape shaders/attn_scores.comp quantizes its heads with.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer Y  { float y[];    };  // the product, gate rows then up rows
+layout(std430, binding = 1) readonly  buffer GT { float gelu[]; };  // ggml's table, 65536 entries
+layout(std430, binding = 2) writeonly buffer AQ { uint  aq[];   };  // the activation, Q8_0
+layout(std430, binding = 3) writeonly buffer AS { float as_[];  };  // its scales, then its corrections
+
+layout(push_constant) uniform Push {
+    uint dim;   // the product's stride: twice the feed-forward width
+    uint ffn;   // the feed-forward width, which is where the up rows begin
+    uint used;  // one, for a shared branch; this kernel serves no other
+    uint act;   // 0: ggml's tabulated GELU; 1: SiLU, which is a swiglu's half
+    uint col;   // the first column of the pass this dispatch answers
+    uint split;
+    uint cap;
+} p;
+
+// floatToHalf is nn/half.go, bit for bit, and shaders/moe_gateup.comp says
+// why it is written out rather than taken from packHalf2x16: the GELU table is
+// indexed by those sixteen bits and the Q8_0 scale is the fp16 the reference
+// stored, so a bucket away is a divergence in both.
+uint floatToHalf(float f) {
+    uint bits     = floatBitsToUint(f);
+    uint sign     = (bits >> 16) & 0x8000u;
+    int  exponent = int((bits >> 23) & 0xFFu) - 127 + 15;
+    uint mantissa = bits & 0x7FFFFFu;
+
+    if ((bits & 0x7FFFFFFFu) == 0u) return sign;
+    if (exponent >= 0x1F) {
+        if ((bits & 0x7F800000u) == 0x7F800000u && mantissa != 0u) return sign | 0x7E00u;
+        return sign | 0x7C00u;
+    }
+    if (exponent <= 0) {
+        if (exponent < -10) return sign;
+        mantissa |= 0x800000u;
+        uint shift = uint(14 - exponent);
+        uint value = mantissa >> shift;
+        uint rest  = mantissa & ((1u << shift) - 1u);
+        uint mid   = 1u << (shift - 1u);
+        if (rest > mid || (rest == mid && (value & 1u) == 1u)) value++;
+        return sign | value;
+    }
+    uint value = (uint(exponent) << 10) | (mantissa >> 13);
+    uint rest  = mantissa & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (value & 1u) == 1u)) value++;
+    return sign | value;
+}
+
+float halfToFloat(uint h) { return unpackHalf2x16(h).x; }
+
+// nearestInt is ggml's round-half-to-even, as moe_gateup.comp's copy.
+int nearestInt(float f) {
+    return (floatBitsToInt(f + 12582912.0) & 0x007fffff) - 0x00400000;
+}
+
+void main() {
+    uint t   = gl_LocalInvocationID.x;
+    uint j   = gl_WorkGroupID.x * 256u + t;   // which value of the feed-forward
+    uint col = p.col + gl_WorkGroupID.y;
+    if (j >= p.ffn) return;   // the width is a whole number of blocks, so a
+                              // cluster is never half in and half out
+
+    uint base = col * p.dim;
+    float g = y[base + j];
+    float a;
+    if (p.act == 1u) {
+        // SiLU, evaluated rather than looked up: ggml computes a swiglu's half
+        // as x/(1+exp(-x)), and nn/swiglu.go is the other copy.
+        a = g / (1.0 + exp(-g));
+    } else if (g <= -10.0) {
+        // ggml does not evaluate GELU: it rounds to fp16 and looks the answer
+        // up, with the two ends left alone. nn/gelu_table.go says why.
+        a = 0.0;
+    } else if (g >= 10.0) {
+        a = g;
+    } else {
+        a = gelu[floatToHalf(g)];
+    }
+    float value = a * y[base + p.ffn + j];
+
+    // The Q8_0 block, thirty-two consecutive threads to one of them.
+    float peak = subgroupClusteredMax(abs(value), 32u);
+    float scale = 0.0;
+    int   q = 0;
+    if (peak > 0.0) {
+        // The scale the product uses is the fp16 the reference stored.
+        scale = halfToFloat(floatToHalf(peak / 127.0));
+        // precise, because the magic constant of nearestInt only rounds
+        // correctly when the product it is added to has already been rounded
+        // to float32. Left alone the compiler contracts the two into a fused
+        // multiply-add.
+        precise float scaled = value * (127.0 / peak);
+        q = clamp(nearestInt(scaled), -128, 127);
+    }
+    int total = subgroupClusteredAdd(q, 32u);
+    uint word = subgroupClusteredOr(uint(q & 0xFF) << ((t & 3u) * 8u), 4u);
+
+    if ((j & 3u) == 0u) aq[(col * p.ffn + j) >> 2] = word;
+    if ((j & 31u) == 0u) {
+        uint blocks = p.ffn >> 5;
+        uint blk    = j >> 5;
+        as_[col * 2u * blocks + blk]          = scale;
+        as_[col * 2u * blocks + blocks + blk] = 8.0 * scale * float(total);
+    }
+}

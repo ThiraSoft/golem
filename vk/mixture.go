@@ -30,6 +30,7 @@ import (
 )
 
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_act.comp -o shaders/moe_act.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_down.comp -o shaders/moe_down.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec.spv
 
@@ -59,6 +60,13 @@ var moeIDCombineSPIRV []byte
 
 //go:embed shaders/moe_gateup.spv
 var moeGateUpSPIRV []byte
+
+// The activation and the quantization on their own, for the pass that takes
+// its gate and up products from the tiled kernel instead. See
+// shaders/moe_act.comp.
+//
+//go:embed shaders/moe_act.spv
+var moeActSPIRV []byte
 
 //go:embed shaders/moe_down.spv
 var moeDownSPIRV []byte
@@ -188,6 +196,15 @@ type Mixture struct {
 	gelu      *Buffer // ggml's GELU table, uploaded once
 	zero      *Buffer // one identifier, always zero, for the shared branch
 
+	// The shared branch's gate and up as a tiled product rather than a fused
+	// mat-vec: gateOut is where both halves land, activate is the kernel that
+	// reads them back, and actSet is its one set for the whole mixture — the
+	// weights are the only thing in that stage that belongs to a block.
+	// Record says at what width this path takes over.
+	activate *Pipeline
+	gateOut  *Buffer
+	actSet   *Set
+
 	// The expert branch's traffic, reused by every block.
 	xq, xs, ids, cw, out *Buffer
 	aq, as               *Buffer // the intermediate, which never leaves the card
@@ -206,6 +223,7 @@ type mixtureBlock struct {
 	denseGateUp, denseDown *Buffer
 	setGateUp, setDown     *Set
 	setDenseUp, setDenseDn *Set
+	setDenseProd           *Set // the gate and up through the tiled product, for a wide pass
 	setDenseDnParts        *Set // the same, writing the slices of a split product
 	setIDGateUp, setIDDown *Set // the expert branch read by expert, for a prompt
 }
@@ -312,6 +330,7 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 	}{
 		{&m.gateUp, moeGateUpSPIRV, 7},
 		{&m.denseDown, matvecSPIRV, 4},
+		{&m.activate, moeActSPIRV, 4},
 		{&m.reduce, matmulReduceSPIRV, 2},
 	}
 	if experts > 0 {
@@ -391,6 +410,12 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		{&m.doutParts, dim * 4 * maxColumns * matmulSplit(dim), true},
 		{&m.daq, dense * maxColumns, true},        // its intermediate
 		{&m.das, 2 * dmid * 4 * maxColumns, true}, //
+		// Both halves of the shared branch's first projection, in float,
+		// which is the price of giving that projection a tile: the fused
+		// kernel never wrote them down. Thirty-one megabytes on the 12B, and
+		// what it buys is the gate and up matrices read once a block instead
+		// of thirty-two times.
+		{&m.gateOut, 2 * dense * 4 * maxColumns, true},
 	}
 	if experts > 0 {
 		// Every column of a pass routes for itself, and the buffers between
@@ -438,6 +463,11 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 			m.Close()
 			return nil, err
 		}
+	}
+	// The activation reads no weight, so one set serves every block.
+	if m.actSet, err = m.activate.NewSet([]*Buffer{m.gateOut, m.gelu, m.daq, m.das}); err != nil {
+		m.Close()
+		return nil, err
 	}
 	if experts > 0 {
 		// Neither of these reads a weight, so one set serves every block.
@@ -526,6 +556,10 @@ func (m *Mixture) AddBlock(gateUpExps, downExps, gate, up, down []byte) error {
 	}
 	sets := []setSpec{
 		{&b.setDenseUp, m.gateUp, []*Buffer{b.denseGateUp, m.dxq, m.dxs, m.zero, m.gelu, m.daq, m.das}},
+		// The same weights through the tiled product, which is the wide
+		// pass's path: same layout on the card, so the matrix is uploaded
+		// once and the two kernels read it the same way.
+		{&b.setDenseProd, m.denseDown, []*Buffer{b.denseGateUp, m.dxq, m.dxs, m.gateOut}},
 		{&b.setDenseDn, m.denseDown, []*Buffer{b.denseDown, m.daq, m.das, m.dout}},
 	}
 	if m.splitDown > 1 {
@@ -585,7 +619,19 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 	} else if m.experts > 0 {
 		r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
 	}
-	if width > 1 {
+	switch {
+	case width >= tiledColumns:
+		// The tiled product and then the activation, which is two kernels
+		// where the fused one was a kernel. shaders/moe_act.comp says why:
+		// the fused kernel carries eight columns because that is what a wave
+		// holds, so a pass of two hundred and fifty-six ran it thirty-two
+		// times and read the gate and up matrices thirty-two times with it.
+		product := moePush{dim: uint32(2 * m.dense), ffn: uint32(m.dim), used: 1, split: 1}
+		r.DispatchWide(b.setDenseProd, width, productGroups(width, 2*m.dense), unsafe.Pointer(&product))
+		r.Barrier()
+		gelu := moePush{dim: uint32(2 * m.dense), ffn: uint32(m.dense), used: 1, act: uint32(m.act)}
+		r.DispatchColumns(m.actSet, uint32((m.dense+255)/256), uint32(width), unsafe.Pointer(&gelu))
+	case width > 1:
 		gate := gateColumns
 		if width < gate {
 			gate = width
@@ -595,7 +641,7 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 			at.col = uint32(c)
 			r.DispatchWide(b.setDenseUp, gate, up, unsafe.Pointer(&at))
 		}
-	} else {
+	default:
 		r.Dispatch(b.setDenseUp, up, unsafe.Pointer(&shared))
 	}
 	r.Barrier()
@@ -650,7 +696,7 @@ func (m *Mixture) Close() {
 	}
 	m.blocks = nil
 	for _, b := range []**Buffer{
-		&m.das, &m.daq, &m.doutParts, &m.dout, &m.dxs, &m.dxq,
+		&m.gateOut, &m.das, &m.daq, &m.doutParts, &m.dout, &m.dxs, &m.dxq,
 		&m.as, &m.aq, &m.out, &m.cw, &m.ids, &m.xs, &m.xq,
 		&m.dpart, &m.plan, &m.pairs, &m.counts,
 		&m.zero, &m.gelu,
@@ -660,14 +706,14 @@ func (m *Mixture) Close() {
 			*b = nil
 		}
 	}
-	for _, s := range []**Set{&m.reduceSet, &m.scatterSet, &m.combineSet} {
+	for _, s := range []**Set{&m.reduceSet, &m.actSet, &m.scatterSet, &m.combineSet} {
 		if *s != nil {
 			(*s).Close()
 			*s = nil
 		}
 	}
 	for _, p := range []**Pipeline{
-		&m.denseDown, &m.down, &m.gateUp, &m.reduce,
+		&m.denseDown, &m.down, &m.gateUp, &m.activate, &m.reduce,
 		&m.idGateUp, &m.idDown, &m.scatter, &m.idCombine,
 	} {
 		if *p != nil {
@@ -679,7 +725,7 @@ func (m *Mixture) Close() {
 
 func (b *mixtureBlock) close() {
 	for _, s := range []**Set{
-		&b.setDenseDn, &b.setDenseDnParts, &b.setDenseUp,
+		&b.setDenseDn, &b.setDenseDnParts, &b.setDenseUp, &b.setDenseProd,
 		&b.setDown, &b.setGateUp, &b.setIDGateUp, &b.setIDDown,
 	} {
 		if *s != nil {
