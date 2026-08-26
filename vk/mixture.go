@@ -699,7 +699,48 @@ func (m *Mixture) mark(r *Recorder, label string) {
 // Record puts one block's feed-forward half into a recording, for the given
 // number of columns. More than one is a stretch of a prompt, and only the
 // shared branch can take it — see the note beside the wide pipelines above.
-func (m *Mixture) Record(r *Recorder, block, columns int) {
+// RecordSharedUp and RecordSharedDown issue the shared branch's two products
+// on their own, and say whether they did.
+//
+// The shared branch of a mixture block reads what the residual kernel wrote
+// and nothing the routing writes — stack.go binds its quantized input to the
+// same dispatch that writes the residual. The routing beside it is three
+// dispatches of almost nothing: a norm, a hundred and twenty-eight logits, and
+// a sort of a hundred and twenty-eight numbers. Serialized behind their own
+// barriers those cost six and a half microseconds each, which is what a
+// dispatch of one workgroup costs to traverse the pipeline whatever is in it —
+// measured, by serializing ten copies of the attention norm and reading the
+// slope.
+//
+// So they are issued as passengers instead. The gate-and-up product carries
+// the router's norm, the down product carries the router's logits, and the
+// card runs each pair together because nothing in either reads the other. The
+// arithmetic is untouched: the same kernels read the same bytes and write the
+// same answers, and only what they ride beside changes.
+//
+// One column only. A prompt's shared branch is a tiled product with a barrier
+// inside it, and the prompt is not the side that needs this.
+func (m *Mixture) RecordSharedUp(r *Recorder, block, columns int) bool {
+	if passWidth(columns) != 1 {
+		return false
+	}
+	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act), split: 1}
+	r.Dispatch(m.blocks[block].setDenseUp, uint32(m.dense/nn.QuantBlock), unsafe.Pointer(&shared))
+	return true
+}
+
+func (m *Mixture) RecordSharedDown(r *Recorder, block, columns int) bool {
+	if passWidth(columns) != 1 {
+		return false
+	}
+	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act), split: 1}
+	r.Dispatch(m.blocks[block].setDenseDn, m.productGroups(1, m.dim), unsafe.Pointer(&shared))
+	return true
+}
+
+// sharedUp and sharedDown say those two products have already been issued by
+// the two calls above, and this recording must not issue them twice.
+func (m *Mixture) Record(r *Recorder, block, columns int, sharedUp, sharedDown bool) {
 	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed, act: uint32(m.act),
 		cap: uint32(maxColumns), split: 1}
 	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act), split: 1}
@@ -768,7 +809,9 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 			r.DispatchWide(b.setDenseUp, gate, up, unsafe.Pointer(&at))
 		}
 	default:
-		r.Dispatch(b.setDenseUp, up, unsafe.Pointer(&shared))
+		if !sharedUp {
+			r.Dispatch(b.setDenseUp, up, unsafe.Pointer(&shared))
+		}
 	}
 	r.Barrier()
 	m.tl.Stamp(r, "moe shared gate/up")
@@ -793,7 +836,7 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 		r.Dispatch(m.reduceSet, uint32((m.dim*width+255)/256), unsafe.Pointer(&fold))
 	} else if width > 1 {
 		r.DispatchWide(b.setDenseDn, width, down, unsafe.Pointer(&shared))
-	} else {
+	} else if !sharedDown {
 		r.Dispatch(b.setDenseDn, down, unsafe.Pointer(&shared))
 	}
 	r.Barrier()

@@ -615,13 +615,21 @@ func (s *Stack) record(r *Recorder, experts, used, columns int) {
 		r.DispatchColumns(b.setResid, 1, cols, unsafe.Pointer(&resid))
 		r.Barrier()
 		tl.Stamp(r, "post+resid")
+		sharedUp, sharedDown := false, false
 		if b.layout == LayoutMixture {
+			// The routing rides beside the shared branch rather than in front
+			// of it. Each of these three is one workgroup, and a dispatch of
+			// one workgroup costs six and a half microseconds to serialize
+			// whatever is in it; beside a product that fills the card they
+			// cost nothing. vk/mixture.go says what may ride with what.
+			sharedUp = s.mix.RecordSharedUp(r, i, columns)
 			// The expert branch's norm and the routing both read the residual
 			// and neither reads the other.
 			r.DispatchColumns(b.setExpert, 1, cols, unsafe.Pointer(&quant))
 			r.DispatchColumns(b.setRouterIn, 1, cols, unsafe.Pointer(&routerIn))
 			r.Barrier()
 			tl.Stamp(r, "expert norm")
+			sharedDown = s.mix.RecordSharedDown(r, i, columns)
 			r.DispatchColumns(b.setRouterW, uint32(experts), uint32((columns+routerBN-1)/routerBN), unsafe.Pointer(&route))
 			r.Barrier()
 			tl.Stamp(r, "router")
@@ -629,7 +637,7 @@ func (s *Stack) record(r *Recorder, experts, used, columns int) {
 			r.Barrier()
 			tl.Stamp(r, "pick")
 		}
-		s.mix.Record(r, i, columns)
+		s.mix.Record(r, i, columns, sharedUp, sharedDown)
 		r.Barrier()
 		r.DispatchColumns(b.setCombine, 1, cols, unsafe.Pointer(&combine))
 		r.Barrier()
