@@ -3,6 +3,7 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 // The attention itself: one query head against everything it can see, the
 // softmax over that, and the values mixed by it. FlashAttention, which here
@@ -259,9 +260,6 @@ void main() {
                 uvec4 q1 = qs[r1 * QST + off + j];
                 uvec4 k0 = ks[sc * CST + j];
                 uvec4 k1 = ks[(sc + 16u) * CST + j];
-                // Component by component rather than all sixteen halves
-                // unpacked at once: the four scores want four live pairs, not
-                // sixteen, and the wider form spills.
                 [[unroll]] for (uint w = 0u; w < 4u; w++) {
                     vec2 a0 = unpackHalf2x16(q0[w]), a1 = unpackHalf2x16(q1[w]);
                     vec2 b0 = unpackHalf2x16(k0[w]), b1 = unpackHalf2x16(k1[w]);
@@ -342,18 +340,22 @@ void main() {
     // whether it does is uniform across the workgroup, which is what lets the
     // clustered reduces stand inside the branch.
     uint blocks = (p.heads * hd) >> 5;
+    float invSum[BR];
+    for (uint r = 0u; r < rows; r++) {
+        invSum[r] = (sums[r] > 0.0) ? (1.0 / sums[r]) : 0.0;
+    }
     for (uint u = 0u; u < DPT; u++) {
         uint d = t + u * 256u;
         if (d >= hd) break;
         uint slot = ((h * hd) >> 5) + (d >> 5);
         for (uint r = 0u; r < rows; r++) {
-            float value = (sums[r] > 0.0) ? acc[r][u] / sums[r] : 0.0;
+            float value = acc[r][u] * invSum[r];
 
             float peak = subgroupClusteredMax(abs(value), 32u);
             float scale = 0.0;
             int   q = 0;
             if (peak > 0.0) {
-                scale = unpackHalf2x16(floatToHalf(peak / 127.0)).x;
+                scale = unpackHalf2x16(floatToHalf(peak * (1.0 / 127.0))).x;
                 precise float scaled = value * (127.0 / peak);
                 q = clamp(nearestInt(scaled), -128, 127);
             }

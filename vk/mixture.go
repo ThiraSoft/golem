@@ -274,7 +274,7 @@ type moePush struct {
 // entries — sixteen at a pass of two hundred and fifty-six.
 const (
 	idProductBN     = 16
-	idProductCoopBN = 32
+	idProductCoopBN = 64
 	idProductCoopBM = 128
 )
 
@@ -708,6 +708,7 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 			experts: uint32(m.experts), cap: uint32(maxColumns), bn: bn}
 		r.Dispatch(m.scatterSet, 1, unsafe.Pointer(&scat))
 		r.Barrier()
+		m.tl.Stamp(r, "moe scatter")
 
 		// The gate and up halves as one product of 2*ffn rows, then the
 		// activation over what it wrote. Two kernels where there was one, and
@@ -722,10 +723,13 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 		}
 		r.Dispatch(b.setIDProd, prodRows*uint32(idPlanMax(m.experts, columns, idBN(m.coop))), unsafe.Pointer(&prod))
 		r.Barrier()
+		m.tl.Stamp(r, "moe expert gate/up")
 
 		act := moePush{dim: uint32(2 * m.ffn), ffn: uint32(m.ffn), used: expertsUsed,
 			act: uint32(m.act), cap: uint32(maxColumns)}
 		r.DispatchColumns(m.idActSet, uint32((m.ffn+255)/256), uint32(columns*expertsUsed), unsafe.Pointer(&act))
+		r.Barrier()
+		m.tl.Stamp(r, "moe expert act")
 	} else if m.experts > 0 {
 		r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
 	}
@@ -755,7 +759,7 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 		r.Dispatch(b.setDenseUp, up, unsafe.Pointer(&shared))
 	}
 	r.Barrier()
-	m.tl.Stamp(r, "moe gate/up")
+	m.tl.Stamp(r, "moe shared gate/up")
 	if byExpert {
 		downPush := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed,
 			act: uint32(m.act), bycol: 0, cap: uint32(maxColumns), split: 1}
@@ -764,6 +768,8 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 			rows = uint32((m.dim + idProductCoopBM - 1) / idProductCoopBM)
 		}
 		r.Dispatch(b.setIDDown, rows*uint32(idPlanMax(m.experts, columns, idBN(m.coop))), unsafe.Pointer(&downPush))
+		r.Barrier()
+		m.tl.Stamp(r, "moe expert down")
 	} else if m.experts > 0 {
 		r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
 	}
@@ -779,13 +785,16 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 	} else {
 		r.Dispatch(b.setDenseDn, down, unsafe.Pointer(&shared))
 	}
+	r.Barrier()
+	m.tl.Stamp(r, "moe shared down")
 	if byExpert {
 		// The eight rows a column's experts wrote, weighted and added. It
 		// waits on the down projection above and on nothing else, so it goes
 		// in after the shared branch rather than between the two.
-		r.Barrier()
 		fold := combinePairsPush{dim: uint32(m.dim), used: expertsUsed, columns: uint32(columns)}
 		r.Dispatch(m.combineSet, uint32((m.dim*columns+255)/256), unsafe.Pointer(&fold))
+		r.Barrier()
+		m.tl.Stamp(r, "moe combine pairs")
 	}
 }
 

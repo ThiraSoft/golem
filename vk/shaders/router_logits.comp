@@ -1,4 +1,6 @@
 #version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
 
 // One expert's routing logit to a workgroup, staged across BN columns.
 //
@@ -28,13 +30,14 @@ layout(push_constant) uniform Push {
     float scalar;
 } p;
 
-shared float partial[256];
+shared float partial[BN * 8];
 
 void main() {
     uint e    = gl_WorkGroupID.x;
     uint col0 = gl_WorkGroupID.y * BN;
     uint t    = gl_LocalInvocationID.x;
     uint at   = e * p.n;
+    uint wave = gl_SubgroupID;
 
     precise float sum[BN];
     for (uint c = 0u; c < BN; c++) sum[c] = 0.0;
@@ -49,14 +52,21 @@ void main() {
     }
 
     for (uint c = 0u; c < BN; c++) {
-        if (col0 + c >= p.columns) break;
-        partial[t] = sum[c];
-        barrier();
-        for (uint stride = 128u; stride > 0u; stride >>= 1) {
-            if (t < stride) partial[t] += partial[t + stride];
-            barrier();
+        float s = subgroupAdd(sum[c]);
+        if (gl_SubgroupInvocationID == 0u) {
+            partial[c * gl_NumSubgroups + wave] = s;
         }
-        if (t == 0u) logits[(col0 + c) * p.experts + e] = partial[0];
-        barrier();
+    }
+
+    barrier();
+
+    if (wave == 0u) {
+        for (uint c = 0u; c < BN; c++) {
+            if (col0 + c < p.columns) {
+                float s = (t < gl_NumSubgroups) ? partial[c * gl_NumSubgroups + t] : 0.0;
+                s = subgroupAdd(s);
+                if (t == 0u) logits[(col0 + c) * p.experts + e] = s;
+            }
+        }
     }
 }

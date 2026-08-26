@@ -631,7 +631,6 @@ func (s *Stack) record(r *Recorder, experts, used, columns int) {
 		}
 		s.mix.Record(r, i, columns)
 		r.Barrier()
-		tl.Stamp(r, "moe down")
 		r.DispatchColumns(b.setCombine, 1, cols, unsafe.Pointer(&combine))
 		r.Barrier()
 		tl.Stamp(r, "combine")
