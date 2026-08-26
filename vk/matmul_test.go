@@ -82,7 +82,12 @@ func TestMatMulMatchesCPU(t *testing.T) {
 	// The same widths for the cooperative product, and for the same reason:
 	// it has its own BN and its own split, and either one left uncounted in
 	// the dispatch answers a fraction of the batch and reads as a speed-up.
-	for _, columns := range []int{32, 64, 128, 256} {
+	//
+	// Five hundred and twelve is in the list because it is the width the
+	// prompt pass now carries, and because its geometry is not the geometry
+	// of the widths below it: BM and BN both a hundred and twenty-eight,
+	// answered by a two-by-two grid of waves.
+	for _, columns := range []int{32, 64, 128, 256, 512} {
 		t.Run("coopmat"+itoa(columns), func(t *testing.T) { matMulMatchesCPU(t, columns, true) })
 	}
 }

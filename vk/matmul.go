@@ -106,6 +106,35 @@ func matmulCoopColBlock(width int) int {
 	return 128
 }
 
+// coopSplit is the slicing of the shared dimension a matrix of that many rows
+// takes. The cooperative product's tile is wider than the integer one's, so a
+// row-poor matrix leaves it fewer workgroups and wants the split; a row-rich
+// one already fills the card and the split only costs it a reduction.
+//
+// Every caller has to agree on this, and on matmulCoopRows with it: the number
+// here and the -DBM the generate lines pass are the same number said twice,
+// and left disagreeing the dispatch covers a fraction of the answer and leaves
+// the rest zero. It reads as a speed-up.
+func coopSplit(rows, columns int, coop bool) int {
+	if coop && rows/matmulCoopRows(columns) > 96 {
+		return 1
+	}
+	return matmulSplit(rows)
+}
+
+// coopProductGroups is the workgroup count a pass of that width dispatches to
+// answer that many outputs, for whichever product is bound at that width.
+func coopProductGroups(coop bool, width, outputs int) uint32 {
+	if width < tiledColumns {
+		return uint32((outputs + matvecOuts - 1) / matvecOuts)
+	}
+	rows, cols := matmulRows, matmulColGroups(width)
+	if coop {
+		rows, cols = matmulCoopRows(width), matmulCoopColGroups(width)
+	}
+	return uint32((outputs+rows-1)/rows) * uint32(cols)
+}
+
 // matmulCoopColGroups is how many of those a pass of that width makes.
 func matmulCoopColGroups(width int) int {
 	block := matmulCoopColBlock(width)
@@ -178,10 +207,7 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int, coop bool) (*Mat
 	// tile is wider, so a row-poor matrix leaves it even fewer workgroups than
 	// shaders/matmul.comp's, and its own header says the split and the column
 	// blocking together are what first put it ahead of the dot products.
-	split := matmulSplit(rows)
-	if coop && rows/matmulCoopRows(columns) > 96 {
-		split = 1
-	}
+	split := coopSplit(rows, columns, coop)
 	m := &MatMul{d: d, rows: rows, cols: cols, columns: columns, perGroup: perGroup, split: split, coop: coop && d.Coopmat()}
 	layout := splitQ4_0(data, rows, cols)
 	if m.weights, err = d.Upload(layout); err != nil {

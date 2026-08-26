@@ -8,8 +8,10 @@
 // y = W * X on the matrix cores, for one Q4_0 matrix against a batch of Q8_0
 // activations.
 //
-// **This is not bound in, and here is what it measures and why it was
-// written.** llama.cpp's own Vulkan build on this card says
+// **This is what the prompt pass runs on a card with matrix cores**, since
+// 2026-08-26; the journal below is how it got there, and every claim in it is
+// dated because several were overturned by the ones after them. llama.cpp's
+// own Vulkan build on this card says
 // `matrix cores: KHR_coopmat` in its log, and turning them off with
 // GGML_VK_DISABLE_COOPMAT=1 takes its Qwen3 4B prompt from 2958 tokens a
 // second to 1532. That factor of 1.93 is the largest single piece of the gap
@@ -47,13 +49,17 @@
 //     and fifty-six all lose, monotonically, and the reason is that the staged
 //     tile is what decides how many workgroups a compute unit holds. At BK=32
 //     this kernel is under eight kilobytes and the card runs eight of them.
+//     *Overturned twice below: BK 128 wins once a thread stages a whole
+//     block, and BK 32 wins again once the waves are a grid.*
 //   - **A bigger BM.** A hundred and twenty-eight and two hundred and
-//     fifty-six lose the same way and for the same reason.
+//     fifty-six lose the same way and for the same reason. *Overturned below:
+//     BM 128 wins once WAVE_M stops being every wave.*
 //   - **Interleaving the weights by tile** so that a workgroup's read of one
 //     block is one contiguous run instead of BM sixteen-byte pieces a row
-//     apart — vk/mixture.go's tileQ4_0. It is the layout this kernel reads and
-//     it changed nothing measurable, which says the level two cache was
-//     already absorbing the waste.
+//     apart — vk/mixture.go's tileQ4_0. It changed nothing measurable, which
+//     says the level two cache was already absorbing the waste. *That layout
+//     has since been deleted: this kernel reads the ordinary row-major
+//     splitQ4_0 that every other kernel here reads.*
 //   - **Reading the activation as fp16 straight from a buffer** instead of
 //     staging it, so that forty workgroups stop dequantising the same twelve
 //     million values into forty copies. Thirty-two columns got worse (11.1
@@ -202,6 +208,35 @@
 // and at sixty-four columns golem is ahead on both -- 5.26 against 13.48 on
 // ffn_down, 5.02 against 5.62 on ffn_gate. The engine never had this problem:
 // vk/mixture.go has always kept every intermediate in Local.
+//
+// **The wave grid, 2026-08-26, and it is what bound this kernel in.** Every
+// geometry above was swept with one shape of wave: WAVE_M waves each owning
+// RSUB row blocks and *every* column block, which is the 4/1 the defaults
+// still give. The disassembly entry above already named the cost -- one and a
+// half shared loads per multiply, where llama.cpp's four-by-four accumulator
+// grid pays half -- but it looked for the fix in a bigger BM alone, and a
+// bigger BM alone is what the sweep had already refused.
+//
+// Splitting the waves in both directions is what that entry was missing. At
+// WAVE_M 2, WAVE_N 2 a wave owns a four-by-four grid of accumulators, which is
+// their ratio exactly, and BM 128 with BN 128 now fits four waves without
+// scratch. That is why vk/matmul.go's generate lines read as they do: BM 128,
+// BN 128, BK 32 from a hundred and twenty-eight columns up, and the old 64/32
+// kept only at thirty-two columns, where BN cannot exceed the pass.
+//
+// Measured end to end rather than per kernel, which is the number that
+// matters: prompt tokens a second, before against after. Gemma 26B A4B:
+// 1085 -> 1174 at sixty-four columns, 1443 -> 1659 at two hundred and
+// fifty-six, 1677 -> 1979 at five hundred and twelve. Gemma 12B at two hundred
+// and fifty-six: 1093 -> 1723. Qwen3 0.6B at five hundred and twelve:
+// 7609 -> 11034, and that width used to be a regression against its own two
+// hundred and fifty-six.
+//
+// **What this does not fix.** llama.cpp's Vulkan build on the same prompts is
+// 2886 at two hundred and fifty-six and 4037 at five hundred and twelve on the
+// 26B, against golem's 1659 and 1979. golem is ahead at sixty-four columns and
+// level at a hundred and twenty-eight, and then it plateaus where they keep
+// climbing. This kernel is no longer the reason: what is left is above it.
 
 #ifndef COLUMNS
 #define COLUMNS 32
@@ -231,12 +266,22 @@
 #define BN COLUMNS
 #endif
 
-// WAVE is the width vk/device.go asks the driver for, and the reason it has to
-// be asked for rather than taken: WAVES below is how many row blocks each wave
-// owns, and an accumulator array indexed by anything the compiler cannot fold
-// is not in registers at all. It is in scratch memory, and a cooperative
-// matrix in scratch memory is the difference between a kernel that runs at the
-// cores' speed and one that runs at a fifth of it.
+// The waves of a workgroup as a WAVE_M by WAVE_N grid, so that a wave owns
+// RSUB row blocks by CSUB column blocks rather than every column block of its
+// rows. WAVE_M * WAVE_N has to be THREADS divided by the subgroup width
+// vk/device.go asks the driver for -- sixty-four here, and the reason it has
+// to be asked for rather than taken.
+//
+// Both counts have to divide their side of the tile exactly. RSUB and CSUB are
+// then compile-time constants, and that is not a detail: an accumulator array
+// indexed by anything the compiler cannot fold is not in registers at all. It
+// is in scratch memory, and a cooperative matrix in scratch memory is the
+// difference between a kernel that runs at the cores' speed and one that runs
+// at a fifth of it.
+//
+// A square-ish grid is what makes the shared loads pay: at 2 by 2, over a
+// four-by-four grid of accumulators, a wave issues half a shared load per
+// multiply against one and a half at 4 by 1. See the journal above.
 #ifndef WAVE_M
 #define WAVE_M 4
 #endif
@@ -270,11 +315,32 @@ layout(push_constant) uniform Push {
 shared float16_t sa[BM * SA_STRIDE];
 shared float16_t sb[BN * SB_STRIDE];
 
+// The answer goes straight out. A cooperative matrix is stored to a stride the
+// whole sixteen-row tile has to exist for, which is why vk/matmul.go refuses a
+// matrix whose row count is not a multiple of sixteen: with that, a block of
+// TILE rows is either wholly inside the matrix or wholly outside it, and the
+// store at the end skips the outside ones. BM itself need not divide the row
+// count -- that guard is per tile, not per workgroup.
+
 void main() {
     uint t    = gl_LocalInvocationID.x;
     uint nb   = p.ffn >> 5;          // blocks of the shared dimension
+    // The slice of the shared dimension this workgroup answers. A tile this
+    // wide leaves a row-poor matrix few workgroups against the card's compute
+    // units; p.split is what puts them back.
     uint wgs  = (p.dim + uint(BM) - 1u) / uint(BM);
     const uint CGROUPS = uint(COLUMNS) / uint(BN);
+    // The column group is the fast index and the row group the slow one, and
+    // that ordering is worth a factor on the shapes with many rows.
+    //
+    // The CGROUPS workgroups that answer different columns of the same rows
+    // read the same weight tile. Whether that tile is read once from memory
+    // or CGROUPS times depends entirely on whether those workgroups are in
+    // flight together, which depends on how far apart they are in dispatch
+    // order. With the row group fast they are wgs apart: sixty on ffn_down,
+    // which is inside what the card runs at once, and two hundred and forty
+    // on ffn_gate, which is not -- so ffn_down was reading its matrix out of
+    // cache and ffn_gate was reading it eight times out of DRAM.
     uint ic   = gl_WorkGroupID.x % CGROUPS;
     uint ir   = (gl_WorkGroupID.x / CGROUPS) % wgs;
     uint ik   = gl_WorkGroupID.x / (wgs * CGROUPS);
@@ -305,15 +371,16 @@ void main() {
 
         // The weights, dequantised.
         //
-        // The layout is vk/mixture.go's tileQ4_0: this workgroup's BM rows are
-        // interleaved, so one block of the shared dimension is BM fp16 scales
-        // and then BM sets of sixteen nibble bytes, all of it one run. A wave
-        // reading it reads consecutive addresses, which is the difference
-        // between using a cache line and using an eighth of one.
+        // The layout is vk/mixture.go's splitQ4_0, which every kernel here
+        // reads: a row is all of its fp16 scales and then all of its nibbles,
+        // so both halves are four-byte aligned where the file's own eighteen-
+        // byte blocks would not be. A row is nb * 18 bytes and this workgroup
+        // owns the BM rows from row0.
         //
-        // A thread takes one uint of nibbles, which is eight weights: four in
-        // the low nibbles at k, four in the high nibbles sixteen further on.
-        // That is the Q4_0 layout, not a choice.
+        // The tile-interleaved layout this kernel was written for is gone. It
+        // made a workgroup's read of one block contiguous, it measured no
+        // faster, and a second layout on the device is a second thing to keep
+        // true.
         // A thread takes a whole Q4_0 block — sixteen bytes of nibbles, one
         // scale — rather than a quarter of one. The narrow form issued four
         // four-byte loads for the same sixteen bytes and four loads of the

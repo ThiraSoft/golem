@@ -217,10 +217,10 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 		}
 	}
 	coop := d.Coopmat()
-	splitOut := matmulSplit(dim)
-	if coop && dim/64 > 96 {
-		splitOut = 1
-	}
+	// The output projection is dispatched at every width this stack carries,
+	// and one split has to serve them all, so it is taken at the widest —
+	// which is the pass that has the fewest workgroups to spare.
+	splitOut := coopSplit(dim, wideColumns, coop)
 	a := &Attention{d: d, dim: dim, maxHeads: maxHeads, maxKV: maxKV, maxContext: maxContext, splitOut: splitOut, coop: coop}
 
 	var err error
@@ -667,16 +667,7 @@ func groups(outputs int) uint32 { return uint32((outputs + matvecOuts - 1) / mat
 // A tiled product is cut across its columns as well as its rows above BN of
 // them, so the grid is rows over BM by columns over BN.
 func (a *Attention) productGroups(width, outputs int) uint32 {
-	rows := matvecOuts
-	if width >= tiledColumns {
-		if a.coop {
-			rows = matmulCoopRows(width)
-			return uint32((outputs+rows-1)/rows) * uint32(matmulCoopColGroups(width))
-		}
-		rows = matmulRows
-		return uint32((outputs+rows-1)/rows) * uint32(matmulColGroups(width))
-	}
-	return uint32((outputs + rows - 1) / rows)
+	return coopProductGroups(a.coop, width, outputs)
 }
 
 func (a *Attention) Close() {

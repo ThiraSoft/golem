@@ -418,10 +418,9 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		}
 	}
 
-	m.splitDown = matmulSplit(dim)
-	if coop && dim/64 > 96 {
-		m.splitDown = 1
-	}
+	// One split for every width the down projection is dispatched at, taken
+	// at the widest for the reason vk/attention.go gives.
+	m.splitDown = coopSplit(dim, wideColumns, coop)
 	if m.gelu, err = d.Upload(asBytes(nn.GELUTableData())); err != nil {
 		m.Close()
 		return nil, err
@@ -805,55 +804,11 @@ func splitQ4_0(src []byte, rows, cols int) []byte {
 	return dst
 }
 
-// tileQ4_0 is splitQ4_0 with the rows interleaved by tile.
-//
-// The row-major form is what the file holds and what every other kernel here
-// reads. A workgroup owning BM rows takes sixteen bytes of each of them per
-// block, from BM addresses a row apart — sixteen bytes of a hundred-and-
-// twenty-eight byte line, eight times over. Interleaved, a tile's block is BM
-// scales then BM sets of nibbles, all of it contiguous, and the same read is
-// one run of BM*18 bytes.
-//
-// **It measured no faster**, which is worth recording: on a matrix whose rows
-// fit in the level two cache several times over, the line that looked wasted
-// was being finished by the next step down the same rows. Only the cooperative
-// product reads this layout, and only because it was written for it.
-func tileQ4_0(src []byte, rows, cols, bm int) []byte {
-	nb := cols / nn.QuantBlock
-	stride := nb * 18
-	tiles := (rows + bm - 1) / bm
-	dst := make([]byte, tiles*bm*stride)
-	for t := 0; t < tiles; t++ {
-		for b := 0; b < nb; b++ {
-			out := dst[(t*nb+b)*bm*18:]
-			for r := 0; r < bm; r++ {
-				row := t*bm + r
-				if row >= rows {
-					break
-				}
-				block := src[row*stride+b*18 : row*stride+(b+1)*18]
-				binary.LittleEndian.PutUint16(out[2*r:], binary.LittleEndian.Uint16(block))
-				copy(out[2*bm+r*16:], block[2:])
-			}
-		}
-	}
-	return dst
-}
-
 // asBytes views a float slice as the bytes behind it, for an upload.
 func asBytes(f []float32) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(&f[0])), len(f)*4)
 }
 
 func (m *Mixture) productGroups(width, outputs int) uint32 {
-	rows := matvecOuts
-	if width >= tiledColumns {
-		if m.coop {
-			rows = matmulCoopRows(width)
-			return uint32((outputs+rows-1)/rows) * uint32(matmulCoopColGroups(width))
-		}
-		rows = matmulRows
-		return uint32((outputs+rows-1)/rows) * uint32(matmulColGroups(width))
-	}
-	return uint32((outputs + rows - 1) / rows)
+	return coopProductGroups(m.coop, width, outputs)
 }
