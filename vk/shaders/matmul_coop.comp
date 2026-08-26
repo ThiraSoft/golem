@@ -349,9 +349,135 @@ shared float16_t sb[BN * SB_STRIDE];
 // store at the end skips the outside ones. BM itself need not divide the row
 // count -- that guard is per tile, not per workgroup.
 
+// Q4_0 blocks in one step of the shared dimension, as a constant the
+// preprocessor can divide by: the prefetch arrays below have to be sized at
+// compile time or they are scratch memory rather than registers.
+#define KBC (BK / 32)
+#define WPT ((BM * KBC + THREADS - 1) / THREADS)
+#define APT ((BN * KBC + THREADS - 1) / THREADS)
+
+// The reads of the *next* step, held in registers while the cores work on the
+// one staged already.
+//
+// The journal above named this: their loop is one basic block with the global
+// loads sitting among the multiplies, ours was stage, barrier, multiply with
+// nothing in flight during the multiply. Splitting the staging in two --
+// issue the loads for step k+1, then multiply step k -- puts the wait for
+// memory behind thirty-two matrix multiplies instead of in front of them. It
+// costs registers and not a byte of shared memory: the loads land in the same
+// tile the step after, so there is still one tile.
+uvec4 pw[WPT];
+float pws[WPT];
+uvec4 plo[APT], phi[APT];
+float pas[APT];
+
+// What the two halves of the staging need out of main. They are file-scope
+// because GLSL has no closures and passing eight unchanging values through
+// two calls a step is noise.
+uint t, nb, row0, rowBytes, wbase, aw, col0;
+
+// prefetch issues the global reads of step kb into the registers above.
+void prefetch(uint kb) {
+    [[unroll]] for (uint i = 0u; i < uint(WPT); i++) {
+        uint idx = t + i * uint(THREADS);
+        pw[i]  = uvec4(0u);
+        pws[i] = 0.0;
+        if (idx < uint(BM * KBC)) {
+            uint r = idx & (uint(BM) - 1u);
+            uint b = kb + idx / uint(BM);
+            if (row0 + r < p.dim && b < nb) {
+                uint base = wbase + (row0 + r) * rowBytes;
+                uint at4  = (base + 2u * nb + 16u * b) >> 2;
+                pw[i]  = uvec4(w[at4], w[at4 + 1u], w[at4 + 2u], w[at4 + 3u]);
+                pws[i] = unpackHalf2x16(w[(base + 2u * b) >> 2])[b & 1u];
+            }
+        }
+    }
+    [[unroll]] for (uint i = 0u; i < uint(APT); i++) {
+        uint idx = t + i * uint(THREADS);
+        plo[i] = uvec4(0u);
+        phi[i] = uvec4(0u);
+        pas[i] = 0.0;
+        if (idx < uint(BN * KBC)) {
+            uint c = idx / uint(KBC);
+            uint b = kb + idx % uint(KBC);
+            if (b < nb) {
+                uint at8 = ACOL(c) * aw + b * 8u;
+                plo[i] = uvec4(aq[at8],      aq[at8 + 1u], aq[at8 + 2u], aq[at8 + 3u]);
+                phi[i] = uvec4(aq[at8 + 4u], aq[at8 + 5u], aq[at8 + 6u], aq[at8 + 7u]);
+                pas[i] = ASCALE(c, b);
+            }
+        }
+    }
+}
+
+// stageTile dequantises what prefetch read into the shared tile.
+//
+// The weights: the layout is vk/mixture.go's splitQ4_0, which every kernel
+// here reads -- a row is all of its fp16 scales and then all of its nibbles,
+// so both halves are four-byte aligned where the file's own eighteen-byte
+// blocks would not be. The tile-interleaved layout this kernel was written
+// for is gone; it made a workgroup's read of one block contiguous, it
+// measured no faster, and a second layout on the device is a second thing to
+// keep true. A thread takes a whole Q4_0 block -- sixteen bytes of nibbles,
+// one scale -- rather than a quarter of one: that is one dwordx4 on an
+// aligned run where the narrow form issued four loads for the same bytes.
+//
+// The activation: one Q8_0 block a thread, thirty-two magnitudes read as two
+// dwordx4, one scale read once instead of eight times, and the sign extension
+// as one v_bfe_i32 rather than extract, compare and subtract. It does pass
+// through shared memory: read straight from a buffer instead, as fp16 written
+// once by the kernel upstream, a thirty-two column pass measured worse and
+// only a hundred-and-twenty-eight column pass measured better.
+void stageTile() {
+    [[unroll]] for (uint i = 0u; i < uint(WPT); i++) {
+        uint idx = t + i * uint(THREADS);
+        if (idx >= uint(BM * KBC)) break;
+        uint r  = idx & (uint(BM) - 1u);
+        uint k  = idx / uint(BM);
+        uint at = r * uint(SA_STRIDE) + k * 32u;
+        float ws = pws[i];
+        [[unroll]] for (uint u = 0u; u < 4u; u++) {
+            uint w0 = pw[i][u] & 0x0F0F0F0Fu;
+            uint w1 = (pw[i][u] >> 4u) & 0x0F0F0F0Fu;
+            vec4 v0 = (unpackUnorm4x8(w0) * 255.0 - 8.0) * ws;
+            vec4 v1 = (unpackUnorm4x8(w1) * 255.0 - 8.0) * ws;
+
+            sa[at + u * 4u     ] = float16_t(v0.x);
+            sa[at + u * 4u + 1u] = float16_t(v0.y);
+            sa[at + u * 4u + 2u] = float16_t(v0.z);
+            sa[at + u * 4u + 3u] = float16_t(v0.w);
+
+            sa[at + 16u + u * 4u     ] = float16_t(v1.x);
+            sa[at + 16u + u * 4u + 1u] = float16_t(v1.y);
+            sa[at + 16u + u * 4u + 2u] = float16_t(v1.z);
+            sa[at + 16u + u * 4u + 3u] = float16_t(v1.w);
+        }
+    }
+    [[unroll]] for (uint i = 0u; i < uint(APT); i++) {
+        uint idx = t + i * uint(THREADS);
+        if (idx >= uint(BN * KBC)) break;
+        uint k    = idx % uint(KBC);
+        uint c    = idx / uint(KBC);
+        uint base = c * uint(SB_STRIDE) + k * 32u;
+        float as = pas[i];
+        [[unroll]] for (uint u = 0u; u < 8u; u++) {
+            uint word = (u < 4u) ? plo[i][u] : phi[i][u - 4u];
+            int q0 = bitfieldExtract(int(word), 0, 8);
+            int q1 = bitfieldExtract(int(word), 8, 8);
+            int q2 = bitfieldExtract(int(word), 16, 8);
+            int q3 = bitfieldExtract(int(word), 24, 8);
+            sb[base + u * 4u     ] = float16_t(float(q0) * as);
+            sb[base + u * 4u + 1u] = float16_t(float(q1) * as);
+            sb[base + u * 4u + 2u] = float16_t(float(q2) * as);
+            sb[base + u * 4u + 3u] = float16_t(float(q3) * as);
+        }
+    }
+}
+
 void main() {
-    uint t    = gl_LocalInvocationID.x;
-    uint nb   = p.ffn >> 5;          // blocks of the shared dimension
+    t         = gl_LocalInvocationID.x;
+    nb        = p.ffn >> 5;          // blocks of the shared dimension
     uint wgs  = (p.dim + uint(BM) - 1u) / uint(BM);
 
 #ifdef BYID
@@ -360,12 +486,12 @@ void main() {
     uint gi = gl_WorkGroupID.x / wgs;
     if (gi >= plan[0]) return;
     uint e    = plan[1u + 2u * gi];
-    uint col0 = plan[2u + 2u * gi];
+    col0      = plan[2u + 2u * gi];
     uint n    = counts[e];
     uint ir   = gl_WorkGroupID.x % wgs;
     uint ik   = 0u;             // no split: the lists are short already
-    uint rowBytes = nb * 18u;
-    uint wbase = e * p.dim * rowBytes;
+    rowBytes  = nb * 18u;
+    wbase     = e * p.dim * rowBytes;
     for (uint k = t; k < uint(BN); k += uint(THREADS)) {
         bool live = col0 + k < n;
         spair[k]  = pairs[e * p.cap + (live ? col0 + k : col0)];
@@ -388,12 +514,12 @@ void main() {
     uint ic   = gl_WorkGroupID.x % CGROUPS;
     uint ir   = (gl_WorkGroupID.x / CGROUPS) % wgs;
     uint ik   = gl_WorkGroupID.x / (wgs * CGROUPS);
-    uint col0 = ic * uint(BN);
-    uint rowBytes = nb * 18u;
-    uint wbase = 0u;
+    col0      = ic * uint(BN);
+    rowBytes  = nb * 18u;
+    wbase     = 0u;
 #endif
-    uint row0 = ir * uint(BM);
-    uint aw   = p.ffn >> 2;          // one column of the activation, in uints
+    row0      = ir * uint(BM);
+    aw        = p.ffn >> 2;          // one column of the activation, in uints
     const uint KB = uint(BK) >> 5;   // Q4_0 blocks in one step
     uint per  = ((nb + p.split - 1u) / p.split + KB - 1u) & ~(KB - 1u);
     uint kb0  = ik * per;
@@ -412,93 +538,13 @@ void main() {
         }
     }
 
+    prefetch(kb0);
     for (uint kb = kb0; kb < kbn; kb += KB) {
         barrier();
-
-        // The weights, dequantised.
-        //
-        // The layout is vk/mixture.go's splitQ4_0, which every kernel here
-        // reads: a row is all of its fp16 scales and then all of its nibbles,
-        // so both halves are four-byte aligned where the file's own eighteen-
-        // byte blocks would not be. A row is nb * 18 bytes and this workgroup
-        // owns the BM rows from row0.
-        //
-        // The tile-interleaved layout this kernel was written for is gone. It
-        // made a workgroup's read of one block contiguous, it measured no
-        // faster, and a second layout on the device is a second thing to keep
-        // true.
-        // A thread takes a whole Q4_0 block — sixteen bytes of nibbles, one
-        // scale — rather than a quarter of one. The narrow form issued four
-        // four-byte loads for the same sixteen bytes and four loads of the
-        // same scale word, and the count of loads in flight is what a kernel
-        // that is eighty per cent staging is made of. Sixteen bytes is one
-        // dwordx4 and the run is aligned: BM * 18 is a multiple of sixteen
-        // for every BM this kernel is built at, and so is BM * 2.
-        for (uint idx = t; idx < BM * KB; idx += uint(THREADS)) {
-            uint r    = idx & (uint(BM) - 1u);
-            uint k    = idx / uint(BM);
-            uint b    = kb + k;
-            uvec4 words = uvec4(0u);
-            float ws = 0.0;
-            if (row0 + r < p.dim && b < nb) {
-                uint base = wbase + (row0 + r) * rowBytes;
-                uint at4  = (base + 2u * nb + 16u * b) >> 2;
-                words = uvec4(w[at4], w[at4 + 1u], w[at4 + 2u], w[at4 + 3u]);
-                ws    = unpackHalf2x16(w[(base + 2u * b) >> 2])[b & 1u];
-            }
-            uint at = r * uint(SA_STRIDE) + k * 32u;
-            [[unroll]] for (uint u = 0u; u < 4u; u++) {
-                uint w0 = words[u] & 0x0F0F0F0Fu;
-                uint w1 = (words[u] >> 4u) & 0x0F0F0F0Fu;
-                vec4 v0 = (unpackUnorm4x8(w0) * 255.0 - 8.0) * ws;
-                vec4 v1 = (unpackUnorm4x8(w1) * 255.0 - 8.0) * ws;
-
-                sa[at + u * 4u     ] = float16_t(v0.x);
-                sa[at + u * 4u + 1u] = float16_t(v0.y);
-                sa[at + u * 4u + 2u] = float16_t(v0.z);
-                sa[at + u * 4u + 3u] = float16_t(v0.w);
-
-                sa[at + 16u + u * 4u     ] = float16_t(v1.x);
-                sa[at + 16u + u * 4u + 1u] = float16_t(v1.y);
-                sa[at + 16u + u * 4u + 2u] = float16_t(v1.z);
-                sa[at + 16u + u * 4u + 3u] = float16_t(v1.w);
-            }
-        }
-
-        // The activation, dequantised. A thread takes one uint, four
-        // magnitudes, signed. This one does pass through shared memory: read
-        // straight from a buffer instead, as fp16 written once by the kernel
-        // upstream, a thirty-two column pass measured worse and only a
-        // hundred-and-twenty-eight column pass measured better.
-        // The same for the activation: one Q8_0 block a thread, thirty-two
-        // magnitudes read as two dwordx4 rather than eight dwords, and one
-        // scale read once instead of eight times.
-        for (uint idx = t; idx < BN * KB; idx += uint(THREADS)) {
-            uint k    = idx % KB;
-            uint c    = idx / KB;
-            uint b    = kb + k;
-            uvec4 lo = uvec4(0u), hi = uvec4(0u);
-            float as = 0.0;
-            if (b < nb) {
-                uint at8 = ACOL(c) * aw + b * 8u;
-                lo = uvec4(aq[at8],      aq[at8 + 1u], aq[at8 + 2u], aq[at8 + 3u]);
-                hi = uvec4(aq[at8 + 4u], aq[at8 + 5u], aq[at8 + 6u], aq[at8 + 7u]);
-                as = ASCALE(c, b);
-            }
-            uint base = c * uint(SB_STRIDE) + k * 32u;
-            [[unroll]] for (uint u = 0u; u < 8u; u++) {
-                uint word = (u < 4u) ? lo[u] : hi[u - 4u];
-                int q0 = bitfieldExtract(int(word), 0, 8);
-                int q1 = bitfieldExtract(int(word), 8, 8);
-                int q2 = bitfieldExtract(int(word), 16, 8);
-                int q3 = bitfieldExtract(int(word), 24, 8);
-                sb[base + u * 4u     ] = float16_t(float(q0) * as);
-                sb[base + u * 4u + 1u] = float16_t(float(q1) * as);
-                sb[base + u * 4u + 2u] = float16_t(float(q2) * as);
-                sb[base + u * 4u + 3u] = float16_t(float(q3) * as);
-            }
-        }
-
+        stageTile();
+        // The next step's reads go out before the multiplies below rather than
+        // after them, so the wait for memory sits behind the cores' work.
+        if (kb + KB < kbn) prefetch(kb + KB);
         barrier();
 
         // The cores.
