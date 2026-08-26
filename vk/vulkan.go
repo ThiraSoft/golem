@@ -54,6 +54,7 @@ const (
 	structDotProductFeatures        = 1000280000
 	structFloat16Int8Features       = 1000082000
 	struct16BitStorageFeatures      = 1000083000
+	struct8BitStorageFeatures       = 1000177000
 	structMemoryModelFeatures       = 1000211000
 	structCooperativeMatrixFeatures = 1000506000
 	structSubgroupSizeFeatures      = 1000225002
@@ -134,6 +135,19 @@ type shaderFloat16Int8Features struct {
 	pNext         uintptr
 	shaderFloat16 uint32
 	shaderInt8    uint32
+}
+
+// storage8BitFeatures asks for 8-bit types in a storage buffer. Nothing golem
+// compiles needs it; llama.cpp's own product does, and vk/llamamm_test.go
+// runs that shader on this device to say whether the gap between the two is
+// in the shader or around it.
+type storage8BitFeatures struct {
+	sType                             uint32
+	_                                 uint32
+	pNext                             uintptr
+	storageBuffer8BitAccess           uint32
+	uniformAndStorageBuffer8BitAccess uint32
+	storagePushConstant8              uint32
 }
 
 // storage16BitFeatures asks for 16-bit types in a storage buffer, which is how

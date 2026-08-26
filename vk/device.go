@@ -115,6 +115,7 @@ func Open() (*Device, error) {
 	model := memoryModelFeatures{sType: structMemoryModelFeatures, vulkanMemoryModel: 1}
 	f16 := shaderFloat16Int8Features{sType: structFloat16Int8Features, shaderFloat16: 1, shaderInt8: 1}
 	st16 := storage16BitFeatures{sType: struct16BitStorageFeatures, storageBuffer16BitAccess: 1, uniformAndStorageBuffer16BitAccess: 1}
+	st8 := storage8BitFeatures{sType: struct8BitStorageFeatures, storageBuffer8BitAccess: 1, uniformAndStorageBuffer8BitAccess: 1}
 	waves := subgroupSizeFeatures{sType: structSubgroupSizeFeatures, subgroupSizeControl: 1, computeFullSubgroups: 1}
 	chain := uintptr(unsafe.Pointer(&dot))
 	d.coopmat = true
@@ -131,7 +132,8 @@ func Open() (*Device, error) {
 		coop.pNext = uintptr(unsafe.Pointer(&model))
 		model.pNext = uintptr(unsafe.Pointer(&f16))
 		f16.pNext = uintptr(unsafe.Pointer(&st16))
-		st16.pNext = uintptr(unsafe.Pointer(&waves))
+		st16.pNext = uintptr(unsafe.Pointer(&st8))
+		st8.pNext = uintptr(unsafe.Pointer(&waves))
 	}
 	pointers := make([]uintptr, len(names))
 	for i := range names {
@@ -192,6 +194,7 @@ var coopmatExtensions = []string{
 	"VK_KHR_vulkan_memory_model",
 	"VK_KHR_shader_float16_int8",
 	"VK_KHR_16bit_storage",
+	"VK_KHR_8bit_storage",
 	"VK_EXT_subgroup_size_control",
 }
 
