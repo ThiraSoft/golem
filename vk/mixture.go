@@ -683,6 +683,19 @@ func (m *Mixture) AddBlock(gateUpExps, downExps, gate, up, down []byte) error {
 // Profile is Stack.Profile, forwarded: one stamp between the two halves.
 func (m *Mixture) Profile(t *Timeline) { m.tl = t }
 
+// mark names a span inside the block, and is nothing at all when no timeline
+// is set. A stamp only reads the clock, but a span is only honest if what it
+// measures has finished, so the barrier that pins it down goes in here — and
+// stays out of the recording the rest of the time, where the two branches are
+// meant to run over each other.
+func (m *Mixture) mark(r *Recorder, label string) {
+	if m.tl == nil {
+		return
+	}
+	r.Barrier()
+	m.tl.Stamp(r, label)
+}
+
 // Record puts one block's feed-forward half into a recording, for the given
 // number of columns. More than one is a stretch of a prompt, and only the
 // shared branch can take it — see the note beside the wide pipelines above.
@@ -728,8 +741,7 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 		act := moePush{dim: uint32(2 * m.ffn), ffn: uint32(m.ffn), used: expertsUsed,
 			act: uint32(m.act), cap: uint32(maxColumns)}
 		r.DispatchColumns(m.idActSet, uint32((m.ffn+255)/256), uint32(columns*expertsUsed), unsafe.Pointer(&act))
-		r.Barrier()
-		m.tl.Stamp(r, "moe expert act")
+		m.mark(r, "moe expert act")
 	} else if m.experts > 0 {
 		r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
 	}
@@ -768,8 +780,7 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 			rows = uint32((m.dim + idProductCoopBM - 1) / idProductCoopBM)
 		}
 		r.Dispatch(b.setIDDown, rows*uint32(idPlanMax(m.experts, columns, idBN(m.coop))), unsafe.Pointer(&downPush))
-		r.Barrier()
-		m.tl.Stamp(r, "moe expert down")
+		m.mark(r, "moe expert down")
 	} else if m.experts > 0 {
 		r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
 	}
@@ -793,8 +804,7 @@ func (m *Mixture) Record(r *Recorder, block, columns int) {
 		// in after the shared branch rather than between the two.
 		fold := combinePairsPush{dim: uint32(m.dim), used: expertsUsed, columns: uint32(columns)}
 		r.Dispatch(m.combineSet, uint32((m.dim*columns+255)/256), unsafe.Pointer(&fold))
-		r.Barrier()
-		m.tl.Stamp(r, "moe combine pairs")
+		m.mark(r, "moe combine pairs")
 	}
 }
 
