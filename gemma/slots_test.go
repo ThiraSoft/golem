@@ -23,7 +23,7 @@ func TestSlotsAreIndependent(t *testing.T) {
 	solo.ForwardBatch(mine, 0)
 	want := append([]float32(nil), solo.ForwardBatch([]int32{next}, len(mine))[0]...)
 
-	m := openEngine(t, 4096)
+	m := open26B(t)
 	if err := m.SetSlots(2); err != nil {
 		t.Fatal(err)
 	}
@@ -63,4 +63,27 @@ func same(a, b []float32) bool {
 		}
 	}
 	return true
+}
+
+// The card holds one key-value cache, so a model that has been given slots
+// cannot have the stack, and a model that has the stack cannot be given slots.
+// Both directions are refused rather than answered wrongly: two conversations
+// over one cache write each other's positions, which the test above shows on
+// the processor and nothing would have shown on the card.
+func TestVulkanStackRefusesSlots(t *testing.T) {
+	m := open26B(t)
+	if err := m.SetSlots(2); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UseVulkanStack(); err == nil {
+		t.Error("the stack was built over two slots")
+	}
+
+	n := open26B(t)
+	if err := n.UseVulkanStack(); err != nil {
+		t.Skipf("no Vulkan stack: %v", err)
+	}
+	if err := n.SetSlots(2); err == nil {
+		t.Error("two slots were accepted over the stack")
+	}
 }

@@ -1,5 +1,6 @@
 #version 450
 #extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_clustered : require
 
 // y = W * x for one Q4_0 matrix against one Q8_0 activation.
 //
@@ -12,26 +13,10 @@
 // the reason the mixture's shape has — a lane walks the blocks of its row
 // eight at a time, so the eight of them read a hundred and twenty-eight
 // contiguous bytes at once — and gives up the wide workgroup that came with
-// it. Sixty-four outputs to a workgroup left the attention's output
-// projection with forty-four workgroups for sixty-four compute units, and a
-// fifth of the card idle for the length of the kernel. Sixteen gives it a
-// hundred and seventy-six.
+// it. Sixteen outputs give 128 threads to a workgroup.
 //
-// COLUMNS is how many activations one pass answers, and it is the whole of why
-// a prompt is not the same shape as a token. Generating reads every weight in
-// the model to produce one column, and the card is at its memory ceiling doing
-// it — measured, 350 gigabytes a second on this one. A prompt of sixty-four
-// positions needs the same weights sixty-four times, and reading them once for
-// eight columns instead of once for each is eight times less traffic for the
-// same arithmetic. The weight word is loaded outside the column loop; that one
-// line is the optimization.
-//
-// It is a compile-time constant rather than a push constant so that the
-// accumulators stay in registers: an array indexed by a loop whose bound the
-// compiler does not know goes to scratch memory, and the kernel would spend
-// what it saved. The file is built twice, at one and at eight — vk/mixture.go
-// names both — and a token drawn one at a time reads the same binary it
-// always did.
+// Clustered subgroup reduction across the 8 consecutive lanes of a row replaces
+// the shared memory array and barriers.
 
 #ifndef COLUMNS
 #define COLUMNS 1
@@ -54,8 +39,6 @@ layout(push_constant) uniform Push {
 const uint LANES = 8u;
 const uint OUTS  = 16u;   // outputs to a workgroup, which is 128 / LANES
 
-shared float partial[128 * COLUMNS];
-
 // lanePart is one lane's share of a Q4_0 row against every column.
 void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
     uint nb  = p.ffn >> 5;
@@ -72,14 +55,6 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
 
         uint at = (nib + 16u * b) >> 2;
         uint ab = b * 8u;
-        // The weight word is read here, once, and met by every column below.
-        // Four products to an instruction. A Q4_0 word holds eight weights
-        // as nibbles, and the two halves of it come out as two packed
-        // quadruples with one mask each — which is the layout's gift: a mask
-        // and a shift give four weights already sitting in the four bytes the
-        // dot product wants. The accumulator is integer and exact, so this is
-        // the same number the unpacked loop produced, in a quarter of the
-        // instructions. vk/device.go says what the card is asked for.
         uint lo[4], hi[4];
         for (uint u = 0u; u < 4u; u++) {
             uint word = w[at + u];
@@ -113,17 +88,10 @@ void main() {
     } else {
         for (uint c = 0u; c < COLUMNS; c++) part[c] = 0.0;
     }
-    for (uint c = 0u; c < COLUMNS; c++) partial[t * COLUMNS + c] = part[c];
-    barrier();
-    for (uint stride = LANES >> 1; stride > 0u; stride >>= 1) {
-        if (lane < stride) {
-            for (uint c = 0u; c < COLUMNS; c++) {
-                partial[t * COLUMNS + c] += partial[(t + stride) * COLUMNS + c];
-            }
+    for (uint c = 0u; c < COLUMNS; c++) {
+        float sum = subgroupClusteredAdd(part[c], LANES);
+        if (lane == 0u && i < p.dim) {
+            y[c * p.dim + i] = sum;
         }
-        barrier();
-    }
-    if (lane == 0u && i < p.dim) {
-        for (uint c = 0u; c < COLUMNS; c++) y[c * p.dim + i] = partial[t * COLUMNS + c];
     }
 }

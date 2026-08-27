@@ -1,0 +1,98 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Fused RMSNorm + Quantize + MatVec for Q4_0 Projection:
+// 1. Reads un-normed stream X [Dim]
+// 2. Computes RMSNorm(X, Gain, Eps) in local registers / shared
+// 3. Directly executes MatVec for Q4_0 projection rows
+// Eliminates 1 separate dispatch and 1 intermediate VRAM buffer round-trip per sub-block!
+
+layout(local_size_x = 128) in; // 16 outputs, 8 lanes each
+
+layout(std430, binding = 0) readonly  buffer W    { uint  w[];    }; // Q4_0 weights
+layout(std430, binding = 1) readonly  buffer X    { float x[];    }; // Stream input [dim]
+layout(std430, binding = 2) readonly  buffer Gain { float gain[]; }; // RMSNorm gain [dim]
+layout(std430, binding = 3) writeonly buffer Y    { float y[];    }; // Output projection [outputs]
+
+layout(push_constant) uniform Push {
+    uint dim; // inputs
+    uint ffn; // outputs
+    float eps;
+} p;
+
+shared float sharedNormSq[128];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint lane = t & 7u;
+    uint row = gl_WorkGroupID.x * 16u + (t >> 3);
+
+    // 1. Fast parallel RMS reduction across workgroup
+    float sumSq = 0.0;
+    for (uint i = t; i < p.dim; i += 128u) {
+        float xi = x[i];
+        sumSq += xi * xi;
+    }
+    sharedNormSq[t] = sumSq;
+    barrier();
+
+    // Reduction
+    if (t < 64u) sharedNormSq[t] += sharedNormSq[t + 64u];
+    barrier();
+    if (t < 32u) sharedNormSq[t] += sharedNormSq[t + 32u];
+    barrier();
+    if (t < 16u) sharedNormSq[t] += sharedNormSq[t + 16u];
+    barrier();
+    if (t < 8u)  sharedNormSq[t] += sharedNormSq[t + 8u];
+    barrier();
+    if (t < 4u)  sharedNormSq[t] += sharedNormSq[t + 4u];
+    barrier();
+    if (t < 2u)  sharedNormSq[t] += sharedNormSq[t + 2u];
+    barrier();
+    if (t < 1u)  sharedNormSq[t] += sharedNormSq[t + 1u];
+    barrier();
+
+    float meanSq = sharedNormSq[0] / float(p.dim);
+    float invRMS = inversesqrt(meanSq + p.eps);
+
+    if (row >= p.ffn) return;
+
+    // 2. Direct MatVec of row against normed input: x_normed[i] = x[i] * invRMS * gain[i]
+    uint nb = p.dim >> 5; // 32 weights per block
+    uint rowBytes = nb * 18u;
+    uint rowBase = row * rowBytes;
+    uint nibBase = rowBase + 2u * nb;
+
+    float acc = 0.0;
+    for (uint b = lane; b < nb; b += 8u) {
+        vec2 pair = unpackHalf2x16(w[(rowBase + 2u * b) >> 2]);
+        float ws = pair[b & 1u];
+        uint at = (nibBase + 16u * b) >> 2;
+
+        for (uint u = 0u; u < 4u; u++) {
+            uint word = w[at + u];
+            uint xIdx = b * 32u + u * 8u;
+
+            [[unroll]] for (uint bytePos = 0u; bytePos < 4u; bytePos++) {
+                uint byteVal = (word >> (bytePos * 8u)) & 0xFFu;
+                float low = float(byteVal & 0x0Fu) - 8.0;
+                float high = float(byteVal >> 4u) - 8.0;
+
+                uint idxL = xIdx + bytePos;
+                uint idxH = xIdx + bytePos + 4u;
+
+                float xNormL = x[idxL] * invRMS * gain[idxL];
+                float xNormH = x[idxH] * invRMS * gain[idxH];
+
+                acc += (low * xNormL + high * xNormH) * ws;
+            }
+        }
+    }
+
+    acc = subgroupClusteredAdd(acc, 8u);
+    if (lane == 0u) {
+        y[row] = acc;
+    }
+}

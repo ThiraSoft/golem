@@ -19,6 +19,7 @@ import (
 	"github.com/ThiraSoft/golem/chat"
 	"github.com/ThiraSoft/golem/engine"
 	"github.com/ThiraSoft/golem/gemma"
+	"github.com/ThiraSoft/golem/qwen35"
 	"github.com/ThiraSoft/golem/sample"
 )
 
@@ -39,6 +40,18 @@ type forward interface {
 // sixty-four it turns back down, because the activations of a batch stop
 // fitting in the caches and every position attends to every position before it.
 const promptBatch = 32
+
+// speculative is the part of a model that can draft with a prediction block,
+// and speculator is one prepared to. Nothing outside qwen35 implements either
+// yet, and a model that does not simply generates a token at a time.
+type speculative interface {
+	Speculate() bool
+	NewSpeculator() (*qwen35.Speculator, error)
+}
+
+type speculator interface {
+	Step(token int32, hidden []float32, pos int, pick func([]float32) int32) ([]int32, []float32, error)
+}
 
 // vocabulary is the part of bpe.Vocab a conversation uses.
 type vocabulary interface {
@@ -213,21 +226,79 @@ func (s *Session) AskWithMedia(text string, images, audio [][]byte, w io.Writer)
 	var answer strings.Builder
 	start = time.Now()
 	last := int32(-1)
+
+	// A checkpoint that carries a prediction block drafts with it. Two tokens
+	// then come out of one reading of the weights, which is what a token
+	// actually costs; qwen35/speculate.go says how, and what a refused draft
+	// has to undo.
+	var draft speculator
+	if sp, ok := s.model.(speculative); ok && sp.Speculate() {
+		if d, err := sp.NewSpeculator(); err == nil {
+			draft = d
+		}
+	}
+
+	emit := func(id int32) error {
+		piece := s.vocab.Piece(id, false)
+		answer.WriteString(piece)
+		if w == nil {
+			return nil
+		}
+		_, err := io.WriteString(w, piece)
+		return err
+	}
+
+	// pending is a token a speculative step already drew from the model's own
+	// distribution. Drawing it again would be a second reading of the head,
+	// which is the largest matrix in the model.
+	pending := int32(-1)
+
 	for turn.Generated < s.maxTokens && len(s.held) < s.maxContext {
-		s.model.Logits(hidden, s.logits)
-		id := s.sampler.Pick(s.logits)
+		id := pending
+		if id < 0 {
+			s.model.Logits(hidden, s.logits)
+			id = s.sampler.Pick(s.logits)
+		}
+		pending = -1
 		turn.Generated++
 		last = id
 		if s.vocab.IsEOG(id) {
 			break
 		}
-		piece := s.vocab.Piece(id, false)
-		answer.WriteString(piece)
-		if w != nil {
-			if _, err := io.WriteString(w, piece); err != nil {
+		if err := emit(id); err != nil {
+			return turn, err
+		}
+
+		if draft != nil && turn.Generated+1 < s.maxTokens && len(s.held)+2 <= s.maxContext {
+			next, h, err := draft.Step(id, hidden, len(s.held), s.sampler.Pick)
+			if err != nil {
 				return turn, err
 			}
+			s.held = append(s.held, id)
+			// The last of what came back is the token after everything the
+			// model has read, which is this loop's next `id`. Everything
+			// before it is decided and goes into the cache.
+			stop := false
+			for _, tok := range next[:len(next)-1] {
+				turn.Generated++
+				last = tok
+				if s.vocab.IsEOG(tok) {
+					stop = true
+					break
+				}
+				if err := emit(tok); err != nil {
+					return turn, err
+				}
+				s.held = append(s.held, tok)
+			}
+			if stop {
+				break
+			}
+			hidden = h
+			pending = next[len(next)-1]
+			continue
 		}
+
 		hidden = s.model.ForwardBatch([]int32{id}, len(s.held))[0]
 		s.held = append(s.held, id)
 	}

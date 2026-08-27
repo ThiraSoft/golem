@@ -75,3 +75,59 @@ func liveToolCall(t *testing.T, path string) {
 	}
 	t.Logf("arguments: %#v", c.Message.ToolCalls[0].Arguments)
 }
+
+func TestLiveParallelSlotsVulkan(t *testing.T) {
+	for _, key := range []string{"GOLEM_MODEL", "GOLEM_MODEL_QWEN"} {
+		t.Run(key, func(t *testing.T) {
+			path := os.Getenv(key)
+			if path == "" {
+				t.Skipf("%s is not set", key)
+			}
+			m, err := engine.Open(path, 4096, 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			if err := m.UseVulkan(); err != nil {
+				t.Skipf("no Vulkan: %v", err)
+			}
+
+			params := m.Sampling
+			params.Temperature = 0
+
+			calls := 0
+			runner := NewRunner(m.Forward)
+			stop := make(chan struct{})
+			defer close(stop)
+			go runner.Run(stop)
+
+			slots := make([]*slot, 2)
+			for i := range slots {
+				ctx := NewSlotContext(runner, i, m.Window, m.SlotContext(), time.Now, 0)
+				gen := NewGenerator(ctx, m.Vocab, m.Template, m.Vocabulary, 32)
+				gen.calls = &calls
+				slots[i] = &slot{index: i, ctx: ctx, gen: gen}
+			}
+			pool := NewPool(slots, time.Now)
+			server := NewServer(pool, m.Vocab, "live", m.Template, params)
+
+			body1 := `{"messages":[{"role":"user","content":"Count to 3: 1, 2,"}],"temperature":0,"max_tokens":10}`
+			body2 := `{"messages":[{"role":"user","content":"Say Hello in French"}],"temperature":0,"max_tokens":10}`
+
+			done := make(chan struct{}, 2)
+			for _, body := range []string{body1, body2} {
+				go func(b string) {
+					req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(b))
+					w := httptest.NewRecorder()
+					server.Handler().ServeHTTP(w, req)
+					if w.Code != 200 {
+						t.Errorf("%d: %s", w.Code, w.Body)
+					}
+					done <- struct{}{}
+				}(body)
+			}
+			<-done
+			<-done
+		})
+	}
+}

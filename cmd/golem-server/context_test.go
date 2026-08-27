@@ -32,6 +32,10 @@ func (e *recordingEngine) ForwardBatch(tokens []int32, startPos int) [][]float32
 	return hidden
 }
 
+func (e *recordingEngine) Logits(hidden []float32, out []float32) {
+	e.LogitsBatch([][]float32{hidden}, [][]float32{out})
+}
+
 // The score of a state is the state itself, so a test can say which token the
 // pass ended on.
 func (e *recordingEngine) LogitsBatch(hidden [][]float32, out [][]float32) {

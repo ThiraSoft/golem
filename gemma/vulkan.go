@@ -97,8 +97,13 @@ func (m *Model) UseVulkanStack() error {
 	if cfg.PLEDim > 0 {
 		return fmt.Errorf("gemma: the Vulkan stack has no per-layer embedding branch, and this checkpoint carries one")
 	}
-	if len(m.caches) > 1 {
-		return fmt.Errorf("gemma: the device holds one cache, and this model was opened with %d slots", len(m.caches))
+	// The stack holds one key-value cache, indexed by position alone: the ring
+	// the kernels read has no room in it for a slot. Two conversations on the
+	// card would write each other's positions and read each other's keys,
+	// which is a wrong answer and not a slow one — so it is refused here
+	// rather than fallen back from. Slots on the processor are unaffected.
+	if m.Slots() > 1 {
+		return fmt.Errorf("gemma: the Vulkan stack holds one conversation, not %d", m.Slots())
 	}
 	d, err := m.device()
 	if err != nil {

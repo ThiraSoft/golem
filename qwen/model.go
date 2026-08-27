@@ -30,6 +30,7 @@ type Model struct {
 	slotContext int
 	scratch     *Scratch
 	embedded    map[int]*nn.Batch
+	ids         []int32 // one embedding row a column, for the device path
 	xs          [][]float32
 	hidden      [][]float32
 	outputs     [][]float32 // one per block, for the tests that locate a divergence
@@ -95,6 +96,7 @@ func (m *Model) reserve(batch int) {
 	}
 	m.batch = batch
 	m.scratch.Reserve(batch)
+	m.ids = make([]int32, batch)
 	m.xs = rows(batch, m.Cfg.Dim)
 	m.hidden = rows(batch, m.Cfg.Dim)
 }
@@ -107,6 +109,9 @@ func (m *Model) Close() error {
 // File is the mapped GGUF. The tokenizer lives in the same file as the weights,
 // and a caller that wants both should not have to open it twice.
 func (m *Model) File() *tensors.GGUF { return m.file }
+
+// Vocabulary is how many tokens the model's vocabulary holds.
+func (m *Model) Vocabulary() int { return m.W.TokenEmbd.Rows }
 
 // Reset forgets the conversation. The weights stay mapped.
 func (m *Model) Reset() { m.cache.Reset() }
@@ -129,13 +134,17 @@ func (m *Model) Forward(token int32, pos int) []float32 {
 // one hidden state per token, after the final norm.
 //
 // The batch exists for one reason: a matrix of weights is read once for the
-// whole of it. Generating an answer offers a batch of one and reads the weights
+// whole of it. Generating an answer offers a batch of one and reads a gigabyte
 // per token; reading a prompt offers as many positions as it has, and reads the
-// same weights for all of them. The arithmetic is identical either way — the
-// results of a batch are what the same tokens would have given one at a time —
-// and only the memory traffic changes.
+// same gigabyte for all of them. The arithmetic is identical either way — the
+// results of a batch are what the same tokens would have given one at a time,
+// to the last bit — and only the memory traffic changes.
 func (m *Model) ForwardBatch(tokens []int32, startPos int) [][]float32 {
-	return m.ForwardMixed(tokens, Run(m.cache, startPos, len(tokens)))
+	places := make([]Place, len(tokens))
+	for i := range tokens {
+		places[i] = Place{Cache: m.cache, Pos: startPos + i}
+	}
+	return m.ForwardMixed(tokens, places)
 }
 
 // ForwardMixed is the same pass over a batch whose tokens need not belong to
@@ -162,6 +171,22 @@ func (m *Model) ForwardMixed(tokens []int32, at []Place) [][]float32 {
 	cfg, w := m.Cfg, m.W
 	batch := len(tokens)
 	m.reserve(batch)
+
+	if m.stack != nil && m.stack.Embedding() {
+		ids := m.ids[:batch]
+		for t := range tokens {
+			ids[t] = tokens[t]
+		}
+		if err := m.stack.SetTokens(ids); err != nil {
+			panic(fmt.Sprintf("qwen: the device refused the identifiers: %v", err))
+		}
+		m.runStack(nil, at)
+		xs := m.stack.Stream().Floats()
+		for t := range tokens {
+			copy(m.hidden[t], xs[t*cfg.Dim:(t+1)*cfg.Dim])
+		}
+		return m.hidden[:batch]
+	}
 
 	embedded, ok := m.embedded[batch]
 	if !ok {
@@ -254,6 +279,12 @@ func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
 		if len(o) != m.Cfg.Vocab {
 			panic(fmt.Sprintf("qwen: logits need %d entries, given %d", m.Cfg.Vocab, len(o)))
 		}
+	}
+	if m.head != nil {
+		for i := range hidden {
+			m.Logits(hidden[i], out[i])
+		}
+		return
 	}
 	m.reserve(len(hidden))
 	v := m.scratch.Batch(m.Cfg.Dim, len(hidden))

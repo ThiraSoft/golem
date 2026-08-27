@@ -170,9 +170,8 @@ type attentionBlock struct {
 }
 
 // maxBlocks is how many entries the position buffer holds, which caps the
-// blocks a stack may have. Sixty-four is twice the deepest model here and the
-// buffer is a kilobyte.
-const maxBlocks = 64
+// blocks a stack may have.
+const maxBlocks = 128
 
 // attnPush is what the two attention kernels take. The two shaders declare the
 // same block; the fields past what each reads are ignored.

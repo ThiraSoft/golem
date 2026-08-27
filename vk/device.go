@@ -359,6 +359,10 @@ func (d *Device) Local(size int, usage uint32) (*Buffer, error) {
 	return d.newBuffer(uint64(size), usage, memoryDeviceLocal)
 }
 
+// Size is how many bytes the buffer holds, whether or not it has an address on
+// this side.
+func (b *Buffer) Size() int { return int(b.size) }
+
 // Bytes is the mapped buffer as a slice. It panics on a buffer that lives in
 // device memory, which has no address on this side.
 func (b *Buffer) Bytes() []byte {

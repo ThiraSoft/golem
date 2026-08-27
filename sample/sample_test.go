@@ -190,3 +190,14 @@ func TestPickOverAWholeVocabulary(t *testing.T) {
 		}
 	}
 }
+func BenchmarkPickVocab(b *testing.B) {
+	row := make([]float32, 262144)
+	for i := range row {
+		row[i] = float32(-i%1000) / 100
+	}
+	s := New(Params{Temperature: 1, TopK: 64, TopP: 0.95, Seed: 9})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s.Pick(row)
+	}
+}

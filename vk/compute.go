@@ -322,6 +322,13 @@ func (r *Recorder) Copy(dst *Buffer, offset int, src *Buffer, size int) {
 	r.CopyFrom(dst, offset, src, 0, size)
 }
 
+// Fill writes one word over the whole of a buffer. It is how a conversation's
+// recurrent state is cleared: a delta net's state is three megabytes a block,
+// and re-uploading it would be the same bytes across the bus.
+func (r *Recorder) Fill(b *Buffer, word uint32) {
+	vkCmdFillBuffer(r.cb, b.handle, 0, ^uint64(0), word)
+}
+
 // CopyFrom is Copy from somewhere other than the start of the source, which is
 // what a pass carrying several columns needs: the tracer keeps one of them.
 func (r *Recorder) CopyFrom(dst *Buffer, offset int, src *Buffer, from, size int) {

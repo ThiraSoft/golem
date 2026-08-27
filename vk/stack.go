@@ -28,11 +28,13 @@ import (
 )
 
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/norm.comp -o shaders/norm.spv
+//go:generate glslc -O -DMAXN=8192u --target-env=vulkan1.1 -fshader-stage=compute shaders/norm.comp -o shaders/norm_wide.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/router_logits.comp -o shaders/router_logits.spv
 //go:generate glslc -O -DPICK --target-env=vulkan1.1 -fshader-stage=compute shaders/router_logits.comp -o shaders/router_logits_pick.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/router_pick.comp -o shaders/router_pick.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/combine.comp -o shaders/combine.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_q6k.comp -o shaders/embed_q6k.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_q40.comp -o shaders/embed_q40.spv
 
 //go:embed shaders/norm.spv
 var normSPIRV []byte
@@ -51,6 +53,9 @@ var combineSPIRV []byte
 
 //go:embed shaders/embed_q6k.spv
 var embedQ6KSPIRV []byte
+
+//go:embed shaders/embed_q40.spv
+var embedQ40SPIRV []byte
 
 // The flags shaders/norm.comp reads.
 const (
@@ -130,10 +135,10 @@ type Stack struct {
 	norm, routerW, routerWPick, routerPick, combine *Pipeline
 	// embed reads one row of the token embedding into the stream, when the
 	// caller gave the stack a table to read it from.
-	embed    *Pipeline
-	embedSet *Set
-	ids      *Buffer // one identifier a column, negative where the caller wrote its own
-	embedOf  embedPush
+	embed, embedQ40 *Pipeline
+	embedSet        *Set
+	ids             *Buffer // one identifier a column, negative where the caller wrote its own
+	embedOf         embedPush
 
 	routerIn  *Buffer // the residual under the router's own norm and scale
 	routerOut *Buffer // one logit per expert
@@ -224,6 +229,7 @@ func NewStack(d *Device, dim int, eps float32, attn *Attention, mix *Mixture) (*
 		{&s.routerPick, routerPickSPIRV, 4, unsafe.Sizeof(routerPush{})},
 		{&s.combine, combineSPIRV, 7, unsafe.Sizeof(combinePush{})},
 		{&s.embed, embedQ6KSPIRV, 3, unsafe.Sizeof(embedPush{})},
+		{&s.embedQ40, embedQ40SPIRV, 3, unsafe.Sizeof(embedPush{})},
 	} {
 		if *spec.into, err = d.NewPipeline(spec.spirv, spec.bindings, uint32(spec.push)); err != nil {
 			s.Close()
@@ -271,6 +277,29 @@ func (s *Stack) SetEmbedding(table *Buffer, cols int, scale float32) error {
 		return err
 	}
 	s.embedOf = embedPush{cols: uint32(cols), superblocks: uint32(cols / 256), scale: scale}
+	s.programs = nil
+	return nil
+}
+
+// SetEmbeddingQ40 gives the stack a Q4_0 token embedding table to read on-card.
+func (s *Stack) SetEmbeddingQ40(table *Buffer, cols int, scale float32) error {
+	if cols != s.dim {
+		return fmt.Errorf("vk: the embedding is %d wide and the stream is %d", cols, s.dim)
+	}
+	if cols%32 != 0 {
+		return fmt.Errorf("vk: a Q4_0 row needs a multiple of 32 columns, given %d", cols)
+	}
+	if s.embedSet != nil {
+		return fmt.Errorf("vk: the embedding is already set")
+	}
+	var err error
+	if s.ids, err = s.d.Host(maxColumns*4, bufferUsageStorage); err != nil {
+		return err
+	}
+	if s.embedSet, err = s.embedQ40.NewSet([]*Buffer{table, s.ids, s.xs}); err != nil {
+		return err
+	}
+	s.embedOf = embedPush{cols: uint32(cols), superblocks: uint32(cols / 32), scale: scale}
 	s.programs = nil
 	return nil
 }
@@ -598,18 +627,19 @@ func (s *Stack) record(r *Recorder, experts, used, columns int) {
 		tl.Reset(r)
 		tl.Stamp(r, "start")
 	}
-	// What the caller wrote into the stream this pass. A picture's rows reach
-	// the model this way, and so does a model whose embedding is not on the
-	// card; the copy is four megabytes at the widest and costs a fraction of
-	// a millisecond against the eighty it saves.
-	r.CopyFrom(s.xs, 0, s.stage, 0, columns*s.dim*4)
-	r.Barrier()
 	if s.embedSet != nil {
 		// The embedding before anything, since the stream is what the first
 		// block norms.
 		r.Dispatch(s.embedSet, cols, unsafe.Pointer(&s.embedOf))
 		r.Barrier()
 		tl.Stamp(r, "embed")
+	} else {
+		// What the caller wrote into the stream this pass. A picture's rows reach
+		// the model this way, and so does a model whose embedding is not on the
+		// card; the copy is four megabytes at the widest and costs a fraction of
+		// a millisecond against the eighty it saves.
+		r.CopyFrom(s.xs, 0, s.stage, 0, columns*s.dim*4)
+		r.Barrier()
 	}
 	// The angles first: every block reads them and nothing writes them but
 	// this, so one dispatch a geometry at the head of the pass serves the
@@ -733,7 +763,7 @@ func (s *Stack) Close() {
 			*b = nil
 		}
 	}
-	for _, p := range []**Pipeline{&s.embed, &s.combine, &s.routerPick, &s.routerWPick, &s.routerW, &s.norm} {
+	for _, p := range []**Pipeline{&s.embed, &s.embedQ40, &s.combine, &s.routerPick, &s.routerWPick, &s.routerW, &s.norm} {
 		if *p != nil {
 			(*p).Close()
 			*p = nil

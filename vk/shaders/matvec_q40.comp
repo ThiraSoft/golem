@@ -1,0 +1,79 @@
+#version 450
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// y = W * x for a Q4_0 matrix against float activations.
+//
+// A workgroup takes sixteen outputs with eight lanes to each, so the eight
+// lanes of a row read a hundred and twenty-eight contiguous bytes at once.
+// The row layout is the split one every kernel here reads: all of a row's
+// scales, then all of its nibbles.
+//
+// COLUMNS is how many activations one reading of the weights answers. It is
+// compiled in rather than pushed because the accumulators are registers: a
+// token is one column, and a draft verified beside the token that drafted it
+// is two, for the same gigabytes off the card.
+
+#ifndef COLUMNS
+#define COLUMNS 1
+#endif
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly  buffer W { uint  w[]; };
+layout(std430, binding = 1) readonly  buffer X { float x[]; };  // [COLUMNS][ffn]
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };  // [COLUMNS][dim]
+
+layout(push_constant) uniform Push {
+    uint dim; // outputs
+    uint ffn; // inputs
+} p;
+
+const uint LANES = 8u;
+const uint OUTS  = 16u;
+
+void main() {
+    uint row = gl_WorkGroupID.x * OUTS + (gl_LocalInvocationID.x / LANES);
+    uint lane = gl_LocalInvocationID.x % LANES;
+
+    uint nb = p.ffn / 32u;
+    uint rowBase = row * nb * 18u;
+    uint nibBase = rowBase + 2u * nb;
+
+    float sum[COLUMNS];
+    [[unroll]] for (uint c = 0u; c < COLUMNS; c++) sum[c] = 0.0;
+
+    if (row < p.dim) {
+        for (uint b = lane; b < nb; b += LANES) {
+            vec2 pair = unpackHalf2x16(w[(rowBase + 2u * b) >> 2]);
+            float ws = pair[b & 1u];
+
+            uint at = (nibBase + 16u * b) >> 2;
+            uint xOffset = b * 32u;
+
+            uvec4 words = uvec4(w[at], w[at + 1u], w[at + 2u], w[at + 3u]);
+
+            [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+                uint xc = c * p.ffn + xOffset;
+                float nibX = 0.0;
+                float plainX = 0.0;
+                [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                    uint word = words[u];
+                    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                        uint byteVal = (word >> (i * 8u)) & 0xFFu;
+                        float xL = x[xc + u * 4u + i];
+                        float xH = x[xc + u * 4u + i + 16u];
+                        nibX += float(byteVal & 0x0Fu) * xL + float(byteVal >> 4u) * xH;
+                        plainX += xL + xH;
+                    }
+                }
+                sum[c] += (nibX - 8.0 * plainX) * ws;
+            }
+        }
+    }
+
+    [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+        float total = subgroupClusteredAdd(sum[c], LANES);
+        if (lane == 0u && row < p.dim) y[c * p.dim + row] = total;
+    }
+}

@@ -48,6 +48,7 @@ func distinct(slots []int) map[int]bool {
 // Engine is what the runner drives. Nothing else in this command holds one.
 type Engine interface {
 	ForwardSlots(tokens []int32, slots, positions []int) [][]float32
+	Logits(hidden, out []float32)
 	LogitsBatch(hidden [][]float32, out [][]float32)
 	UseSlot(i int)
 	Reset()
@@ -205,6 +206,9 @@ func (r *Runner) Run(stop <-chan struct{}) {
 // gather waits, briefly, for the passes of the other conversations in flight,
 // and returns what goes through the model now and what waits for the next one.
 func (r *Runner) gather(batch, held []*pass) (now, later []*pass) {
+	if r.inFlight() <= 1 && len(held) == 0 {
+		return batch, held
+	}
 	deadline := time.After(r.window())
 	size := positions(batch)
 	for size < budget && len(batch)+len(held) < r.inFlight() {
@@ -281,7 +285,9 @@ func (r *Runner) run(batch []*pass) {
 			outs = append(outs, p.logits)
 		}
 	}
-	if len(last) > 0 {
+	if len(last) == 1 {
+		r.engine.Logits(last[0], outs[0])
+	} else if len(last) > 1 {
 		r.engine.LogitsBatch(last, outs)
 	}
 	took := time.Since(start)

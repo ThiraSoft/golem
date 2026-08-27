@@ -1,0 +1,71 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// RMSNorm + Optional Residual Add for Qwen 3.8:
+// Workgroup: 256 threads
+// Stride across 5120 dimensions (20 elements per thread)
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer In      { float in_[];     }; // [5120]
+layout(std430, binding = 1) readonly  buffer Resid   { float resid[];   }; // [5120] (optional)
+layout(std430, binding = 2) readonly  buffer Gain    { float gain[];    }; // [5120]
+layout(std430, binding = 3) writeonly buffer OutNorm { float outNorm[]; }; // [5120]
+layout(std430, binding = 4) writeonly buffer OutSum  { float outSum[];  }; // [5120]
+
+layout(push_constant) uniform Push {
+    uint n;          // 5120
+    uint addResid;   // 1 if adding resid, 0 otherwise
+    uint writeSum;   // 1 if writing outSum, 0 otherwise
+    float eps;       // 1e-6
+} p;
+
+shared float sharedReduce[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    float threadSumSq = 0.0;
+    for (uint i = tid; i < p.n; i += 256u) {
+        float x = in_[i];
+        if (p.addResid != 0u) {
+            x += resid[i];
+        }
+        if (p.writeSum != 0u) {
+            outSum[i] = x;
+        }
+        threadSumSq += x * x;
+    }
+
+    sharedReduce[tid] = threadSumSq;
+    barrier();
+
+    if (tid < 128u) sharedReduce[tid] += sharedReduce[tid + 128u];
+    barrier();
+    if (tid < 64u)  sharedReduce[tid] += sharedReduce[tid + 64u];
+    barrier();
+    if (tid < 32u)  sharedReduce[tid] += sharedReduce[tid + 32u];
+    barrier();
+    if (tid < 16u)  sharedReduce[tid] += sharedReduce[tid + 16u];
+    barrier();
+    if (tid < 8u)   sharedReduce[tid] += sharedReduce[tid + 8u];
+    barrier();
+    if (tid < 4u)   sharedReduce[tid] += sharedReduce[tid + 4u];
+    barrier();
+    if (tid < 2u)   sharedReduce[tid] += sharedReduce[tid + 2u];
+    barrier();
+    if (tid < 1u)   sharedReduce[tid] += sharedReduce[tid + 1u];
+    barrier();
+
+    float meanSq = sharedReduce[0] / float(p.n);
+    float invRMS = inversesqrt(meanSq + p.eps);
+
+    for (uint i = tid; i < p.n; i += 256u) {
+        float x = in_[i];
+        if (p.addResid != 0u) {
+            x += resid[i];
+        }
+        outNorm[i] = x * invRMS * gain[i];
+    }
+}

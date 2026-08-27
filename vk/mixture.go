@@ -947,6 +947,27 @@ func splitQ4_0(src []byte, rows, cols int) []byte {
 	return dst
 }
 
+// splitQ4_1 is splitQ4_0 for the format with a minimum beside the scale: the
+// twenty bytes of a block are a scale, a minimum, and sixteen nibble pairs, and
+// the kernels want all the scale-and-minimum pairs of a row before any of its
+// nibbles.
+func splitQ4_1(src []byte, rows, cols int) []byte {
+	nb := cols / nn.QuantBlock
+	stride := nb * 20
+	dst := make([]byte, len(src))
+	for r := 0; r < rows; r++ {
+		in := src[r*stride : (r+1)*stride]
+		out := dst[r*stride : (r+1)*stride]
+		nibbles := out[4*nb:]
+		for b := 0; b < nb; b++ {
+			block := in[b*20 : (b+1)*20]
+			copy(out[4*b:], block[:4])
+			copy(nibbles[b*16:], block[4:])
+		}
+	}
+	return dst
+}
+
 // asBytes views a float slice as the bytes behind it, for an upload.
 func asBytes(f []float32) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(&f[0])), len(f)*4)

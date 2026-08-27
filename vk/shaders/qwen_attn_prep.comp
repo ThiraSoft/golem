@@ -1,0 +1,106 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Qwen3.5 attention, everything that happens before the scores: the query and
+// key norms, the rotation, and the write into the cache.
+//
+// The query projection carries the output gate interleaved with the queries,
+// one 256-wide pair per head — [q0|g0][q1|g1]… — which is how llama.cpp views
+// the same tensor (models/qwen35.cpp). So a query head begins at h*512, not at
+// h*256, and the gate for that head begins 256 further on.
+//
+// The keys and values are written into the cache here rather than by the
+// scores kernel, because a workgroup barrier does not order two workgroups: a
+// head that reads the cache for this position has to be in a later dispatch
+// than the head that wrote it, not merely a later line of the same shader.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer QIn    { float qIn[];    }; // [heads*512], per head [q|gate]
+layout(std430, binding = 1) readonly  buffer KIn    { float kIn[];    }; // [kvHeads*256]
+layout(std430, binding = 2) readonly  buffer VIn    { float vIn[];    }; // [kvHeads*256]
+layout(std430, binding = 3) readonly  buffer QNorm  { float qNorm[];  }; // [256]
+layout(std430, binding = 4) readonly  buffer KNorm  { float kNorm[];  }; // [256]
+layout(std430, binding = 5) writeonly buffer QOut   { float qOut[];   }; // [heads*256]
+layout(std430, binding = 6)           buffer KCache { float kCache[]; };
+layout(std430, binding = 7)           buffer VCache { float vCache[]; };
+// The position lives in a buffer rather than a push constant, so that the whole
+// pass can be recorded once and replayed: laying down the command buffer again
+// for every token cost 2.4 milliseconds of a 36-millisecond token, on the CPU,
+// with the card waiting.
+layout(std430, binding = 8) readonly buffer Pos { uint posv[]; };
+
+layout(push_constant) uniform Push {
+    uint maxContext;
+    uint heads;      // 24
+    uint kvHeads;    // 4
+    float ropeBase;
+    float eps;
+    uint ropeDims;   // 64
+} p;
+
+// One workgroup a head, one column of the pass on the second axis. Every
+// column's keys and values are in the cache before any of them is read, which
+// is what lets the scores kernel be a dispatch of its own.
+#define COL (gl_WorkGroupID.y)
+
+shared float partial[8];
+shared float invRMS;
+
+// rmsOf folds the squares of a 256-wide head across the workgroup.
+float rmsOf(float val, float eps) {
+    float folded = subgroupAdd(val * val);
+    if (subgroupElect()) partial[gl_SubgroupID] = folded;
+    barrier();
+    float total = 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; s++) total += partial[s];
+    barrier();
+    return inversesqrt(total / 256.0 + eps);
+}
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint j = gl_LocalInvocationID.x;
+    uint half_ = p.ropeDims / 2u;
+    uint pos = posv[COL];
+
+    if (head < p.heads) {
+        uint base = COL * p.heads * 512u + head * 512u; // this head's [q|gate] pair
+        float val = qIn[base + j];
+        float inv = rmsOf(val, p.eps);
+        float normed = val * inv * qNorm[j];
+
+        if (j < p.ropeDims) {
+            uint pair = j % half_;
+            float angle = float(pos) * pow(p.ropeBase, -float(pair * 2u) / float(p.ropeDims));
+            float cosA = cos(angle);
+            float sinA = sin(angle);
+            uint otherJ = (j < half_) ? (j + half_) : (j - half_);
+            float other = qIn[base + otherJ] * inv * qNorm[otherJ];
+            normed = (j < half_) ? (normed * cosA - other * sinA)
+                                 : (other * sinA + normed * cosA);
+        }
+        qOut[COL * p.heads * 256u + head * 256u + j] = normed;
+    } else {
+        uint kv = head - p.heads;
+        uint kBase = COL * p.kvHeads * 256u + kv * 256u;
+        float val = kIn[kBase + j];
+        float inv = rmsOf(val, p.eps);
+        float normed = val * inv * kNorm[j];
+
+        if (j < p.ropeDims) {
+            uint pair = j % half_;
+            float angle = float(pos) * pow(p.ropeBase, -float(pair * 2u) / float(p.ropeDims));
+            float cosA = cos(angle);
+            float sinA = sin(angle);
+            uint otherJ = (j < half_) ? (j + half_) : (j - half_);
+            float other = kIn[kBase + otherJ] * inv * kNorm[otherJ];
+            normed = (j < half_) ? (normed * cosA - other * sinA)
+                                 : (other * sinA + normed * cosA);
+        }
+        uint at = (kv * p.maxContext + pos) * 256u + j;
+        kCache[at] = normed;
+        vCache[at] = vIn[kBase + j];
+    }
+}

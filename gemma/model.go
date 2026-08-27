@@ -432,6 +432,12 @@ func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
 			panic(fmt.Sprintf("gemma: logits need %d entries, given %d", m.Cfg.Vocab, len(o)))
 		}
 	}
+	if m.head != nil {
+		for i := range hidden {
+			m.Logits(hidden[i], out[i])
+		}
+		return
+	}
 	m.reserve(len(hidden))
 	v := m.scratch.Batch(m.Cfg.Dim, len(hidden))
 	for i := range hidden {

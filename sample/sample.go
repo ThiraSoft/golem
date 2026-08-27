@@ -143,30 +143,39 @@ func (s *Sampler) topK(logits []float32) []candidate {
 	if k <= 0 || k > len(logits) {
 		k = len(logits)
 	}
+	if len(logits) <= k {
+		if cap(s.pool) < len(logits) {
+			s.pool = make([]candidate, len(logits))
+		}
+		res := s.pool[:len(logits)]
+		for i, v := range logits {
+			res[i] = candidate{id: int32(i), logit: v}
+		}
+		sort.Slice(res, func(i, j int) bool { return better(res[i], res[j]) })
+		return res
+	}
 	if cap(s.pool) < k {
 		s.pool = make([]candidate, k)
 	}
-	heap := s.pool[:0]
+	heap := s.pool[:k]
+	for i := 0; i < k; i++ {
+		heap[i] = candidate{id: int32(i), logit: logits[i]}
+	}
+	buildMinHeap(heap)
+	minLogit := heap[0].logit
 
-	for i, v := range logits {
-		c := candidate{id: int32(i), logit: v}
-		if len(heap) < k {
-			heap = append(heap, c)
-			if len(heap) == k {
-				buildMinHeap(heap)
-			}
+	for i := k; i < len(logits); i++ {
+		v := logits[i]
+		if v < minLogit {
 			continue
 		}
-		// The root is the worst kept candidate; anything not better than it is
-		// dropped without a second thought.
+		c := candidate{id: int32(i), logit: v}
 		if better(heap[0], c) {
 			continue
 		}
 		heap[0] = c
 		siftDown(heap, 0)
-	}
-	if len(heap) < k {
-		buildMinHeap(heap)
+		minLogit = heap[0].logit
 	}
 	sort.Slice(heap, func(i, j int) bool { return better(heap[i], heap[j]) })
 	return heap

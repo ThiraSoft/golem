@@ -20,6 +20,11 @@ func (m *Model) SetSlots(n int) error {
 	if n < 1 {
 		return fmt.Errorf("qwen: %d slots", n)
 	}
+	// See UseVulkanStack: the card holds one cache, so slots have to be asked
+	// for before the stack is built and cannot be asked for after.
+	if n > 1 && m.stack != nil {
+		return fmt.Errorf("qwen: the Vulkan stack holds one conversation, not %d", n)
+	}
 	per := m.Cfg.MaxContext / n
 	if per < 1 {
 		return fmt.Errorf("qwen: a context of %d cut into %d slots leaves no position each", m.Cfg.MaxContext, n)

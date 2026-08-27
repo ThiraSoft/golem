@@ -69,6 +69,10 @@ func (e *scriptedEngine) ForwardBatch(tokens []int32, startPos int) [][]float32 
 	return hidden
 }
 
+func (e *scriptedEngine) Logits(hidden []float32, out []float32) {
+	e.LogitsBatch([][]float32{hidden}, [][]float32{out})
+}
+
 // Each state scored takes the next word of the script, which is what makes a
 // batch of several states legible: they take them in the order of the batch.
 func (e *scriptedEngine) LogitsBatch(hidden [][]float32, out [][]float32) {

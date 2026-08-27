@@ -5,18 +5,7 @@
 // The end of a mixture block: three post-norms, the sum of the two branches,
 // and the residual that puts it back in the stream.
 //
-// The three norms are why a mixture block is not a dense one with more
-// matrices. Each branch is normed on its own, their sum is normed again, and
-// only then does it rejoin. gemma/moe.go says what happens when the outer one
-// is missing: every waypoint inside the block agrees to a millionth and only
-// the block's output is wrong.
-//
-// Three norms read as three passes and there are only two here, because the
-// first two do not depend on each other: one walk over both branches sums both
-// their squares. A pass over this vector is not arithmetic, it is a wait —
-// eleven kilobytes at a memory latency an iteration, on the one compute unit a
-// single workgroup gets — so the passes are what this kernel costs and the
-// count of them is the only thing worth tuning.
+// Subgroup wave-level reductions replace the 10-step shared memory binary tree.
 
 layout(local_size_x = 1024) in;
 
@@ -41,38 +30,32 @@ const uint LANES = 1024u;
 
 shared float u[MAXN];
 shared float w[MAXN];
-shared float pa[LANES];
-shared float pb[LANES];
+shared float partialA[32];
+shared float partialB[32];
 
-// reduce2 sums two values across the workgroup at once, which is what the two
-// independent norms want and costs one tree rather than two.
+// reduce2 sums two values across the workgroup using subgroup arithmetic
 void reduce2(float a, float b, out float sa, out float sb) {
-    uint t = gl_LocalInvocationID.x;
-    pa[t] = a;
-    pb[t] = b;
-    barrier();
-    for (uint stride = LANES >> 1; stride > 0u; stride >>= 1) {
-        if (t < stride) {
-            pa[t] += pa[t + stride];
-            pb[t] += pb[t + stride];
-        }
-        barrier();
+    float fa = subgroupAdd(a);
+    float fb = subgroupAdd(b);
+    if (subgroupElect()) {
+        partialA[gl_SubgroupID] = fa;
+        partialB[gl_SubgroupID] = fb;
     }
-    sa = pa[0];
-    sb = pb[0];
+    barrier();
+    float sumA = 0.0, sumB = 0.0;
+    for (uint i = 0u; i < gl_NumSubgroups; i++) {
+        sumA += partialA[i];
+        sumB += partialB[i];
+    }
+    sa = sumA;
+    sb = sumB;
 }
 
 void main() {
     uint t    = gl_LocalInvocationID.x;
-    uint base = gl_WorkGroupID.y * p.n;   // the column is the second axis
+    uint base = gl_WorkGroupID.y * p.n;
 
-    // A dense block has one branch and one post-norm. Running it through the
-    // path below would norm the normed vector a second time — which RMS norm
-    // very nearly forgives, and "very nearly" is not what a reference test is
-    // for — and would read an expert branch that was never written.
     if (p.layout_ == 2u) {
-        // A pre-norm block: the feed forward rejoins the residual with nothing
-        // between them. qwen/block.go is the other copy.
         for (uint i = t; i < p.n; i += LANES) {
             xs[base + i] = (resid[base + i] + shared_[base + i]) * p.outScale;
         }
@@ -86,7 +69,6 @@ void main() {
             u[i] = a;
             q += a * a;
         }
-        barrier();
         float tq, ignored;
         reduce2(q, 0.0, tq, ignored);
         float s = 1.0 / sqrt(tq / float(p.n) + p.eps);
@@ -105,7 +87,6 @@ void main() {
         qu += a * a;
         qw += b * b;
     }
-    barrier();
     float tu, tw;
     reduce2(qu, qw, tu, tw);
     float su = 1.0 / sqrt(tu / float(p.n) + p.eps);
@@ -118,7 +99,6 @@ void main() {
         u[i] = x;
         qc += x * x;
     }
-    barrier();
     float tc, unused;
     reduce2(qc, 0.0, tc, unused);
     float sc = 1.0 / sqrt(tc / float(p.n) + p.eps);

@@ -45,8 +45,26 @@ func (m *Model) UseVulkanHead() error {
 		return err
 	}
 	m.head = h
+	if m.stack != nil {
+		if err := m.useVulkanEmbedding(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
+
+// useVulkanEmbedding points the stack at the head's Q4_0 table.
+func (m *Model) useVulkanEmbedding() error {
+	if m.head == nil || m.stack == nil || m.stack.Embedding() {
+		return nil
+	}
+	table, cols := m.head.Table()
+	return m.stack.SetEmbeddingQ40(table, cols, 1.0)
+}
+
+// VulkanEmbedding says whether the card looks the token embedding up itself,
+// which it does when both the stack and the head are on it.
+func (m *Model) VulkanEmbedding() bool { return m.stack != nil && m.stack.Embedding() }
 
 // UseVulkanStack puts every block of the model on a Vulkan device: the
 // attention with its cache, the feed forward, and the two norms between them.
@@ -59,10 +77,15 @@ func (m *Model) UseVulkanStack() error {
 	if m.stack != nil {
 		return nil
 	}
-	cfg := m.Cfg
-	if len(m.caches) > 1 {
-		return fmt.Errorf("qwen: the device holds one cache, and this model was opened with %d slots", len(m.caches))
+	// The stack holds one key-value cache, indexed by position alone: the ring
+	// the kernels read has no room in it for a slot. Two conversations on the
+	// card would write each other's positions and read each other's keys,
+	// which is a wrong answer and not a slow one — so it is refused here
+	// rather than fallen back from. Slots on the processor are unaffected.
+	if m.Slots() > 1 {
+		return fmt.Errorf("qwen: the Vulkan stack holds one conversation, not %d", m.Slots())
 	}
+	cfg := m.Cfg
 	d, err := m.device()
 	if err != nil {
 		return err
@@ -161,6 +184,9 @@ func (m *Model) UseVulkanStack() error {
 		return err
 	}
 	m.stack = stack
+	if err := m.useVulkanEmbedding(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -249,12 +275,14 @@ func (m *Model) closeVulkan() {
 
 // runStack carries a stretch of positions through every block on the device,
 // in one submission. What crosses is those vectors in and the same vectors
-// back.
+// back (or nil when the card looks up embeddings directly).
 func (m *Model) runStack(xs [][]float32, at []Place) {
 	cfg := m.Cfg
-	stream := m.stack.Stream().Floats()
-	for t := range xs {
-		copy(stream[t*cfg.Dim:], xs[t])
+	if xs != nil {
+		stream := m.stack.Stream().Floats()
+		for t := range xs {
+			copy(stream[t*cfg.Dim:], xs[t])
+		}
 	}
 
 	positions := make([]vk.Position, len(at))
@@ -269,9 +297,11 @@ func (m *Model) runStack(xs [][]float32, at []Place) {
 	if err := m.stack.Run(positions, 0, 0); err != nil {
 		panic(fmt.Sprintf("qwen: the device failed: %v", err))
 	}
-	stream = m.stack.Stream().Floats()
-	for t := range xs {
-		copy(xs[t], stream[t*cfg.Dim:])
+	if xs != nil {
+		stream := m.stack.Stream().Floats()
+		for t := range xs {
+			copy(xs[t], stream[t*cfg.Dim:])
+		}
 	}
 }
 

@@ -1,0 +1,60 @@
+#version 450
+#extension GL_EXT_integer_dot_product : enable
+#extension GL_KHR_shader_subgroup_clustered : require
+
+// MatVec for Q8_0 weights against Float32 activation.
+// Workgroup: 128 threads -> 16 output rows, 8 lanes per row.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly  buffer W { uint w[]; };  // Q8_0 weights
+layout(std430, binding = 1) readonly  buffer X { float x[]; }; // Float32 activation
+layout(std430, binding = 2) writeonly buffer Y { float y[]; }; // Float32 output
+
+layout(push_constant) uniform Push {
+    uint dim; // outputs (5120)
+    uint ffn; // inputs (10240)
+} p;
+
+const uint LANES = 8u;
+const uint OUTS  = 16u;
+
+int sbyte(uint b) {
+    return bitfieldExtract(int(w[b >> 2]), int((b & 3u) * 8u), 8);
+}
+
+float halfAt(uint b) {
+    uint word = w[b >> 2];
+    uint h = (b & 2u) != 0u ? (word >> 16) : (word & 0xFFFFu);
+    return unpackHalf2x16(h).x;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x * OUTS + (gl_LocalInvocationID.x / LANES);
+    uint lane = gl_LocalInvocationID.x % LANES;
+    if (row >= p.dim) return;
+
+    uint nb = p.ffn >> 5; // e.g. 320
+    uint rowBytes = nb * 34u;
+    uint rowBase = row * rowBytes;
+
+    float sum = 0.0;
+
+    for (uint b = lane; b < nb; b += LANES) {
+        uint bBase = rowBase + b * 34u;
+        float d = halfAt(bBase);
+        uint qBase = bBase + 2u;
+        uint xBase = b * 32u;
+
+        float blockSum = 0.0;
+        for (uint i = 0u; i < 32u; i++) {
+            blockSum += float(sbyte(qBase + i)) * x[xBase + i];
+        }
+        sum += d * blockSum;
+    }
+
+    sum = subgroupClusteredAdd(sum, LANES);
+    if (lane == 0u) {
+        y[row] = sum;
+    }
+}

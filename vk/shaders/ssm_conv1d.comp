@@ -1,0 +1,62 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// Causal 1D Convolution with SiLU for SSM (Mamba) layers.
+// Channels: 10240
+// Kernel: 4 steps (3 historical from state buffer + 1 current from qkv)
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer Weight { float weight[]; }; // [4, 10240]
+layout(std430, binding = 1) readonly  buffer QKV    { float qkv[];    }; // [10240]
+layout(std430, binding = 2) buffer State  { float state[];  }; // [3, 10240]
+layout(std430, binding = 3) writeonly buffer Out    { float out_[];   }; // [10240]
+// See ssm_scan.comp: the window is copied aside between the committed columns
+// and the drafted one.
+layout(std430, binding = 4) writeonly buffer Shadow { float shadow[]; }; // [3, 10240]
+
+layout(push_constant) uniform Push {
+    uint channels; // 10240
+    uint kernel;   // 4
+    uint columns;  // tokens carried by this pass
+    uint snapAt;   // the column at whose start to copy the window aside; ~0 for none
+} p;
+
+// The window slides, so the columns of a pass are done in order inside one
+// invocation rather than across dispatches: column one's convolution reads the
+// input column zero just pushed into the state.
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= p.channels) return;
+
+    // The GGUF kernel is [taps, channels] with the taps contiguous, which is
+    // how ggml_compute_forward_ssm_conv_f32 reads it: c[tap + channel*taps].
+    uint wb = c * p.kernel;
+    float w0 = weight[wb + 0u];
+    float w1 = weight[wb + 1u];
+    float w2 = weight[wb + 2u];
+    float w3 = weight[wb + 3u];
+
+    float s0 = state[0 * p.channels + c];
+    float s1 = state[1 * p.channels + c];
+    float s2 = state[2 * p.channels + c];
+
+    for (uint col = 0u; col < p.columns; col++) {
+        if (col == p.snapAt) {
+            shadow[0 * p.channels + c] = s0;
+            shadow[1 * p.channels + c] = s1;
+            shadow[2 * p.channels + c] = s2;
+        }
+        float s3 = qkv[col * p.channels + c];
+        float sum = w0*s0 + w1*s1 + w2*s2 + w3*s3;
+        // SiLU
+        out_[col * p.channels + c] = sum / (1.0 + exp(-sum));
+        s0 = s1;
+        s1 = s2;
+        s2 = s3;
+    }
+
+    state[0 * p.channels + c] = s0;
+    state[1 * p.channels + c] = s1;
+    state[2 * p.channels + c] = s2;
+}

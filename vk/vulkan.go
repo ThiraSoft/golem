@@ -570,6 +570,7 @@ var (
 	vkCmdPushConstants                   func(commandBuffer, uint64, uint32, uint32, uint32, unsafe.Pointer)
 	vkCmdDispatch                        func(commandBuffer, uint32, uint32, uint32)
 	vkCmdCopyBuffer                      func(commandBuffer, uint64, uint64, uint32, *bufferCopy)
+	vkCmdFillBuffer                      func(commandBuffer, uint64, uint64, uint64, uint32)
 	vkCmdPipelineBarrier                 func(commandBuffer, uint32, uint32, uint32, uint32, *memoryBarrier, uint32, uintptr, uint32, uintptr)
 	vkCreateQueryPool                    func(device, *queryPoolCreateInfo, uintptr, *uint64) int32
 	vkDestroyQueryPool                   func(device, uint64, uintptr)
@@ -636,6 +637,7 @@ func load() error {
 	bind(&vkCmdPushConstants, "vkCmdPushConstants")
 	bind(&vkCmdDispatch, "vkCmdDispatch")
 	bind(&vkCmdCopyBuffer, "vkCmdCopyBuffer")
+	bind(&vkCmdFillBuffer, "vkCmdFillBuffer")
 	bind(&vkCmdPipelineBarrier, "vkCmdPipelineBarrier")
 	bind(&vkCreateQueryPool, "vkCreateQueryPool")
 	bind(&vkDestroyQueryPool, "vkDestroyQueryPool")

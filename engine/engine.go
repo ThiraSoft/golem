@@ -13,6 +13,7 @@ import (
 	"github.com/ThiraSoft/golem/chat"
 	"github.com/ThiraSoft/golem/gemma"
 	"github.com/ThiraSoft/golem/qwen"
+	"github.com/ThiraSoft/golem/qwen35"
 	"github.com/ThiraSoft/golem/sample"
 	"github.com/ThiraSoft/golem/tensors"
 	"github.com/ThiraSoft/golem/token/bpe"
@@ -146,6 +147,8 @@ func Open(path string, maxContext int, slots ...int) (*Model, error) {
 		m, err = openGemma(g, maxContext)
 	case "qwen3":
 		m, err = openQwen(g, maxContext)
+	case "qwen35", "qwen3.8":
+		m, err = openQwen35(g, maxContext)
 	default:
 		err = unknownArchitecture(arch)
 	}
@@ -206,6 +209,23 @@ func openQwen(g *tensors.GGUF, maxContext int) (*Model, error) {
 	}, nil
 }
 
+func openQwen35(g *tensors.GGUF, maxContext int) (*Model, error) {
+	inner, err := qwen35.New(g, maxContext)
+	if err != nil {
+		return nil, err
+	}
+	vocab, err := bytebpe.Load(g)
+	if err != nil {
+		return nil, err
+	}
+	return &Model{
+		Forward: inner, Vocab: vocab, Template: qwen.NewTemplate(&qwen.Config{}),
+		Window: 0, Vocabulary: inner.Cfg.Vocab,
+		Blocks: len(inner.Cfg.Blocks), Sampling: inner.Cfg.Sampling,
+		closer: inner,
+	}, nil
+}
+
 func unknownArchitecture(arch string) error {
-	return fmt.Errorf("engine: architecture %q is not implemented; gemma4 and qwen3 are", arch)
+	return fmt.Errorf("engine: architecture %q is not implemented; gemma4, qwen3, and qwen35 are", arch)
 }

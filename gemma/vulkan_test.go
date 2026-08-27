@@ -418,4 +418,3 @@ func TestVulkanBatchMatchesTokenPath(t *testing.T) {
 		compareRelative(t, "l_out-"+itoa(il)+" batch against token", batch[il], m.BlockOutput(il), 3e-2)
 	}
 }
-

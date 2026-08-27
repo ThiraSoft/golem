@@ -1,0 +1,156 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Gated Delta Net recurrence + L2 Norm + Gated RMSNorm for Qwen 3.8 / 3.5 SSM layers.
+// Total Heads: 48 workgroups (h = 0..47)
+// Workgroup size: 128 threads (j = 0..127, one thread per row of 128x128 state matrix)
+// State per head: 128 * 128 = 16,384 floats
+// Total state across 48 heads: 786,432 floats (3 MiB)
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly  buffer ConvOut  { float convOut[];  }; // [10240] (q:2048, k:2048, v:6144)
+layout(std430, binding = 1) readonly  buffer GateZ    { float gateZ[];    }; // [6144]
+layout(std430, binding = 2) readonly  buffer Alpha    { float alpha[];    }; // [48]
+layout(std430, binding = 3) readonly  buffer DTBias   { float dtBias[];   }; // [48]
+layout(std430, binding = 4) readonly  buffer SSMA     { float ssmA[];     }; // [48]
+layout(std430, binding = 5) readonly  buffer Beta     { float beta[];     }; // [48]
+layout(std430, binding = 6) readonly  buffer SSMNorm  { float ssmNorm[];  }; // [128]
+layout(std430, binding = 7)           buffer SSMState { float ssmState[]; }; // [48 * 128 * 128]
+layout(std430, binding = 8) writeonly buffer Out      { float out_[];     }; // [6144]
+// Where the state is copied aside when a pass carries a draft. The copy is
+// taken here rather than by a transfer before the pass because the token in
+// column zero is committed and the one in the last column is not: the state
+// that has to survive a refusal is the one between them, and nothing outside
+// this loop can see that moment.
+layout(std430, binding = 9) writeonly buffer Shadow   { float shadow[];   };
+
+layout(push_constant) uniform Push {
+    uint numHeads;   // 48
+    uint stateSize;  // 128
+    float eps;       // 1e-6
+    float scale;     // 1.0 / sqrt(128) = 0.0883883476
+    uint columns;    // tokens carried by this pass
+    uint snapAt;     // the column at whose start to copy the state aside; ~0 for none
+    uint convDim;    // 10240, the stride between one column's channels and the next
+    uint inner;      // 6144, the stride of the gate and of the output
+    uint rank;       // 48, the stride of alpha and beta
+} p;
+
+shared float sharedQNorm[128];
+shared float sharedKNorm[128];
+shared float sharedReduce[128];
+
+void main() {
+    uint h = gl_WorkGroupID.x; // Head 0..47
+    uint j = gl_LocalInvocationID.x; // Channel/Row 0..127
+    uint qkHead = h % 16u;
+    uint rowBase = h * 16384u + j * 128u;
+
+    // The recurrence carries the state from one token to the next, so the
+    // columns of a pass are walked in order here rather than dispatched apart.
+    // The state is read and written once a column, which is the least a
+    // 128x128 matrix a head can cost.
+    for (uint col = 0u; col < p.columns; col++) {
+        if (col == p.snapAt) {
+            [[unroll]] for (uint i = 0u; i < 128u; i++) shadow[rowBase + i] = ssmState[rowBase + i];
+        }
+        uint cq = col * p.convDim;
+        uint cr = col * p.rank;
+
+        float alphaVal = alpha[cr + h] + dtBias[h];
+        float softplusVal = (alphaVal > 20.0) ? alphaVal : log(1.0 + exp(alphaVal));
+        float decay = exp(softplusVal * ssmA[h]);
+        float betaVal = 1.0 / (1.0 + exp(-beta[cr + h]));
+
+        float rawQ = convOut[cq + qkHead * 128u + j];
+        float rawK = convOut[cq + 2048u + qkHead * 128u + j];
+
+        sharedReduce[j] = rawQ * rawQ;
+        barrier();
+        if (j < 64u) sharedReduce[j] += sharedReduce[j + 64u];
+        barrier();
+        if (j < 32u) sharedReduce[j] += sharedReduce[j + 32u];
+        barrier();
+        if (j < 16u) sharedReduce[j] += sharedReduce[j + 16u];
+        barrier();
+        if (j < 8u)  sharedReduce[j] += sharedReduce[j + 8u];
+        barrier();
+        if (j < 4u)  sharedReduce[j] += sharedReduce[j + 4u];
+        barrier();
+        if (j < 2u)  sharedReduce[j] += sharedReduce[j + 2u];
+        barrier();
+        if (j < 1u)  sharedReduce[j] += sharedReduce[j + 1u];
+        barrier();
+        sharedQNorm[j] = rawQ * inversesqrt(sharedReduce[0] + p.eps);
+        barrier();
+
+        sharedReduce[j] = rawK * rawK;
+        barrier();
+        if (j < 64u) sharedReduce[j] += sharedReduce[j + 64u];
+        barrier();
+        if (j < 32u) sharedReduce[j] += sharedReduce[j + 32u];
+        barrier();
+        if (j < 16u) sharedReduce[j] += sharedReduce[j + 16u];
+        barrier();
+        if (j < 8u)  sharedReduce[j] += sharedReduce[j + 8u];
+        barrier();
+        if (j < 4u)  sharedReduce[j] += sharedReduce[j + 4u];
+        barrier();
+        if (j < 2u)  sharedReduce[j] += sharedReduce[j + 2u];
+        barrier();
+        if (j < 1u)  sharedReduce[j] += sharedReduce[j + 1u];
+        barrier();
+        sharedKNorm[j] = rawK * inversesqrt(sharedReduce[0] + p.eps);
+        barrier();
+
+        float vVal = convOut[cq + 4096u + h * 128u + j];
+
+        // The row is decayed, corrected by delta, and read against Q — and the
+        // whole of it is one read and one write, not two of each. The first
+        // pass takes the dot against K without storing the decayed row: decay
+        // is a scalar, so it can come out of the sum afterwards.
+        float sumK = 0.0;
+        [[unroll]] for (uint i = 0u; i < 128u; i++) {
+            sumK += ssmState[rowBase + i] * sharedKNorm[i];
+        }
+        sumK *= decay;
+
+        float delta = (vVal - sumK) * betaVal;
+
+        float sumQ = 0.0;
+        [[unroll]] for (uint i = 0u; i < 128u; i++) {
+            float sv = ssmState[rowBase + i] * decay + delta * sharedKNorm[i];
+            ssmState[rowBase + i] = sv;
+            sumQ += sv * sharedQNorm[i];
+        }
+
+        float yVal = sumQ * p.scale;
+        sharedReduce[j] = yVal * yVal;
+        barrier();
+        if (j < 64u) sharedReduce[j] += sharedReduce[j + 64u];
+        barrier();
+        if (j < 32u) sharedReduce[j] += sharedReduce[j + 32u];
+        barrier();
+        if (j < 16u) sharedReduce[j] += sharedReduce[j + 16u];
+        barrier();
+        if (j < 8u)  sharedReduce[j] += sharedReduce[j + 8u];
+        barrier();
+        if (j < 4u)  sharedReduce[j] += sharedReduce[j + 4u];
+        barrier();
+        if (j < 2u)  sharedReduce[j] += sharedReduce[j + 2u];
+        barrier();
+        if (j < 1u)  sharedReduce[j] += sharedReduce[j + 1u];
+        barrier();
+
+        float invRMS = inversesqrt(sharedReduce[0] / 128.0 + p.eps);
+        float normedY = yVal * invRMS * ssmNorm[j];
+
+        uint outIdx = col * p.inner + h * 128u + j;
+        float zVal = gateZ[outIdx];
+        out_[outIdx] = normedY * (zVal / (1.0 + exp(-zVal)));
+        barrier();
+    }
+}

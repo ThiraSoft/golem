@@ -1,0 +1,156 @@
+#version 450
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// MatVec for Q5_K weights (256 weights in 176 bytes = 44 uints) against float32
+// activations. Qwen3.5 quantises the delta net's output projection this way,
+// which is a gigabyte a token — the largest single thing in the model after
+// the feed forward.
+//
+// Workgroup: 128 threads -> 16 output rows, 8 lanes per row. COLUMNS is
+// matvec_q40.comp's: how many activations one reading of the weights answers.
+
+#ifndef COLUMNS
+#define COLUMNS 1
+#endif
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly  buffer W { uint  w[]; }; // Q5_K raw bytes
+layout(std430, binding = 1) readonly  buffer X { float x[]; }; // Float32 activation [inputs]
+layout(std430, binding = 2) writeonly buffer Y { float y[]; }; // Float32 output [outputs]
+
+layout(push_constant) uniform Push {
+    uint dim; // outputs
+    uint ffn; // inputs
+} p;
+
+const uint LANES = 8u;
+const uint OUTS  = 16u;
+
+void main() {
+    uint row = gl_WorkGroupID.x * OUTS + (gl_LocalInvocationID.x / LANES);
+    uint lane = gl_LocalInvocationID.x % LANES;
+    bool live = row < p.dim;
+    if (!live) row = 0u;
+
+    // Superblock count along the row
+    uint nSuper = p.ffn / 256u;
+    // 176 bytes = 44 uints per superblock
+    uint rowBase = row * nSuper * 44u;
+
+    float sum[COLUMNS];
+    [[unroll]] for (uint c = 0u; c < COLUMNS; c++) sum[c] = 0.0;
+
+    for (uint sb = lane; live && sb < nSuper; sb += LANES) {
+        uint sbOffset = rowBase + sb * 44u;
+        uint xOffset = sb * 256u;
+
+        // d, dmin
+        uint dPair = w[sbOffset];
+        vec2 dFloats = unpackHalf2x16(dPair);
+        float d = dFloats.x;
+        float dmin = dFloats.y;
+
+        // Scales raw: 12 bytes = 3 uints
+        uint s0 = w[sbOffset + 1u];
+        uint s1 = w[sbOffset + 2u];
+        uint s2 = w[sbOffset + 3u];
+
+        uint sc[8], m[8];
+        // sc[0..3] = s0 byte 0..3 & 63
+        sc[0] = s0 & 63u;
+        sc[1] = (s0 >> 8u) & 63u;
+        sc[2] = (s0 >> 16u) & 63u;
+        sc[3] = (s0 >> 24u) & 63u;
+
+        // m[0..3] = s1 byte 0..3 & 63
+        m[0] = s1 & 63u;
+        m[1] = (s1 >> 8u) & 63u;
+        m[2] = (s1 >> 16u) & 63u;
+        m[3] = (s1 >> 24u) & 63u;
+
+        // sc[4..7] & m[4..7] from s2 bytes and high bits of s0/s1
+        // In CPU:
+        // sc[4] = (scalesRaw[8] & 0xF) | ((scalesRaw[0] >> 6) << 4)
+        // m[4]  = (scalesRaw[8] >> 4)  | ((scalesRaw[4] >> 6) << 4)
+        uint s2_0 = s2 & 0xFFu;
+        uint s2_1 = (s2 >> 8u) & 0xFFu;
+        uint s2_2 = (s2 >> 16u) & 0xFFu;
+        uint s2_3 = (s2 >> 24u) & 0xFFu;
+
+        uint s0_0 = s0 & 0xFFu;
+        uint s0_1 = (s0 >> 8u) & 0xFFu;
+        uint s0_2 = (s0 >> 16u) & 0xFFu;
+        uint s0_3 = (s0 >> 24u) & 0xFFu;
+
+        uint s1_0 = s1 & 0xFFu;
+        uint s1_1 = (s1 >> 8u) & 0xFFu;
+        uint s1_2 = (s1 >> 16u) & 0xFFu;
+        uint s1_3 = (s1 >> 24u) & 0xFFu;
+
+        sc[4] = (s2_0 & 0x0Fu) | ((s0_0 >> 6u) << 4u);
+        m[4]  = (s2_0 >> 4u)   | ((s1_0 >> 6u) << 4u);
+
+        sc[5] = (s2_1 & 0x0Fu) | ((s0_1 >> 6u) << 4u);
+        m[5]  = (s2_1 >> 4u)   | ((s1_1 >> 6u) << 4u);
+
+        sc[6] = (s2_2 & 0x0Fu) | ((s0_2 >> 6u) << 4u);
+        m[6]  = (s2_2 >> 4u)   | ((s1_2 >> 6u) << 4u);
+
+        sc[7] = (s2_3 & 0x0Fu) | ((s0_3 >> 6u) << 4u);
+        m[7]  = (s2_3 >> 4u)   | ((s1_3 >> 6u) << 4u);
+
+        // qh: 32 bytes = 8 uints (offsets +4 .. +11)
+        uint qhOffset = sbOffset + 4u;
+        // qs: 128 bytes = 32 uints (offsets +12 .. +43)
+        uint qsOffset = sbOffset + 12u;
+
+        for (uint i = 0u; i < 8u; i++) {
+            float d1 = d * float(sc[i]);
+            float m1 = dmin * float(m[i]);
+            uint chunkBase = qsOffset + i * 4u;
+            uint chunkX = xOffset + i * 32u;
+            uint qhBit = 1u << i;
+
+            float chunkSum[COLUMNS];
+            float chunkSumX[COLUMNS];
+            [[unroll]] for (uint c = 0u; c < COLUMNS; c++) { chunkSum[c] = 0.0; chunkSumX[c] = 0.0; }
+
+            for (uint l = 0u; l < 4u; l++) {
+                uint word = w[chunkBase + l];
+                uint qhWordLow = w[qhOffset + l];
+                uint qhWordHigh = w[qhOffset + 4u + l];
+
+                for (uint b = 0u; b < 4u; b++) {
+                    uint byteVal = (word >> (b * 8u)) & 0xFFu;
+                    uint qhByteLow = (qhWordLow >> (b * 8u)) & 0xFFu;
+                    uint qhByteHigh = (qhWordHigh >> (b * 8u)) & 0xFFu;
+
+                    uint h1 = (qhByteLow & qhBit) != 0u ? 16u : 0u;
+                    uint h2 = (qhByteHigh & qhBit) != 0u ? 16u : 0u;
+
+                    float wLow  = float((byteVal & 0x0Fu) | h1);
+                    float wHigh = float((byteVal >> 4u) | h2);
+                    uint at = chunkX + (l * 4u + b);
+
+                    [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+                        float xL = x[c * p.ffn + at];
+                        float xH = x[c * p.ffn + at + 16u];
+                        chunkSum[c] += wLow * xL + wHigh * xH;
+                        chunkSumX[c] += xL + xH;
+                    }
+                }
+            }
+            [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+                sum[c] += chunkSum[c] * d1 - chunkSumX[c] * m1;
+            }
+        }
+    }
+
+    // Cluster reduction across the 8 lanes of this row
+    [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+        float total = subgroupClusteredAdd(sum[c], LANES);
+        if (lane == 0u && live) y[c * p.dim + row] = total;
+    }
+}

@@ -154,7 +154,7 @@ func Load(g *tensors.GGUF) (*Vocab, error) {
 // tokens per sentence and never raise an error.
 func knownPre(pre string) bool {
 	switch pre {
-	case "qwen2", "deepseek-r1-qwen":
+	case "qwen2", "qwen35", "qwen3.8", "deepseek-r1-qwen":
 		return true
 	}
 	return false

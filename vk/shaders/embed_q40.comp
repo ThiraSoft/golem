@@ -1,0 +1,111 @@
+#version 450
+
+// The Q4_0 token embedding, read on the card.
+//
+// Qwen3 (and quantized checkpoints with Q4_0 embeddings) stores its token
+// embedding in Q4_0. When the head is uploaded to the device, the table is
+// already there.
+//
+// A column whose identifier is negative is left alone (e.g. for vision tokens).
+//
+// A Q4_0 block has 32 weights: an fp16 scale and 16 bytes of nibbles.
+// The weights in vk are stored in splitQ4_0 layout: all scales first (2*nb bytes),
+// then all nibbles (16*nb bytes).
+//
+// In each block, low nibble is element j, high nibble is element j+16.
+// Each nibble is unsigned (0..15), representing value - 8.
+// The float value is (nibble - 8) * scale * push.scale.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer W  { uint w[];   };
+layout(std430, binding = 1) readonly  buffer ID { int  ids[]; };
+layout(std430, binding = 2) writeonly buffer Y  { float y[];  };
+
+layout(push_constant) uniform Push {
+    uint  cols;        // the width of a row (dim)
+    uint  superblocks; // cols / 32
+    float scale;       // scalar multiplier (1.0 for Qwen3, or sqrt(dim) if needed)
+} p;
+
+void main() {
+    uint col = gl_WorkGroupID.x;
+    int  id  = ids[col];
+    if (id < 0) return;   // the caller wrote this column itself
+
+    uint t = gl_LocalInvocationID.x;
+
+    uint nb = p.superblocks;
+    uint rowBytes = nb * 18u;
+    uint rowBase = uint(id) * rowBytes;
+    uint nibBase = rowBase + 2u * nb;
+    uint ybase = col * p.cols;
+
+    for (uint b = t; b < nb; b += 64u) {
+        vec2 pair = unpackHalf2x16(w[(rowBase + 2u * b) >> 2]);
+        float ws = pair[b & 1u] * p.scale;
+
+        uint at = (nibBase + 16u * b) >> 2;
+        uint dst = ybase + b * 32u;
+
+        vec4 low0, high0, low1, high1;
+        uint word0 = w[at];
+        uint word1 = w[at + 1u];
+        uint word2 = w[at + 2u];
+        uint word3 = w[at + 3u];
+
+        uint b0 = (word0)       & 0xFFu;
+        uint b1 = (word0 >> 8)  & 0xFFu;
+        uint b2 = (word0 >> 16) & 0xFFu;
+        uint b3 = (word0 >> 24) & 0xFFu;
+
+        uint b4 = (word1)       & 0xFFu;
+        uint b5 = (word1 >> 8)  & 0xFFu;
+        uint b6 = (word1 >> 16) & 0xFFu;
+        uint b7 = (word1 >> 24) & 0xFFu;
+
+        uint b8 = (word2)       & 0xFFu;
+        uint b9 = (word2 >> 8)  & 0xFFu;
+        uint bA = (word2 >> 16) & 0xFFu;
+        uint bB = (word2 >> 24) & 0xFFu;
+
+        uint bC = (word3)       & 0xFFu;
+        uint bD = (word3 >> 8)  & 0xFFu;
+        uint bE = (word3 >> 16) & 0xFFu;
+        uint bF = (word3 >> 24) & 0xFFu;
+
+        y[dst + 0u]  = float(int(b0 & 0x0Fu) - 8) * ws;
+        y[dst + 1u]  = float(int(b1 & 0x0Fu) - 8) * ws;
+        y[dst + 2u]  = float(int(b2 & 0x0Fu) - 8) * ws;
+        y[dst + 3u]  = float(int(b3 & 0x0Fu) - 8) * ws;
+        y[dst + 4u]  = float(int(b4 & 0x0Fu) - 8) * ws;
+        y[dst + 5u]  = float(int(b5 & 0x0Fu) - 8) * ws;
+        y[dst + 6u]  = float(int(b6 & 0x0Fu) - 8) * ws;
+        y[dst + 7u]  = float(int(b7 & 0x0Fu) - 8) * ws;
+        y[dst + 8u]  = float(int(b8 & 0x0Fu) - 8) * ws;
+        y[dst + 9u]  = float(int(b9 & 0x0Fu) - 8) * ws;
+        y[dst + 10u] = float(int(bA & 0x0Fu) - 8) * ws;
+        y[dst + 11u] = float(int(bB & 0x0Fu) - 8) * ws;
+        y[dst + 12u] = float(int(bC & 0x0Fu) - 8) * ws;
+        y[dst + 13u] = float(int(bD & 0x0Fu) - 8) * ws;
+        y[dst + 14u] = float(int(bE & 0x0Fu) - 8) * ws;
+        y[dst + 15u] = float(int(bF & 0x0Fu) - 8) * ws;
+
+        y[dst + 16u] = float(int(b0 >> 4)   - 8) * ws;
+        y[dst + 17u] = float(int(b1 >> 4)   - 8) * ws;
+        y[dst + 18u] = float(int(b2 >> 4)   - 8) * ws;
+        y[dst + 19u] = float(int(b3 >> 4)   - 8) * ws;
+        y[dst + 20u] = float(int(b4 >> 4)   - 8) * ws;
+        y[dst + 21u] = float(int(b5 >> 4)   - 8) * ws;
+        y[dst + 22u] = float(int(b6 >> 4)   - 8) * ws;
+        y[dst + 23u] = float(int(b7 >> 4)   - 8) * ws;
+        y[dst + 24u] = float(int(b8 >> 4)   - 8) * ws;
+        y[dst + 25u] = float(int(b9 >> 4)   - 8) * ws;
+        y[dst + 26u] = float(int(bA >> 4)   - 8) * ws;
+        y[dst + 27u] = float(int(bB >> 4)   - 8) * ws;
+        y[dst + 28u] = float(int(bC >> 4)   - 8) * ws;
+        y[dst + 29u] = float(int(bD >> 4)   - 8) * ws;
+        y[dst + 30u] = float(int(bE >> 4)   - 8) * ws;
+        y[dst + 31u] = float(int(bF >> 4)   - 8) * ws;
+    }
+}

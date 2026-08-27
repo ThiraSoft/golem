@@ -1,0 +1,58 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 1024) in;
+
+layout(std430, binding = 0) readonly  buffer E    { float e[];    }; // [5120]
+layout(std430, binding = 1) readonly  buffer EG   { float eg[];   }; // [5120] ENorm gain
+layout(std430, binding = 2) readonly  buffer H    { float h[];    }; // [5120]
+layout(std430, binding = 3) readonly  buffer HG   { float hg[];   }; // [5120] HNorm gain
+layout(std430, binding = 4) writeonly buffer EH   { float eh[];   }; // [10240] output
+
+layout(push_constant) uniform Push {
+    uint  dim; // 5120
+    float eps; // 1e-6
+} p;
+
+shared float partialE[32];
+shared float partialH[32];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint n = p.dim;
+
+    float sumSqE = 0.0;
+    float sumSqH = 0.0;
+
+    for (uint i = t; i < n; i += 1024u) {
+        float ve = e[i];
+        float vh = h[i];
+        sumSqE += ve * ve;
+        sumSqH += vh * vh;
+    }
+
+    sumSqE = subgroupAdd(sumSqE);
+    sumSqH = subgroupAdd(sumSqH);
+
+    if (subgroupElect()) {
+        partialE[gl_SubgroupID] = sumSqE;
+        partialH[gl_SubgroupID] = sumSqH;
+    }
+    barrier();
+
+    float totalE = 0.0;
+    float totalH = 0.0;
+    for (uint i = 0u; i < gl_NumSubgroups; i++) {
+        totalE += partialE[i];
+        totalH += partialH[i];
+    }
+
+    float scaleE = inversesqrt(totalE / float(n) + p.eps);
+    float scaleH = inversesqrt(totalH / float(n) + p.eps);
+
+    for (uint i = t; i < n; i += 1024u) {
+        eh[i]     = e[i] * scaleE * eg[i];
+        eh[n + i] = h[i] * scaleH * hg[i];
+    }
+}

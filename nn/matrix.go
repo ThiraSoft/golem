@@ -56,8 +56,14 @@ func (m Matrix) RowBytes() int {
 		return m.Cols / QuantBlock * q4_0BlockBytes
 	case Q4_1:
 		return m.Cols / QuantBlock * q4_1BlockBytes
+	case Q4_K:
+		return m.Cols / SuperBlock * q4_kBlockBytes
+	case Q5_K:
+		return m.Cols / SuperBlock * q5_kBlockBytes
 	case Q6_K:
 		return m.Cols / SuperBlock * q6_kBlockBytes
+	case Q8_0:
+		return m.Cols / QuantBlock * q8_0BlockBytes
 	}
 	panic(fmt.Sprintf("nn: no row size for %s", m.Quant))
 }
@@ -122,8 +128,17 @@ func (m Matrix) rows(b *Batch, ys [][]float32, start, end int) {
 				ys[c][r] = DotF32(row, b.F[c])
 			}
 		}
+	case Q4_K:
+		matVecQ4_KRows(m.Data, b, m.Cols, ys, start, end)
+	case Q5_K:
+		matVecQ5_KRows(m.Data, b, m.Cols, ys, start, end)
 	case Q6_K:
+		if b.QK == nil {
+			b.QuantizeK()
+		}
 		matVecQ6_KRows(m.Data, b, m.Cols, ys, start, end)
+	case Q8_0:
+		matVecQ8_0Rows(m.Data, b, m.Cols, ys, start, end)
 	default:
 		panic(fmt.Sprintf("nn: %s is not a matrix format", m.Quant))
 	}
@@ -146,6 +161,10 @@ func (m Matrix) Row(index int, out []float32) {
 	switch m.Quant {
 	case Q6_K:
 		DequantizeQ6_K(row, m.Cols, out)
+	case Q5_K:
+		DequantizeQ5_K(row, m.Cols, out)
+	case Q4_K:
+		DequantizeQ4_K(row, m.Cols, out)
 	case F32:
 		for i := 0; i < m.Cols; i++ {
 			out[i] = float32FromBytes(row[i*4:])
@@ -158,6 +177,8 @@ func (m Matrix) Row(index int, out []float32) {
 		dequantizeQ4_0Row(row, m.Cols, out)
 	case Q4_1:
 		dequantizeQ4_1Row(row, m.Cols, out)
+	case Q8_0:
+		dequantizeQ8_0Row(row, m.Cols, out)
 	}
 }
 

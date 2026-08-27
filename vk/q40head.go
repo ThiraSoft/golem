@@ -130,6 +130,10 @@ func (h *Q40Head) MatVec(b *nn.Batch, out []float32) error {
 	return nil
 }
 
+// Table is the matrix itself, so that a caller holding both this and a Stack
+// can read a row of it for on-device token embedding lookup.
+func (h *Q40Head) Table() (*Buffer, int) { return h.weights, h.cols }
+
 func (h *Q40Head) Close() {
 	if h.set != nil {
 		h.set.Close()

@@ -1,0 +1,48 @@
+#version 450
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// y = W * x for float32 weights. Qwen3.5 keeps the delta net's two 48-wide
+// projections in float32, which is a megabyte a block and forty-eight of them.
+// COLUMNS is matvec_q40.comp's.
+
+#ifndef COLUMNS
+#define COLUMNS 1
+#endif
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly  buffer W { float w[]; };
+layout(std430, binding = 1) readonly  buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint dim;
+    uint ffn;
+} p;
+
+const uint LANES = 8u;
+const uint OUTS  = 16u;
+
+void main() {
+    uint row = gl_WorkGroupID.x * OUTS + (gl_LocalInvocationID.x / LANES);
+    uint lane = gl_LocalInvocationID.x % LANES;
+
+    float sum[COLUMNS];
+    [[unroll]] for (uint c = 0u; c < COLUMNS; c++) sum[c] = 0.0;
+
+    if (row < p.dim) {
+        uint rowBase = row * p.ffn;
+        for (uint i = lane; i < p.ffn; i += LANES) {
+            float wi = w[rowBase + i];
+            [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+                sum[c] += wi * x[c * p.ffn + i];
+            }
+        }
+    }
+
+    [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+        float total = subgroupClusteredAdd(sum[c], LANES);
+        if (lane == 0u && row < p.dim) y[c * p.dim + row] = total;
+    }
+}

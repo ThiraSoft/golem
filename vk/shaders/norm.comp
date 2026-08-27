@@ -92,7 +92,13 @@ const uint VSCALE = 8u;
 const uint FLOAT  = 16u;  // write the normed vector as floats
 const uint QUANT  = 32u;  // write its Q8_0 form
 
-const uint MAXN = 4096u;
+// MAXN is the widest vector this binary norms, and it is the staging array's
+// size. A model whose hidden state is wider needs the binary built with a
+// larger one: Qwen3.5's 5120 does not fit the default, and overrunning a
+// shared array is not a fault, it is a wrong answer.
+#ifndef MAXN
+#define MAXN 4096u
+#endif
 
 shared float v[MAXN];
 // One partial a wave, not one a thread.

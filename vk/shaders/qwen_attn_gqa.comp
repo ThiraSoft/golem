@@ -1,0 +1,112 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// One token's grouped-query attention: scores, softmax, mix, and the output
+// gate, one workgroup to a query head.
+//
+// The keys and values are already in the cache — qwen_attn_prep put them
+// there — so nothing here writes across workgroups and nothing has to be
+// ordered against another head.
+//
+// The scores are tiled eight positions at a time with thirty-two lanes to a
+// position, so the thirty-two lanes of one position read thirty-two
+// consecutive floats of its key. A lane per position instead, walking a whole
+// key by itself, reads the same bytes in as many separate transactions as
+// there are lanes.
+
+#ifndef MAXCTX
+#define MAXCTX 8192u
+#endif
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer QOut   { float qOut[];   }; // [heads*256], normed and rotated
+layout(std430, binding = 1) readonly  buffer KCache { float kCache[]; };
+layout(std430, binding = 2) readonly  buffer VCache { float vCache[]; };
+layout(std430, binding = 3) readonly  buffer QIn    { float qIn[];    }; // [heads*512], the gate at +256
+layout(std430, binding = 4) writeonly buffer Out    { float out_[];   }; // [heads*256]
+// See qwen_attn_prep.comp: the position is a buffer so the pass compiles once.
+layout(std430, binding = 5) readonly  buffer Pos    { uint  posv[];   };
+
+layout(push_constant) uniform Push {
+    uint maxContext;
+    uint headsPerKV; // 6
+    uint heads;      // 24
+    float scale;     // 1/sqrt(headDim)
+} p;
+
+// One workgroup a head, one column of the pass on the second axis.
+#define COL (gl_WorkGroupID.y)
+
+shared float scores[MAXCTX];
+shared float reduce_[8];
+
+const uint LANES = 32u;      // lanes to a position
+const uint TILE  = 8u;       // positions to a tile, LANES*TILE == 256
+
+void main() {
+    uint h  = gl_WorkGroupID.x;
+    uint t  = gl_LocalInvocationID.x;
+    uint kv = h / p.headsPerKV;
+
+    uint lane = t % LANES;
+    uint slot = t / LANES;
+
+    uint n = posv[COL] + 1u;
+    uint qBase = COL * p.heads * 256u + h * 256u;
+    uint cacheBase = kv * p.maxContext * 256u;
+
+    // 1. scores[i] = dot(q, k_i) * scale
+    for (uint i0 = 0u; i0 < n; i0 += TILE) {
+        uint i = i0 + slot;
+        float part = 0.0;
+        if (i < n) {
+            uint kBase = cacheBase + i * 256u;
+            [[unroll]] for (uint d = lane; d < 256u; d += LANES) {
+                part += qOut[qBase + d] * kCache[kBase + d];
+            }
+        }
+        float sum = subgroupClusteredAdd(part, LANES);
+        if (lane == 0u && i < n) scores[i] = sum * p.scale;
+    }
+    barrier();
+
+    // 2. softmax over the run, folded across the whole workgroup
+    float localMax = -1.0 / 0.0;
+    for (uint i = t; i < n; i += 256u) localMax = max(localMax, scores[i]);
+    float folded = subgroupMax(localMax);
+    if (subgroupElect()) reduce_[gl_SubgroupID] = folded;
+    barrier();
+    float runMax = -1.0 / 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; s++) runMax = max(runMax, reduce_[s]);
+    barrier();
+
+    float localSum = 0.0;
+    for (uint i = t; i < n; i += 256u) {
+        float e = exp(scores[i] - runMax);
+        scores[i] = e;
+        localSum += e;
+    }
+    folded = subgroupAdd(localSum);
+    if (subgroupElect()) reduce_[gl_SubgroupID] = folded;
+    barrier();
+    float total = 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; s++) total += reduce_[s];
+    float inv = 1.0 / total;
+    barrier();
+
+    // 3. the mix: one thread to a dimension, so the values of a position are
+    //    read by consecutive threads from consecutive addresses.
+    float acc = 0.0;
+    for (uint i = 0u; i < n; i++) {
+        acc += scores[i] * vCache[cacheBase + i * 256u + t];
+    }
+    acc *= inv;
+
+    // 4. the output gate, which sits after this head's queries
+    float g = qIn[COL * p.heads * 512u + h * 512u + 256u + t];
+    out_[COL * p.heads * 256u + h * 256u + t] = acc / (1.0 + exp(-g));
+}

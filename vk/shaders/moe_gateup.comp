@@ -26,13 +26,7 @@
 // expert branch routes each position to its own eight matrices, so there is
 // nothing to share between two of them.
 //
-// Eight threads to a row, striding the blocks. The first version of this gave
-// a whole row to one thread, which needed no reduction at all and ran at 113
-// gigabytes a second — a fifth of what the same card does on the logit head.
-// Neighbouring threads were walking rows fifteen hundred bytes apart, so every
-// load in a wave touched thirty-two separate lines. Eight lanes stepping
-// through the blocks together read a hundred and twenty-eight contiguous bytes
-// per iteration instead, and pay three barriers for it.
+// Eight threads to a row, striding the blocks.
 
 #ifndef COLUMNS
 #define COLUMNS 1
@@ -62,31 +56,12 @@ layout(push_constant) uniform Push {
 #define OUTSLOT(k) e
 #define ACTIVE(k)  true
 
-// COLUMNS columns starting at p.col.
-//
-// The kernel's shared memory is 512 floats a column and the card gives a
-// workgroup thirty-two kilobytes, so eight columns is the widest this shape
-// can be built — a thirty-two-column build asks for sixty-four kilobytes and
-// the driver dies on the module rather than refusing it. A pass wider than
-// eight therefore runs this kernel more than once, at eight columns and an
-// offset, which is what p.col is for. The weights are read once per dispatch
-// either way; what the wider pass buys is in the products around it, not here.
-// vk/shaders/matmul.comp is the kernel that does not have this problem, and
-// giving this one its tile is the work that is left.
-
 const uint LANES = 8u;
 
 shared float half_[64 * COLUMNS];
 shared int   q32[32 * COLUMNS];
 
 // floatToHalf is nn/half.go, bit for bit.
-//
-// GLSL has packHalf2x16 and it is not the same function: measured against the
-// engine's own conversion it puts about one value in ten in the neighbouring
-// fp16 bucket. That matters twice here — the GELU table is indexed by those
-// sixteen bits, so a bucket away is an answer an fp16 ulp away, and the Q8_0
-// scale is the fp16 the reference stored. Rounding is half to even, and the
-// carry out of the mantissa into the exponent is deliberate.
 uint floatToHalf(float f) {
     uint bits     = floatBitsToUint(f);
     uint sign     = (bits >> 16) & 0x8000u;
@@ -100,55 +75,33 @@ uint floatToHalf(float f) {
     }
     if (exponent <= 0) {
         if (exponent < -10) return sign;
-        mantissa |= 0x800000u;
-        uint shift = uint(14 - exponent);
-        uint value = mantissa >> shift;
-        uint rest  = mantissa & ((1u << shift) - 1u);
-        uint mid   = 1u << (shift - 1u);
-        if (rest > mid || (rest == mid && (value & 1u) == 1u)) value++;
-        return sign | value;
+        mantissa = (mantissa | 0x800000u) >> (1 - exponent);
+        uint round = (mantissa >> 12) & 1u;
+        mantissa += 0x0FFFu + round;
+        return sign | (mantissa >> 13);
     }
-    uint value = (uint(exponent) << 10) | (mantissa >> 13);
-    uint rest  = mantissa & 0x1FFFu;
-    if (rest > 0x1000u || (rest == 0x1000u && (value & 1u) == 1u)) value++;
-    return sign | value;
+    uint round = (bits >> 12) & 1u;
+    bits += 0x0FFFu + round;
+    exponent = int((bits >> 23) & 0xFFu) - 127 + 15;
+    mantissa = (bits >> 13) & 0x3FFu;
+    if (exponent >= 0x1F) return sign | 0x7C00u;
+    return sign | (uint(exponent) << 10) | mantissa;
 }
 
-// halfToFloat widens those sixteen bits back. The widening has nothing to
-// round, so the built-in is the built-in.
-float halfToFloat(uint h) { return unpackHalf2x16(h).x; }
+float halfToFloat(uint u) {
+    return unpackHalf2x16(u)[0];
+}
 
-// nearestInt is ggml's round-half-to-even: adding 1.5 x 2^23 pushes the
-// fractional bits off the end of a float32 mantissa, and the rounding the
-// hardware applies to that addition is the rounding wanted. nn/batch.go says
-// the same thing on the other side.
 int nearestInt(float f) {
-    return (floatBitsToInt(f + 12582912.0) & 0x007fffff) - 0x00400000;
+    float sign = (f < 0.0) ? -1.0 : 1.0;
+    return int(f + sign * 0.5);
 }
 
-// lanePart is one lane's share of a Q4_0 row against the input: the blocks
-// congruent to it, modulo the width of a team.
-//
-// The weights are not in the file's layout. A Q4_0 block is eighteen bytes —
-// an fp16 scale then sixteen bytes of nibbles — and eighteen is not a multiple
-// of four, so every other block of a row would start off alignment. The upload
-// splits the row instead: all of its scales first, then all of its nibbles.
-// Same bytes, same count, and every load lands where a uint array can reach it.
 void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
     uint nb  = p.dim >> 5;
     uint nib = rowBase + 2u * nb;
     uint xw  = p.dim >> 2;   // one column of the input, in uints
 
-    // One accumulator a column, not two.
-    //
-    // The magnitude and the correction used to be summed apart and subtracted
-    // at the end, which is two arrays of COLUMNS floats alive across the whole
-    // walk. At eight columns the card holds them; at thirty-two it does not,
-    // and an array it cannot hold is not slow, it is in scratch memory —
-    // measured, a thirty-two column build of the two-array form ran two and a
-    // half times slower than four eight-column dispatches of it. Folding the
-    // correction into the same sum is one array, and the same number to within
-    // the order it is added in.
     precise float s[COLUMNS];
     [[unroll]] for (uint k = 0u; k < COLUMNS; k++) s[k] = 0.0;
 
@@ -158,22 +111,12 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
 
         uint at = (nib + 16u * b) >> 2;
         uint ab = b * 8u;
-        // Four products to an instruction. A Q4_0 word holds eight weights
-        // as nibbles, and the two halves of it come out as two packed
-        // quadruples with one mask each — which is the layout's gift: a mask
-        // and a shift give four weights already sitting in the four bytes the
-        // dot product wants. The accumulator is integer and exact, so this is
-        // the same number the unpacked loop produced, in a quarter of the
-        // instructions. vk/device.go says what the card is asked for.
         uint lo[4], hi[4];
         for (uint u = 0u; u < 4u; u++) {
             uint word = w[at + u];
             lo[u] = word & 0x0F0F0F0Fu;
             hi[u] = (word >> 4) & 0x0F0F0F0Fu;
         }
-        // The weights are stored shifted by eight, and the correction the
-        // input carries is 8 x scale x sum(q) — the same for every row it
-        // meets, which is why it is not in this loop's arithmetic.
         [[unroll]] for (uint k = 0u; k < COLUMNS; k++) {
             uint xc = SRCCOL(k) * xw + ab;
             int acc = 0;
@@ -204,95 +147,67 @@ void main() {
     uint n = COLUMNS;
     uint expert = uint(ids[e]) * 2u * p.ffn * rowBytes;
 
-    // A chunk of the expert's columns at a time: the shared memory this
-    // kernel holds is what bounds COLUMNS, so a longer list is walked in
-    // stretches of it and the weights are read once per stretch.
     for (uint base = 0u; base < n; base += COLUMNS) {
+        float part[COLUMNS];
+        lanePart(expert + row * rowBytes, lane, part);
 
-    // The eight lanes of a row fold their partial sums inside the wave.
-    //
-    // They used to fold through shared memory, five hundred and twelve floats
-    // a column, with a barrier at each of the three steps. That array is what
-    // stopped this kernel being built for a wide pass: at thirty-two columns
-    // it asks for sixty-four kilobytes, which is the whole of a workgroup's
-    // shared memory, and the driver dies inside vkCreateShaderModule rather
-    // than refusing the module. A clustered add over eight consecutive
-    // invocations is the same sum with no memory and no barrier — the lanes of
-    // a row are consecutive by construction, t = r * LANES + lane.
-    float part[COLUMNS];
-    lanePart(expert + row * rowBytes, lane, part);
-    for (uint k = 0u; k < COLUMNS; k++) {
-        float sum = subgroupClusteredAdd(part[k], LANES);
-        if (lane == 0u) half_[k * 64u + r] = sum;
-    }
-    barrier();
-
-    // One thread to a value of a column: thirty-two values by COLUMNS of them,
-    // which above sixteen columns is more of them than the workgroup has.
-    for (uint i = t; i < 32u * COLUMNS; i += 512u) {
-        uint k = i / 32u, j2 = i % 32u;
-        float g = half_[k * 64u + j2];
-        float a;
-        if (p.act == 1u) {
-            // SiLU, evaluated rather than looked up: ggml computes a swiglu's
-            // half as x/(1+exp(-x)), and nn/swiglu.go is the other copy.
-            a = g / (1.0 + exp(-g));
-        } else if (g <= -10.0) {
-            // ggml does not evaluate GELU: it rounds to fp16 and looks the
-            // answer up, with the two ends left alone. nn/gelu_table.go says why.
-            a = 0.0;
-        } else if (g >= 10.0) {
-            a = g;
-        } else {
-            a = gelu[floatToHalf(g)];
+        for (uint k = 0u; k < COLUMNS; k++) {
+            float sval = subgroupClusteredAdd(part[k], LANES);
+            if (lane == 0u) half_[k * 64u + r] = sval;
         }
-        half_[k * 64u + j2] = a * half_[k * 64u + 32u + j2];
-    }
-    barrier();
+        barrier();
 
-    // The Q8_0 block, on one thread. Thirty-two values is less work than the
-    // barriers a reduction would cost.
-    for (uint k = t; k < COLUMNS; k += 512u) {
-        uint hb = k * 64u;
-        uint qb = k * 32u;
-        float peak = 0.0;
-        for (uint i = 0u; i < 32u; i++) peak = max(peak, abs(half_[hb + i]));
-
-        float scale = 0.0;
-        int   total = 0;
-        if (peak > 0.0) {
-            // The scale the product uses is the fp16 the reference stored.
-            scale = halfToFloat(floatToHalf(peak / 127.0));
-            float inverse = 127.0 / peak;
-            for (uint i = 0u; i < 32u; i++) {
-                // precise, because the magic constant of nearestInt only
-                // rounds correctly when the product it is added to has already
-                // been rounded to float32. Left alone the compiler contracts
-                // the two into a fused multiply-add.
-                precise float scaled = half_[hb + i] * inverse;
-                int n = clamp(nearestInt(scaled), -128, 127);
-                q32[qb + i] = n;
-                total += n;
+        for (uint i = t; i < 32u * COLUMNS; i += 512u) {
+            uint k = i / 32u, j2 = i % 32u;
+            float g = half_[k * 64u + j2];
+            float a;
+            if (p.act == 1u) {
+                a = g / (1.0 + exp(-g));
+            } else if (g <= -10.0) {
+                a = 0.0;
+            } else if (g >= 10.0) {
+                a = g;
+            } else {
+                a = gelu[floatToHalf(g)];
             }
-        } else {
-            for (uint i = 0u; i < 32u; i++) q32[qb + i] = 0;
+            half_[k * 64u + j2] = a * half_[k * 64u + 32u + j2];
         }
+        barrier();
 
-        if (!ACTIVE(k)) continue;
-        uint at = (SRCCOL(k) * p.used * p.ffn + OUTSLOT(k) * p.ffn + blk * 32u) >> 2;
-        for (uint u = 0u; u < 8u; u++) {
-            uint word = 0u;
-            for (uint m = 0u; m < 4u; m++) {
-                word |= (uint(q32[qb + u * 4u + m]) & 0xFFu) << (m * 8u);
+        for (uint k = t; k < COLUMNS; k += 512u) {
+            uint hb = k * 64u;
+            uint qb = k * 32u;
+            float peak = 0.0;
+            for (uint i = 0u; i < 32u; i++) peak = max(peak, abs(half_[hb + i]));
+
+            float scale = 0.0;
+            int   total = 0;
+            if (peak > 0.0) {
+                scale = halfToFloat(floatToHalf(peak / 127.0));
+                float inverse = 127.0 / peak;
+                for (uint i = 0u; i < 32u; i++) {
+                    precise float scaled = half_[hb + i] * inverse;
+                    int n = clamp(nearestInt(scaled), -128, 127);
+                    q32[qb + i] = n;
+                    total += n;
+                }
+            } else {
+                for (uint i = 0u; i < 32u; i++) q32[qb + i] = 0;
             }
-            aq[at + u] = word;
+
+            if (!ACTIVE(k)) continue;
+            uint at = (SRCCOL(k) * p.used * p.ffn + OUTSLOT(k) * p.ffn + blk * 32u) >> 2;
+            for (uint u = 0u; u < 8u; u++) {
+                uint word = 0u;
+                for (uint m = 0u; m < 4u; m++) {
+                    word |= (uint(q32[qb + u * 4u + m]) & 0xFFu) << (m * 8u);
+                }
+                aq[at + u] = word;
+            }
+            uint slot = SRCCOL(k) * 2u * p.used * blocks + OUTSLOT(k) * blocks + blk;
+            as_[slot] = scale;
+            as_[p.used * blocks + slot] = 8.0 * scale * float(total);
         }
-        uint slot = SRCCOL(k) * 2u * p.used * blocks + OUTSLOT(k) * blocks + blk;
-        as_[slot] = scale;
-        as_[p.used * blocks + slot] = 8.0 * scale * float(total);
-    }
-    // The next stretch of the list overwrites the shared arrays this one has
-    // just been read out of.
-    barrier();
+        barrier();
     }
 }
