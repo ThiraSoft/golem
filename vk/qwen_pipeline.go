@@ -23,6 +23,7 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q40.comp -o shaders/matvec_q40.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q41.comp -o shaders/matvec_q41.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q5k.comp -o shaders/matvec_q5k.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/swiglu_act.comp -o shaders/swiglu_act.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/qwen_attn_prep.comp -o shaders/qwen_attn_prep.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/qwen_attn_gqa.comp -o shaders/qwen_attn_gqa.spv
@@ -69,9 +70,13 @@ var matvecQ80SPIRV []byte
 //go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q41.comp -o shaders/matvec_q41_16.spv
 //go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q5k.comp -o shaders/matvec_q5k_16.spv
 //go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32_16.spv
-//go:generate glslc -O -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q40.comp -o shaders/matvec_q40_32.spv
-//go:generate glslc -O -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q41.comp -o shaders/matvec_q41_32.spv
-//go:generate glslc -O -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q5k.comp -o shaders/matvec_q5k_32.spv
+
+// The tiled product again, for the Q4_1 weights a Q4_0 checkpoint still keeps:
+// llama.cpp's quantizer leaves ffn_down at Q4_1, and it is the largest matrix
+// in a block. shaders/matmul.comp's -DQ41 says what differs — twenty bytes a
+// block instead of eighteen, and a minimum where the nibble's offset of eight
+// was.
+//
 
 //go:embed shaders/matvec2.spv
 var matvec2SPIRV []byte
@@ -137,24 +142,26 @@ var matvecQ5K_16SPIRV []byte
 //go:embed shaders/matvec_f32_16.spv
 var matvecF32_16SPIRV []byte
 
-//go:embed shaders/matvec_q40_32.spv
-var matvecQ40_32SPIRV []byte
-
-//go:embed shaders/matvec_q41_32.spv
-var matvecQ41_32SPIRV []byte
-
-//go:embed shaders/matvec_q5k_32.spv
-var matvecQ5K_32SPIRV []byte
+// narrowChunk is the widest a mat-vec is dispatched at. A pass wider than this
+// runs it that many columns at a time, at an offset.
+//
+// Sixteen and not more. The kernels build at thirty-two too, and the
+// thirty-two-wide form looked a third faster — and was wrong.
+// TestVulkanWidePassMatchesTokenPath holds a wide pass to what the same tokens
+// give one at a time, bit for bit, and only widths up to sixteen pass it. What
+// this caps is the two projections whose weights have no tiled form here;
+// everything else goes through the tiled product at these widths anyway.
+const narrowChunk = 16
 
 // qwenWide is the widest pass any of these binaries answers. Everything
 // per-column is allocated for it.
-const qwenWide = 512
+const qwenWide = 128
 
 // qwenWidths are the widths a pass may take, largest first. A run of tokens is
 // cut into passes of these: a hundred positions is twelve of eight and one of
 // four, and the remainder never falls back to one column at a time unless it
 // is one column.
-var qwenWidths = [...]int{512, 256, 128, 64, 32, 16, 8, 4, 2, 1}
+var qwenWidths = [...]int{128, 64, 32, 16, 8, 4, 2, 1}
 
 //go:embed shaders/swiglu_act.spv
 var swigluActSPIRV []byte
@@ -425,9 +432,9 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		spirv   []byte
 	}{
 		{p.pipeMatvec, 2, matvec2SPIRV}, {p.pipeMatvec, 4, matvec4SPIRV}, {p.pipeMatvec, 8, matvecQwen8SPIRV}, {p.pipeMatvec, 16, matvecQwen16SPIRV},
-		{p.pipeMatQ40, 2, matvecQ40_2SPIRV}, {p.pipeMatQ40, 4, matvecQ40_4SPIRV}, {p.pipeMatQ40, 8, matvecQ40_8SPIRV}, {p.pipeMatQ40, 16, matvecQ40_16SPIRV}, {p.pipeMatQ40, 32, matvecQ40_32SPIRV},
-		{p.pipeMatQ41, 2, matvecQ41_2SPIRV}, {p.pipeMatQ41, 4, matvecQ41_4SPIRV}, {p.pipeMatQ41, 8, matvecQ41_8SPIRV}, {p.pipeMatQ41, 16, matvecQ41_16SPIRV}, {p.pipeMatQ41, 32, matvecQ41_32SPIRV},
-		{p.pipeMatQ5K, 2, matvecQ5K_2SPIRV}, {p.pipeMatQ5K, 4, matvecQ5K_4SPIRV}, {p.pipeMatQ5K, 8, matvecQ5K_8SPIRV}, {p.pipeMatQ5K, 16, matvecQ5K_16SPIRV}, {p.pipeMatQ5K, 32, matvecQ5K_32SPIRV},
+		{p.pipeMatQ40, 2, matvecQ40_2SPIRV}, {p.pipeMatQ40, 4, matvecQ40_4SPIRV}, {p.pipeMatQ40, 8, matvecQ40_8SPIRV}, {p.pipeMatQ40, 16, matvecQ40_16SPIRV},
+		{p.pipeMatQ41, 2, matvecQ41_2SPIRV}, {p.pipeMatQ41, 4, matvecQ41_4SPIRV}, {p.pipeMatQ41, 8, matvecQ41_8SPIRV}, {p.pipeMatQ41, 16, matvecQ41_16SPIRV},
+		{p.pipeMatQ5K, 2, matvecQ5K_2SPIRV}, {p.pipeMatQ5K, 4, matvecQ5K_4SPIRV}, {p.pipeMatQ5K, 8, matvecQ5K_8SPIRV}, {p.pipeMatQ5K, 16, matvecQ5K_16SPIRV},
 		{p.pipeMatF32, 2, matvecF32_2SPIRV}, {p.pipeMatF32, 4, matvecF32_4SPIRV}, {p.pipeMatF32, 8, matvecF32_8SPIRV}, {p.pipeMatF32, 16, matvecF32_16SPIRV},
 	} {
 		if err := w.pipe.Wide(w.columns, w.spirv); err != nil {
@@ -452,8 +459,6 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		{tiledColumns, matmulWide32SPIRV},
 		{64, matmulWide64SPIRV},
 		{128, matmulWidest128SPIRV},
-		{256, matmulWidest256SPIRV},
-		{wideColumns, matmulWide()},
 	}
 	wave := uint32(0)
 	if p.coop {
@@ -465,8 +470,6 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 			{tiledColumns, matmulCoop32SPIRV},
 			{64, matmulCoop64SPIRV},
 			{128, matmulCoop128SPIRV},
-			{256, matmulCoop256SPIRV},
-			{wideColumns, matmulCoop512SPIRV},
 		}
 	}
 	for _, w := range tiled {
@@ -485,10 +488,15 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 	if p.hidden, err = d.Readback(dim*4, bufferUsageStorage); err != nil {
 		return nil, err
 	}
-	if p.posIn, err = d.Host(64, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
+	// One position a column of the widest pass. It was sixty-four bytes when a
+	// pass carried two, which is sixteen of them — and a pass of thirty-two
+	// then wrote past the end of it and copied twice the buffer's length into
+	// the device's. That answered rather than failing: every wide pass read
+	// somebody else's positions.
+	if p.posIn, err = d.Host(qwenWide*4, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
 		return nil, err
 	}
-	if p.posBuf, err = d.Local(64, bufferUsageStorage); err != nil {
+	if p.posBuf, err = d.Local(qwenWide*4, bufferUsageStorage); err != nil {
 		return nil, err
 	}
 	for _, into := range []**Buffer{&p.xs, &p.resid, &p.normed, &p.normedQ, &p.normedS, &p.ffnNorm, &p.ffnNormQ, &p.ffnNormS, &p.ffnOut, &p.none} {
@@ -950,8 +958,14 @@ func (p *QwenPipeline) record(r *Recorder, columns, snapAt int) {
 // The two push blocks put that offset in different places, so there is one of
 // these for each rather than an unsafe.Pointer and a field index.
 func (p *QwenPipeline) product(r *Recorder, set *Set, rows, columns int, push moePush) {
+	// One slice of the shared dimension, always. The tiled product divides by
+	// this to find its slice, and a zero here is a division by zero in the
+	// shader — which does not fail, it answers: every wide pass was wrong
+	// until this line, and nothing caught it because no test read a prompt
+	// past sixteen positions. TestVulkanWidePassMatchesTokenPath does now.
+	push.split = 1
 	for at := 0; at < columns; {
-		w := set.widest(columns - at)
+		w := set.widest(min(columns-at, narrowChunk))
 		if w == 0 {
 			w = 1
 		}
@@ -966,7 +980,7 @@ func (p *QwenPipeline) product(r *Recorder, set *Set, rows, columns int, push mo
 // the mat-vec.
 func (p *QwenPipeline) productK(r *Recorder, set *Set, rows, columns int, push matvecKPush) {
 	for at := 0; at < columns; {
-		w := set.widest(columns - at)
+		w := set.widest(min(columns-at, narrowChunk))
 		if w == 0 {
 			w = 1
 		}
@@ -1315,6 +1329,15 @@ func (p *QwenPipeline) recordFFN(r *Recorder, b *qwenFFNBlock, columns int) {
 	r.Dispatch(p.setAct, uint32((s.FFN*columns+255)/256), unsafe.Pointer(&act))
 	r.Barrier()
 
+	// Wide enough and the down projection is a tiled product against the
+	// eight-bit form; narrow and it is the mat-vec against the floats, which
+	// is what a token has always run.
+	// The down projection stays on the mat-vec against the floats at every
+	// width. Everything above it reads an activation that was already in eight
+	// bits, so moving those to the tiled product changed nothing about the
+	// arithmetic; this one would have to be quantized first, and a wide pass
+	// would then answer something a token does not. What it costs is measured
+	// in qwen35/cost_test.go and it is most of what is left.
 	p.productK(r, b.setDown, s.Dim, columns, down)
 }
 
