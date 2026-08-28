@@ -148,20 +148,21 @@ func (m *Model) Forward(token int32, pos int) []float32 {
 
 // ForwardBatch processes a sequential run of tokens starting at startPos.
 //
-// On the card the run is carried two tokens to a pass, because a pass reads
-// every weight in the model once whether it answers one column or two. The
-// delta net's recurrence still runs in order inside the pass; what is shared is
-// the reading of the weights, which is the whole cost.
+// On the card the run is carried up to eight tokens to a pass, because a pass
+// reads every weight in the model once whatever it answers — a pass of two
+// costs 1.056 of a pass of one. The delta net's recurrence still runs in order
+// inside the pass; what is shared is the reading of the weights, which is the
+// whole cost. WidthFor picks the widest binary that fits what is left, so a
+// run ends on a pass of four or two rather than on a tail of single columns.
 func (m *Model) ForwardBatch(tokens []int32, startPos int) [][]float32 {
 	out := make([][]float32, len(tokens))
 	if m.gpuPipe != nil {
-		wide := m.gpuPipe.Columns()
-		embeds := make([][]float32, wide)
+		embeds := make([][]float32, m.gpuPipe.Columns())
 		for i := range embeds {
 			embeds[i] = make([]float32, m.Cfg.Dim)
 		}
 		for t := 0; t < len(tokens); {
-			n := min(wide, len(tokens)-t)
+			n := m.gpuPipe.WidthFor(len(tokens) - t)
 			positions := make([]int, n)
 			for c := 0; c < n; c++ {
 				m.W.TokenEmbd.Row(int(tokens[t+c]), embeds[c])
@@ -174,7 +175,7 @@ func (m *Model) ForwardBatch(tokens []int32, startPos int) [][]float32 {
 			for c := 0; c < n; c++ {
 				out[t+c] = append([]float32(nil), hs[c]...)
 			}
-			copy(m.x, m.gpuPipe.Hidden()[(n-1)*m.Cfg.Dim:])
+			copy(m.x, m.gpuPipe.HiddenColumn(n-1))
 			t += n
 		}
 		return out

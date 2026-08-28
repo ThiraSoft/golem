@@ -39,16 +39,36 @@ var matvecF32SPIRV []byte
 //go:embed shaders/matvec_q80.spv
 var matvecQ80SPIRV []byte
 
-// The same five kernels built for a pass of two columns. Two is what a draft
-// verified beside the token that drafted it needs, and a pass of two costs
-// what a pass of one costs: the weights are read once either way, and a token
-// is bounded by reading them.
+// The same five kernels built for a pass of two, four and eight columns.
+//
+// Two is what a draft verified beside the token that drafted it needs, and a
+// pass of two costs 1.056 of a pass of one: the weights are read once either
+// way, and a token is bounded by reading them. Reading a prompt is the same
+// bargain taken further — eight columns for one reading of the model — and
+// eight is where a mat-vec stops, because past it the accumulator a thread
+// carries a column in stops fitting in registers and the answer is a tiled
+// product rather than a wider mat-vec. vk/matmul.go's smallColumns says the
+// same number for the same reason.
 //
 //go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec2.spv
 //go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q40.comp -o shaders/matvec_q40_2.spv
 //go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q41.comp -o shaders/matvec_q41_2.spv
 //go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q5k.comp -o shaders/matvec_q5k_2.spv
 //go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32_2.spv
+//go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec4.spv
+//go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q40.comp -o shaders/matvec_q40_4.spv
+//go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q41.comp -o shaders/matvec_q41_4.spv
+//go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q5k.comp -o shaders/matvec_q5k_4.spv
+//go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32_4.spv
+//go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q40.comp -o shaders/matvec_q40_8.spv
+//go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q41.comp -o shaders/matvec_q41_8.spv
+//go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q5k.comp -o shaders/matvec_q5k_8.spv
+//go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32_8.spv
+//go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_qwen16.spv
+//go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q40.comp -o shaders/matvec_q40_16.spv
+//go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q41.comp -o shaders/matvec_q41_16.spv
+//go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q5k.comp -o shaders/matvec_q5k_16.spv
+//go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32_16.spv
 
 //go:embed shaders/matvec2.spv
 var matvec2SPIRV []byte
@@ -65,9 +85,64 @@ var matvecQ5K_2SPIRV []byte
 //go:embed shaders/matvec_f32_2.spv
 var matvecF32_2SPIRV []byte
 
-// qwenWide is the widest pass the two-column binaries answer. Everything
+//go:embed shaders/matvec4.spv
+var matvec4SPIRV []byte
+
+// matvec8.spv is vk/mixture.go's, built from the same source at eight columns.
+// The delta net's largest two projections read it: its q+k+v and its gate are
+// the widest matrices in the block, and eight columns is where a mat-vec ends.
+//
+//go:embed shaders/matvec8.spv
+var matvecQwen8SPIRV []byte
+
+//go:embed shaders/matvec_q40_4.spv
+var matvecQ40_4SPIRV []byte
+
+//go:embed shaders/matvec_q41_4.spv
+var matvecQ41_4SPIRV []byte
+
+//go:embed shaders/matvec_q5k_4.spv
+var matvecQ5K_4SPIRV []byte
+
+//go:embed shaders/matvec_f32_4.spv
+var matvecF32_4SPIRV []byte
+
+//go:embed shaders/matvec_q40_8.spv
+var matvecQ40_8SPIRV []byte
+
+//go:embed shaders/matvec_q41_8.spv
+var matvecQ41_8SPIRV []byte
+
+//go:embed shaders/matvec_q5k_8.spv
+var matvecQ5K_8SPIRV []byte
+
+//go:embed shaders/matvec_f32_8.spv
+var matvecF32_8SPIRV []byte
+
+//go:embed shaders/matvec_qwen16.spv
+var matvecQwen16SPIRV []byte
+
+//go:embed shaders/matvec_q40_16.spv
+var matvecQ40_16SPIRV []byte
+
+//go:embed shaders/matvec_q41_16.spv
+var matvecQ41_16SPIRV []byte
+
+//go:embed shaders/matvec_q5k_16.spv
+var matvecQ5K_16SPIRV []byte
+
+//go:embed shaders/matvec_f32_16.spv
+var matvecF32_16SPIRV []byte
+
+// qwenWide is the widest pass any of these binaries answers. Everything
 // per-column is allocated for it.
-const qwenWide = 2
+const qwenWide = 16
+
+// qwenWidths are the widths a pass may take, largest first. A run of tokens is
+// cut into passes of these: a hundred positions is twelve of eight and one of
+// four, and the remainder never falls back to one column at a time unless it
+// is one column.
+var qwenWidths = [...]int{16, 8, 4, 2, 1}
 
 //go:embed shaders/swiglu_act.spv
 var swigluActSPIRV []byte
@@ -316,19 +391,22 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 			return nil, err
 		}
 	}
-	// The two-column binaries share their pipelines' layouts, so the sets made
-	// for the one-column form reach them without being made again.
+	// The wide binaries share their pipelines' layouts, so the sets made for
+	// the one-column form reach them without being made again. Every one of
+	// them has to exist at every width qwenWidths names: a pass asks for its
+	// width by name and there is no falling back to a narrower binary.
 	for _, w := range []struct {
-		pipe  *Pipeline
-		spirv []byte
+		pipe    *Pipeline
+		columns int
+		spirv   []byte
 	}{
-		{p.pipeMatvec, matvec2SPIRV},
-		{p.pipeMatQ40, matvecQ40_2SPIRV},
-		{p.pipeMatQ41, matvecQ41_2SPIRV},
-		{p.pipeMatQ5K, matvecQ5K_2SPIRV},
-		{p.pipeMatF32, matvecF32_2SPIRV},
+		{p.pipeMatvec, 2, matvec2SPIRV}, {p.pipeMatvec, 4, matvec4SPIRV}, {p.pipeMatvec, 8, matvecQwen8SPIRV}, {p.pipeMatvec, 16, matvecQwen16SPIRV},
+		{p.pipeMatQ40, 2, matvecQ40_2SPIRV}, {p.pipeMatQ40, 4, matvecQ40_4SPIRV}, {p.pipeMatQ40, 8, matvecQ40_8SPIRV}, {p.pipeMatQ40, 16, matvecQ40_16SPIRV},
+		{p.pipeMatQ41, 2, matvecQ41_2SPIRV}, {p.pipeMatQ41, 4, matvecQ41_4SPIRV}, {p.pipeMatQ41, 8, matvecQ41_8SPIRV}, {p.pipeMatQ41, 16, matvecQ41_16SPIRV},
+		{p.pipeMatQ5K, 2, matvecQ5K_2SPIRV}, {p.pipeMatQ5K, 4, matvecQ5K_4SPIRV}, {p.pipeMatQ5K, 8, matvecQ5K_8SPIRV}, {p.pipeMatQ5K, 16, matvecQ5K_16SPIRV},
+		{p.pipeMatF32, 2, matvecF32_2SPIRV}, {p.pipeMatF32, 4, matvecF32_4SPIRV}, {p.pipeMatF32, 8, matvecF32_8SPIRV}, {p.pipeMatF32, 16, matvecF32_16SPIRV},
 	} {
-		if err := w.pipe.Wide(qwenWide, w.spirv); err != nil {
+		if err := w.pipe.Wide(w.columns, w.spirv); err != nil {
 			return nil, err
 		}
 	}
@@ -1048,7 +1126,15 @@ func (p *QwenPipeline) setPos(pos int) {
 
 // Hidden is the last pass's state before the output norm. The
 // multi-token-prediction block reads it, and so does the block after it.
-func (p *QwenPipeline) Hidden() []float32 { return p.hidden.Floats()[:p.shape.Dim] }
+func (p *QwenPipeline) Hidden() []float32 { return p.HiddenColumn(0) }
+
+// HiddenColumn is the same for one column of a wider pass. The readback holds
+// every column of the pass that wrote it, and the last of them is the one a
+// caller carrying a conversation forward wants.
+func (p *QwenPipeline) HiddenColumn(c int) []float32 {
+	dim := p.shape.Dim
+	return p.hidden.Floats()[c*dim : (c+1)*dim]
+}
 
 func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt int) {
 	s := p.shape
@@ -1300,6 +1386,18 @@ func (p *QwenPipeline) HasMTP() bool { return p.mtp != nil }
 
 // Columns is how many tokens one pass can carry.
 func (p *QwenPipeline) Columns() int { return qwenWide }
+
+// WidthFor is the widest pass that fits n remaining tokens. A run is read in
+// passes of these rather than one width and a ragged tail of single columns:
+// the mat-vec binaries exist at four widths and the largest that fits wins.
+func (p *QwenPipeline) WidthFor(n int) int {
+	for _, w := range qwenWidths {
+		if w <= n {
+			return w
+		}
+	}
+	return 1
+}
 
 // DraftMTP runs the prediction block over one already-normed and concatenated
 // [enorm(embed) | hnorm(hidden)] pair and returns the hidden state under the

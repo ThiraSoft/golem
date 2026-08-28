@@ -90,7 +90,7 @@ Qwen3.5 27B A3B, a seventeen-token prompt, greedy:
 
 | | prompt | a token at a time | drafting | drafts accepted |
 | --- | ---: | ---: | ---: | ---: |
-| RX 9070 XT | 47.6 /s | 30.8 t/s | **45.2 t/s** | 75% |
+| RX 9070 XT | 98.6 /s | 30.1 t/s | **45.1 t/s** | 75% |
 | i7-9700K, 8 threads | 0.7 /s | 0.72 t/s | _refused_ | — |
 
 **Drafting is refused on the processor**, and the reason is one measurement. A speculative step costs a draft plus a pass of two columns, against the one-column pass it hopes to replace:
@@ -98,10 +98,21 @@ Qwen3.5 27B A3B, a seventeen-token prompt, greedy:
 | cost, as a fraction of one token | on the card | on the processor |
 | --- | ---: | ---: |
 | the draft | 0.08 | 0.03 |
-| the pass of two columns | **0.97** | **1.98** |
-| drafts that must be accepted to break even | 5% | 101% |
+| the pass of two columns | **0.95** | **1.96** |
+| drafts that must be accepted to break even | 3% | 99% |
 
 The card reads a block's weights once whether the pass carries one column or two, so verifying two tokens costs what drawing one did. The processor at this size is bound by arithmetic rather than by reading the weights, so two columns cost two columns — and no acceptance rate can pay for that. `qwen35/cost_test.go` is where both tables come from.
+
+The same bargain is what reads a prompt, taken as far as a mat-vec goes. A pass carries up to sixteen positions, and what one costs on the card says where that stops:
+
+| positions in the pass | 1 | 2 | 4 | 8 | 16 | 32 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| the pass | 34.4ms | 34.7ms | 36.9ms | 52.3ms | 86.2ms | 190.8ms |
+| positions a second | 29 | 58 | 108 | 153 | **186** | 168 |
+
+Two columns for the price of one, four for a tenth more, and then a fixed 34ms of weight reading with about four milliseconds a column on top. Thirty-two is slower than sixteen — the accumulator a thread carries a column in stops fitting in registers — so sixteen is where a mat-vec ends. A prompt of 256 positions reads at 183 a second, against 62 when a pass carried two.
+
+**It is still four times behind llama.cpp**, which reads the same model at 615. The remaining four milliseconds a column are not the recurrence: with the delta net's scan and convolution forced down to one column the sixteen-wide pass only falls from 86.2ms to 81.7ms, so the state that runs from one position to the next costs a twentieth of it. It is the mat-vec, which reads a weight once for sixteen columns but has no tiling and no reuse of the activation. Past this width the answer is the tiled product `vk/matmul.go` already runs for Gemma, which is what reads that model's prompts at 4541 a second — and porting Qwen3.5's projections onto it is the work left.
 
 ## 🧠 Supported Models
 
@@ -109,14 +120,14 @@ The card reads a block's weights once whether the pass carries one column or two
 | --- | --- | --- |
 | **Gemma 4** | E2B, 12B, 26B A4B (mixture of 128 experts). Text, Vision, Audio. | Reading a prompt ×1.24 (E2B), ×1.33 (12B), ×1.06 (26B A4B). Generating, a tie: ×1.01, ×1.04, ×1.06 — vs llama.cpp |
 | **Qwen3** | Dense models, from a GGUF. | 4B: ×1.13 reading, ×1.00 generating. 0.6B: ×0.99 reading, ×0.85 generating — vs llama.cpp |
-| **Qwen3.5** | 27B A3B: forty-eight gated delta nets and sixteen attentions, three to one, over a mixture of experts — plus the checkpoint's own multi-token-prediction head, which drafts the second token of every pass. | 0.72 t/s on an i7-9700K: a delta net rewrites a 128×128 state a head every token, and that is arithmetic no kernel makes cheaper. On a card, 30.8 a token at a time and **45.2 drafting**, against llama.cpp's Vulkan build at 32.6 |
+| **Qwen3.5** | 27B A3B: forty-eight gated delta nets and sixteen attentions, three to one, over a mixture of experts — plus the checkpoint's own multi-token-prediction head, which drafts the second token of every pass. | 0.72 t/s on an i7-9700K: a delta net rewrites a 128×128 state a head every token, and that is arithmetic no kernel makes cheaper. On a card, 30.1 a token at a time and **45.1 drafting**, against llama.cpp's Vulkan build at 32.6 |
 | **Pocket TTS** | 13 shipped models across 6 languages, voice cloning included. | ×2.31 and ×1.69 the speed of the PyTorch reference, on the 24- and 6-layer models |
 
 In absolute terms, on an i7-9700K with eight threads and Q4_0 weights: Gemma E2B draws 22.6 tokens a second and reads 204; the 12B, 5.0 and 42; the 26B A4B, 13.1 and 51; Qwen3 4B, 14.6 and 110. Pocket TTS speaks at ×2.94 real time in French, ×6.81 in English.
 
 **The 0.6B is the one this engine loses**, and [`qwen/README.md`](qwen/README.md) says why: at 320 MB the weights fit close enough that the memory bus stops being the limit, and what is left is arithmetic, where llama.cpp's kernels win. This engine is built for the regime where reading the weights is the cost, and it says so where it is not.
 
-**Qwen3.5 reads prompts slowly** — 47.6 positions a second on a card against llama.cpp's 615. Generation is ahead; the prompt is not, because a recurrent block carries state from one position to the next and this engine's pass is two positions wide where it wants five hundred. That is the work left on it, and it is named here rather than left out of the table.
+**Qwen3.5 reads prompts slowly** — 183 positions a second on a card against llama.cpp's 615. Generation is ahead; the prompt is not, because a recurrent block carries state from one position to the next and this engine's pass is two positions wide where it wants five hundred. That is the work left on it, and it is named here rather than left out of the table.
 
 ## 👁️ Multimodal (Vision & Audio)
 

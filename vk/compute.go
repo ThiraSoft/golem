@@ -17,6 +17,8 @@ package vk
 // with a barrier between them.
 
 import (
+	"fmt"
+	"sort"
 	"unsafe"
 )
 
@@ -290,7 +292,24 @@ func (r *Recorder) DispatchColumns(s *Set, groups, columns uint32, push unsafe.P
 // though how many workgroups it takes is the kernel's own business and the
 // caller passes it.
 func (r *Recorder) DispatchWide(s *Set, columns int, groups uint32, push unsafe.Pointer) {
-	r.dispatch(s, s.p.wide[columns], groups, 1, push)
+	pipeline, ok := s.p.wide[columns]
+	if !ok {
+		// Without this the zero handle reaches the driver and the process
+		// dies inside vkCmdBindPipeline with no line of its own.
+		panic(fmt.Sprintf("vk: no binary for a pass of %d columns; this pipeline was built for %v",
+			columns, sortedWidths(s.p.wide)))
+	}
+	r.dispatch(s, pipeline, groups, 1, push)
+}
+
+// sortedWidths is what a pipeline was built for, for that message.
+func sortedWidths(wide map[int]uint64) []int {
+	out := make([]int, 0, len(wide))
+	for w := range wide {
+		out = append(out, w)
+	}
+	sort.Ints(out)
+	return out
 }
 
 func (r *Recorder) dispatch(s *Set, pipeline uint64, groups, columns uint32, push unsafe.Pointer) {
