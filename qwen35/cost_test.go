@@ -160,9 +160,9 @@ func TestGenerationCost(t *testing.T) {
 // A pass reads every weight in the model once whatever it carries, so the
 // first columns are nearly free. Measured on an RX 9070 XT:
 //
-//	positions   1       16      32       64       128      256
-//	the pass    31.9ms  85.2ms  125.2ms  221.2ms  423.8ms  834.3ms
-//	a second    31      188     256      289      302      307
+//	positions   1     16      32    64     128      256      512
+//	the pass    32ms  83.4ms  90ms  154ms  291.3ms  539.6ms  1.063s
+//	a second    31    192     355   416    439      474      481
 //
 // The widest is the fastest and the test says so, because that is the property
 // vk/qwen_pipeline.go's qwenWidths depends on: a run takes the widest pass that
@@ -188,7 +188,7 @@ func TestPassWidthCost(t *testing.T) {
 	m.W.TokenEmbd.Row(100, emb)
 
 	best, at := 0.0, 0
-	for _, w := range []int{1, 16, 32, 64, 128, 256} {
+	for _, w := range []int{1, 16, 32, 64, 128, 256, 512} {
 		if w > m.gpuPipe.Columns() {
 			continue
 		}

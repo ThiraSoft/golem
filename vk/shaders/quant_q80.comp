@@ -1,25 +1,23 @@
 #version 450
 #extension GL_EXT_control_flow_attributes : enable
 
-// Pointwise SwiGLU activation, and its Q8_0 form beside it.
+// The Q8_0 form of an activation that is already in floats, in the layout the
+// quantized products read: a column's scales, then its corrections, and the
+// magnitudes packed four to a word.
 //
-// act = SiLU(gate) * up. Thirty-two values to a thread rather than one,
-// because thirty-two is a Q8_0 block and the thread that computed them is
-// holding all of it — the same reason shaders/moe_gateup.comp quantizes where
-// it activates rather than in a pass of its own.
+// shaders/norm.comp writes this beside a norm and shaders/swiglu_act.comp
+// beside an activation, because both hold the values in registers when they
+// are done with them. This one is for the activations nothing else was going
+// to touch — the delta net's output, which reaches its projection as floats
+// out of shaders/ssm_scan.comp and has no other reason to be walked again.
 //
-// The floats are still written. A down projection whose weights are Q4_1 or
-// whose pass is narrow reads them through a mat-vec; a Q4_0 one in a wide pass
-// reads the quantized form instead, because the tiled product wants its
-// activation already in eight bits. vk/qwen_pipeline.go's recordFFN chooses.
+// A thread a block of thirty-two, which is what it quantizes.
 
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly  buffer Gate { float gate[]; };
-layout(std430, binding = 1) readonly  buffer Up   { float up[];   };
-layout(std430, binding = 2) writeonly buffer Act  { float act[];  };
-layout(std430, binding = 3) writeonly buffer AQ   { uint  aq[];   };
-layout(std430, binding = 4) writeonly buffer AS   { float as_[];  };
+layout(std430, binding = 0) readonly  buffer X  { float x[];   };
+layout(std430, binding = 1) writeonly buffer AQ { uint  aq[];  };
+layout(std430, binding = 2) writeonly buffer AS { float as_[]; };
 
 layout(push_constant) uniform Push {
     uint n;       // values in one column, a multiple of thirty-two
@@ -70,15 +68,8 @@ void main() {
     uint b    = id - c * nb;
     uint base = c * p.n + b * 32u;
 
-    float v[32];
     float peak = 0.0;
-    [[unroll]] for (uint i = 0u; i < 32u; i++) {
-        float g = gate[base + i];
-        float x = (g / (1.0 + exp(-g))) * up[base + i];
-        v[i] = x;
-        act[base + i] = x;
-        peak = max(peak, abs(x));
-    }
+    [[unroll]] for (uint i = 0u; i < 32u; i++) peak = max(peak, abs(x[base + i]));
 
     float scale = 0.0;
     int   total = 0;
@@ -91,7 +82,7 @@ void main() {
         [[unroll]] for (uint u = 0u; u < 8u; u++) {
             uint w = 0u;
             [[unroll]] for (uint m = 0u; m < 4u; m++) {
-                int q = clamp(nearestInt(v[u * 4u + m] * inverse), -128, 127);
+                int q = clamp(nearestInt(x[base + u * 4u + m] * inverse), -128, 127);
                 total += q;
                 w |= (uint(q) & 0xFFu) << (m * 8u);
             }
@@ -102,8 +93,6 @@ void main() {
     uint at = base >> 2;
     [[unroll]] for (uint u = 0u; u < 8u; u++) aq[at + u] = word[u];
 
-    // A column's scales, then its corrections, which is the layout
-    // shaders/matvec.comp and shaders/matmul.comp both read.
     uint slot = c * 2u * nb + b;
     as_[slot]      = scale;
     as_[slot + nb] = 8.0 * scale * float(total);

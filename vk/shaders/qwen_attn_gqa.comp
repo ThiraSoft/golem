@@ -4,30 +4,38 @@
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_control_flow_attributes : enable
 
-// One token's grouped-query attention: scores, softmax, mix, and the output
-// gate, one workgroup to a query head.
+// Grouped-query attention: scores, softmax, mix, and the output gate, one
+// workgroup to a head and QTILE columns of the pass.
 //
 // The keys and values are already in the cache — qwen_attn_prep put them
 // there — so nothing here writes across workgroups and nothing has to be
 // ordered against another head.
 //
-// The scores are tiled eight positions at a time with thirty-two lanes to a
-// position, so the thirty-two lanes of one position read thirty-two
-// consecutive floats of its key. A lane per position instead, walking a whole
-// key by itself, reads the same bytes in as many separate transactions as
-// there are lanes.
-
-#ifndef MAXCTX
-#define MAXCTX 8192u
-#endif
+// **A workgroup answers several columns at once, and that is the whole point
+// of this kernel's shape.** It used to answer one, which meant that a pass of
+// five hundred and twelve positions read the entire key and value cache five
+// hundred and twelve times over per head: the arithmetic of an attention is
+// quadratic but its *traffic* need not be, and one column to a workgroup makes
+// it so. With QTILE columns to a workgroup a tile of keys is read once and
+// scored against QTILE queries out of registers, and a tile of values is read
+// once and mixed into QTILE accumulators — the same multiplications, QTILE
+// times less memory. llama.cpp's flash_attn kernels tile the queries for
+// exactly this reason and measure a fraction of a millisecond on the shape
+// where this file used to measure nine.
+//
+// The scores are still tiled sixteen positions at a time with sixteen lanes to
+// a position, so the sixteen lanes of one position read sixteen consecutive
+// floats of its key. A lane per position instead, walking a whole key by
+// itself, reads the same bytes in as many separate transactions as there are
+// lanes.
 
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly  buffer QOut   { float qOut[];   }; // [heads*256], normed and rotated
+layout(std430, binding = 0) readonly  buffer QOut   { float qOut[];   }; // [cols*heads*256], normed and rotated
 layout(std430, binding = 1) readonly  buffer KCache { float kCache[]; };
 layout(std430, binding = 2) readonly  buffer VCache { float vCache[]; };
-layout(std430, binding = 3) readonly  buffer QIn    { float qIn[];    }; // [heads*512], the gate at +256
-layout(std430, binding = 4) writeonly buffer Out    { float out_[];   }; // [heads*256]
+layout(std430, binding = 3) readonly  buffer QIn    { float qIn[];    }; // [cols*heads*512], the gate at +256
+layout(std430, binding = 4) writeonly buffer Out    { float out_[];   }; // [cols*heads*256]
 // See qwen_attn_prep.comp: the position is a buffer so the pass compiles once.
 layout(std430, binding = 5) readonly  buffer Pos    { uint  posv[];   };
 
@@ -36,77 +44,144 @@ layout(push_constant) uniform Push {
     uint headsPerKV; // 6
     uint heads;      // 24
     float scale;     // 1/sqrt(headDim)
+    uint columns;    // how many columns the pass carries, for the tail tile
 } p;
 
-// One workgroup a head, one column of the pass on the second axis.
-#define COL (gl_WorkGroupID.y)
+// QTILE columns of the pass to a workgroup. Eight holds ninety-odd registers a
+// thread, which the occupancy still absorbs; the traffic saving is the factor
+// itself, so this is the number to sweep.
+#ifndef QTILE
+#define QTILE 8u
+#endif
 
-shared float scores[MAXCTX];
-shared float reduce_[8];
+const uint LANES = 16u;      // lanes to a position
+const uint TILE  = 16u;      // positions to a tile, LANES*TILE == 256
+const uint DIM   = 256u;     // the head dimension
+const uint PERL  = DIM / LANES;
 
-const uint LANES = 32u;      // lanes to a position
-const uint TILE  = 8u;       // positions to a tile, LANES*TILE == 256
+// One tile of scores for every query of the workgroup, and their exponentials.
+// This kernel used to keep the whole row — `shared float scores[8192]`,
+// thirty-two kilobytes whatever the context actually was — and a workgroup
+// that asks for half the card's shared memory gets two per compute unit
+// whatever else is true. The softmax runs over the tiles instead, carrying a
+// running maximum and sum a query and rescaling the mix when the maximum
+// moves, which is what FlashAttention is and what llama.cpp's
+// flash_attn_cm1.comp does. A kilobyte now, and the occupancy is the register
+// file's business again.
+shared float scores[QTILE * TILE];
+shared float expw[QTILE * TILE];
 
 void main() {
-    uint h  = gl_WorkGroupID.x;
-    uint t  = gl_LocalInvocationID.x;
-    uint kv = h / p.headsPerKV;
-
+    uint h    = gl_WorkGroupID.x;
+    uint t    = gl_LocalInvocationID.x;
+    uint kv   = h / p.headsPerKV;
     uint lane = t % LANES;
     uint slot = t / LANES;
 
-    uint n = posv[COL] + 1u;
-    uint qBase = COL * p.heads * 256u + h * 256u;
-    uint cacheBase = kv * p.maxContext * 256u;
+    uint col0 = gl_WorkGroupID.y * QTILE;
+    uint cacheBase = kv * p.maxContext * DIM;
 
-    // 1. scores[i] = dot(q, k_i) * scale
-    for (uint i0 = 0u; i0 < n; i0 += TILE) {
-        uint i = i0 + slot;
-        float part = 0.0;
-        if (i < n) {
-            uint kBase = cacheBase + i * 256u;
-            [[unroll]] for (uint d = lane; d < 256u; d += LANES) {
-                part += qOut[qBase + d] * kCache[kBase + d];
-            }
+    // How far each of this workgroup's queries may look. A column past the end
+    // of the pass looks nowhere and is never written.
+    uint n[QTILE];
+    uint nMax = 0u;
+    [[unroll]] for (uint q = 0u; q < QTILE; q++) {
+        n[q] = (col0 + q < p.columns) ? posv[col0 + q] + 1u : 0u;
+        nMax = max(nMax, n[q]);
+    }
+
+    // A thread owns one dimension of the answer of every query, for the whole
+    // walk, so the values of a position are read by consecutive threads from
+    // consecutive addresses exactly as they were.
+    float acc[QTILE], runMax[QTILE], runSum[QTILE];
+    [[unroll]] for (uint q = 0u; q < QTILE; q++) {
+        acc[q] = 0.0; runMax[q] = -1.0 / 0.0; runSum[q] = 0.0;
+    }
+
+    for (uint i0 = 0u; i0 < nMax; i0 += TILE) {
+        uint rows = min(TILE, nMax - i0);
+        uint i    = i0 + slot;
+        bool have = i < nMax;
+
+        // 1. this lane's share of one position's key, held in registers and
+        //    scored against every query. This is the read that used to happen
+        //    QTILE times.
+        float kreg[PERL];
+        if (have) {
+            uint kBase = cacheBase + i * DIM;
+            [[unroll]] for (uint j = 0u; j < PERL; j++) kreg[j] = kCache[kBase + lane + j * LANES];
+        } else {
+            [[unroll]] for (uint j = 0u; j < PERL; j++) kreg[j] = 0.0;
         }
-        float sum = subgroupClusteredAdd(part, LANES);
-        if (lane == 0u && i < n) scores[i] = sum * p.scale;
+
+        [[unroll]] for (uint q = 0u; q < QTILE; q++) {
+            float part = 0.0;
+            if (col0 + q < p.columns && have) {
+                uint qb = (col0 + q) * p.heads * DIM + h * DIM;
+                [[unroll]] for (uint j = 0u; j < PERL; j++) {
+                    part += qOut[qb + lane + j * LANES] * kreg[j];
+                }
+            }
+            float sum = subgroupClusteredAdd(part, LANES);
+            if (lane == 0u) scores[q * TILE + slot] = sum * p.scale;
+        }
+        barrier();
+
+        // 2. the running maximum a query, and what moving it costs what is
+        //    already accumulated. Every thread folds the tile itself: sixteen
+        //    values is cheaper read sixteen times than reduced once, and every
+        //    thread needs the answer.
+        float newMax[QTILE], rescale[QTILE];
+        [[unroll]] for (uint q = 0u; q < QTILE; q++) {
+            uint lim = (n[q] > i0) ? min(rows, n[q] - i0) : 0u;
+            float m = -1.0 / 0.0;
+            [[unroll]] for (uint j = 0u; j < TILE; j++) {
+                if (j < lim) m = max(m, scores[q * TILE + j]);
+            }
+            newMax[q]  = max(runMax[q], m);
+            rescale[q] = (runMax[q] == -1.0 / 0.0) ? 0.0 : exp(runMax[q] - newMax[q]);
+        }
+
+        // 3. the weights, one entry a thread rather than the whole tile in
+        //    every thread: QTILE*TILE of them and 256 threads. Masked entries
+        //    weigh nothing, which is what keeps the causal edge out of both
+        //    the sum and the mix.
+        if (t < QTILE * TILE) {
+            uint q = t / TILE, j = t % TILE;
+            uint lim = (n[q] > i0) ? min(rows, n[q] - i0) : 0u;
+            expw[t] = (j < lim) ? exp(scores[t] - newMax[q]) : 0.0;
+        }
+        barrier();
+
+        float tileSum[QTILE];
+        [[unroll]] for (uint q = 0u; q < QTILE; q++) {
+            float s = 0.0;
+            [[unroll]] for (uint j = 0u; j < TILE; j++) s += expw[q * TILE + j];
+            tileSum[q] = s;
+        }
+
+        // 4. one value read, mixed into every query's accumulator. The other
+        //    half of the traffic this kernel exists to save.
+        float mix[QTILE];
+        [[unroll]] for (uint q = 0u; q < QTILE; q++) mix[q] = 0.0;
+        for (uint j = 0u; j < rows; j++) {
+            float v = vCache[cacheBase + (i0 + j) * DIM + t];
+            [[unroll]] for (uint q = 0u; q < QTILE; q++) mix[q] += expw[q * TILE + j] * v;
+        }
+
+        [[unroll]] for (uint q = 0u; q < QTILE; q++) {
+            acc[q]    = acc[q] * rescale[q] + mix[q];
+            runSum[q] = runSum[q] * rescale[q] + tileSum[q];
+            runMax[q] = newMax[q];
+        }
+        barrier();
     }
-    barrier();
 
-    // 2. softmax over the run, folded across the whole workgroup
-    float localMax = -1.0 / 0.0;
-    for (uint i = t; i < n; i += 256u) localMax = max(localMax, scores[i]);
-    float folded = subgroupMax(localMax);
-    if (subgroupElect()) reduce_[gl_SubgroupID] = folded;
-    barrier();
-    float runMax = -1.0 / 0.0;
-    for (uint s = 0u; s < gl_NumSubgroups; s++) runMax = max(runMax, reduce_[s]);
-    barrier();
-
-    float localSum = 0.0;
-    for (uint i = t; i < n; i += 256u) {
-        float e = exp(scores[i] - runMax);
-        scores[i] = e;
-        localSum += e;
+    // 5. the output gate, which sits after this head's queries
+    [[unroll]] for (uint q = 0u; q < QTILE; q++) {
+        uint c = col0 + q;
+        if (c >= p.columns) continue;
+        float g = qIn[c * p.heads * 512u + h * 512u + DIM + t];
+        out_[c * p.heads * DIM + h * DIM + t] = (acc[q] / runSum[q]) / (1.0 + exp(-g));
     }
-    folded = subgroupAdd(localSum);
-    if (subgroupElect()) reduce_[gl_SubgroupID] = folded;
-    barrier();
-    float total = 0.0;
-    for (uint s = 0u; s < gl_NumSubgroups; s++) total += reduce_[s];
-    float inv = 1.0 / total;
-    barrier();
-
-    // 3. the mix: one thread to a dimension, so the values of a position are
-    //    read by consecutive threads from consecutive addresses.
-    float acc = 0.0;
-    for (uint i = 0u; i < n; i++) {
-        acc += scores[i] * vCache[cacheBase + i * 256u + t];
-    }
-    acc *= inv;
-
-    // 4. the output gate, which sits after this head's queries
-    float g = qIn[COL * p.heads * 512u + h * 512u + 256u + t];
-    out_[COL * p.heads * 256u + h * 256u + t] = acc / (1.0 + exp(-g));
 }

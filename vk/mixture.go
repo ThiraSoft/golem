@@ -1035,3 +1035,100 @@ func asBytes(f []float32) []byte {
 func (m *Mixture) productGroups(width, outputs int) uint32 {
 	return coopProductGroups(m.coop, width, outputs)
 }
+
+// rowBytesQ5_K is what one row of that many inputs occupies once splitQ5_K has
+// had it: twenty-four bytes to a block of thirty-two, against the format's own
+// twenty-two.
+func rowBytesQ5_K(cols int) int { return cols / nn.QuantBlock * 24 }
+
+// splitQ5_K rewrites a Q5_K matrix into blocks of thirty-two that stand alone.
+//
+// This is the one format here whose blocks do not: a Q5_K superblock is two
+// fp16 magnitudes, twelve bytes of six-bit scales and minima for its eight
+// sub-blocks, thirty-two bytes of fifth bits, and a hundred and twenty-eight
+// of nibbles — and the fifth bits are *bit-sliced*, so sub-block i is bit i of
+// all thirty-two of those bytes. A kernel that wants one sub-block has to read
+// all thirty-two, and the header on top of that. Staged a sub-block to a
+// thread, which is the shape every other product here has, that is eighty
+// bytes read where twenty-two are wanted.
+//
+// That is why the delta net's output projection was the last matrix in the
+// model still on a hand-rolled tile at a quarter of the cooperative kernel's
+// throughput: the cooperative kernel stages a block to a thread and there was
+// no way to give it one. So the block is made to stand alone here instead, on
+// the way to the card, once:
+//
+//	[0,      4nb)  d1 and m1, one fp16 pair a block, already multiplied out
+//	[4nb,    8nb)  the fifth bits, one uint a block, bit l for weight l
+//	[8nb,   24nb)  the nibbles, sixteen bytes a block, in Q4_0's own order —
+//	               low nibble of byte j is weight j, high nibble is weight j+16
+//
+// Six bits a weight where the format spends five and a half, and in exchange
+// the staging is Q4_0's with three more instructions: spread four bits over
+// four bytes, or them into the nibbles, and subtract a minimum instead of
+// eight. shaders/matmul_coop.comp reads this under -DQ5K.
+//
+// The scale and minimum are folded here rather than staged, which the format
+// does not lose anything by: d*sc[i] and dmin*m[i] are what every reader
+// computed anyway, and an fp16 pair a block is what Q4_1 already carries.
+func splitQ5_K(src []byte, rows, cols int) []byte {
+	const superBytes = 176
+	nb := cols / nn.QuantBlock // blocks of thirty-two
+	nsb := cols / 256          // superblocks
+	inStride := nsb * superBytes
+	outStride := nb * 24
+	dst := make([]byte, rows*outStride)
+	for r := 0; r < rows; r++ {
+		in := src[r*inStride : (r+1)*inStride]
+		out := dst[r*outStride : (r+1)*outStride]
+		highs := out[4*nb:]
+		nibbles := out[8*nb:]
+		for sb := 0; sb < nsb; sb++ {
+			block := in[sb*superBytes : (sb+1)*superBytes]
+			d := nn.Widen(binary.LittleEndian.Uint16(block[0:]))
+			dmin := nn.Widen(binary.LittleEndian.Uint16(block[2:]))
+			raw := block[4:16]
+			qh := block[16:48]
+			qs := block[48:176]
+
+			var sc, m [8]uint8
+			for i := 0; i < 4; i++ {
+				sc[i] = raw[i] & 63
+				m[i] = raw[i+4] & 63
+				sc[i+4] = (raw[i+8] & 0xF) | ((raw[i] >> 6) << 4)
+				m[i+4] = (raw[i+8] >> 4) | ((raw[i+4] >> 6) << 4)
+			}
+
+			for i := 0; i < 8; i++ {
+				b := sb*8 + i
+				d1 := d * float32(sc[i])
+				m1 := dmin * float32(m[i])
+				binary.LittleEndian.PutUint16(out[4*b:], nn.Narrow(d1))
+				binary.LittleEndian.PutUint16(out[4*b+2:], nn.Narrow(m1))
+
+				qSub := qs[(i/2)*32:]
+				shift := uint(4 * (i & 1))
+				qhBit := uint8(1) << uint(i)
+
+				// Q4_0's order: byte j carries weight j low and weight j+16
+				// high, so that the staging can mask 0x0F0F0F0F and shift by
+				// four exactly as it does for a Q4_0 block.
+				var hi uint32
+				pack := nibbles[b*16 : b*16+16]
+				for j := 0; j < 16; j++ {
+					lo := (qSub[j] >> shift) & 0xF
+					up := (qSub[j+16] >> shift) & 0xF
+					pack[j] = lo | up<<4
+					if qh[j]&qhBit != 0 {
+						hi |= 1 << uint(j)
+					}
+					if qh[j+16]&qhBit != 0 {
+						hi |= 1 << uint(j+16)
+					}
+				}
+				binary.LittleEndian.PutUint32(highs[4*b:], hi)
+			}
+		}
+	}
+	return dst
+}

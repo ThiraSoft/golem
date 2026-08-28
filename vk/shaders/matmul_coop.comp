@@ -368,6 +368,14 @@ shared float16_t sb[BN * SB_STRIDE];
 // tile the step after, so there is still one tile.
 uvec4 pw[WPT];
 float pws[WPT];
+#ifdef Q5K
+// A Q5_K block, once vk/mixture.go's splitQ5_K has made it stand alone, is the
+// same sixteen bytes of nibbles as a Q4_0 one plus a word of fifth bits and a
+// minimum beside the scale. Two more registers a block, and the staging below
+// is Q4_0's with three instructions added.
+uint  pwh[WPT];
+float pwm[WPT];
+#endif
 uvec4 plo[APT], phi[APT];
 float pas[APT];
 
@@ -385,11 +393,24 @@ void prefetch(uint kb) {
         if (idx < uint(BM * KBC)) {
             uint r = idx & (uint(BM) - 1u);
             uint b = kb + idx / uint(BM);
+#ifdef Q5K
+            pwh[i] = 0u;
+            pwm[i] = 0.0;
+#endif
             if (row0 + r < p.dim && b < nb) {
                 uint base = wbase + (row0 + r) * rowBytes;
+#ifdef Q5K
+                uint at4  = (base + 8u * nb + 16u * b) >> 2;
+                pw[i]  = uvec4(w[at4], w[at4 + 1u], w[at4 + 2u], w[at4 + 3u]);
+                pwh[i] = w[(base + 4u * nb + 4u * b) >> 2];
+                vec2 dm = unpackHalf2x16(w[(base + 4u * b) >> 2]);
+                pws[i] = dm.x;
+                pwm[i] = dm.y;
+#else
                 uint at4  = (base + 2u * nb + 16u * b) >> 2;
                 pw[i]  = uvec4(w[at4], w[at4 + 1u], w[at4 + 2u], w[at4 + 3u]);
                 pws[i] = unpackHalf2x16(w[(base + 2u * b) >> 2])[b & 1u];
+#endif
             }
         }
     }
@@ -437,11 +458,27 @@ void stageTile() {
         uint k  = idx / uint(BM);
         uint at = r * uint(SA_STRIDE) + k * 32u;
         float ws = pws[i];
+#ifdef Q5K
+        float wm = pwm[i];
+        uint  wh = pwh[i];
+#endif
         [[unroll]] for (uint u = 0u; u < 4u; u++) {
             uint w0 = pw[i][u] & 0x0F0F0F0Fu;
             uint w1 = (pw[i][u] >> 4u) & 0x0F0F0F0Fu;
+#ifdef Q5K
+            // The fifth bits, four at a time, spread one to a byte so that
+            // they or straight into the nibbles: multiplying a nibble by
+            // 0x00204081 lands its four bits in bits 0, 8, 16 and 24, and the
+            // mask keeps nothing else. Three instructions for four weights,
+            // which is what makes this format worth reading the ordinary way.
+            uint h0 = ((((wh >> (4u * u))        & 0xFu) * 0x00204081u) & 0x01010101u) * 16u;
+            uint h1 = ((((wh >> (16u + 4u * u))  & 0xFu) * 0x00204081u) & 0x01010101u) * 16u;
+            vec4 v0 = unpackUnorm4x8(w0 | h0) * 255.0 * ws - wm;
+            vec4 v1 = unpackUnorm4x8(w1 | h1) * 255.0 * ws - wm;
+#else
             vec4 v0 = (unpackUnorm4x8(w0) * 255.0 - 8.0) * ws;
             vec4 v1 = (unpackUnorm4x8(w1) * 255.0 - 8.0) * ws;
+#endif
 
             sa[at + u * 4u     ] = float16_t(v0.x);
             sa[at + u * 4u + 1u] = float16_t(v0.y);
@@ -515,7 +552,11 @@ void main() {
     uint ir   = (gl_WorkGroupID.x / CGROUPS) % wgs;
     uint ik   = gl_WorkGroupID.x / (wgs * CGROUPS);
     col0      = ic * uint(BN);
+#ifdef Q5K
+    rowBytes  = nb * 24u;
+#else
     rowBytes  = nb * 18u;
+#endif
     wbase     = 0u;
 #endif
     row0      = ir * uint(BM);

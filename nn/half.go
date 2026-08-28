@@ -59,3 +59,8 @@ func RoundBF16(v float32) float32 {
 	}
 	return math.Float32frombits((bits + 0x7FFF + (bits >> 16 & 1)) &^ 0xFFFF)
 }
+
+// Narrow is floatToHalf for the packers outside this package: vk/mixture.go's
+// splitQ5_K folds a Q5_K sub-block's scale and minimum into an fp16 pair on
+// the way to the card.
+func Narrow(f float32) uint16 { return floatToHalf(f) }

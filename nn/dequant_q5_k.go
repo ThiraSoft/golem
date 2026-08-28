@@ -34,25 +34,31 @@ func DequantizeQ5_K(w []byte, n int, out []float32) {
 			m[j] = (scalesRaw[j+4] >> 4) | ((scalesRaw[j] >> 6) << 4)
 		}
 
+		// Two sub-blocks share thirty-two bytes of qs: the even one takes
+		// their low nibbles and the odd one their high nibbles, both over the
+		// same thirty-two positions. The fifth bit is bit i of qh's thirty-two
+		// bytes, one byte a position.
+		//
+		// This used to read sixteen consecutive bytes a sub-block and take the
+		// low nibbles for its first sixteen weights and the high nibbles for
+		// its last sixteen, which is a different sixteen weights and a
+		// different bit of qh. Half of every sub-block was somebody else's.
+		// ggml-quants.c's dequantize_row_q5_K is the definition and
+		// TestQ5_KMatchesGGML holds this to it.
 		for i := 0; i < 8; i++ {
 			d1 := d * float32(sc[i])
 			m1 := dmin * float32(m[i])
-			qSub := qs[i*16 : (i+1)*16]
+			qSub := qs[(i/2)*32 : (i/2)*32+32]
+			shift := uint(4 * (i & 1))
 			qhBit := uint8(1 << i)
 
-			for l := 0; l < 16; l++ {
-				h1 := uint8(0)
+			for l := 0; l < 32; l++ {
+				h := uint8(0)
 				if qh[l]&qhBit != 0 {
-					h1 = 16
+					h = 16
 				}
-				h2 := uint8(0)
-				if qh[l+16]&qhBit != 0 {
-					h2 = 16
-				}
-				low := (qSub[l] & 0xF) | h1
-				high := (qSub[l] >> 4) | h2
-				dst[i*32+l] = float32(low)*d1 - m1
-				dst[i*32+l+16] = float32(high)*d1 - m1
+				q := ((qSub[l] >> shift) & 0xF) | h
+				dst[i*32+l] = float32(q)*d1 - m1
 			}
 		}
 	}

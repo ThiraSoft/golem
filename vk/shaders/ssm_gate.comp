@@ -1,0 +1,47 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// The gated RMS norm that shaders/ssm_scan.comp no longer carries.
+//
+// It is over one head's hundred and twenty-eight rows for one token, so the
+// kernel that walks the recurrence would have to own all of them — which is
+// what kept that kernel at one workgroup a head. Here it is thirty-two threads
+// to a head and a token, four rows a lane, one clustered add, no barrier.
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0)           buffer Y       { float y[];       };
+layout(std430, binding = 1) readonly  buffer GateZ   { float gateZ[];   };
+layout(std430, binding = 2) readonly  buffer SSMNorm { float ssmNorm[]; };
+
+layout(push_constant) uniform Push {
+    uint inner;   // the stride of a column, and the head's rows times the heads
+    float eps;
+} p;
+
+const uint LANES = 32u;
+const uint PER   = 4u;
+
+void main() {
+    uint h    = gl_WorkGroupID.x;
+    uint col  = gl_WorkGroupID.y;
+    uint lane = gl_LocalInvocationID.x;
+    uint base = col * p.inner + h * 128u;
+
+    float v[PER];
+    float sum = 0.0;
+    [[unroll]] for (uint r = 0u; r < PER; r++) {
+        v[r] = y[base + r * LANES + lane];
+        sum += v[r] * v[r];
+    }
+    float inv = inversesqrt(subgroupClusteredAdd(sum, LANES) / 128.0 + p.eps);
+
+    [[unroll]] for (uint r = 0u; r < PER; r++) {
+        uint i = r * LANES + lane;
+        float z = gateZ[base + i];
+        y[base + i] = v[r] * inv * ssmNorm[i] * (z / (1.0 + exp(-z)));
+    }
+}

@@ -14,9 +14,31 @@ var ssmConv1dSPIRV []byte
 //
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/ssm_conv1d.comp -o shaders/ssm_conv1d.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/ssm_scan.comp -o shaders/ssm_scan.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/ssm_qknorm.comp -o shaders/ssm_qknorm.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/ssm_gate.comp -o shaders/ssm_gate.spv
 
 //go:embed shaders/ssm_scan.spv
 var ssmScanSPIRV []byte
+
+// The two normalisations the recurrence used to carry, and the reason it could
+// not be split. See the header of shaders/ssm_scan.comp.
+//
+//go:embed shaders/ssm_qknorm.spv
+var ssmQKNormSPIRV []byte
+
+//go:embed shaders/ssm_gate.spv
+var ssmGateSPIRV []byte
+
+// ssmQKNormPush and ssmGatePush are those kernels' blocks.
+type ssmQKNormPush struct {
+	ConvDim uint32
+	Eps     float32
+}
+
+type ssmGatePush struct {
+	Inner uint32
+	Eps   float32
+}
 
 //go:embed shaders/matvec_q4k.spv
 var matvecQ4KSPIRV []byte

@@ -1,0 +1,61 @@
+#version 450
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// The L2 norms of the delta net's Q and K, for every column of a pass.
+//
+// These used to live inside shaders/ssm_scan.comp, and they are the reason
+// that kernel was one workgroup a head: the norm is over a head's whole
+// hundred and twenty-eight channels, so a kernel that computes it has to own
+// all of them — and the recurrence, which is otherwise a hundred and
+// twenty-eight independent columns of the state, was chained to that shape.
+// Forty-eight workgroups on a sixty-four compute unit card, with six barriers
+// and a hundred and twenty-eight shared loads a thread a token.
+//
+// llama.cpp computes them in a batched pass of their own (their L2_NORM op,
+// three milliseconds of a 512-token prompt across all forty-eight blocks) and
+// that is what frees their scan to be a subgroup with no barrier in it at all.
+// This is that pass.
+//
+// One workgroup a query-key head and a column: thirty-two threads, four
+// channels each, two clustered adds, no shared memory and no barrier.
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly  buffer ConvOut { float convOut[]; };
+layout(std430, binding = 1) writeonly buffer QKNorm  { float qk[];      };
+
+layout(push_constant) uniform Push {
+    uint convDim; // the stride of a column in convOut
+    float eps;
+} p;
+
+const uint LANES = 32u;
+const uint PER   = 4u;   // 128 channels over thirty-two lanes
+
+void main() {
+    uint head = gl_WorkGroupID.x;   // 0..15, the query-key heads
+    uint col  = gl_WorkGroupID.y;
+    uint lane = gl_LocalInvocationID.x;
+
+    uint src = col * p.convDim + head * 128u;
+    uint dst = col * 4096u + head * 128u;
+
+    float q[PER], k[PER];
+    float qq = 0.0, kk = 0.0;
+    [[unroll]] for (uint r = 0u; r < PER; r++) {
+        uint i = r * LANES + lane;
+        q[r] = convOut[src + i];
+        k[r] = convOut[src + 2048u + i];
+        qq += q[r] * q[r];
+        kk += k[r] * k[r];
+    }
+    float invQ = inversesqrt(subgroupClusteredAdd(qq, LANES) + p.eps);
+    float invK = inversesqrt(subgroupClusteredAdd(kk, LANES) + p.eps);
+
+    [[unroll]] for (uint r = 0u; r < PER; r++) {
+        uint i = r * LANES + lane;
+        qk[dst + i]         = q[r] * invQ;
+        qk[dst + 2048u + i] = k[r] * invK;
+    }
+}

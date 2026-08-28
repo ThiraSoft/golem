@@ -25,6 +25,9 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q5k.comp -o shaders/matvec_q5k.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/swiglu_act.comp -o shaders/swiglu_act.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/quant_q80.comp -o shaders/quant_q80.spv
+//go:generate glslc -O -DBM=64 -DBN=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_q5k.comp -o shaders/matmul_q5k.spv
+//go:generate glslc -O -DQ41 -DBM=64 -DBN=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_q5k.comp -o shaders/matmul_q41t.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/qwen_attn_prep.comp -o shaders/qwen_attn_prep.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/qwen_attn_gqa.comp -o shaders/qwen_attn_gqa.spv
 
@@ -146,23 +149,74 @@ var matvecF32_16SPIRV []byte
 // alone: the pipelines product serves carry the tiled binaries as well, and
 // there the widest available is the one to take.
 //
-// Sixteen and not more. The kernels build at thirty-two too, and the
-// thirty-two-wide form looked a third faster — and was wrong.
+// Sixteen and not more, and the reason changed once the fault below it was
+// found. The thirty-two-wide form used to look a third faster and answer
+// wrongly, which was dispatchAt taking the tiled workgroup count for any pass
+// of thirty-two or more — a mat-vec dispatched over a sixty-fourth of the rows
+// it needed. With that fixed the binary is right and simply slower: 387
+// positions a second at two hundred and fifty-six columns against 441 at
+// sixteen, because a thread carrying thirty-two accumulators spills.
 // TestVulkanWidePassMatchesTokenPath holds a wide pass to what the same tokens
 // give one at a time, bit for bit, and only widths up to sixteen pass it. What
 // this caps is the two projections whose weights have no tiled form here;
 // everything else goes through the tiled product at these widths anyway.
 const narrowChunk = 16
 
+// quantBlock is nn.QuantBlock, said here so this file keeps its import list.
+const quantBlock = 32
+
 // qwenWide is the widest pass any of these binaries answers. Everything
 // per-column is allocated for it.
-const qwenWide = 256
+const qwenWide = 512
 
 // qwenWidths are the widths a pass may take, largest first. A run of tokens is
 // cut into passes of these: a hundred positions is twelve of eight and one of
 // four, and the remainder never falls back to one column at a time unless it
 // is one column.
-var qwenWidths = [...]int{256, 128, 64, 32, 16, 8, 4, 2, 1}
+var qwenWidths = [...]int{512, 256, 128, 64, 32, 16, 8, 4, 2, 1}
+
+//go:embed shaders/quant_q80.spv
+var quantQ80SPIRV []byte
+
+// The tiled Q5_K product. One binary whatever the width: the columns are the
+// dispatch's business, not the kernel's, so unlike every other product here it
+// takes no COLUMNS.
+//
+//go:embed shaders/matmul_q5k.spv
+var matmulQ5KSPIRV []byte
+
+// The delta net's output projection on the matrix cores.
+//
+// This is shaders/matmul_coop.comp under -DQ5K, and it exists because that
+// projection was the one matrix in the model still read by a hand-rolled
+// tile: 68ms of a 512-column pass against llama.cpp's 28, where the same
+// kernel's Q4_0 form runs the feed forward's gate and up *faster* than theirs.
+// A quarter of the throughput of our own best product, on the same card, for
+// no reason but the format's packing — which vk/mixture.go's splitQ5_K now
+// undoes on the way to the card.
+//
+//go:embed shaders/matmul_coop_q5k64.spv
+var matmulCoopQ5K64SPIRV []byte
+
+//go:embed shaders/matmul_coop_q5k128.spv
+var matmulCoopQ5K128SPIRV []byte
+
+//go:embed shaders/matmul_coop_q5k256.spv
+var matmulCoopQ5K256SPIRV []byte
+
+//go:embed shaders/matmul_coop_q5k512.spv
+var matmulCoopQ5K512SPIRV []byte
+
+// The same tile over Q4_1 weights, which is what this checkpoint keeps eight
+// of its sixty-five down projections in.
+//
+//go:embed shaders/matmul_q41t.spv
+var matmulQ41TSPIRV []byte
+
+// q5kRows and q5kCols are that kernel's tile, and the three have to agree: the
+// shader's BM and BN, and the workgroup count recordSSM dispatches.
+const q5kRows = 64
+const q5kCols = 64
 
 //go:embed shaders/swiglu_act.spv
 var swigluActSPIRV []byte
@@ -192,7 +246,8 @@ const matvecRows = 16
 func matvecGroups(rows int) uint32 { return uint32((rows + matvecRows - 1) / matvecRows) }
 
 type swigluPush struct {
-	N uint32
+	N       uint32
+	Columns uint32
 }
 
 type attnPrepPush struct {
@@ -209,7 +264,15 @@ type attnGQAPush struct {
 	HeadsPerKV uint32
 	Heads      uint32
 	Scale      float32
+	Columns    uint32
 }
+
+// qAttnTile is shaders/qwen_attn_gqa.comp's QTILE: how many columns of the
+// pass one attention workgroup answers. The keys and the values of a tile are
+// read once for all of them, so this is the factor by which the attention's
+// traffic falls — it is quadratic in the context either way, but the constant
+// is this. The two have to agree: the grid is sized from here.
+const qAttnTile = 8
 
 // QwenShape is the geometry every block of one model shares. It is passed once
 // rather than rediscovered per block because nothing in Qwen3.5 varies from
@@ -237,6 +300,16 @@ type QwenShape struct {
 func (s QwenShape) qDim() int     { return s.Heads * s.HeadDim }
 func (s QwenShape) qFullDim() int { return s.qDim() * 2 }
 func (s QwenShape) kvDim() int    { return s.KVHeads * s.HeadDim }
+
+// qkHeads is how many query-key heads the delta net's convolution carries.
+// Its output is those heads' q, then their k, then one v a head of the state,
+// so what is left of ConvDim once the values are taken out is two of them.
+func (s QwenShape) qkHeads() int { return (s.ConvDim - s.Inner) / 2 / s.StateSize }
+
+// scanColumns is shaders/ssm_scan.comp's COLS: how many columns of a head's
+// state one workgroup of the recurrence owns. The two have to agree — the grid
+// is sized from here.
+const scanColumns = 8
 
 type QwenSSMData struct {
 	WQKV     []byte
@@ -279,6 +352,12 @@ type qwenSSMBlock struct {
 
 	setQKV, setGate, setAlpha, setBeta *Set
 	setConv, setScan, setOut           *Set
+	// setNormGate is the gated RMS norm of the recurrence's output, which used
+	// to be the tail of the scan and is now a pass of its own.
+	setNormGate *Set
+	// setOutWide is that projection through the tiled Q5_K product against the
+	// output's Q8_0 form. Nil where the weights are not Q5_K.
+	setOutWide *Set
 }
 
 type qwenAttnBlock struct {
@@ -288,17 +367,32 @@ type qwenAttnBlock struct {
 
 	setQ, setK, setV *Set
 	setPrep, setGQA  *Set
-	setO             *Set
+	setO, setOWide   *Set
 }
 
 type qwenFFNBlock struct {
 	wGate, wUp, wDown       *Buffer
 	setGate, setUp, setDown *Set
+	// setDownWide is the same projection through the tiled product against the
+	// activation's Q8_0 form, which only a pass of thirty-two columns or more
+	// reaches. It is nil where the weights are Q4_1, which has no tiled form
+	// here — eight blocks of sixty-five in this checkpoint, the rest Q4_0.
+	setDownWide *Set
+	// q41 says which of the two the weights are, because the tiled forms are
+	// dispatched differently: the Q4_1 one answers a fixed tile of columns
+	// where the Q4_0 one is a width-compiled binary.
+	q41 bool
 }
 
 type QwenPipeline struct {
 	d     *Device
 	shape QwenShape
+	// tl is where a recording writes the card's clock, when one is installed.
+	// Qwen3.5 is the only pipeline here that never had one: every number this
+	// model's performance work has ever rested on came from ablation — remove
+	// a kernel, time the whole pass — which measures a difference and never a
+	// share, and cannot see time that belongs to no kernel at all.
+	tl *Timeline
 	// coop says the card has cooperative matrices, which decides which tiled
 	// product the wide projections are bound to and how many workgroups it
 	// wants. vk/matmul.go owns both.
@@ -313,9 +407,14 @@ type QwenPipeline struct {
 	pipeSwiglu   *Pipeline
 	pipeConv     *Pipeline
 	pipeScan     *Pipeline
+	pipeQKNorm   *Pipeline
+	pipeGate     *Pipeline
 	pipeAttnPrep *Pipeline
 	pipeAttnGQA  *Pipeline
 	pipeMatQ80   *Pipeline // the prediction block's front projection
+	pipeQuant    *Pipeline // floats to their Q8_0 form
+	pipeMatT5K   *Pipeline // the tiled Q5_K product, which only a wide pass reaches
+	pipeMatT41   *Pipeline // the same tile over Q4_1 weights
 
 	// The stream, which lives in device memory. xin and stage are its host
 	// ends: one copy in at the head of a pass and one out at the foot, rather
@@ -339,12 +438,18 @@ type QwenPipeline struct {
 	// serves them all. A set a block, at a hundred and twenty-eight columns,
 	// was a gigabyte — enough to push the logit head off the card, which
 	// showed up as a token costing 200ms instead of 34.
-	convOut, qkvBuf   *Buffer
-	gateZBuf, ySSM    *Buffer
-	alphaBuf, betaBuf *Buffer
-	qIn, kIn, vIn     *Buffer
-	qOut, attnOut     *Buffer
-	mixOut            *Buffer // whichever mixer this block has, into the norm
+	convOut, qkvBuf    *Buffer
+	// qkNorm is the delta net's q and k for a whole pass, L2 normed: q at the
+	// head of a column and k two thousand and forty-eight floats after it.
+	qkNorm *Buffer
+	gateZBuf, ySSM     *Buffer
+	alphaBuf, betaBuf  *Buffer
+	qIn, kIn, vIn      *Buffer
+	qOut, attnOut      *Buffer
+	mixOut             *Buffer // whichever mixer this block has, into the norm
+	actQ, actS         *Buffer // the feed forward's activation in its Q8_0 form
+	ySSMQ, ySSMS       *Buffer // the delta net's output in its Q8_0 form
+	attnOutQ, attnOutS *Buffer // the attention's mix in its Q8_0 form
 
 	resid    *Buffer
 	normed   *Buffer
@@ -355,11 +460,14 @@ type QwenPipeline struct {
 	ffnNormS *Buffer
 	none     *Buffer
 
-	gateBuf *Buffer
-	upBuf   *Buffer
-	actBuf  *Buffer
-	ffnOut  *Buffer
-	setAct  *Set
+	gateBuf      *Buffer
+	upBuf        *Buffer
+	actBuf       *Buffer
+	ffnOut       *Buffer
+	setAct       *Set
+	setQuantY    *Set
+	setQKNorm    *Set
+	setQuantAttn *Set
 
 	attnNorms []*Buffer
 	ffnNorms  []*Buffer
@@ -413,9 +521,14 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		{&p.pipeMatQ41, matvecQ41SPIRV, 3, unsafe.Sizeof(matvecKPush{})},
 		{&p.pipeMatQ5K, matvecQ5KSPIRV, 3, unsafe.Sizeof(matvecKPush{})},
 		{&p.pipeMatF32, matvecF32SPIRV, 3, unsafe.Sizeof(matvecKPush{})},
-		{&p.pipeSwiglu, swigluActSPIRV, 3, unsafe.Sizeof(swigluPush{})},
+		{&p.pipeSwiglu, swigluActSPIRV, 5, unsafe.Sizeof(swigluPush{})},
+		{&p.pipeQuant, quantQ80SPIRV, 3, unsafe.Sizeof(swigluPush{})},
+		{&p.pipeMatT5K, matmulQ5KSPIRV, 4, unsafe.Sizeof(moePush{})},
+		{&p.pipeMatT41, matmulQ41TSPIRV, 4, unsafe.Sizeof(moePush{})},
 		{&p.pipeConv, ssmConv1dSPIRV, 5, unsafe.Sizeof(ssmConvPush{})},
-		{&p.pipeScan, ssmScanSPIRV, 10, unsafe.Sizeof(ssmScanPush{})},
+		{&p.pipeScan, ssmScanSPIRV, 9, unsafe.Sizeof(ssmScanPush{})},
+		{&p.pipeQKNorm, ssmQKNormSPIRV, 2, unsafe.Sizeof(ssmQKNormPush{})},
+		{&p.pipeGate, ssmGateSPIRV, 3, unsafe.Sizeof(ssmGatePush{})},
 		{&p.pipeAttnPrep, qwenAttnPrepSPIRV, 9, unsafe.Sizeof(attnPrepPush{})},
 		{&p.pipeAttnGQA, qwenAttnGQASPIRV, 6, unsafe.Sizeof(attnGQAPush{})},
 	} {
@@ -461,6 +574,7 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		{64, matmulWide64SPIRV},
 		{128, matmulWidest128SPIRV},
 		{256, matmulWidest256SPIRV},
+		{wideColumns, matmulWide()},
 	}
 	wave := uint32(0)
 	if p.coop {
@@ -473,11 +587,31 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 			{64, matmulCoop64SPIRV},
 			{128, matmulCoop128SPIRV},
 			{256, matmulCoop256SPIRV},
+			{wideColumns, matmulCoop512SPIRV},
 		}
 	}
 	for _, w := range tiled {
 		if err := p.pipeMatvec.WideWave(w.columns, w.spirv, wave); err != nil {
 			return nil, err
+		}
+	}
+	// And the same kernel over Q5_K, on the one pipeline whose weights are
+	// packed by splitQ5_K. Only a card with matrix cores gets it: without them
+	// the delta net's output projection stays on the mat-vec, which reads the
+	// same packing.
+	if p.coop {
+		for _, w := range []struct {
+			columns int
+			spirv   []byte
+		}{
+			{64, matmulCoopQ5K64SPIRV},
+			{128, matmulCoopQ5K128SPIRV},
+			{256, matmulCoopQ5K256SPIRV},
+			{wideColumns, matmulCoopQ5K512SPIRV},
+		} {
+			if err := p.pipeMatT5K.WideWave(w.columns, w.spirv, coopmatWave); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -512,12 +646,36 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 			return nil, err
 		}
 	}
+	// The same activation in eight bits, which is what the tiled product reads.
+	if p.actQ, err = p.local(shape.FFN * qwenWide); err != nil {
+		return nil, err
+	}
+	if p.actS, err = p.local(2 * (shape.FFN / quantBlock) * qwenWide * 4); err != nil {
+		return nil, err
+	}
+	// And the delta net's output in the same two forms, for the same reason:
+	// its projection is Q5_K and the tiled product wants eight bits.
+	if p.ySSMQ, err = p.local(shape.Inner * qwenWide); err != nil {
+		return nil, err
+	}
+	if p.ySSMS, err = p.local(2 * (shape.Inner / quantBlock) * qwenWide * 4); err != nil {
+		return nil, err
+	}
+	// And the attention's mix, whose output projection is Q4_0 and wants the
+	// same eight bits.
+	if p.attnOutQ, err = p.local(shape.qDim() * qwenWide); err != nil {
+		return nil, err
+	}
+	if p.attnOutS, err = p.local(2 * (shape.qDim() / quantBlock) * qwenWide * 4); err != nil {
+		return nil, err
+	}
 	// The mixer's scratch, one set for every block. See the field comment.
 	for _, l := range []struct {
 		into  **Buffer
 		bytes int
 	}{
 		{&p.convOut, shape.ConvDim * qwenWide * 4}, {&p.qkvBuf, shape.ConvDim * qwenWide * 4},
+		{&p.qkNorm, 4096 * qwenWide * 4},
 		{&p.gateZBuf, shape.Inner * qwenWide * 4}, {&p.ySSM, shape.Inner * qwenWide * 4},
 		{&p.alphaBuf, shape.Rank * qwenWide * 4}, {&p.betaBuf, shape.Rank * qwenWide * 4},
 		{&p.qIn, shape.qFullDim() * qwenWide * 4},
@@ -529,7 +687,16 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 			return nil, err
 		}
 	}
-	if p.setAct, err = p.pipeSwiglu.NewSet([]*Buffer{p.gateBuf, p.upBuf, p.actBuf}); err != nil {
+	if p.setAct, err = p.pipeSwiglu.NewSet([]*Buffer{p.gateBuf, p.upBuf, p.actBuf, p.actQ, p.actS}); err != nil {
+		return nil, err
+	}
+	if p.setQKNorm, err = p.pipeQKNorm.NewSet([]*Buffer{p.convOut, p.qkNorm}); err != nil {
+		return nil, err
+	}
+	if p.setQuantY, err = p.pipeQuant.NewSet([]*Buffer{p.ySSM, p.ySSMQ, p.ySSMS}); err != nil {
+		return nil, err
+	}
+	if p.setQuantAttn, err = p.pipeQuant.NewSet([]*Buffer{p.attnOut, p.attnOutQ, p.attnOutS}); err != nil {
 		return nil, err
 	}
 	return p, nil
@@ -578,7 +745,12 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 		return err
 	}
 	switch {
-	case d.OutIsQ5K, d.OutIsF32:
+	case d.OutIsQ5K:
+		// splitQ5_K, not the file's own superblocks: both readers of this
+		// matrix — the mat-vec a token runs and the cooperative tile a prompt
+		// runs — want a block of thirty-two that stands alone.
+		b.wOut, err = p.upload(splitQ5_K(d.WOut, s.Dim, s.Inner))
+	case d.OutIsF32:
 		b.wOut, err = p.upload(d.WOut)
 	default:
 		b.wOut, err = p.uploadQ4_1(d.WOut, s.Dim, s.Inner)
@@ -618,7 +790,10 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 	if b.setConv, err = p.pipeConv.NewSet([]*Buffer{b.convWeight, p.qkvBuf, b.convState, p.convOut, b.shadowConv}); err != nil {
 		return err
 	}
-	if b.setScan, err = p.pipeScan.NewSet([]*Buffer{p.convOut, p.gateZBuf, p.alphaBuf, b.dtBias, b.ssmA, p.betaBuf, b.ssmNorm, b.ssmState, p.ySSM, b.shadowState}); err != nil {
+	if b.setScan, err = p.pipeScan.NewSet([]*Buffer{p.convOut, p.qkNorm, p.alphaBuf, b.dtBias, b.ssmA, p.betaBuf, b.ssmState, p.ySSM, b.shadowState}); err != nil {
+		return err
+	}
+	if b.setNormGate, err = p.pipeGate.NewSet([]*Buffer{p.ySSM, p.gateZBuf, b.ssmNorm}); err != nil {
 		return err
 	}
 	outPipe := p.pipeMatQ41
@@ -627,6 +802,14 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 		outPipe = p.pipeMatF32
 	case d.OutIsQ5K:
 		outPipe = p.pipeMatQ5K
+	}
+	// The tiled form of it, which only a Q5_K block has and only a wide pass
+	// reaches. It reads the delta net's output in eight bits where the mat-vec
+	// reads it in floats, so a token draws exactly as it did.
+	if d.OutIsQ5K && p.coop {
+		if b.setOutWide, err = p.pipeMatT5K.NewSet([]*Buffer{b.wOut, p.ySSMQ, p.ySSMS, p.mixOut}); err != nil {
+			return err
+		}
 	}
 	if b.setOut, err = outPipe.NewSet([]*Buffer{b.wOut, p.ySSM, p.mixOut}); err != nil {
 		return err
@@ -694,6 +877,12 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 	if b.setO, err = p.pipeMatQ40.NewSet([]*Buffer{b.wO, p.attnOut, p.mixOut}); err != nil {
 		return nil, err
 	}
+	// And through the tiled product against that mix in eight bits, which only
+	// a wide pass reaches. The output projection is Q4_0 like the three above
+	// it; it read floats only because nothing had quantized the mix.
+	if b.setOWide, err = p.pipeMatvec.NewSet([]*Buffer{b.wO, p.attnOutQ, p.attnOutS, p.mixOut}); err != nil {
+		return nil, err
+	}
 
 	return b, nil
 }
@@ -737,6 +926,14 @@ func (p *QwenPipeline) newFFNBlock(d QwenFFNData) (*qwenFFNBlock, error) {
 		down = p.pipeMatQ41
 	}
 	if b.setDown, err = down.NewSet([]*Buffer{b.wDown, p.actBuf, p.ffnOut}); err != nil {
+		return nil, err
+	}
+	b.q41 = d.DownQ4_1
+	wide := p.pipeMatvec // Q4_0 against the Q8_0 activation
+	if d.DownQ4_1 {
+		wide = p.pipeMatT41
+	}
+	if b.setDownWide, err = wide.NewSet([]*Buffer{b.wDown, p.actQ, p.actS, p.ffnOut}); err != nil {
 		return nil, err
 	}
 
@@ -918,6 +1115,11 @@ func (p *QwenPipeline) record(r *Recorder, columns, snapAt int) {
 
 	blocks := min(len(p.isSSM), len(p.ffnBlocks))
 
+	tl := p.tl
+	if tl != nil {
+		tl.Reset(r)
+		tl.Stamp(r, "start")
+	}
 	r.Copy(p.xs, 0, p.xin, s.Dim*columns*4)
 	r.Copy(p.posBuf, 0, p.posIn, 4*columns)
 	r.Barrier()
@@ -929,6 +1131,7 @@ func (p *QwenPipeline) record(r *Recorder, columns, snapAt int) {
 		}
 		r.DispatchColumns(p.setAttnNorms[i], 1, cols, unsafe.Pointer(push))
 		r.Barrier()
+		tl.Stamp(r, "norm")
 
 		if p.isSSM[i] {
 			p.recordSSM(r, p.ssmBlocks[i], columns, snapAt)
@@ -936,16 +1139,24 @@ func (p *QwenPipeline) record(r *Recorder, columns, snapAt int) {
 			p.recordAttn(r, p.attnBlocks[i], columns)
 		}
 		r.Barrier()
+		if p.isSSM[i] {
+			tl.Stamp(r, "ssm out")
+		} else {
+			tl.Stamp(r, "attn out")
+		}
 
 		r.DispatchColumns(p.setFFNNorms[i], 1, cols, unsafe.Pointer(&normFFN))
 		r.Barrier()
+		tl.Stamp(r, "norm")
 
 		p.recordFFN(r, p.ffnBlocks[i], columns)
 		r.Barrier()
+		tl.Stamp(r, "ffn down")
 	}
 
 	r.DispatchColumns(p.setFinalNorm, 1, cols, unsafe.Pointer(&normFinal))
 	r.Barrier()
+	tl.Stamp(r, "final norm")
 	r.Copy(p.hidden, 0, p.xs, s.Dim*columns*4)
 }
 
@@ -979,7 +1190,7 @@ func (p *QwenPipeline) product(r *Recorder, set *Set, rows, columns int, push mo
 			w = 1
 		}
 		push.col = uint32(at)
-		p.dispatchAt(r, set, rows, w, unsafe.Pointer(&push))
+		p.dispatchAt(r, set, rows, w, true, unsafe.Pointer(&push))
 		at += w
 	}
 }
@@ -994,7 +1205,7 @@ func (p *QwenPipeline) productK(r *Recorder, set *Set, rows, columns int, push m
 			w = 1
 		}
 		push.Col = uint32(at)
-		p.dispatchAt(r, set, rows, w, unsafe.Pointer(&push))
+		p.dispatchAt(r, set, rows, w, false, unsafe.Pointer(&push))
 		at += w
 	}
 }
@@ -1003,8 +1214,16 @@ func (p *QwenPipeline) productK(r *Recorder, set *Set, rows, columns int, push m
 // that width wants: a mat-vec answers a fixed number of outputs to a
 // workgroup, and the tiled product answers a tile of rows by a block of
 // columns. vk/matmul.go owns both counts.
-func (p *QwenPipeline) dispatchAt(r *Recorder, set *Set, rows, columns int, push unsafe.Pointer) {
-	if columns >= tiledColumns {
+//
+// tiled says which is bound, and it is the caller's to know rather than
+// something to infer from the width. Inferring it is a fault this had: the
+// tiled count was taken for any pass of thirty-two columns or more, so a
+// mat-vec pipeline given a thirty-two-wide binary was dispatched over a
+// sixty-fourth of the workgroups it needed. It covered a fraction of the rows,
+// left the rest untouched, and measured a third faster for it — which is how a
+// wrong kernel looks like a fast one.
+func (p *QwenPipeline) dispatchAt(r *Recorder, set *Set, rows, columns int, tiled bool, push unsafe.Pointer) {
+	if tiled && columns >= tiledColumns {
 		r.DispatchWide(set, columns, coopProductGroups(p.coop, columns, rows), push)
 		return
 	}
@@ -1014,6 +1233,19 @@ func (p *QwenPipeline) dispatchAt(r *Recorder, set *Set, rows, columns int, push
 		return
 	}
 	r.DispatchWide(set, columns, groups, push)
+}
+
+// Profile installs a timeline, or takes one out, and forgets the recordings
+// so that the next pass is recorded with the stamps in it.
+func (p *QwenPipeline) Profile(t *Timeline) {
+	p.tl = t
+	p.pass = nil
+}
+
+// NewTimeline is a timeline sized for one pass of this pipeline: nine stamps a
+// block and a few for the ends.
+func (p *QwenPipeline) NewTimeline() (*Timeline, error) {
+	return p.d.NewTimeline(12*len(p.isSSM) + 8)
 }
 
 // CompileAt records a pass and keeps it. It exists for the benchmark that
@@ -1273,17 +1505,51 @@ func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt i
 	p.productK(r, b.setAlpha, s.Rank, columns, small)
 	p.productK(r, b.setBeta, s.Rank, columns, small)
 	r.Barrier()
+	p.tl.Stamp(r, "ssm in")
 
 	// The convolution and the scan carry the columns inside themselves: both
 	// hold state that runs from one token to the next, so a column cannot
 	// start before the one before it has finished.
 	r.Dispatch(b.setConv, uint32((s.ConvDim+255)/256), unsafe.Pointer(&conv))
 	r.Barrier()
+	p.tl.Stamp(r, "ssm conv")
 
-	r.Dispatch(b.setScan, uint32(s.Rank), unsafe.Pointer(&scan))
+	// The two norms the recurrence used to carry, before and after it. They are
+	// what kept it to one workgroup a head; see shaders/ssm_scan.comp.
+	qkn := ssmQKNormPush{ConvDim: uint32(s.ConvDim), Eps: s.Eps}
+	r.DispatchColumns(p.setQKNorm, uint32(s.qkHeads()), uint32(columns), unsafe.Pointer(&qkn))
 	r.Barrier()
+	p.tl.Stamp(r, "ssm qknorm")
 
-	p.productK(r, b.setOut, s.Dim, columns, out)
+	// One workgroup a head and COLS state columns of it: 48 by 16 rather than
+	// the 48 this kernel ran in for the life of the engine.
+	r.DispatchColumns(b.setScan, uint32(s.Rank), uint32(s.StateSize/scanColumns), unsafe.Pointer(&scan))
+	r.Barrier()
+	p.tl.Stamp(r, "ssm scan")
+
+	gateNorm := ssmGatePush{Inner: uint32(s.Inner), Eps: s.Eps}
+	r.DispatchColumns(b.setNormGate, uint32(s.Rank), uint32(columns), unsafe.Pointer(&gateNorm))
+	r.Barrier()
+	p.tl.Stamp(r, "ssm gate")
+
+	// Wide enough and the weights Q5_K, and the output projection is the tiled
+	// product against the eight-bit form; otherwise the mat-vec against the
+	// floats. llama.cpp's own profiler puts this projection and the Q4_1 down
+	// at 24ms of a 512-token prompt where ours took 324, and it is the last of
+	// the model's matrices to be read sixteen columns at a time.
+	// q5kCols and not tiledColumns: the tile answers that many columns and a
+	// pass narrower than one would dispatch no workgroups at all and leave the
+	// projection undone. Every width qwenWidths names from sixty-four up is a
+	// multiple of it.
+	if b.setOutWide != nil && columns >= q5kCols && columns%q5kCols == 0 {
+		quant := swigluPush{N: uint32(s.Inner), Columns: uint32(columns)}
+		r.Dispatch(p.setQuantY, uint32((s.Inner/quantBlock*columns+255)/256), unsafe.Pointer(&quant))
+		r.Barrier()
+		p.product(r, b.setOutWide, s.Dim, columns,
+			moePush{dim: uint32(s.Dim), ffn: uint32(s.Inner), used: 1})
+	} else {
+		p.productK(r, b.setOut, s.Dim, columns, out)
+	}
 }
 
 func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
@@ -1304,23 +1570,35 @@ func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
 		HeadsPerKV: uint32(s.Heads / s.KVHeads),
 		Heads:      uint32(s.Heads),
 		Scale:      float32(1 / sqrtOf(s.HeadDim)),
+		Columns:    uint32(columns),
 	}
 
 	p.product(r, b.setQ, s.qFullDim(), columns, q)
 	p.product(r, b.setK, s.kvDim(), columns, kv)
 	p.product(r, b.setV, s.kvDim(), columns, kv)
 	r.Barrier()
+	p.tl.Stamp(r, "attn qkv")
 
 	// Every column's keys and values go into the cache before any column reads
 	// them, which is why this is a dispatch of its own and not the head of the
 	// one below: a barrier inside a workgroup does not order two workgroups.
 	r.DispatchColumns(b.setPrep, uint32(s.Heads+s.KVHeads), uint32(columns), unsafe.Pointer(&prep))
 	r.Barrier()
+	p.tl.Stamp(r, "attn prep")
 
-	r.DispatchColumns(b.setGQA, uint32(s.Heads), uint32(columns), unsafe.Pointer(&gqa))
+	r.DispatchColumns(b.setGQA, uint32(s.Heads), uint32((columns+qAttnTile-1)/qAttnTile), unsafe.Pointer(&gqa))
 	r.Barrier()
+	p.tl.Stamp(r, "attn gqa")
 
-	p.productK(r, b.setO, s.Dim, columns, out)
+	if columns >= tiledColumns {
+		quant := swigluPush{N: uint32(s.qDim()), Columns: uint32(columns)}
+		r.Dispatch(p.setQuantAttn, uint32((s.qDim()/quantBlock*columns+255)/256), unsafe.Pointer(&quant))
+		r.Barrier()
+		p.product(r, b.setOWide, s.Dim, columns,
+			moePush{dim: uint32(s.Dim), ffn: uint32(s.qDim()), used: 1})
+	} else {
+		p.productK(r, b.setO, s.Dim, columns, out)
+	}
 }
 
 func (p *QwenPipeline) recordFFN(r *Recorder, b *qwenFFNBlock, columns int) {
@@ -1328,26 +1606,40 @@ func (p *QwenPipeline) recordFFN(r *Recorder, b *qwenFFNBlock, columns int) {
 	up := moePush{dim: uint32(s.FFN), ffn: uint32(s.Dim), used: 1}
 	// The activation is elementwise and the columns lie end to end, so a wide
 	// pass is the same kernel over more of the buffer.
-	act := swigluPush{N: uint32(s.FFN * columns)}
+	act := swigluPush{N: uint32(s.FFN), Columns: uint32(columns)}
 	down := matvecKPush{Dim: uint32(s.Dim), FFN: uint32(s.FFN)}
 
 	p.product(r, b.setGate, s.FFN, columns, up)
 	p.product(r, b.setUp, s.FFN, columns, up)
 	r.Barrier()
+	p.tl.Stamp(r, "ffn up")
 
-	r.Dispatch(p.setAct, uint32((s.FFN*columns+255)/256), unsafe.Pointer(&act))
+	// A thread a Q8_0 block, because that is what it quantizes.
+	blocks := s.FFN / quantBlock * columns
+	r.Dispatch(p.setAct, uint32((blocks+255)/256), unsafe.Pointer(&act))
 	r.Barrier()
+	p.tl.Stamp(r, "ffn act")
 
 	// Wide enough and the down projection is a tiled product against the
 	// eight-bit form; narrow and it is the mat-vec against the floats, which
 	// is what a token has always run.
-	// The down projection stays on the mat-vec against the floats at every
-	// width. Everything above it reads an activation that was already in eight
-	// bits, so moving those to the tiled product changed nothing about the
-	// arithmetic; this one would have to be quantized first, and a wide pass
-	// would then answer something a token does not. What it costs is measured
-	// in qwen35/cost_test.go and it is most of what is left.
-	p.productK(r, b.setDown, s.Dim, columns, down)
+	// Wide enough and the weights Q4_0, and the down projection is the tiled
+	// product against the eight-bit form; otherwise the mat-vec against the
+	// floats, which is what a token has always run. llama.cpp's own profiler
+	// says this projection is the largest matrix product in the model — 95 of
+	// its 421ms for a 512-token prompt — so it is the one that had to move.
+	switch {
+	case b.q41 && columns >= q5kCols && columns%q5kCols == 0:
+		// The tiled Q4_1, which is the Q5_K tile over a simpler weight.
+		tile := moePush{dim: uint32(s.Dim), ffn: uint32(s.FFN), used: 1}
+		rows := (s.Dim + q5kRows - 1) / q5kRows
+		r.Dispatch(b.setDownWide, uint32(rows*(columns/q5kCols)), unsafe.Pointer(&tile))
+	case !b.q41 && columns >= tiledColumns:
+		p.product(r, b.setDownWide, s.Dim, columns,
+			moePush{dim: uint32(s.Dim), ffn: uint32(s.FFN), used: 1})
+	default:
+		p.productK(r, b.setDown, s.Dim, columns, down)
+	}
 }
 
 // ResetState clears what a conversation accumulates: the delta nets' state
