@@ -126,6 +126,7 @@ func Attention(
 		}
 	})
 
+	calib(bc.Index, "o", set.F[:batch])
 	bw.O.MatVecBatch(set, out)
 }
 

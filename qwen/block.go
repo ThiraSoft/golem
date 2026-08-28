@@ -51,6 +51,7 @@ func Block(
 		}
 	})
 
+	calib(bc.Index, "qkv", normed.F[:batch])
 	attn := s.attn[:batch]
 	Attention(cfg, bc, bw, ropes, at, s, normed, attn)
 
@@ -76,6 +77,7 @@ func Block(
 	//
 	// SiLU on the gate, times the up projection, in one pass — ggml's
 	// swiglu, where Gemma has a tabulated GELU.
+	calib(bc.Index, "gateup", normed.F[:batch])
 	if bw.Gate.WantsQ8K() || bw.Up.WantsQ8K() {
 		normed.QuantizeK()
 	}
@@ -93,6 +95,7 @@ func Block(
 	})
 
 	ffn := s.ffn[:batch]
+	calib(bc.Index, "down", gate.F[:batch])
 	bw.Down.MatVecBatch(gate, ffn)
 
 	nn.InParallel(batch, batch*cfg.Dim*perPosition, func(first, last int) {

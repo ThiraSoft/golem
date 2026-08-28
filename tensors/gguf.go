@@ -299,9 +299,10 @@ func (g *GGUF) readTensorTable(r *reader, count uint64) error {
 			return fmt.Errorf("tensor %q runs from %d to %d, past the end of the file", e.name, start, end)
 		}
 		g.Tensors[e.name] = Tensor{
-			Shape: e.shape,
-			DType: e.dtype,
-			Raw:   g.m.data[start:end],
+			Shape:  e.shape,
+			DType:  e.dtype,
+			Raw:    g.m.data[start:end],
+			Offset: start,
 		}
 	}
 	return nil

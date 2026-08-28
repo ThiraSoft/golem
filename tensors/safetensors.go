@@ -21,6 +21,10 @@ type Tensor struct {
 	DType string
 	Shape []int
 	Raw   []byte
+
+	// Offset is where Raw begins in the file. Reading never needs it; a tool
+	// that rewrites a tensor in place does.
+	Offset int
 }
 
 // Elems is the number of scalars in the tensor.
