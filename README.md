@@ -110,7 +110,9 @@ The same bargain is what reads a prompt. A pass carries up to five hundred and t
 | the pass | 31.9ms | 85.2ms | 125.2ms | 221.2ms | 423.8ms | 834.3ms |
 | positions a second | 31 | 188 | 256 | 289 | 302 | **307** |
 
-A prompt reads at **303 a second, against 62 when a pass carried two** — and against llama.cpp's 615, which is still twice that.
+A prompt reads at **303 a second, against 62 when a pass carried two** — and against llama.cpp's 1241, which is still four times that.
+
+That 1241 is measured here, `llama-bench -p 512` on the same file and the same card, because the 615 this file used to quote came from an older build and was wrong. The two benchmarks do the same work: 512 tokens from an empty cache, both warm, both synchronised, load time excluded. Two differences and both are ours — llama.cpp carries the 512 in one pass where golem takes two of 256, and golem reads every position's hidden state back over the bus where llama.cpp keeps only the last, about 5ms of 1645.
 
 Three things had to change for that. The pass had to widen at all: two columns is what a draft verified beside the token that drafted it needs, and nothing had asked for more. Then the mat-vec ran out — it reads a weight once for every column it carries, but past sixteen the accumulator a thread holds a column in stops fitting in registers, and thirty-two is slower than sixteen. So the projections whose weights are Q4_0 against a Q8_0 activation moved to the tiled product `vk/matmul.go` already runs for Gemma, which stages both operands and keeps a tile of the answer in registers; llama.cpp draws the same line, at eight. And the scratch a mixer passes through became the pipeline's rather than each block's — sixty-four blocks go through one command buffer with a barrier between them, so no two are ever in flight, and a set apiece at that width was a gigabyte. Enough to push the logit head off the card, which showed up as a token costing 200ms instead of 34.
 
@@ -126,14 +128,14 @@ A note on how that was measured, because it was measured wrongly first. The mat-
 | --- | --- | --- |
 | **Gemma 4** | E2B, 12B, 26B A4B (mixture of 128 experts). Text, Vision, Audio. | Reading a prompt ×1.24 (E2B), ×1.33 (12B), ×1.06 (26B A4B). Generating, a tie: ×1.01, ×1.04, ×1.06 — vs llama.cpp |
 | **Qwen3** | Dense models, from a GGUF. | 4B: ×1.13 reading, ×1.00 generating. 0.6B: ×0.99 reading, ×0.85 generating — vs llama.cpp |
-| **Qwen3.5** | 27B A3B: forty-eight gated delta nets and sixteen attentions, three to one, over a mixture of experts — plus the checkpoint's own multi-token-prediction head, which drafts the second token of every pass. | 0.72 t/s on an i7-9700K: a delta net rewrites a 128×128 state a head every token, and that is arithmetic no kernel makes cheaper. On a card, 30.1 a token at a time, **45.1 drafting** and 303 reading a prompt, against llama.cpp's Vulkan build at 32.6 and 615 |
+| **Qwen3.5** | 27B A3B: forty-eight gated delta nets and sixteen attentions, three to one, over a mixture of experts — plus the checkpoint's own multi-token-prediction head, which drafts the second token of every pass. | 0.72 t/s on an i7-9700K: a delta net rewrites a 128×128 state a head every token, and that is arithmetic no kernel makes cheaper. On a card, 30.1 a token at a time, **45.1 drafting** and 303 reading a prompt, against llama.cpp's Vulkan build at 32.7 and 1241 |
 | **Pocket TTS** | 13 shipped models across 6 languages, voice cloning included. | ×2.31 and ×1.69 the speed of the PyTorch reference, on the 24- and 6-layer models |
 
 In absolute terms, on an i7-9700K with eight threads and Q4_0 weights: Gemma E2B draws 22.6 tokens a second and reads 204; the 12B, 5.0 and 42; the 26B A4B, 13.1 and 51; Qwen3 4B, 14.6 and 110. Pocket TTS speaks at ×2.94 real time in French, ×6.81 in English.
 
 **The 0.6B is the one this engine loses**, and [`qwen/README.md`](qwen/README.md) says why: at 320 MB the weights fit close enough that the memory bus stops being the limit, and what is left is arithmetic, where llama.cpp's kernels win. This engine is built for the regime where reading the weights is the cost, and it says so where it is not.
 
-**Qwen3.5 is the one this engine reads slowly** — 62 positions a second on a card against llama.cpp's 615, because a pass carried two positions where it wanted five hundred. It now reads at 303. What is left there is the Q4_1 and Q5_K projections, which the section above prices at most of the pass.
+**Qwen3.5 is the one this engine reads slowly** — 62 positions a second on a card against llama.cpp's 1241, because a pass carried two positions where it wanted five hundred. It now reads at 303. What is left there is the Q4_1 and Q5_K projections, which the section above prices at most of the pass.
 
 ## 👁️ Multimodal (Vision & Audio)
 
