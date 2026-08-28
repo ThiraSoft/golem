@@ -155,21 +155,22 @@ func TestGenerationCost(t *testing.T) {
 	report("card", 64)
 }
 
-// What a pass costs by its width, which is where the prompt rate comes from
-// and where the mat-vec ends.
+// What a pass costs by its width, which is where the prompt rate comes from.
 //
 // A pass reads every weight in the model once whatever it carries, so the
-// first columns are nearly free; what is left after that is about four
-// milliseconds a column, and it grows until the accumulator a thread holds a
-// column in stops fitting in registers. Measured on an RX 9070 XT:
+// first columns are nearly free. Measured on an RX 9070 XT:
 //
-//	positions   1       2       4       8      16      32
-//	the pass    34.4ms  34.7ms  36.9ms  52.3ms  86.2ms  190.8ms
-//	a second    29      58      108     153     186     168
+//	positions   1       32       64      128      256      512
+//	the pass    34.5ms  104.9ms  128.5ms  205.7ms  372.4ms  716.4ms
+//	a second    29      305      498      622      687      715
 //
-// Thirty-two is slower than sixteen, which is why vk/qwen_pipeline.go's
-// qwenWidths stops there. Past it the answer is the tiled product in
-// vk/matmul.go rather than a wider mat-vec.
+// The widest is the fastest and the test says so, because that is the property
+// vk/qwen_pipeline.go's qwenWidths depends on: a run takes the widest pass that
+// fits what is left, and a width that has stopped paying should fail here
+// rather than ship. It did stop paying once — a mat-vec at thirty-two columns
+// is slower than one at sixteen, because the accumulator a thread carries a
+// column in stops fitting in registers, which is why the projections that can
+// go through the tiled product now do.
 func TestPassWidthCost(t *testing.T) {
 	g, err := tensors.OpenGGUF(qwen38)
 	if err != nil {
@@ -187,27 +188,30 @@ func TestPassWidthCost(t *testing.T) {
 	m.W.TokenEmbd.Row(100, emb)
 
 	best, at := 0.0, 0
-	for _, w := range []int{1, 2, 4, 8, 16} {
+	for _, w := range []int{1, 32, 64, 128, 256, 512} {
+		if w > m.gpuPipe.Columns() {
+			continue
+		}
 		xs := make([][]float32, w)
 		pos := make([]int, w)
 		for i := range xs {
 			xs[i], pos[i] = emb, 100+i
 		}
-		for i := 0; i < 3; i++ {
+		for i := 0; i < 2; i++ {
 			if _, err := m.gpuPipe.ForwardColumns(xs, pos); err != nil {
 				t.Fatal(err)
 			}
 		}
-		const reps = 10
+		reps := max(2, 64/w)
 		start := time.Now()
 		for i := 0; i < reps; i++ {
 			if _, err := m.gpuPipe.ForwardColumns(xs, pos); err != nil {
 				t.Fatal(err)
 			}
 		}
-		each := time.Since(start) / reps
+		each := time.Since(start) / time.Duration(reps)
 		rate := float64(w) / each.Seconds()
-		fmt.Printf("%2d columns: %v a pass (%.0f positions/s)\n", w, each.Round(100*time.Microsecond), rate)
+		fmt.Printf("%3d columns: %v a pass (%.0f positions/s)\n", w, each.Round(100*time.Microsecond), rate)
 		if rate > best {
 			best, at = rate, w
 		}
@@ -218,12 +222,12 @@ func TestPassWidthCost(t *testing.T) {
 	}
 
 	// And a prompt read end to end, which is what the README quotes.
-	toks := make([]int32, 256)
+	toks := make([]int32, 512)
 	for i := range toks {
 		toks[i] = int32(100 + i)
 	}
 	m.Reset()
-	m.ForwardBatch(toks[:16], 0)
+	m.ForwardBatch(toks[:64], 0)
 	m.Reset()
 	start := time.Now()
 	m.ForwardBatch(toks, 0)

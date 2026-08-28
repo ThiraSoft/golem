@@ -23,6 +23,7 @@ layout(std430, binding = 2) writeonly buffer Y { float y[]; }; // Float32 output
 layout(push_constant) uniform Push {
     uint dim; // outputs
     uint ffn; // inputs
+    uint col; // the first column of the pass this dispatch answers
 } p;
 
 const uint LANES = 8u;
@@ -135,8 +136,8 @@ void main() {
                     uint at = chunkX + (l * 4u + b);
 
                     [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
-                        float xL = x[c * p.ffn + at];
-                        float xH = x[c * p.ffn + at + 16u];
+                        float xL = x[(p.col + c) * p.ffn + at];
+                        float xH = x[(p.col + c) * p.ffn + at + 16u];
                         chunkSum[c] += wLow * xL + wHigh * xH;
                         chunkSumX[c] += xL + xH;
                     }
@@ -151,6 +152,6 @@ void main() {
     // Cluster reduction across the 8 lanes of this row
     [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
         float total = subgroupClusteredAdd(sum[c], LANES);
-        if (lane == 0u && live) y[c * p.dim + row] = total;
+        if (lane == 0u && live) y[(p.col + c) * p.dim + row] = total;
     }
 }

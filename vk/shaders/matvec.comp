@@ -34,6 +34,7 @@ layout(push_constant) uniform Push {
     uint ffn;   // inputs
     uint used;  // one, and only here so that every kernel takes the same block
     uint act;   // the activation, which is spent before this kernel runs
+    uint col;   // the first column of the pass this dispatch answers
 } p;
 
 const uint LANES = 8u;
@@ -62,13 +63,13 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
             hi[u] = (word >> 4) & 0x0F0F0F0Fu;
         }
         for (uint c = 0u; c < COLUMNS; c++) {
-            uint ac = c * aw + ab;
+            uint ac = (p.col + c) * aw + ab;
             int acc = 0;
             for (uint u = 0u; u < 4u; u++) {
                 acc = dotPacked4x8AccSatEXT(lo[u], int(aq[ac + u]),      acc);
                 acc = dotPacked4x8AccSatEXT(hi[u], int(aq[ac + u + 4u]), acc);
             }
-            uint sc = c * 2u * nb;
+            uint sc = (p.col + c) * 2u * nb;
             sum[c]  += float(acc) * ws * as_[sc + b];
             corr[c] += ws * as_[sc + nb + b];
         }
@@ -91,7 +92,7 @@ void main() {
     for (uint c = 0u; c < COLUMNS; c++) {
         float sum = subgroupClusteredAdd(part[c], LANES);
         if (lane == 0u && i < p.dim) {
-            y[c * p.dim + i] = sum;
+            y[(p.col + c) * p.dim + i] = sum;
         }
     }
 }

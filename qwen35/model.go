@@ -157,7 +157,11 @@ func (m *Model) Forward(token int32, pos int) []float32 {
 func (m *Model) ForwardBatch(tokens []int32, startPos int) [][]float32 {
 	out := make([][]float32, len(tokens))
 	if m.gpuPipe != nil {
-		embeds := make([][]float32, m.gpuPipe.Columns())
+		// One row a column of the widest pass this run will actually take,
+		// which is not the widest the pipeline can take: a card that reads a
+		// prompt a hundred and twenty-eight positions at a time would
+		// otherwise allocate and clear that many rows to draw one token.
+		embeds := make([][]float32, m.gpuPipe.WidthFor(len(tokens)))
 		for i := range embeds {
 			embeds[i] = make([]float32, m.Cfg.Dim)
 		}

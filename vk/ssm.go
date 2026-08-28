@@ -43,6 +43,11 @@ type ssmScanPush struct {
 type matvecKPush struct {
 	Dim uint32
 	FFN uint32
+	// Col is the first column of the pass a dispatch answers. These kernels
+	// are built for a fixed number of columns, so a pass wider than the widest
+	// binary is run as several dispatches at an offset. See QwenPipeline's
+	// product.
+	Col uint32
 }
 
 type SSMBlock struct {

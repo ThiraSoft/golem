@@ -69,6 +69,9 @@ var matvecQ80SPIRV []byte
 //go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q41.comp -o shaders/matvec_q41_16.spv
 //go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q5k.comp -o shaders/matvec_q5k_16.spv
 //go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32_16.spv
+//go:generate glslc -O -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q40.comp -o shaders/matvec_q40_32.spv
+//go:generate glslc -O -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q41.comp -o shaders/matvec_q41_32.spv
+//go:generate glslc -O -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q5k.comp -o shaders/matvec_q5k_32.spv
 
 //go:embed shaders/matvec2.spv
 var matvec2SPIRV []byte
@@ -134,15 +137,24 @@ var matvecQ5K_16SPIRV []byte
 //go:embed shaders/matvec_f32_16.spv
 var matvecF32_16SPIRV []byte
 
+//go:embed shaders/matvec_q40_32.spv
+var matvecQ40_32SPIRV []byte
+
+//go:embed shaders/matvec_q41_32.spv
+var matvecQ41_32SPIRV []byte
+
+//go:embed shaders/matvec_q5k_32.spv
+var matvecQ5K_32SPIRV []byte
+
 // qwenWide is the widest pass any of these binaries answers. Everything
 // per-column is allocated for it.
-const qwenWide = 16
+const qwenWide = 512
 
 // qwenWidths are the widths a pass may take, largest first. A run of tokens is
 // cut into passes of these: a hundred positions is twelve of eight and one of
 // four, and the remainder never falls back to one column at a time unless it
 // is one column.
-var qwenWidths = [...]int{16, 8, 4, 2, 1}
+var qwenWidths = [...]int{512, 256, 128, 64, 32, 16, 8, 4, 2, 1}
 
 //go:embed shaders/swiglu_act.spv
 var swigluActSPIRV []byte
@@ -252,12 +264,10 @@ type QwenFFNData struct {
 type qwenSSMBlock struct {
 	wQKV, wGate, wAlpha, wBeta, wOut *Buffer
 
-	convWeight, convState, convOut *Buffer
-	shadowState, shadowConv        *Buffer
-	qkvBuf, gateZBuf               *Buffer
-	alphaBuf, betaBuf              *Buffer
-	dtBias, ssmA, ssmNorm          *Buffer
-	ssmState, ySSM, outBuf         *Buffer
+	convWeight, convState   *Buffer
+	shadowState, shadowConv *Buffer
+	dtBias, ssmA, ssmNorm   *Buffer
+	ssmState                *Buffer
 
 	setQKV, setGate, setAlpha, setBeta *Set
 	setConv, setScan, setOut           *Set
@@ -266,11 +276,7 @@ type qwenSSMBlock struct {
 type qwenAttnBlock struct {
 	wQ, wK, wV, wO *Buffer
 	qNorm, kNorm   *Buffer
-
-	qIn, kIn, vIn  *Buffer
-	qOut, attnOut  *Buffer
 	kCache, vCache *Buffer
-	outBuf         *Buffer
 
 	setQ, setK, setV *Set
 	setPrep, setGQA  *Set
@@ -285,6 +291,10 @@ type qwenFFNBlock struct {
 type QwenPipeline struct {
 	d     *Device
 	shape QwenShape
+	// coop says the card has cooperative matrices, which decides which tiled
+	// product the wide projections are bound to and how many workgroups it
+	// wants. vk/matmul.go owns both.
+	coop bool
 
 	pipeNorm     *Pipeline
 	pipeMatvec   *Pipeline // Q4_0 against the Q8_0 activation
@@ -314,6 +324,19 @@ type QwenPipeline struct {
 	posIn  *Buffer
 	posBuf *Buffer
 	pass   map[int]*Program
+
+	// The scratch a block passes through, which is the pipeline's and not the
+	// block's: sixty-four blocks go through one command buffer with a barrier
+	// between them, so no two of them are ever in flight and one set of these
+	// serves them all. A set a block, at a hundred and twenty-eight columns,
+	// was a gigabyte — enough to push the logit head off the card, which
+	// showed up as a token costing 200ms instead of 34.
+	convOut, qkvBuf   *Buffer
+	gateZBuf, ySSM    *Buffer
+	alphaBuf, betaBuf *Buffer
+	qIn, kIn, vIn     *Buffer
+	qOut, attnOut     *Buffer
+	mixOut            *Buffer // whichever mixer this block has, into the norm
 
 	resid    *Buffer
 	normed   *Buffer
@@ -363,6 +386,7 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 	p := &QwenPipeline{
 		d:          d,
 		shape:      shape,
+		coop:       d.Coopmat(),
 		ssmBlocks:  make(map[int]*qwenSSMBlock),
 		attnBlocks: make(map[int]*qwenAttnBlock),
 	}
@@ -401,12 +425,52 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		spirv   []byte
 	}{
 		{p.pipeMatvec, 2, matvec2SPIRV}, {p.pipeMatvec, 4, matvec4SPIRV}, {p.pipeMatvec, 8, matvecQwen8SPIRV}, {p.pipeMatvec, 16, matvecQwen16SPIRV},
-		{p.pipeMatQ40, 2, matvecQ40_2SPIRV}, {p.pipeMatQ40, 4, matvecQ40_4SPIRV}, {p.pipeMatQ40, 8, matvecQ40_8SPIRV}, {p.pipeMatQ40, 16, matvecQ40_16SPIRV},
-		{p.pipeMatQ41, 2, matvecQ41_2SPIRV}, {p.pipeMatQ41, 4, matvecQ41_4SPIRV}, {p.pipeMatQ41, 8, matvecQ41_8SPIRV}, {p.pipeMatQ41, 16, matvecQ41_16SPIRV},
-		{p.pipeMatQ5K, 2, matvecQ5K_2SPIRV}, {p.pipeMatQ5K, 4, matvecQ5K_4SPIRV}, {p.pipeMatQ5K, 8, matvecQ5K_8SPIRV}, {p.pipeMatQ5K, 16, matvecQ5K_16SPIRV},
+		{p.pipeMatQ40, 2, matvecQ40_2SPIRV}, {p.pipeMatQ40, 4, matvecQ40_4SPIRV}, {p.pipeMatQ40, 8, matvecQ40_8SPIRV}, {p.pipeMatQ40, 16, matvecQ40_16SPIRV}, {p.pipeMatQ40, 32, matvecQ40_32SPIRV},
+		{p.pipeMatQ41, 2, matvecQ41_2SPIRV}, {p.pipeMatQ41, 4, matvecQ41_4SPIRV}, {p.pipeMatQ41, 8, matvecQ41_8SPIRV}, {p.pipeMatQ41, 16, matvecQ41_16SPIRV}, {p.pipeMatQ41, 32, matvecQ41_32SPIRV},
+		{p.pipeMatQ5K, 2, matvecQ5K_2SPIRV}, {p.pipeMatQ5K, 4, matvecQ5K_4SPIRV}, {p.pipeMatQ5K, 8, matvecQ5K_8SPIRV}, {p.pipeMatQ5K, 16, matvecQ5K_16SPIRV}, {p.pipeMatQ5K, 32, matvecQ5K_32SPIRV},
 		{p.pipeMatF32, 2, matvecF32_2SPIRV}, {p.pipeMatF32, 4, matvecF32_4SPIRV}, {p.pipeMatF32, 8, matvecF32_8SPIRV}, {p.pipeMatF32, 16, matvecF32_16SPIRV},
 	} {
 		if err := w.pipe.Wide(w.columns, w.spirv); err != nil {
+			return nil, err
+		}
+	}
+	// And the tiled product on the one pipeline whose weights are Q4_0 against
+	// the Q8_0 activation, which is what it reads. Its bindings and its push
+	// block are the mat-vec's, so no set has to be made again — vk/mixture.go
+	// binds the same two kernels to one pipeline for the same reason.
+	//
+	// It is the largest projections that go through it: the delta net's q+k+v
+	// and its gate, the attention's three, and the feed forward's gate and up.
+	// A mat-vec reads a weight once for sixteen columns and stops there,
+	// because the accumulator a thread carries a column in stops fitting in
+	// registers; the tiled product stages both operands and keeps a tile of
+	// the answer, and llama.cpp draws the same line at eight.
+	tiled := []struct {
+		columns int
+		spirv   []byte
+	}{
+		{tiledColumns, matmulWide32SPIRV},
+		{64, matmulWide64SPIRV},
+		{128, matmulWidest128SPIRV},
+		{256, matmulWidest256SPIRV},
+		{wideColumns, matmulWide()},
+	}
+	wave := uint32(0)
+	if p.coop {
+		wave = coopmatWave
+		tiled = []struct {
+			columns int
+			spirv   []byte
+		}{
+			{tiledColumns, matmulCoop32SPIRV},
+			{64, matmulCoop64SPIRV},
+			{128, matmulCoop128SPIRV},
+			{256, matmulCoop256SPIRV},
+			{wideColumns, matmulCoop512SPIRV},
+		}
+	}
+	for _, w := range tiled {
+		if err := p.pipeMatvec.WideWave(w.columns, w.spirv, wave); err != nil {
 			return nil, err
 		}
 	}
@@ -434,6 +498,23 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 	}
 	for _, into := range []**Buffer{&p.gateBuf, &p.upBuf, &p.actBuf} {
 		if *into, err = p.local(shape.FFN * qwenWide * 4); err != nil {
+			return nil, err
+		}
+	}
+	// The mixer's scratch, one set for every block. See the field comment.
+	for _, l := range []struct {
+		into  **Buffer
+		bytes int
+	}{
+		{&p.convOut, shape.ConvDim * qwenWide * 4}, {&p.qkvBuf, shape.ConvDim * qwenWide * 4},
+		{&p.gateZBuf, shape.Inner * qwenWide * 4}, {&p.ySSM, shape.Inner * qwenWide * 4},
+		{&p.alphaBuf, shape.Rank * qwenWide * 4}, {&p.betaBuf, shape.Rank * qwenWide * 4},
+		{&p.qIn, shape.qFullDim() * qwenWide * 4},
+		{&p.kIn, shape.kvDim() * qwenWide * 4}, {&p.vIn, shape.kvDim() * qwenWide * 4},
+		{&p.qOut, shape.qDim() * qwenWide * 4}, {&p.attnOut, shape.qDim() * qwenWide * 4},
+		{&p.mixOut, shape.Dim * qwenWide * 4},
+	} {
+		if *l.into, err = p.local(l.bytes); err != nil {
 			return nil, err
 		}
 	}
@@ -511,36 +592,22 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 			return err
 		}
 	}
-	for _, l := range []struct {
-		into  **Buffer
-		bytes int
-	}{
-		{&b.convOut, s.ConvDim * qwenWide * 4}, {&b.qkvBuf, s.ConvDim * qwenWide * 4},
-		{&b.gateZBuf, s.Inner * qwenWide * 4},
-		{&b.alphaBuf, s.Rank * qwenWide * 4}, {&b.betaBuf, s.Rank * qwenWide * 4},
-		{&b.ySSM, s.Inner * qwenWide * 4}, {&b.outBuf, s.Dim * qwenWide * 4},
-	} {
-		if *l.into, err = p.local(l.bytes); err != nil {
-			return err
-		}
-	}
-
-	if b.setQKV, err = p.pipeMatvec.NewSet([]*Buffer{b.wQKV, p.normedQ, p.normedS, b.qkvBuf}); err != nil {
+	if b.setQKV, err = p.pipeMatvec.NewSet([]*Buffer{b.wQKV, p.normedQ, p.normedS, p.qkvBuf}); err != nil {
 		return err
 	}
-	if b.setGate, err = p.pipeMatvec.NewSet([]*Buffer{b.wGate, p.normedQ, p.normedS, b.gateZBuf}); err != nil {
+	if b.setGate, err = p.pipeMatvec.NewSet([]*Buffer{b.wGate, p.normedQ, p.normedS, p.gateZBuf}); err != nil {
 		return err
 	}
-	if b.setAlpha, err = p.pipeMatF32.NewSet([]*Buffer{b.wAlpha, p.normed, b.alphaBuf}); err != nil {
+	if b.setAlpha, err = p.pipeMatF32.NewSet([]*Buffer{b.wAlpha, p.normed, p.alphaBuf}); err != nil {
 		return err
 	}
-	if b.setBeta, err = p.pipeMatF32.NewSet([]*Buffer{b.wBeta, p.normed, b.betaBuf}); err != nil {
+	if b.setBeta, err = p.pipeMatF32.NewSet([]*Buffer{b.wBeta, p.normed, p.betaBuf}); err != nil {
 		return err
 	}
-	if b.setConv, err = p.pipeConv.NewSet([]*Buffer{b.convWeight, b.qkvBuf, b.convState, b.convOut, b.shadowConv}); err != nil {
+	if b.setConv, err = p.pipeConv.NewSet([]*Buffer{b.convWeight, p.qkvBuf, b.convState, p.convOut, b.shadowConv}); err != nil {
 		return err
 	}
-	if b.setScan, err = p.pipeScan.NewSet([]*Buffer{b.convOut, b.gateZBuf, b.alphaBuf, b.dtBias, b.ssmA, b.betaBuf, b.ssmNorm, b.ssmState, b.ySSM, b.shadowState}); err != nil {
+	if b.setScan, err = p.pipeScan.NewSet([]*Buffer{p.convOut, p.gateZBuf, p.alphaBuf, b.dtBias, b.ssmA, p.betaBuf, b.ssmNorm, b.ssmState, p.ySSM, b.shadowState}); err != nil {
 		return err
 	}
 	outPipe := p.pipeMatQ41
@@ -550,7 +617,7 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 	case d.OutIsQ5K:
 		outPipe = p.pipeMatQ5K
 	}
-	if b.setOut, err = outPipe.NewSet([]*Buffer{b.wOut, b.ySSM, b.outBuf}); err != nil {
+	if b.setOut, err = outPipe.NewSet([]*Buffer{b.wOut, p.ySSM, p.mixOut}); err != nil {
 		return err
 	}
 
@@ -598,36 +665,22 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 			return nil, err
 		}
 	}
-	for _, l := range []struct {
-		into  **Buffer
-		bytes int
-	}{
-		{&b.qIn, s.qFullDim() * qwenWide * 4},
-		{&b.kIn, s.kvDim() * qwenWide * 4}, {&b.vIn, s.kvDim() * qwenWide * 4},
-		{&b.qOut, s.qDim() * qwenWide * 4}, {&b.attnOut, s.qDim() * qwenWide * 4},
-		{&b.outBuf, s.Dim * qwenWide * 4},
-	} {
-		if *l.into, err = p.local(l.bytes); err != nil {
-			return nil, err
-		}
-	}
-
-	if b.setQ, err = p.pipeMatvec.NewSet([]*Buffer{b.wQ, p.normedQ, p.normedS, b.qIn}); err != nil {
+	if b.setQ, err = p.pipeMatvec.NewSet([]*Buffer{b.wQ, p.normedQ, p.normedS, p.qIn}); err != nil {
 		return nil, err
 	}
-	if b.setK, err = p.pipeMatvec.NewSet([]*Buffer{b.wK, p.normedQ, p.normedS, b.kIn}); err != nil {
+	if b.setK, err = p.pipeMatvec.NewSet([]*Buffer{b.wK, p.normedQ, p.normedS, p.kIn}); err != nil {
 		return nil, err
 	}
-	if b.setV, err = p.pipeMatvec.NewSet([]*Buffer{b.wV, p.normedQ, p.normedS, b.vIn}); err != nil {
+	if b.setV, err = p.pipeMatvec.NewSet([]*Buffer{b.wV, p.normedQ, p.normedS, p.vIn}); err != nil {
 		return nil, err
 	}
-	if b.setPrep, err = p.pipeAttnPrep.NewSet([]*Buffer{b.qIn, b.kIn, b.vIn, b.qNorm, b.kNorm, b.qOut, b.kCache, b.vCache, p.posBuf}); err != nil {
+	if b.setPrep, err = p.pipeAttnPrep.NewSet([]*Buffer{p.qIn, p.kIn, p.vIn, b.qNorm, b.kNorm, p.qOut, b.kCache, b.vCache, p.posBuf}); err != nil {
 		return nil, err
 	}
-	if b.setGQA, err = p.pipeAttnGQA.NewSet([]*Buffer{b.qOut, b.kCache, b.vCache, b.qIn, b.attnOut, p.posBuf}); err != nil {
+	if b.setGQA, err = p.pipeAttnGQA.NewSet([]*Buffer{p.qOut, b.kCache, b.vCache, p.qIn, p.attnOut, p.posBuf}); err != nil {
 		return nil, err
 	}
-	if b.setO, err = p.pipeMatQ40.NewSet([]*Buffer{b.wO, b.attnOut, b.outBuf}); err != nil {
+	if b.setO, err = p.pipeMatQ40.NewSet([]*Buffer{b.wO, p.attnOut, p.mixOut}); err != nil {
 		return nil, err
 	}
 
@@ -727,9 +780,9 @@ func (p *QwenPipeline) SetNorms(attnNorms, ffnNorms [][]float32, outNorm []float
 
 		var subOut *Buffer
 		if isSSM[i] {
-			subOut = p.ssmBlocks[i].outBuf
+			subOut = p.mixOut
 		} else {
-			subOut = p.attnBlocks[i].outBuf
+			subOut = p.mixOut
 		}
 
 		// resid = xs + subOut, and the feed forward's input is its norm.
@@ -885,10 +938,53 @@ func (p *QwenPipeline) record(r *Recorder, columns, snapAt int) {
 	r.Copy(p.hidden, 0, p.xs, s.Dim*columns*4)
 }
 
-// product dispatches a mat-vec at the width of the pass. One column runs the
-// plain binary and more than one the binary built for that many, which is the
-// whole of what a wide pass is: the same weights read once for every column.
-func (p *QwenPipeline) product(r *Recorder, set *Set, rows, columns int, push unsafe.Pointer) {
+// product dispatches one projection at the width of the pass.
+//
+// A binary answers exactly the number of columns it was built for, so a pass
+// wider than the widest binary a pipeline has is run as several dispatches at
+// an offset — a hundred and twenty-eight columns through a sixteen-wide
+// mat-vec is eight of them, each told where its columns start. The pipelines
+// that carry the tiled product have a binary at every width a pass takes and
+// never split.
+//
+// The two push blocks put that offset in different places, so there is one of
+// these for each rather than an unsafe.Pointer and a field index.
+func (p *QwenPipeline) product(r *Recorder, set *Set, rows, columns int, push moePush) {
+	for at := 0; at < columns; {
+		w := set.widest(columns - at)
+		if w == 0 {
+			w = 1
+		}
+		push.col = uint32(at)
+		p.dispatchAt(r, set, rows, w, unsafe.Pointer(&push))
+		at += w
+	}
+}
+
+// productK is product for the kernels that take vk/ssm.go's push block: the
+// K-quant, Q4_1 and float projections, which have no tiled form and are always
+// the mat-vec.
+func (p *QwenPipeline) productK(r *Recorder, set *Set, rows, columns int, push matvecKPush) {
+	for at := 0; at < columns; {
+		w := set.widest(columns - at)
+		if w == 0 {
+			w = 1
+		}
+		push.Col = uint32(at)
+		p.dispatchAt(r, set, rows, w, unsafe.Pointer(&push))
+		at += w
+	}
+}
+
+// dispatchAt issues one of those, with the workgroup count the binary bound at
+// that width wants: a mat-vec answers a fixed number of outputs to a
+// workgroup, and the tiled product answers a tile of rows by a block of
+// columns. vk/matmul.go owns both counts.
+func (p *QwenPipeline) dispatchAt(r *Recorder, set *Set, rows, columns int, push unsafe.Pointer) {
+	if columns >= tiledColumns {
+		r.DispatchWide(set, columns, coopProductGroups(p.coop, columns, rows), push)
+		return
+	}
 	groups := matvecGroups(rows)
 	if columns == 1 {
 		r.Dispatch(set, groups, push)
@@ -991,12 +1087,8 @@ func (p *QwenPipeline) ProbeMixer(x []float32, pos, block int) ([]float32, error
 			p.recordFFN(r, p.ffnBlocks[i], 1)
 			r.Barrier()
 		}
-		out := p.attnBlocks[block]
-		if p.isSSM[block] {
-			r.Copy(p.hidden, 0, p.ssmBlocks[block].outBuf, s.Dim*4)
-		} else {
-			r.Copy(p.hidden, 0, out.outBuf, s.Dim*4)
-		}
+		// Whichever mixer this block has wrote into the one scratch.
+		r.Copy(p.hidden, 0, p.mixOut, s.Dim*4)
 	})
 	if err != nil {
 		return nil, err
@@ -1049,38 +1141,36 @@ func (p *QwenPipeline) ProbeRaw(x []float32, pos, block int, what string) ([]flo
 	if pick != nil {
 		// nothing further
 	} else if p.isSSM[block] {
-		b := p.ssmBlocks[block]
 		switch what {
 		case "qkv":
-			pick, n = b.qkvBuf, s.ConvDim
+			pick, n = p.qkvBuf, s.ConvDim
 		case "gate":
-			pick, n = b.gateZBuf, s.Inner
+			pick, n = p.gateZBuf, s.Inner
 		case "alpha":
-			pick, n = b.alphaBuf, s.Rank
+			pick, n = p.alphaBuf, s.Rank
 		case "beta":
-			pick, n = b.betaBuf, s.Rank
+			pick, n = p.betaBuf, s.Rank
 		case "conv":
-			pick, n = b.convOut, s.ConvDim
+			pick, n = p.convOut, s.ConvDim
 		case "y":
-			pick, n = b.ySSM, s.Inner
+			pick, n = p.ySSM, s.Inner
 		case "out":
-			pick, n = b.outBuf, s.Dim
+			pick, n = p.mixOut, s.Dim
 		}
 	} else {
-		b := p.attnBlocks[block]
 		switch what {
 		case "q":
-			pick, n = b.qIn, s.qFullDim()
+			pick, n = p.qIn, s.qFullDim()
 		case "k":
-			pick, n = b.kIn, s.kvDim()
+			pick, n = p.kIn, s.kvDim()
 		case "v":
-			pick, n = b.vIn, s.kvDim()
+			pick, n = p.vIn, s.kvDim()
 		case "qrope":
-			pick, n = b.qOut, s.qDim()
+			pick, n = p.qOut, s.qDim()
 		case "mix":
-			pick, n = b.attnOut, s.qDim()
+			pick, n = p.attnOut, s.qDim()
 		case "out":
-			pick, n = b.outBuf, s.Dim
+			pick, n = p.mixOut, s.Dim
 		}
 	}
 	if pick == nil {
@@ -1155,10 +1245,10 @@ func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt i
 		SnapAt:    uint32(snapAt),
 	}
 
-	p.product(r, b.setQKV, s.ConvDim, columns, unsafe.Pointer(&qkv))
-	p.product(r, b.setGate, s.Inner, columns, unsafe.Pointer(&gate))
-	p.product(r, b.setAlpha, s.Rank, columns, unsafe.Pointer(&small))
-	p.product(r, b.setBeta, s.Rank, columns, unsafe.Pointer(&small))
+	p.product(r, b.setQKV, s.ConvDim, columns, qkv)
+	p.product(r, b.setGate, s.Inner, columns, gate)
+	p.productK(r, b.setAlpha, s.Rank, columns, small)
+	p.productK(r, b.setBeta, s.Rank, columns, small)
 	r.Barrier()
 
 	// The convolution and the scan carry the columns inside themselves: both
@@ -1170,7 +1260,7 @@ func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt i
 	r.Dispatch(b.setScan, uint32(s.Rank), unsafe.Pointer(&scan))
 	r.Barrier()
 
-	p.product(r, b.setOut, s.Dim, columns, unsafe.Pointer(&out))
+	p.productK(r, b.setOut, s.Dim, columns, out)
 }
 
 func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
@@ -1193,9 +1283,9 @@ func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
 		Scale:      float32(1 / sqrtOf(s.HeadDim)),
 	}
 
-	p.product(r, b.setQ, s.qFullDim(), columns, unsafe.Pointer(&q))
-	p.product(r, b.setK, s.kvDim(), columns, unsafe.Pointer(&kv))
-	p.product(r, b.setV, s.kvDim(), columns, unsafe.Pointer(&kv))
+	p.product(r, b.setQ, s.qFullDim(), columns, q)
+	p.product(r, b.setK, s.kvDim(), columns, kv)
+	p.product(r, b.setV, s.kvDim(), columns, kv)
 	r.Barrier()
 
 	// Every column's keys and values go into the cache before any column reads
@@ -1207,7 +1297,7 @@ func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
 	r.DispatchColumns(b.setGQA, uint32(s.Heads), uint32(columns), unsafe.Pointer(&gqa))
 	r.Barrier()
 
-	p.product(r, b.setO, s.Dim, columns, unsafe.Pointer(&out))
+	p.productK(r, b.setO, s.Dim, columns, out)
 }
 
 func (p *QwenPipeline) recordFFN(r *Recorder, b *qwenFFNBlock, columns int) {
@@ -1218,14 +1308,14 @@ func (p *QwenPipeline) recordFFN(r *Recorder, b *qwenFFNBlock, columns int) {
 	act := swigluPush{N: uint32(s.FFN * columns)}
 	down := matvecKPush{Dim: uint32(s.Dim), FFN: uint32(s.FFN)}
 
-	p.product(r, b.setGate, s.FFN, columns, unsafe.Pointer(&up))
-	p.product(r, b.setUp, s.FFN, columns, unsafe.Pointer(&up))
+	p.product(r, b.setGate, s.FFN, columns, up)
+	p.product(r, b.setUp, s.FFN, columns, up)
 	r.Barrier()
 
 	r.Dispatch(p.setAct, uint32((s.FFN*columns+255)/256), unsafe.Pointer(&act))
 	r.Barrier()
 
-	p.product(r, b.setDown, s.Dim, columns, unsafe.Pointer(&down))
+	p.productK(r, b.setDown, s.Dim, columns, down)
 }
 
 // ResetState clears what a conversation accumulates: the delta nets' state
@@ -1371,7 +1461,7 @@ func (p *QwenPipeline) AddMTPBlock(d QwenMTPData) error {
 	if b.setAttnNorm, err = p.pipeNorm.NewSet([]*Buffer{p.xs, p.none, b.attnNorm, p.none, p.none, p.normed, p.normedQ, p.normedS}); err != nil {
 		return err
 	}
-	if b.setFFNNorm, err = p.pipeNorm.NewSet([]*Buffer{p.xs, b.attn.outBuf, b.ffnNorm, p.none, p.resid, p.ffnNorm, p.ffnNormQ, p.ffnNormS}); err != nil {
+	if b.setFFNNorm, err = p.pipeNorm.NewSet([]*Buffer{p.xs, p.mixOut, b.ffnNorm, p.none, p.resid, p.ffnNorm, p.ffnNormQ, p.ffnNormS}); err != nil {
 		return err
 	}
 	if b.setFinal, err = p.pipeNorm.NewSet([]*Buffer{p.resid, p.ffnOut, b.headNorm, p.none, p.xs, p.stage, p.none, p.none}); err != nil {

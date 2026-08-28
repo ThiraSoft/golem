@@ -302,6 +302,23 @@ func (r *Recorder) DispatchWide(s *Set, columns int, groups uint32, push unsafe.
 	r.dispatch(s, pipeline, groups, 1, push)
 }
 
+// widestUpTo is the widest binary this pipeline has that answers no more than
+// n columns, or zero if it has none. A pass wider than any binary is run as
+// several dispatches of the widest that fits, at an offset — see
+// QwenPipeline's product.
+func (p *Pipeline) widestUpTo(n int) int {
+	best := 0
+	for w := range p.wide {
+		if w <= n && w > best {
+			best = w
+		}
+	}
+	return best
+}
+
+// widest is widestUpTo for the pipeline behind a set.
+func (s *Set) widest(n int) int { return s.p.widestUpTo(n) }
+
 // sortedWidths is what a pipeline was built for, for that message.
 func sortedWidths(wide map[int]uint64) []int {
 	out := make([]int, 0, len(wide))
