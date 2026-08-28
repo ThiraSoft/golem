@@ -2,7 +2,7 @@
   <img src="assets/logo.svg" alt="golem" width="420">
 
 **Gemma, Qwen and Pocket TTS in a single static Go binary.**  
-_No Python. No cgo. No GPU required — but with `-vulkan` it outruns llama.cpp's own Vulkan build, reading prompts and generating both._
+_No Python. No cgo. No GPU required — but with `-vulkan` it matches or exceeds llama.cpp's Vulkan performance on AMD hardware._
 
 [![test](https://github.com/ThiraSoft/golem/actions/workflows/test.yml/badge.svg)](https://github.com/ThiraSoft/golem/actions/workflows/test.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/ThiraSoft/golem.svg)](https://pkg.go.dev/github.com/ThiraSoft/golem)
@@ -24,7 +24,7 @@ A golem is inert matter given a voice. That is what these engines do to a file o
 - **Multimodal**: Text, Vision (images) and Audio (WAV/MP3/FLAC) via Gemma 4.
 - **Verified, not asserted**: no layer is deemed correct until its intermediate activations match llama.cpp or PyTorch, waypoint by waypoint.
 - **Fast on CPU**: keeps pace with `llama.cpp` on tuned AVX2 kernels — ahead reading prompts, level generating.
-- **Vulkan GPU**: bound through `purego` rather than cgo. Faster than `llama.cpp`'s own Vulkan build on Gemma, reading prompts and generating; level with it on Qwen3.5 27B, at 1236 positions a second against 1234.7.
+- **Vulkan GPU**: bound through `purego` rather than cgo. Delivers state-of-the-art Vulkan performance (benchmarked on AMD), matching or outperforming `llama.cpp`'s Vulkan backend on Gemma and Qwen3.5.
 - **Serves several clients at once**: `-parallel N` holds N conversations and carries a token for each of them through one read of the weights, on the card as well as on the processor.
 
 ## 🚀 Quickstart
