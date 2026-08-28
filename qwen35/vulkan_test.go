@@ -128,10 +128,10 @@ func TestVulkanTwoColumns(t *testing.T) {
 	}
 }
 
-// A wide pass against the same tokens one at a time, bit for bit.
+// A wide pass against the same tokens one at a time.
 //
-// This is the test that was missing while the pass grew from two columns to
-// five hundred and twelve, and the whole of what it holds is that widening it
+// This is the test that was missing while the pass grew from two columns to a
+// hundred and twenty-eight, and the whole of what it holds is that widening it
 // changes nothing but the reading of the weights. Nothing else covered it:
 // TestVulkanMatchesCPU carries four positions and TestVulkanGenerate a
 // twenty-token prompt, both under the width at which the tiled product and the
@@ -140,10 +140,15 @@ func TestVulkanTwoColumns(t *testing.T) {
 // regenerated after its push block grew, and a thirty-two-wide form of it that
 // answered a third faster and wrongly.
 //
-// Bit for bit and not to a tolerance, deliberately. A column reads the same
-// weights in the same order whatever the width beside it, so anything at all
-// is an indexing fault rather than an arithmetic one, and a tolerance would
-// only say how far a wrong index had drifted.
+// Up to narrowChunk the demand is bit for bit, because it is the same binary
+// summing the same products in the same order and any gap at all is an index.
+// Above it the tiled product answers instead, which folds those products in a
+// different order — a tile of the answer in registers against a running sum a
+// column — so the two differ in the last places and the demand is a tolerance.
+// One per cent of peak is what is measured over sixty-four blocks; gemma's
+// TestVulkanBatchMatchesTokenPath says the same thing about the same trade at
+// 3e-2. What must not differ is the token, which is asserted as well: an index
+// fault does not drift, it answers something else.
 func TestVulkanWidePassMatchesTokenPath(t *testing.T) {
 	m, err := Open(qwen38, 1024)
 	if err != nil {
@@ -153,6 +158,7 @@ func TestVulkanWidePassMatchesTokenPath(t *testing.T) {
 	if err := m.UseVulkan(); err != nil {
 		t.Skipf("no Vulkan: %v", err)
 	}
+	logits := make([]float32, m.Cfg.Vocab)
 
 	// Widths on both sides of every threshold the pipeline has: the mat-vec
 	// binaries, the chunk it is dispatched in, and the tiled product.
@@ -186,9 +192,27 @@ func TestVulkanWidePassMatchesTokenPath(t *testing.T) {
 		}
 
 		maxAbs, rel := diff(wide, narrow)
-		if maxAbs != 0 {
-			t.Errorf("a pass of %d columns answered differently from %d passes of one: max|d|=%g rel=%g",
-				w, w, maxAbs, rel)
+		if w <= narrowChunkTest {
+			if maxAbs != 0 {
+				t.Errorf("a pass of %d columns is the same binary as %d passes of one and answered differently: max|d|=%g rel=%g",
+					w, w, maxAbs, rel)
+			}
+			continue
+		}
+		if rel > 0.02 {
+			t.Errorf("a pass of %d columns drifted from %d passes of one by %g, past the tiled product's own folding",
+				w, w, rel)
+		}
+		m.Logits(wide, logits)
+		a := argmax(logits)
+		m.Logits(narrow, logits)
+		if b := argmax(logits); a != b {
+			t.Errorf("a pass of %d columns named token %d where %d passes of one named %d", w, a, w, b)
 		}
 	}
 }
+
+// narrowChunkTest is vk's narrowChunk, which is not exported. The two have to
+// agree: it is the width at or below which the same binary answers both sides
+// of the comparison above.
+const narrowChunkTest = 16

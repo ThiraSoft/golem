@@ -142,8 +142,9 @@ var matvecQ5K_16SPIRV []byte
 //go:embed shaders/matvec_f32_16.spv
 var matvecF32_16SPIRV []byte
 
-// narrowChunk is the widest a mat-vec is dispatched at. A pass wider than this
-// runs it that many columns at a time, at an offset.
+// narrowChunk is the widest a mat-vec is dispatched at, and it binds productK
+// alone: the pipelines product serves carry the tiled binaries as well, and
+// there the widest available is the one to take.
 //
 // Sixteen and not more. The kernels build at thirty-two too, and the
 // thirty-two-wide form looked a third faster — and was wrong.
@@ -155,13 +156,13 @@ const narrowChunk = 16
 
 // qwenWide is the widest pass any of these binaries answers. Everything
 // per-column is allocated for it.
-const qwenWide = 128
+const qwenWide = 256
 
 // qwenWidths are the widths a pass may take, largest first. A run of tokens is
 // cut into passes of these: a hundred positions is twelve of eight and one of
 // four, and the remainder never falls back to one column at a time unless it
 // is one column.
-var qwenWidths = [...]int{128, 64, 32, 16, 8, 4, 2, 1}
+var qwenWidths = [...]int{256, 128, 64, 32, 16, 8, 4, 2, 1}
 
 //go:embed shaders/swiglu_act.spv
 var swigluActSPIRV []byte
@@ -459,6 +460,7 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		{tiledColumns, matmulWide32SPIRV},
 		{64, matmulWide64SPIRV},
 		{128, matmulWidest128SPIRV},
+		{256, matmulWidest256SPIRV},
 	}
 	wave := uint32(0)
 	if p.coop {
@@ -470,6 +472,7 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 			{tiledColumns, matmulCoop32SPIRV},
 			{64, matmulCoop64SPIRV},
 			{128, matmulCoop128SPIRV},
+			{256, matmulCoop256SPIRV},
 		}
 	}
 	for _, w := range tiled {
@@ -965,7 +968,13 @@ func (p *QwenPipeline) product(r *Recorder, set *Set, rows, columns int, push mo
 	// past sixteen positions. TestVulkanWidePassMatchesTokenPath does now.
 	push.split = 1
 	for at := 0; at < columns; {
-		w := set.widest(min(columns-at, narrowChunk))
+		// The widest this pipeline has, uncapped: these are the projections
+		// that carry the tiled product, and narrowChunk is the mat-vec's
+		// ceiling rather than everyone's. Capping here as well left the tiled
+		// binaries bound and never dispatched — dispatchAt only reaches them
+		// at thirty-two columns or more — so a pass of a hundred and
+		// twenty-eight was eight passes of sixteen and the table flattened.
+		w := set.widest(columns - at)
 		if w == 0 {
 			w = 1
 		}
