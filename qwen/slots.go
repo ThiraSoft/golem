@@ -3,9 +3,13 @@ package qwen
 // Several conversations kept at once, over one set of weights.
 //
 // A slot is a cache and nothing else. The weights are mapped once and the
-// scratch is one request's worth, because the server still drives one request
-// at a time; what having several caches buys is that two clients stop evicting
-// each other's prefix, which is the whole reason the cache exists.
+// scratch is one request's worth; what having several caches buys is that two
+// clients stop evicting each other's prefix, which is the whole reason the
+// cache exists — and that one read of the weights can carry a token for each
+// of them, which is what ForwardMixed is for.
+//
+// The card holds them the same way: one ring a conversation, laid end to end,
+// with the slot travelling beside the position. See vk/attention.go.
 //
 // The context is split rather than multiplied, as llama.cpp's -parallel does:
 // the memory a server was told it may use is what it uses, and each of the n
@@ -20,10 +24,10 @@ func (m *Model) SetSlots(n int) error {
 	if n < 1 {
 		return fmt.Errorf("qwen: %d slots", n)
 	}
-	// See UseVulkanStack: the card holds one cache, so slots have to be asked
-	// for before the stack is built and cannot be asked for after.
-	if n > 1 && m.stack != nil {
-		return fmt.Errorf("qwen: the Vulkan stack holds one conversation, not %d", n)
+	// The card's caches are allocated at the width the stack was built with,
+	// so the slots have to be chosen before it is built. See gemma/slots.go.
+	if m.stack != nil {
+		return fmt.Errorf("qwen: the slots are chosen before the Vulkan stack is built, and it already is")
 	}
 	per := m.Cfg.MaxContext / n
 	if per < 1 {
@@ -64,6 +68,21 @@ func (m *Model) Slot(i int) *Cache {
 		return m.cache
 	}
 	return m.caches[i]
+}
+
+// slotOf is which of the caches a place names, for the device path: a Place
+// carries a pointer and the card wants an index. A model with one cache
+// answers zero for it and never has to look.
+func (m *Model) slotOf(c *Cache) int {
+	if len(m.caches) == 0 {
+		return 0
+	}
+	for i, k := range m.caches {
+		if k == c {
+			return i
+		}
+	}
+	panic("qwen: a place names a cache this model does not hold")
 }
 
 // UseSlot points the next forward pass at one of them. Out of range is a

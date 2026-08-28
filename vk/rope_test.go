@@ -25,7 +25,7 @@ func TestRopeTableMatchesTheCPU(t *testing.T) {
 
 	const dim, heads, kv, queryHeads, context = 256, 256, 256, 4, 4096
 	const dims = 128
-	a, err := NewAttention(d, dim, heads, kv, queryHeads, context, 1)
+	a, err := NewAttention(d, dim, heads, kv, queryHeads, context, 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestRopeTableMatchesTheCPU(t *testing.T) {
 	columns := 32
 	positions := []int{0, 1, 7, 63, 512, 3071, 4095}
 	for c := 0; c < columns; c++ {
-		if err := a.SetWhere(0, c, positions[c%len(positions)], 0, 0); err != nil {
+		if err := a.SetWhere(0, c, 0, positions[c%len(positions)], 0, 0); err != nil {
 			t.Fatal(err)
 		}
 	}

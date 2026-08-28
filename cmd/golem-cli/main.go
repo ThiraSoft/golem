@@ -126,6 +126,11 @@ func main() {
 	newSession := func() *Session {
 		s := NewSession(m.Forward, m.Vocab, m.Template, params,
 			m.Vocabulary, *context, *maxTokens, *system, *think)
+		// A card reads a prompt some five times faster than the width the
+		// processor's caches want; session.go's devicePassWidth measures it.
+		if _, blocks := m.Vulkan(); blocks {
+			s.OnDevice()
+		}
 		if v, ok := m.Media(); ok {
 			s.SetVision(v)
 		}

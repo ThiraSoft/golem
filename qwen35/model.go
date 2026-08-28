@@ -93,10 +93,15 @@ func (m *Model) SlotContext() int {
 }
 
 func (m *Model) SetSlots(n int) error {
-	// The card holds one delta-net state and one key-value cache, and neither
-	// is indexed by slot. Answering several conversations off them would mix
-	// them together, which is a wrong answer and not a slow one, so it is
-	// refused rather than fallen back from.
+	// The card holds one delta net's state per block, and it is not indexed by
+	// slot. The attention blocks could be cut the way gemma's and qwen's now
+	// are — the position buffer carries the slot and vk/attention.go lays one
+	// ring a conversation — but a recurrent block has no ring to cut: its
+	// state is a matrix a head that every token rewrites, and the copies the
+	// speculation path makes of it would each need a slot too. Answering
+	// several conversations off one state mixes them together, which is a
+	// wrong answer and not a slow one, so it is refused rather than fallen
+	// back from. Slots on the processor are unaffected.
 	if n > 1 && m.gpuPipe != nil {
 		return fmt.Errorf("qwen35: the GPU pipeline holds one conversation, not %d", n)
 	}

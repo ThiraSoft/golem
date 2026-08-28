@@ -77,14 +77,6 @@ func (m *Model) UseVulkanStack() error {
 	if m.stack != nil {
 		return nil
 	}
-	// The stack holds one key-value cache, indexed by position alone: the ring
-	// the kernels read has no room in it for a slot. Two conversations on the
-	// card would write each other's positions and read each other's keys,
-	// which is a wrong answer and not a slow one — so it is refused here
-	// rather than fallen back from. Slots on the processor are unaffected.
-	if m.Slots() > 1 {
-		return fmt.Errorf("qwen: the Vulkan stack holds one conversation, not %d", m.Slots())
-	}
 	cfg := m.Cfg
 	d, err := m.device()
 	if err != nil {
@@ -114,7 +106,10 @@ func (m *Model) UseVulkanStack() error {
 			return fmt.Errorf("qwen: the feed-forward width is one buffer on the card, and block %d is %d wide against block 0's %d", i, bc.FFN, ffn)
 		}
 	}
-	attn, err := vk.NewAttention(d, cfg.Dim, maxHeads, maxKV, maxQueryHeads, cfg.MaxContext, len(m.rotations))
+	// One ring a conversation, each holding SlotContext positions, laid end to
+	// end — the same cut the processor's caches take. gemma/vulkan.go says the
+	// rest.
+	attn, err := vk.NewAttention(d, cfg.Dim, maxHeads, maxKV, maxQueryHeads, m.SlotContext(), m.Slots(), len(m.rotations))
 	if err != nil {
 		return err
 	}
@@ -151,7 +146,7 @@ func (m *Model) UseVulkanStack() error {
 		}
 		shape := vk.BlockShape{
 			Heads: bc.Heads, KVHeads: bc.KVHeads, HeadDim: bc.HeadDim,
-			RoPEDims: bc.RoPEDims, Capacity: cfg.MaxContext, Rotation: index[bc.RoPEBase],
+			RoPEDims: bc.RoPEDims, Capacity: m.SlotContext(), Rotation: index[bc.RoPEBase],
 			OwnsKV: true, Eps: cfg.Eps,
 			// llama.cpp passes this into the softmax rather than scaling the
 			// query; qwen/attention.go is the other copy.
@@ -287,7 +282,7 @@ func (m *Model) runStack(xs [][]float32, at []Place) {
 
 	positions := make([]vk.Position, len(at))
 	for c, one := range at {
-		positions[c] = vk.Position{Pos: one.Pos}
+		positions[c] = vk.Position{Slot: m.slotOf(one.Cache), Pos: one.Pos}
 		for _, bc := range cfg.Blocks {
 			first, last := one.Cache.Visible(bc, one.Pos)
 			positions[c].First = append(positions[c].First, first)

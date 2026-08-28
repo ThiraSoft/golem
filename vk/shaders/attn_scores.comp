@@ -74,7 +74,7 @@ layout(std430, binding = 2) readonly  buffer CV { uint  cv[];     };  // the val
 layout(std430, binding = 3) buffer          SC { float scores[];  };  // unused; the online softmax has no scratch
 layout(std430, binding = 4) writeonly buffer AQ { uint  aq[];     };  // the mixed values, Q8_0
 layout(std430, binding = 5) writeonly buffer AS { float as_[];    };  // their scales, then corrections
-layout(std430, binding = 6) readonly  buffer WH { uvec4 where_[]; };  // one per block: position, first, last
+layout(std430, binding = 6) readonly  buffer WH { uvec4 where_[]; };  // one per block and column: position, first, last, slot
 
 layout(push_constant) uniform Push {
     uint heads;
@@ -84,9 +84,9 @@ layout(push_constant) uniform Push {
     uint block;     // which entry of where_ holds the visible range
     uint capacity;
     uint mask;      // capacity - 1 when that is a mask, and zero otherwise
-    uint columns;   // how many columns the pass carries, so the last tile can mask
+    uint columns;   // one past the last column of the run, so the last tile can mask
     float scale;    // 1/sqrt(head_dim), or one where a query norm holds the range
-    uint col0;      // the first column of the pass this dispatch answers
+    uint col0;      // the first column of the run this dispatch answers
 } p;
 
 // WHERE_COLUMNS is vk/attention.go's maxColumns, and the two have to agree.
@@ -201,10 +201,22 @@ int nearestInt(float f) {
     return (floatBitsToInt(f + 12582912.0) & 0x007fffff) - 0x00400000;
 }
 
+// slotBase is where this tile's conversation starts in the cache, in entries.
+// The cache is one buffer holding as many rings as the model was given slots,
+// laid end to end; a column's .w names which of them it belongs to.
+//
+// It is a workgroup-wide value rather than a per-row one, and it can be
+// because the host never puts two conversations in one tile: vk/attention.go's
+// Record dispatches a tile per run of columns that share a slot. That is the
+// whole of what a mixed pass costs — a prompt is one run and tiles as it
+// always did, and a token from each of four conversations is four runs of one
+// column, which is the shape generation has anyway.
+uint slotBase;
+
 // entry locates one head at one position, in units of one half.
 uint entry(uint pos, uint head) {
     uint at = (p.mask != 0u) ? (pos & p.mask) : (pos % p.capacity);
-    return (at * p.kvHeads + head) * p.headDim;
+    return ((slotBase + at) * p.kvHeads + head) * p.headDim;
 }
 
 void main() {
@@ -214,6 +226,7 @@ void main() {
     uint sh   = findMSB(QW);        // hd is a power of two, so this divides by QW
     uint kv   = h / p.perKV;
     uint base = p.col0 + gl_WorkGroupID.y * BR;
+    slotBase  = where_[p.block * WHERE_COLUMNS + base].w * p.capacity;
 
     // This tile's rows, and the stretch of the cache they see between them.
     // Every column of a batch sees a different range — its own position is the

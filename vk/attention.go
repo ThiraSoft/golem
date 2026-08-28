@@ -123,10 +123,11 @@ type Attention struct {
 	where *Buffer // one uvec4 a block: the position and the visible range
 	d     *Device
 
-	dim        int // the stream's width, which is what the output projection makes
-	maxHeads   int // the widest block's query projection, for the shared buffers
-	maxKV      int
-	maxContext int
+	dim         int // the stream's width, which is what the output projection makes
+	maxHeads    int // the widest block's query projection, for the shared buffers
+	maxKV       int
+	slotContext int // the positions one conversation holds
+	slots       int // how many conversations the caches are cut into
 
 	matvec, prepare, scores *Pipeline
 	// rope fills the angle tables from the position buffer, at the head of a
@@ -217,7 +218,16 @@ type scorePush struct {
 // float per head per position per column, and sizing that buffer off
 // maxHeads — which is heads times the head dimension — is a hundred and
 // twenty-eight times more memory than it needs at thirty-two columns.
-func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, rotations int) (*Attention, error) {
+//
+// slotContext is what one conversation holds and slots is how many of them
+// there are. A block's cache is that many rings laid end to end, and a column
+// says which one it belongs to; the context is cut rather than multiplied, so
+// four conversations of a thousand positions cost what one of four thousand
+// did. gemma/slots.go says why it is cut that way.
+func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, slotContext, slots, rotations int) (*Attention, error) {
+	if slots < 1 {
+		return nil, fmt.Errorf("vk: %d slots", slots)
+	}
 	for _, n := range []int{dim, maxHeads, maxKV} {
 		if n%nn.QuantBlock != 0 {
 			return nil, fmt.Errorf("vk: attention shapes must be multiples of %d, given %d", nn.QuantBlock, n)
@@ -228,7 +238,8 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, maxContext, ro
 	// and one split has to serve them all, so it is taken at the widest —
 	// which is the pass that has the fewest workgroups to spare.
 	splitOut := coopSplit(dim, wideColumns, coop)
-	a := &Attention{d: d, dim: dim, maxHeads: maxHeads, maxKV: maxKV, maxContext: maxContext, splitOut: splitOut, coop: coop}
+	a := &Attention{d: d, dim: dim, maxHeads: maxHeads, maxKV: maxKV,
+		slotContext: slotContext, slots: slots, splitOut: splitOut, coop: coop}
 
 	var err error
 	// The scores kernel wants a wave of sixty-four where it uses the cores,
@@ -430,6 +441,9 @@ func (a *Attention) Output() *Buffer { return a.out }
 // Blocks is how many have been added.
 func (a *Attention) Blocks() int { return len(a.blocks) }
 
+// Slots is how many conversations the caches hold.
+func (a *Attention) Slots() int { return a.slots }
+
 // Bytes is what the caches take on the card, which is the part of this that
 // grows with the context rather than with the model.
 func (a *Attention) Bytes() int {
@@ -456,6 +470,10 @@ func (a *Attention) AddBlock(shape BlockShape, q, k, v, o []byte, qnorm, knorm [
 	}
 	if !shape.OwnsKV && (shape.KVSource < 0 || shape.KVSource >= len(a.blocks)) {
 		return fmt.Errorf("vk: block %d reads block %d's cache, which is not there yet", len(a.blocks), shape.KVSource)
+	}
+	if shape.Capacity > a.slotContext {
+		return fmt.Errorf("vk: block %d holds %d positions, past the %d one conversation was given",
+			len(a.blocks), shape.Capacity, a.slotContext)
 	}
 	if shape.Scale == 0 {
 		// A zero here would send every score to the same place and the softmax
@@ -520,7 +538,7 @@ func (a *Attention) AddBlock(shape BlockShape, q, k, v, o []byte, qnorm, knorm [
 	// gemma/cache.go does on the other side and for the same reason.
 	var ck, cv *Buffer
 	if shape.OwnsKV {
-		n := shape.Capacity * shape.KVHeads * shape.HeadDim * 2 // fp16
+		n := a.slots * shape.Capacity * shape.KVHeads * shape.HeadDim * 2 // fp16, one ring a slot
 		if b.ck, err = a.d.Local(n, bufferUsageStorage); err != nil {
 			return fail(err)
 		}
@@ -563,28 +581,72 @@ func (b *attentionBlock) caches() (*Buffer, *Buffer) { return b.ck, b.cv }
 // the four products, the cache and the scores.
 func (a *Attention) Profile(t *Timeline) { a.tl = t }
 
-// SetWhere writes one block's position and visible range, which is everything
-// about a token that a recording cannot hold. It is what lets the recording be
-// made once: the two kernels read these three numbers out of a buffer instead
-// of out of the command buffer's push constants.
-func (a *Attention) SetWhere(block, column, pos, first, last int) error {
+// SetWhere writes one block's slot, position and visible range, which is
+// everything about a token that a recording cannot hold. It is what lets the
+// recording be made once: the two kernels read these four numbers out of a
+// buffer instead of out of the command buffer's push constants.
+//
+// The slot is the fourth of them and was the free one. A ring indexed by the
+// position alone is a card that holds one conversation, and two clients on it
+// write each other's positions — which is a wrong answer and not a slow one.
+func (a *Attention) SetWhere(block, column, slot, pos, first, last int) error {
 	if block < 0 || block >= maxBlocks {
 		return fmt.Errorf("vk: block %d of the %d the position buffer holds", block, maxBlocks)
 	}
 	if column < 0 || column >= maxColumns {
 		return fmt.Errorf("vk: column %d of the %d one pass carries", column, maxColumns)
 	}
+	if slot < 0 || slot >= a.slots {
+		return fmt.Errorf("vk: slot %d of %d", slot, a.slots)
+	}
 	entries := unsafe.Slice((*uint32)(unsafe.Pointer(&a.where.Bytes()[0])), maxBlocks*maxColumns*4)
 	at := entries[(block*maxColumns+column)*4:]
-	at[0], at[1], at[2] = uint32(pos), uint32(first), uint32(last)
+	at[0], at[1], at[2], at[3] = uint32(pos), uint32(first), uint32(last), uint32(slot)
 	return nil
+}
+
+// A span is a run of a pass's columns that belong to one conversation.
+//
+// The scores kernel answers thirty-two columns to a workgroup and stages the
+// keys of the union of their ranges, which two conversations cannot share: a
+// position means a different entry of the cache in each of them. So a tile
+// never straddles two, and the pass is cut into runs of one slot before the
+// tiles are laid out. A prompt is one run and is tiled exactly as it was; a
+// token drawn for each of four conversations is four runs of one column, which
+// is the shape generation has anyway — the tile buys nothing there, since each
+// conversation brings one column and its own range.
+type span struct {
+	first, count int
+}
+
+// spansOf cuts a pass into runs of columns that share a slot. The columns of
+// one conversation are contiguous — cmd/golem-server/runner.go builds a batch
+// by appending each conversation's tokens — so this is a walk and not a sort.
+func spansOf(slots []int) []span {
+	if len(slots) == 0 {
+		return nil
+	}
+	out := []span{{first: 0, count: 1}}
+	for c := 1; c < len(slots); c++ {
+		last := &out[len(out)-1]
+		if slots[c] == slots[last.first] {
+			last.count++
+			continue
+		}
+		out = append(out, span{first: c, count: 1})
+	}
+	return out
 }
 
 // Record puts one block's attention into a recording, for the given number of
 // columns. One column is a token; more is a stretch of a prompt, and the four
 // projections then read their weights once for all of them — which is the
 // whole of why a prompt need not cost what the same tokens cost one at a time.
-func (a *Attention) Record(r *Recorder, block, columns int) {
+//
+// runs is how the pass divides between conversations, which only the scores
+// need: everything else here is per column and reads the slot out of the
+// position buffer. A pass of one conversation is one run.
+func (a *Attention) Record(r *Recorder, block, columns int, runs []span) {
 	b := a.blocks[block]
 	s := b.shape
 	heads, kv := s.Heads*s.HeadDim, s.KVHeads*s.HeadDim
@@ -602,7 +664,7 @@ func (a *Attention) Record(r *Recorder, block, columns int) {
 		heads: uint32(s.Heads), kvHeads: uint32(s.KVHeads), headDim: uint32(s.HeadDim),
 		perKV: uint32(s.Heads / s.KVHeads), block: uint32(block),
 		capacity: uint32(s.Capacity), mask: uint32(ringMask(s.Capacity)),
-		columns: uint32(columns), scale: s.Scale,
+		scale: s.Scale, // col0 and columns are the run's, set below
 	}
 	units := uint32(s.Heads)
 	if s.OwnsKV {
@@ -637,9 +699,12 @@ func (a *Attention) Record(r *Recorder, block, columns int) {
 	// keeps everything it needs in registers and shared memory, so the
 	// stretches this used to be cut into — one at a time through a scratch
 	// buffer the size of the deepest context — are gone with the scratch.
-	score.col0 = 0
-	tiles := uint32((columns + scoreColumns - 1) / scoreColumns)
-	r.DispatchColumns(b.setScores, uint32(s.Heads), tiles, unsafe.Pointer(&score))
+	for _, run := range runs {
+		score.col0 = uint32(run.first)
+		score.columns = uint32(run.first + run.count)
+		tiles := uint32((run.count + scoreColumns - 1) / scoreColumns)
+		r.DispatchColumns(b.setScores, uint32(s.Heads), tiles, unsafe.Pointer(&score))
+	}
 	r.Barrier()
 	a.tl.Stamp(r, "attn scores")
 	if b.setOParts != nil && width >= tiledColumns {

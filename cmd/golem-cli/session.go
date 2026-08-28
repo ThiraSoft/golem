@@ -39,7 +39,16 @@ type forward interface {
 // past that the weights are no longer what limits the pass — and beyond
 // sixty-four it turns back down, because the activations of a batch stop
 // fitting in the caches and every position attends to every position before it.
+//
+// That ceiling is the processor's caches and a card has none of it. Measured on
+// a Gemma 4 26B A4B and an RX 9070 XT, positions a second by the width of the
+// pass: 950 at 32, 2044 at 64, 3797 at 128, 4981 at 256, 5486 at 512. So a
+// model whose blocks are on a card reads devicePassWidth instead, which is the
+// widest the stack carries; Session.OnDevice is how it is told.
 const promptBatch = 32
+
+// devicePassWidth is that width, for a model on a card.
+const devicePassWidth = 512
 
 // speculative is the part of a model that can draft with a prediction block,
 // and speculator is one prepared to. Nothing outside qwen35 implements either
@@ -82,6 +91,9 @@ type Session struct {
 	// whole conversation and feeds only what is not already a prefix of this.
 	held   []int32
 	logits []float32
+
+	// width is how wide a prompt pass may be; zero means the processor's.
+	width int
 	// encoded is what the tower made of each picture, kept for as long as the
 	// conversation holds it. A picture costs a second to look at and the
 	// conversation is re-rendered every turn; looking again each time would
@@ -106,6 +118,19 @@ type Turn struct {
 	Text      string
 	Truncated bool // stopped on a limit rather than on an end-of-turn token
 }
+
+// promptWidth is how many positions of a prompt go through the model together,
+// which is the processor's promptBatch unless the blocks are on a card.
+func (s *Session) promptWidth() int {
+	if s.width == 0 {
+		return promptBatch
+	}
+	return s.width
+}
+
+// OnDevice says the model's blocks are on a card, which is the only thing that
+// changes the width. cmd/golem-cli calls it once, before the first prompt.
+func (s *Session) OnDevice() { s.width = devicePassWidth }
 
 func NewSession(m forward, v vocabulary, tpl chat.Template, p sample.Params,
 	vocabSize, maxContext, maxTokens int, system string, thinking bool) *Session {
@@ -208,14 +233,15 @@ func (s *Session) AskWithMedia(text string, images, audio [][]byte, w io.Writer)
 		// be in the cache before any of its queries is scored, which holds
 		// within one pass and not across two.
 		for at := from; at < len(ids); {
-			to := prompt.Boundary(at, at+promptBatch)
+			to := prompt.Boundary(at, at+s.promptWidth())
 			states := s.vision.ForwardPrompt(prompt.Slice(at, to), at)
 			hidden = states[len(states)-1]
 			at = to
 		}
 	} else {
-		for at := from; at < len(ids); at += promptBatch {
-			to := min(at+promptBatch, len(ids))
+		width := s.promptWidth()
+		for at := from; at < len(ids); at += width {
+			to := min(at+width, len(ids))
 			states := s.model.ForwardBatch(ids[at:to], at)
 			hidden = states[len(states)-1]
 		}

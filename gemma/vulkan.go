@@ -97,14 +97,6 @@ func (m *Model) UseVulkanStack() error {
 	if cfg.PLEDim > 0 {
 		return fmt.Errorf("gemma: the Vulkan stack has no per-layer embedding branch, and this checkpoint carries one")
 	}
-	// The stack holds one key-value cache, indexed by position alone: the ring
-	// the kernels read has no room in it for a slot. Two conversations on the
-	// card would write each other's positions and read each other's keys,
-	// which is a wrong answer and not a slow one — so it is refused here
-	// rather than fallen back from. Slots on the processor are unaffected.
-	if m.Slots() > 1 {
-		return fmt.Errorf("gemma: the Vulkan stack holds one conversation, not %d", m.Slots())
-	}
 	d, err := m.device()
 	if err != nil {
 		return err
@@ -132,7 +124,13 @@ func (m *Model) UseVulkanStack() error {
 		maxQueryHeads = max(maxQueryHeads, bc.Heads)
 		maxKV = max(maxKV, bc.KVHeads*bc.HeadDim)
 	}
-	attn, err := vk.NewAttention(d, cfg.Dim, maxHeads, maxKV, maxQueryHeads, cfg.MaxContext, len(m.rotations))
+	// The caches are cut into slots on the card exactly as they are cut on the
+	// processor: one ring a conversation, each holding SlotContext positions,
+	// the whole of them coming to the context the caller allowed. Which of
+	// them a column belongs to travels in the position buffer, so a pass may
+	// carry tokens of several conversations at once — vk/attention.go's span
+	// says what that costs the scores.
+	attn, err := vk.NewAttention(d, cfg.Dim, maxHeads, maxKV, maxQueryHeads, m.SlotContext(), m.Slots(), len(m.rotations))
 	if err != nil {
 		return err
 	}
@@ -199,7 +197,7 @@ func (m *Model) UseVulkanStack() error {
 				v = bw.V.Data
 			}
 		}
-		capacity := cfg.MaxContext
+		capacity := m.SlotContext()
 		if bc.Window && bc.WindowSize < capacity {
 			capacity = bc.WindowSize
 		}

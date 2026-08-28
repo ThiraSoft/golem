@@ -29,10 +29,27 @@ type Vocabulary interface {
 	IsEOG(id int32) bool
 }
 
-// promptBatch is how many positions go through the model together. Thirty-two
-// is what cmd/golem-cli measured: the gain is flat by sixteen, and past sixty-four
-// the activations stop fitting in the caches.
+// promptBatch is how many positions go through the model together on the
+// processor. Thirty-two is what cmd/golem-cli measured: the gain is flat by
+// sixteen, and past sixty-four the activations stop fitting in the caches.
+//
+// A card has no such ceiling and a far higher floor: it is idle at thirty-two.
+// devicePassWidth is what a model whose blocks are on one reads instead, and
+// Runner.PassWidth is which of the two this server is using — main.go asks the
+// model where its blocks are and says so once.
 const promptBatch = 32
+
+// devicePassWidth is the same for a model on a card. Measured on a Gemma 4 26B
+// A4B and an RX 9070 XT, one conversation, positions a second by the width of
+// the pass: 950 at 32, 2044 at 64, 3797 at 128, 4981 at 256, 5486 at 512.
+//
+// Five hundred and twelve, which is what vk's stack carries at most. It is the
+// widest pass and also the longest — 93ms, against 51ms at 256 — so a
+// conversation waiting on its next token waits that much longer for one that
+// is reading a prompt. Forty milliseconds bought at the price of a tenth of
+// the prompt rate is not a trade worth making: the wait is a fraction of a
+// prompt, once, and the rate is every prompt.
+const devicePassWidth = 512
 
 type Context struct {
 	runner     *Runner
@@ -101,7 +118,7 @@ func (c *Context) PrefillPrompt(p *gemma.Prompt, logits []float32) (int, error) 
 		// A batch may not be cut inside a picture: every key of a span has to
 		// be in the cache before any of its queries is scored, which holds
 		// within one pass and not across two.
-		to := p.Boundary(at, at+promptBatch)
+		to := p.Boundary(at, at+c.runner.PassWidth())
 		// Only the chunk that ends the prompt is scored: the ones before it
 		// are read for their keys and values alone.
 		var out []float32

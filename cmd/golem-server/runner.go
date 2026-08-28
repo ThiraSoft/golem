@@ -97,12 +97,25 @@ type Runner struct {
 	// it: a model drawing a token in 45ms can afford to wait; one drawing it
 	// in 700µs cannot.
 	span time.Duration
+	// width is how wide a pass may be; zero means the processor's.
+	width int
 }
 
-// budget is how many positions go through the model in one pass. It is the
-// same thirty-two a prompt is read in — past sixty-four the activations stop
-// fitting in the caches, whether they belong to one conversation or four.
-const budget = promptBatch
+// PassWidth is how many positions go through the model in one pass, which is
+// also how a prompt is cut into chunks. It is context.go's promptBatch on the
+// processor and devicePassWidth on a card, and it is one number for both
+// because the reason is one: whatever a single read of the weights can carry
+// well, it carries as well for four conversations as for one.
+func (r *Runner) PassWidth() int {
+	if r.width == 0 {
+		return promptBatch
+	}
+	return r.width
+}
+
+// OnDevice says the model's blocks are on a card, which is the only thing that
+// changes the width. main.go calls it once, before anything is served.
+func (r *Runner) OnDevice() { r.width = devicePassWidth }
 
 // gatherShare is the fraction of a pass the runner will spend waiting for
 // company before going without it.
@@ -211,10 +224,11 @@ func (r *Runner) gather(batch, held []*pass) (now, later []*pass) {
 	}
 	deadline := time.After(r.window())
 	size := positions(batch)
-	for size < budget && len(batch)+len(held) < r.inFlight() {
+	width := r.PassWidth()
+	for size < width && len(batch)+len(held) < r.inFlight() {
 		select {
 		case p := <-r.passes:
-			if size+len(p.tokens) > budget {
+			if size+len(p.tokens) > width {
 				held = append(held, p)
 				continue
 			}

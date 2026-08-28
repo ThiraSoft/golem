@@ -105,6 +105,76 @@ arithmetic is what is left. And the output head is the largest matrix in the
 model: it is read once for every state being scored in a pass, which is why the
 scoring travels with the pass rather than after it.
 
+### On the card
+
+`-vulkan -parallel N` batches the same way. The caches are cut the same way
+too: one ring a conversation, laid end to end in the buffer a block already
+had, with the slot travelling beside the position in `vk/attention.go`'s
+position buffer — so the card holds N conversations for the memory one of N
+times the context held. `TestMixedBatchCostVulkan` in `gemma/`, the 26B A4B on
+an RX 9070 XT:
+
+| conversations | pass | head | tokens a second |
+|---|---|---|---|
+| 1 | 11ms | 1ms | 80.3 |
+| 2 | 16ms | 2ms | 110.1 |
+| 4 | 16ms | 5ms | 195.0 |
+| 8 | 22ms | 9ms | 256.5 |
+
+Taken from four hundred and forty-eight positions of context, because a token
+drawn at position 64 costs 7.6ms on this model and one drawn at 512 costs
+14.1ms — the attention reads everything before it, and a table taken at the
+shallow end would say a number no server ever sees.
+
+That is 1.37, 2.43 and 3.19 of one conversation. The mixture takes its own cut
+at two: it answers a single column by reading the eight matrices that column
+routed to, and two or more by reading the whole expert stack once instead
+(`vk/mixture.go`'s `byExpert`), so the second conversation pays for the stack
+and is worth less than the third and fourth. A dense checkpoint has none of
+that.
+
+The scores kernel is what limits how a pass may be mixed. It answers
+thirty-two columns to a workgroup off the keys of the union of their ranges,
+and two conversations cannot share that scratch — a position means a different
+entry of the cache in each. So a pass is cut into runs of one conversation
+before the tiles are laid out. A prompt is one run and tiles as it always did;
+a token drawn for each of four conversations is four runs of one column, which
+is the shape generation has anyway.
+
+How wide a pass may be is the other thing the card changes. A prompt is read in
+chunks of thirty-two positions on the processor, because past sixty-four the
+activations stop fitting in its caches; a card is idle at that width and reads
+a prompt some five times faster at two hundred and fifty-six. Positions a
+second by the width, the same 26B on the same card:
+
+| width | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|
+| positions a second | 950 | 2044 | 3797 | 4981 | 5486 |
+
+`Runner.PassWidth` is which of the two this server uses, and `main.go` asks the
+model where its blocks are and says so once. Five hundred and twelve is the
+widest the stack carries and also the longest pass — 93ms, against 51ms at 256
+— so a conversation waiting on its next token waits that much longer for one
+that is reading a prompt. That wait is a fraction of a prompt, once; the rate
+is every prompt.
+
+End to end, through the API, with prompts of about five hundred and forty
+tokens and nothing else on the card:
+
+| | prompt | drawn |
+|---|---|---|
+| one client | 3785/s | 74.5/s |
+| two clients, each | ~2150/s | ~50/s |
+| two clients, together | ~4300/s | ~100/s |
+
+The prompt figure was 804/s before the width followed the device.
+
+Qwen3.5's GPU pipeline is the exception and still refuses `-parallel` above 1:
+its delta-net blocks keep a state matrix a head rather than a ring, and there
+is nothing there to cut into slots.
+
+### Waiting for a pass
+
 The runner waits a fraction of a pass — an eighth of what the last one took, at
 most two milliseconds — for the other conversations in flight to arrive before
 going without them. A lone client cannot feel that; a second client is worth

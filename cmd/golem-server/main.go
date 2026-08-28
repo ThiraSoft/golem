@@ -67,6 +67,11 @@ func main() {
 		}
 	}
 	runner := NewRunner(m.Forward)
+	// A card reads a prompt at five times the rate the processor's width gets
+	// out of it; context.go's devicePassWidth says the measurement.
+	if _, blocks := m.Vulkan(); blocks {
+		runner.OnDevice()
+	}
 	if v, ok := m.Media(); ok {
 		runner.SetVision(v)
 	}

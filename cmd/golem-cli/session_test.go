@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -79,9 +80,11 @@ type scriptedEngine struct {
 	at     int
 	fed    []int32
 	posOf  []int
+	widths []int // how many positions each prompt pass carried
 }
 
 func (e *scriptedEngine) ForwardBatch(tokens []int32, startPos int) [][]float32 {
+	e.widths = append(e.widths, len(tokens))
 	hidden := make([][]float32, len(tokens))
 	for i, token := range tokens {
 		e.fed = append(e.fed, token)
@@ -293,3 +296,43 @@ type eyesOnly struct{ engine.Media }
 
 func (eyesOnly) CanSee() bool  { return true }
 func (eyesOnly) CanHear() bool { return false }
+
+// A prompt is read in passes of whatever width the model carries well, and
+// where the model is decides that: thirty-two on the processor, where past
+// sixty-four the activations stop fitting in its caches, and the stack's full
+// five hundred and twelve on a card, which is idle at thirty-two.
+func TestAPromptIsReadAtThePassWidth(t *testing.T) {
+	for _, one := range []struct {
+		name   string
+		device bool
+		want   int
+	}{
+		{"processor", false, promptBatch},
+		{"card", true, devicePassWidth},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			v := newWordVocab()
+			e := &scriptedEngine{vocab: v, script: []string{"ok"}}
+			s := newSession(t, v, e, 1, "")
+			if one.device {
+				s.OnDevice()
+			}
+			if got := s.promptWidth(); got != one.want {
+				t.Fatalf("the session reads %d positions a pass, want %d", got, one.want)
+			}
+			words := make([]string, 600)
+			for i := range words {
+				words[i] = fmt.Sprintf("w%d", i)
+			}
+			if _, err := s.Ask(strings.Join(words, " "), io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			if len(e.widths) == 0 {
+				t.Fatal("nothing was fed")
+			}
+			if e.widths[0] != one.want {
+				t.Errorf("the first pass carried %d positions, want %d", e.widths[0], one.want)
+			}
+		})
+	}
+}

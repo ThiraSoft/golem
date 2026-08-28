@@ -24,6 +24,7 @@ package vk
 import (
 	_ "embed"
 	"fmt"
+	"strconv"
 	"unsafe"
 )
 
@@ -183,12 +184,25 @@ type Stack struct {
 	trace  bool // whether Run keeps each block's output; see traces
 	tl     *Timeline
 
-	// programs are the recordings, one per width of pass, made the first time
-	// that width is asked for and kept. A token is one column and a prompt is
+	// programs are the recordings, one per shape of pass, made the first time
+	// that shape is asked for and kept. A token is one column and a prompt is
 	// as many as vk.Columns allows, so a conversation makes two. Trace and
 	// Profile change what is recorded, so both drop them all.
-	programs map[int]*Program
+	//
+	// The shape is the width and how it divides between conversations, because
+	// that is what the scores kernel is dispatched on: see attention.go's span.
+	// A server holding four conversations makes a few more recordings than one
+	// holding a single conversation, and programCap keeps that from being
+	// unbounded.
+	programs map[string]*Program
 }
+
+// programCap is how many recordings a stack keeps before it drops them all and
+// starts again. A recording is a command buffer of some four hundred
+// dispatches, so they are not free, and the shapes a busy server asks for are
+// a handful that repeat — a cap that is never reached in ordinary use, and a
+// bound rather than a leak when it is.
+const programCap = 64
 
 // A stackBlock is one block's norms, its router, and the bindings that read
 // them. The matrices are the Attention's and the Mixture's.
@@ -538,11 +552,11 @@ func (s *Stack) Profile(t *Timeline) {
 	s.mix.Profile(t)
 }
 
-// forget drops the recording, which the next Run makes again.
+// forget drops the recordings, which the next Run makes again.
 func (s *Stack) forget() {
-	for width, p := range s.programs {
+	for shape, p := range s.programs {
 		p.Close()
-		delete(s.programs, width)
+		delete(s.programs, shape)
 	}
 }
 
@@ -562,10 +576,14 @@ func (s *Stack) BlockOutput(block int) []float32 {
 	return s.traces.Floats()[at : at+s.dim]
 }
 
-// A Position says where one token goes and what each block may read. The
-// window rule and the ring agree, so the range is worked out on the caller's
-// side and neither kernel has to check the other.
+// A Position says which conversation one token belongs to, where it goes in
+// it, and what each block may read. The window rule and the ring agree, so the
+// range is worked out on the caller's side and neither kernel has to check the
+// other.
 type Position struct {
+	// Slot is the conversation, and is zero for a model that holds one. Every
+	// cache on the card is that many rings laid end to end.
+	Slot  int
 	Pos   int
 	First []int // one per block
 	Last  []int
@@ -581,33 +599,55 @@ func (s *Stack) Run(at []Position, experts, used int) error {
 	if len(at) == 0 || len(at) > maxColumns {
 		return fmt.Errorf("vk: a pass carries between one and %d columns, given %d", maxColumns, len(at))
 	}
+	slots := make([]int, len(at))
 	for c, one := range at {
 		if len(one.First) != len(s.blocks) || len(one.Last) != len(s.blocks) {
 			return fmt.Errorf("vk: %d blocks want %d ranges, given %d", len(s.blocks), len(s.blocks), len(one.First))
 		}
+		slots[c] = one.Slot
 		for i := range s.blocks {
-			if err := s.attn.SetWhere(i, c, one.Pos, one.First[i], one.Last[i]); err != nil {
+			if err := s.attn.SetWhere(i, c, one.Slot, one.Pos, one.First[i], one.Last[i]); err != nil {
 				return err
 			}
 		}
 	}
 	columns := len(at)
+	runs := spansOf(slots)
 	if s.programs == nil {
-		s.programs = map[int]*Program{}
+		s.programs = map[string]*Program{}
 	}
-	p, ok := s.programs[columns]
+	shape := shapeKey(runs)
+	p, ok := s.programs[shape]
 	if !ok {
+		if len(s.programs) >= programCap {
+			s.forget()
+		}
 		var err error
-		if p, err = s.d.Compile(func(r *Recorder) { s.record(r, experts, used, columns) }); err != nil {
+		if p, err = s.d.Compile(func(r *Recorder) { s.record(r, experts, used, columns, runs) }); err != nil {
 			return err
 		}
-		s.programs[columns] = p
+		s.programs[shape] = p
 	}
 	return p.Run()
 }
 
+// shapeKey names a pass by how it divides between conversations, which is what
+// the recording depends on. The run lengths give the width too, so one string
+// is the whole of it: "512" is a prompt, "1" a token, "1,1,1,1" a token drawn
+// for each of four clients.
+func shapeKey(runs []span) string {
+	var b []byte
+	for i, run := range runs {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = strconv.AppendInt(b, int64(run.count), 10)
+	}
+	return string(b)
+}
+
 // record is the whole stack, written into a command buffer once.
-func (s *Stack) record(r *Recorder, experts, used, columns int) {
+func (s *Stack) record(r *Recorder, experts, used, columns int, runs []span) {
 	cols := uint32(columns)
 	quant := normPush{n: uint32(s.dim), flags: normGain | normQuant, eps: s.eps, scalar: 1}
 	post := normPush{n: uint32(s.dim), flags: normGain | normFloat, eps: s.eps, scalar: 1}
@@ -653,7 +693,7 @@ func (s *Stack) record(r *Recorder, experts, used, columns int) {
 		r.DispatchColumns(b.setAttnNorm, 1, cols, unsafe.Pointer(&quant))
 		r.Barrier()
 		tl.Stamp(r, "attn norm")
-		s.attn.Record(r, i, columns)
+		s.attn.Record(r, i, columns, runs)
 		r.Barrier()
 		tl.Stamp(r, "attn out")
 		if b.layout != LayoutPreNorm {

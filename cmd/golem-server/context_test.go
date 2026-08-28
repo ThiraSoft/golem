@@ -12,6 +12,7 @@ type recordingEngine struct {
 
 	fed    []int32
 	posOf  []int
+	widths []int // how many positions each pass carried
 	resets int
 }
 
@@ -19,6 +20,7 @@ type recordingEngine struct {
 // TestEachContextDrivesItsOwnSlot is what watches several.
 func (e *recordingEngine) ForwardSlots(tokens []int32, slots, positions []int) [][]float32 {
 	e.slot = slots[0]
+	e.widths = append(e.widths, len(tokens))
 	return e.ForwardBatch(tokens, positions[0])
 }
 
@@ -227,3 +229,48 @@ func running(tb testing.TB, e Engine) *Runner {
 // scores is a logits buffer for a test that does not read it. The fake engines
 // score into it and nothing looks: what these tests watch is what was fed.
 func scores() []float32 { return make([]float32, 8) }
+
+// A prompt is cut into passes of whatever width the model carries well, and
+// where the model is decides that: thirty-two on the processor, where past
+// sixty-four the activations stop fitting in the caches, and two hundred and
+// fifty-six on a card, which is idle at thirty-two. Nothing else about a chunk
+// changes with it.
+func TestAPromptIsCutToThePassWidth(t *testing.T) {
+	ids := make([]int32, 600)
+	for i := range ids {
+		ids[i] = int32(i + 1)
+	}
+	for _, one := range []struct {
+		name   string
+		device bool
+		want   int
+	}{
+		{"processor", false, promptBatch},
+		{"card", true, devicePassWidth},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			e := &recordingEngine{}
+			r := running(t, e)
+			if one.device {
+				r.OnDevice()
+			}
+			if got := r.PassWidth(); got != one.want {
+				t.Fatalf("the runner carries %d positions a pass, want %d", got, one.want)
+			}
+			c := NewContext(r, 0, 4096, time.Now, 0)
+			if _, err := c.Prefill(ids, scores()); err != nil {
+				t.Fatal(err)
+			}
+			passes := (len(ids) + one.want - 1) / one.want
+			if len(e.widths) != passes {
+				t.Errorf("%d passes for %d positions, want %d", len(e.widths), len(ids), passes)
+			}
+			if len(e.widths) > 0 && e.widths[0] != one.want {
+				t.Errorf("the first pass carried %d positions, want %d", e.widths[0], one.want)
+			}
+			if n := len(e.fed); n != len(ids) {
+				t.Errorf("%d positions fed, want %d", n, len(ids))
+			}
+		})
+	}
+}

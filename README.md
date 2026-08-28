@@ -46,7 +46,7 @@ go build ./cmd/golem-server
 ./golem-server -model Qwen3-4B-Q4_0.gguf -addr 127.0.0.1:8080
 ```
 
-One model answers one request at a time; a second request waits. `-parallel N` cuts the context into N slots, each keeping its own conversation warm — what that buys is the prompt cache, not throughput.
+`-parallel N` cuts the context into N slots, each holding its own conversation, and the ones waiting at the moment a pass is built go through the weights together — llama.cpp's continuous batching. On the card as well as on the processor: Gemma 4 26B A4B on an RX 9070 XT draws 80.3 tokens a second for one conversation and 256.5 for eight of them, out of one read of the weights.
 
 ## ⚡ Vulkan GPU
 

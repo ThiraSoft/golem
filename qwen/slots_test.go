@@ -65,25 +65,154 @@ func same(a, b []float32) bool {
 	return true
 }
 
-// The card holds one key-value cache, so a model that has been given slots
-// cannot have the stack, and a model that has the stack cannot be given slots.
-// Both directions are refused rather than answered wrongly: two conversations
-// over one cache write each other's positions, which the test above shows on
-// the processor and nothing would have shown on the card.
-func TestVulkanStackRefusesSlots(t *testing.T) {
+// The same independence on the card, where it used to be refused rather than
+// done. One model and one pass shape throughout: a token drawn for slot 0 is
+// one column either way, so the same binaries sum the same products in the
+// same order. What changes between the two draws is only that another
+// conversation has written its own prompt in between — which, when the ring
+// was indexed by the position alone, was enough to hand slot 0 the other's
+// keys.
+func TestSlotsAreIndependentVulkan(t *testing.T) {
 	m := openQuantized(t)
 	if err := m.SetSlots(2); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UseVulkanStack(); err == nil {
-		t.Error("the stack was built over two slots")
-	}
-
-	n := openQuantized(t)
-	if err := n.UseVulkanStack(); err != nil {
+	if err := m.UseVulkanStack(); err != nil {
 		t.Skipf("no Vulkan stack: %v", err)
 	}
-	if err := n.SetSlots(2); err == nil {
-		t.Error("two slots were accepted over the stack")
+	mine, theirs := twoConversations(40)
+	next := mine[0]
+
+	m.UseSlot(0)
+	m.ForwardBatch(mine, 0)
+	alone := append([]float32(nil), m.ForwardBatch([]int32{next}, len(mine))[0]...)
+
+	m.UseSlot(1)
+	m.ForwardBatch(theirs, 0)
+	m.UseSlot(0)
+	after := m.ForwardBatch([]int32{next}, len(mine))[0]
+
+	if !same(alone, after) {
+		t.Error("slot 0 continued into what slot 1 had written")
 	}
+}
+
+// A pass that carries a token of each of two conversations, which is what the
+// server's continuous batching offers.
+//
+// The comparison is not against the two tokens drawn one at a time: a pass of
+// two columns runs a different product binary from a pass of one, and the two
+// sum the same Q4_0 products in different orders. What isolates the slot is to
+// hold column 0 and its conversation still, change only what the other slot
+// holds, and ask that column 0 come out unchanged — same shape, same binaries,
+// bit for bit. When the ring was indexed by the position alone it did not.
+func TestOneSlotOfAMixedPassIgnoresTheOther(t *testing.T) {
+	m := openQuantized(t)
+	if err := m.SetSlots(2); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UseVulkanStack(); err != nil {
+		t.Skipf("no Vulkan stack: %v", err)
+	}
+	mine, theirs := twoConversations(40)
+	other := thirdConversation(len(mine))
+	last := len(mine) - 1
+
+	m.UseSlot(0)
+	m.ForwardBatch(mine[:last], 0)
+
+	// Slot 0's token drawn beside a given neighbour. Priming slot 1 again
+	// writes the same positions with other keys, which is the whole point.
+	beside := func(neighbour []int32) []float32 {
+		m.UseSlot(1)
+		m.ForwardBatch(neighbour[:last], 0)
+		got := m.ForwardMixed(
+			[]int32{mine[last], neighbour[last]},
+			[]Place{
+				{Cache: m.Slot(0), Pos: last},
+				{Cache: m.Slot(1), Pos: last},
+			},
+		)
+		return append([]float32(nil), got[0]...)
+	}
+
+	want := beside(theirs)
+	if got := beside(other); !same(want, got) {
+		compareRelative(t, "slot 0 beside one neighbour and then another", got, want, 0)
+		t.Error("what slot 0 answered depended on what slot 1 was holding")
+	}
+}
+
+// And a whole prompt of each in one pass, which is the tiled scores kernel
+// rather than the token's: a tile answers thirty-two columns off the keys of
+// the union of their ranges, and two conversations cannot share that scratch,
+// so the pass is cut into runs of one slot before the tiles are laid out.
+// Forty columns a conversation is two tiles each, one of them partial.
+func TestAMixedPromptKeepsATileInOneConversation(t *testing.T) {
+	m := openQuantized(t)
+	if err := m.SetSlots(2); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UseVulkanStack(); err != nil {
+		t.Skipf("no Vulkan stack: %v", err)
+	}
+	// Uneven runs, both longer than a tile and neither a multiple of one: a
+	// hundred columns is three tiles and a remainder of four, a hundred and
+	// fifty-six is four and a remainder of twenty-eight.
+	long, other := twoConversations(156)
+	mine, theirs := long[:100], other
+	third := thirdConversation(len(theirs))
+
+	// The last state of slot 0's half of a pass that carries both prompts.
+	beside := func(neighbour []int32) []float32 {
+		both := append(append([]int32(nil), mine...), neighbour...)
+		at := make([]Place, 0, len(both))
+		for i := range mine {
+			at = append(at, Place{Cache: m.Slot(0), Pos: i})
+		}
+		for i := range neighbour {
+			at = append(at, Place{Cache: m.Slot(1), Pos: i})
+		}
+		return append([]float32(nil), m.ForwardMixed(both, at)[len(mine)-1]...)
+	}
+
+	want := beside(theirs)
+	if got := beside(third); !same(want, got) {
+		compareRelative(t, "slot 0's prompt beside one prompt and then another", got, want, 0)
+		t.Error("slot 0's prompt came out changed by what slot 1's tiles held")
+	}
+}
+
+// The card's caches are laid out when the stack is built, so the slots are
+// chosen before it and not after. Asking afterwards is refused rather than
+// answered with a model whose rings are the wrong size.
+func TestVulkanStackRefusesSlotsAskedForAfterIt(t *testing.T) {
+	m := openQuantized(t)
+	if err := m.UseVulkanStack(); err != nil {
+		t.Skipf("no Vulkan stack: %v", err)
+	}
+	if err := m.SetSlots(2); err == nil {
+		t.Error("two slots were accepted over a stack that was already built")
+	}
+}
+
+// twoConversations is two runs of tokens with nothing in common, for the tests
+// that have to tell one cache from another, and thirdConversation is a run
+// unlike either. The identifiers are real rows of the vocabulary and mean
+// nothing beyond that.
+func twoConversations(n int) (mine, theirs []int32) {
+	mine, theirs = make([]int32, n), make([]int32, n)
+	for i := range mine {
+		mine[i] = int32(100 + i)
+		theirs[i] = int32(4000 - i)
+	}
+	return mine, theirs
+}
+
+func thirdConversation(n int) []int32 {
+	out := make([]int32, n)
+	for i := range out {
+		out[i] = int32(9000 + 3*i)
+	}
+	return out
 }

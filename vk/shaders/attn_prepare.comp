@@ -26,7 +26,7 @@ layout(std430, binding = 6) readonly buffer RS { float rsin[]; };
 layout(std430, binding = 7) writeonly buffer QH { float qh[]; };  // the queries, fp16-exact
 layout(std430, binding = 8) buffer CK { uint ck[]; };    // the key cache, two halves to a uint
 layout(std430, binding = 9) buffer CV { uint cv[]; };    // the value cache
-layout(std430, binding = 10) readonly buffer WH { uvec4 where_[]; };  // one per block: position, first, last
+layout(std430, binding = 10) readonly buffer WH { uvec4 where_[]; };  // one per block and column: position, first, last, slot
 
 layout(push_constant) uniform Push {
     uint heads;
@@ -84,10 +84,16 @@ uint floatToHalf(float f) {
 }
 
 // The ring, in units of one half.
+//
+// A column names its conversation as well as its position: the cache is one
+// buffer holding as many rings as the model was given slots, laid end to end,
+// and .w is which of them this column writes. One conversation makes that zero
+// and the arithmetic disappears.
 uint slot(uint head) {
-    uint pos = where_[p.block * WHERE_COLUMNS + COL].x;
+    uvec4 w = where_[p.block * WHERE_COLUMNS + COL];
+    uint pos = w.x;
     uint at = (p.mask != 0u) ? (pos & p.mask) : (pos % p.capacity);
-    return (at * p.kvHeads + head) * p.headDim;
+    return ((w.w * p.capacity + at) * p.kvHeads + head) * p.headDim;
 }
 
 // reduce sums one value per thread into partial[0].
