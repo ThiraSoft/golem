@@ -66,7 +66,7 @@ There is no cgo: `vk/` opens `libvulkan.so.1` through `purego`, and `CGO_ENABLED
 
 ### Generation Speed vs Prompt Speed
 
-On a card, golem is ahead of llama.cpp on both Gemma models, generating and reading, and within two hundredths of it generating on both Qwen3 ones.
+On a card, golem is ahead of llama.cpp on both Gemma models, generating and reading, and within two hundredths of it generating on both Qwen3 ones. Qwen3.8 came later and sits apart: level reading a prompt, behind generating, for a reason that is the architecture's rather than a kernel's.
 
 | tokens a second | golem gen | llama gen | golem pp64 | llama pp64 | golem pp256 | llama pp256 | golem pp512 | llama pp512 |
 | --------------- | --------: | --------: | ---------: | ---------: | ----------: | ----------: | ----------: | ----------: |
@@ -74,8 +74,9 @@ On a card, golem is ahead of llama.cpp on both Gemma models, generating and read
 | Gemma 4 12B     |  **65.4** |      64.6 |   **1499** |        983 |    **2611** |        2471 |        2858 |        2976 |
 | Qwen3 4B        |     167.0 |     169.7 |   **3950** |       2952 |    **5854** |        4545 |        5895 |        6125 |
 | Qwen3 0.6B      |     359.4 |     365.4 |  **13915** |       9966 |   **23787** |       19159 |   **23995** |       22306 |
+| Qwen3.8 27B     |      30.1 |      32.8 |    **799** |      628.7 |    **1134** |      1127.8 |    **1236** |      1234.7 |
 
-golem reads a prompt faster than llama.cpp does on every model here at 64 and 256 positions, and on the 26B A4B and the 0.6B at 512 as well.
+golem reads a prompt faster than llama.cpp does on every model here at 64 and 256 positions, and on the 26B A4B, the 0.6B and Qwen3.8 at 512 as well.
 
 Generation was the side that was left, at 0.83 of llama.cpp on the 26B A4B and 0.93 on the 12B against 0.98 on both Qwen3 models, and the shape of that table was the answer: **the models with a gap were exactly the models with a logit softcap.**
 
@@ -86,3 +87,5 @@ It is a push constant on the head's shader now: the last line of the product wri
 Two things are worth keeping from how it was found, because no profile showed it. A GPU timeline cannot see a CPU loop, and the loop was in the seam between them: `Forward` alone measured 6.322 ms, `Forward` and `Logits` together 9.897, and the head's own benchmark 1.72. The 1.85 that belonged to neither was the whole of it. And llama.cpp's own `GGML_VK_PERF_LOGGER`, run on generation rather than on a prompt, put their every operation beside ours in one pass; nothing else in their table was more than a few per cent from ours.
 
 What is left is Qwen3, at 0.98 on both sizes, where the difference is small and is in the kernels rather than beside them.
+
+Qwen3.8's own gap, at 0.92, is not that story. Forty-eight of its sixty-four blocks are gated delta nets, and a delta net rewrites a 128x128 state a head at every position: the work is per token and there is no batch to spread it over, which is exactly why the prompt side reaches llama.cpp's rate and the generating side does not. What answers it there is not a faster kernel but a second token in the same pass, which is what the checkpoint's prediction block gives — `qwen35/mtp.go`, and 46.0 tokens a second against 30.1.

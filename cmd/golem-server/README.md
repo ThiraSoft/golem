@@ -177,7 +177,7 @@ tokens and nothing else on the card:
 The prompt figure was 804/s before the width followed the device, and two
 clients drew 100/s together before the mixture's threshold moved.
 
-Qwen3.5's GPU pipeline is the exception and still refuses `-parallel` above 1:
+Qwen3.8's GPU pipeline is the exception and still refuses `-parallel` above 1:
 its delta-net blocks keep a state matrix a head rather than a ring, and there
 is nothing there to cut into slots.
 
