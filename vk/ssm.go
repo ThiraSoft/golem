@@ -8,6 +8,13 @@ import (
 //go:embed shaders/ssm_conv1d.spv
 var ssmConv1dSPIRV []byte
 
+// The two kernels a gated delta net is: the causal convolution over its q, k
+// and v channels, and the recurrence itself. Both walk the columns of a pass
+// inside one workgroup, because both carry state from one position to the next.
+//
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/ssm_conv1d.comp -o shaders/ssm_conv1d.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/ssm_scan.comp -o shaders/ssm_scan.spv
+
 //go:embed shaders/ssm_scan.spv
 var ssmScanSPIRV []byte
 

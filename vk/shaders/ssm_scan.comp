@@ -51,11 +51,23 @@ void main() {
 
     // The recurrence carries the state from one token to the next, so the
     // columns of a pass are walked in order here rather than dispatched apart.
-    // The state is read and written once a column, which is the least a
-    // 128x128 matrix a head can cost.
+    //
+    // The row this thread owns lives in registers for the whole of that walk.
+    // A workgroup is one head and a thread is one of its hundred and
+    // twenty-eight rows, so a thread holds a hundred and twenty-eight floats —
+    // two waves of that on a compute unit, which the register file has room
+    // for, and every index into it is a constant because both loops below are
+    // unrolled. What it saves is the whole of what the scan was costing: the
+    // state used to be read and written once a column, three mebibytes a head
+    // set each way, so a pass of five hundred and twelve moved three gigabytes
+    // a block to carry five hundred and twelve tokens. It is now read once at
+    // the head of the pass and written once at the foot.
+    float st[128];
+    [[unroll]] for (uint i = 0u; i < 128u; i++) st[i] = ssmState[rowBase + i];
+
     for (uint col = 0u; col < p.columns; col++) {
         if (col == p.snapAt) {
-            [[unroll]] for (uint i = 0u; i < 128u; i++) shadow[rowBase + i] = ssmState[rowBase + i];
+            [[unroll]] for (uint i = 0u; i < 128u; i++) shadow[rowBase + i] = st[i];
         }
         uint cq = col * p.convDim;
         uint cr = col * p.rank;
@@ -114,7 +126,7 @@ void main() {
         // is a scalar, so it can come out of the sum afterwards.
         float sumK = 0.0;
         [[unroll]] for (uint i = 0u; i < 128u; i++) {
-            sumK += ssmState[rowBase + i] * sharedKNorm[i];
+            sumK += st[i] * sharedKNorm[i];
         }
         sumK *= decay;
 
@@ -122,8 +134,8 @@ void main() {
 
         float sumQ = 0.0;
         [[unroll]] for (uint i = 0u; i < 128u; i++) {
-            float sv = ssmState[rowBase + i] * decay + delta * sharedKNorm[i];
-            ssmState[rowBase + i] = sv;
+            float sv = st[i] * decay + delta * sharedKNorm[i];
+            st[i] = sv;
             sumQ += sv * sharedQNorm[i];
         }
 
@@ -153,4 +165,6 @@ void main() {
         out_[outIdx] = normedY * (zVal / (1.0 + exp(-zVal)));
         barrier();
     }
+
+    [[unroll]] for (uint i = 0u; i < 128u; i++) ssmState[rowBase + i] = st[i];
 }
