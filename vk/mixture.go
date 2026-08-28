@@ -24,6 +24,8 @@ import (
 	_ "embed"
 	"encoding/binary"
 	"fmt"
+	"os"
+	"strconv"
 	"unsafe"
 
 	"github.com/ThiraSoft/golem/nn"
@@ -177,6 +179,11 @@ type Mixture struct {
 	dim, ffn, dense, experts int
 	act                      Activation
 	coop                     bool
+	// byExpertFrom is the width at which Record stops answering a column at a
+	// time. Read once here rather than in Record, so that a test setting the
+	// environment before it opens a model gets the path it asked for and the
+	// recordings are not built against two answers.
+	byExpertFrom int
 
 	gateUp, down, denseDown *Pipeline
 	// The prompt path of the expert branch, which reads the stack by expert
@@ -293,6 +300,40 @@ func idPlanMax(experts, columns, bn int) int {
 	return experts + columns*expertsUsed/bn
 }
 
+// byExpertFrom is the width at which a mixture stops answering a column at a
+// time and starts reading the whole expert stack once for the pass.
+//
+// The two costs are eight matrices a column against every expert the model
+// has, so they cross where the pass is about a sixteenth of the stack wide.
+// Measured on a 26B A4B and an RX 9070 XT, positions a second by width, each
+// path forced:
+//
+//	width        2    4    8   12   16   24    32    64
+//	by column  184  328  557  778  990 1240  1370  1516
+//	by expert  106  207  441  720  943 1228  1734  2765
+//
+// They cross between twenty-four and thirty-two. Below it the by-expert path
+// reads a hundred and twenty-eight experts to answer a handful of pairs, which
+// is what a server drawing a token for each of two conversations was paying.
+//
+// GOLEM_MOE_BY_EXPERT_FROM moves it, which is how the tests reach the other
+// path on a six-token fixture: neither is the fallback and both have to be
+// right, so both are run against the same recording.
+const byExpertFrom = 32
+
+// byExpertWidth is that, with the environment's override if there is one.
+func byExpertWidth() int {
+	v := os.Getenv("GOLEM_MOE_BY_EXPERT_FROM")
+	if v == "" {
+		return byExpertFrom
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return byExpertFrom
+	}
+	return n
+}
+
 // idBN is the entries of a list one workgroup of the by-expert product
 // answers, which is the kernel's own BN and has to reach the scatter, the plan
 // and the dispatch as one number.
@@ -369,7 +410,8 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		return nil, fmt.Errorf("vk: the down kernel writes %d outputs at a time, and %d is not a multiple of it", downOuts, dim)
 	}
 	coop := d.Coopmat()
-	m := &Mixture{d: d, dim: dim, ffn: ffn, dense: dense, experts: experts, act: act, coop: coop}
+	m := &Mixture{d: d, dim: dim, ffn: ffn, dense: dense, experts: experts, act: act, coop: coop,
+		byExpertFrom: byExpertWidth()}
 
 	push := uint32(unsafe.Sizeof(moePush{}))
 	var err error
@@ -755,7 +797,13 @@ func (m *Mixture) Record(r *Recorder, block, columns int, sharedUp, sharedDown b
 	// out, and the two halves below walk one expert's list of columns rather
 	// than one column's list of experts. Same answer, and the stack read once
 	// for a pass instead of once for each of its columns.
-	byExpert := m.experts > 0 && columns > 1
+	//
+	// Which is cheaper depends on the width, and byExpertFrom says where they
+	// cross. This used to read `columns > 1`, which made a pass of two columns
+	// the worst of both: a hundred and twenty-eight experts read to answer
+	// sixteen pairs. A server drawing a token for each of two conversations
+	// lives at exactly that width.
+	byExpert := m.experts > 0 && columns >= m.byExpertFrom
 	bn := uint32(idBN(m.coop))
 	if byExpert {
 		scat := scatterPush{columns: uint32(columns), used: expertsUsed,
@@ -784,7 +832,14 @@ func (m *Mixture) Record(r *Recorder, block, columns int, sharedUp, sharedDown b
 		r.DispatchColumns(m.idActSet, uint32((m.ffn+255)/256), uint32(columns*expertsUsed), unsafe.Pointer(&act))
 		m.mark(r, "moe expert act")
 	} else if m.experts > 0 {
-		r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&experts))
+		// A dispatch a column, each reading that column's own eight matrices.
+		// The columns write disjoint rows of the intermediate, so nothing
+		// between them has to wait.
+		for c := 0; c < columns; c++ {
+			at := experts
+			at.col = uint32(c)
+			r.Dispatch(b.setGateUp, uint32(expertsUsed*m.ffn/nn.QuantBlock), unsafe.Pointer(&at))
+		}
 	}
 	switch {
 	case width >= tiledColumns:
@@ -825,7 +880,11 @@ func (m *Mixture) Record(r *Recorder, block, columns int, sharedUp, sharedDown b
 		r.Dispatch(b.setIDDown, rows*uint32(idPlanMax(m.experts, columns, idBN(m.coop))), unsafe.Pointer(&downPush))
 		m.mark(r, "moe expert down")
 	} else if m.experts > 0 {
-		r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&experts))
+		for c := 0; c < columns; c++ {
+			at := experts
+			at.col = uint32(c)
+			r.Dispatch(b.setDown, uint32(m.dim/downOuts), unsafe.Pointer(&at))
+		}
 	}
 	if b.setDenseDnParts != nil && width >= tiledColumns {
 		split := shared

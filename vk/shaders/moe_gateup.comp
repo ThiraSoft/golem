@@ -145,7 +145,14 @@ void main() {
     uint rowBytes = nb * 18u;
     uint row      = (r < 32u) ? (blk * 32u + j) : (p.ffn + blk * 32u + j);
     uint n = COLUMNS;
-    uint expert = uint(ids[e]) * 2u * p.ffn * rowBytes;
+    // Which expert this workgroup answers. An expert branch routes every
+    // column for itself, so the identifiers are a column's eight at a time and
+    // p.col says whose — a pass of a few columns runs this kernel once for
+    // each of them rather than reading the whole stack by expert. The shared
+    // branch has one expert and it is always zero, and takes the short index
+    // so that its own ids buffer need be no longer than that.
+    uint idAt = (p.used > 1u) ? (SRCCOL(0) * p.used + e) : e;
+    uint expert = uint(ids[idAt]) * 2u * p.ffn * rowBytes;
 
     for (uint base = 0u; base < n; base += COLUMNS) {
         float part[COLUMNS];

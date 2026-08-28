@@ -389,6 +389,10 @@ func TestVulkanPromptProfile(t *testing.T) {
 // the third digit; this pins the two paths to each other instead, and it is
 // the net under any rewrite of either.
 //
+// The fixture is six tokens and vk/mixture.go switches paths at thirty-two, so
+// the environment is what puts the batch on the wide path here — one is not
+// the fallback of the other and both have to be right.
+//
 // The tolerance is the drift load26BStack documents between them — the two
 // fold the same products in different orders and the intermediate is Q8_0, so
 // a value a hair from an integer boundary goes to the other side of it. Two
@@ -396,6 +400,7 @@ func TestVulkanPromptProfile(t *testing.T) {
 // room, and it is a ceiling, not a target. If a change here needs it raised,
 // the change is wrong.
 func TestVulkanBatchMatchesTokenPath(t *testing.T) {
+	t.Setenv("GOLEM_MOE_BY_EXPERT_FROM", "2")
 	f, m := load26BStack(t)
 	m.TraceBlocks()
 
@@ -416,5 +421,41 @@ func TestVulkanBatchMatchesTokenPath(t *testing.T) {
 	}
 	for _, il := range moeBlocks {
 		compareRelative(t, "l_out-"+itoa(il)+" batch against token", batch[il], m.BlockOutput(il), 3e-2)
+	}
+}
+
+// And the same prompt through the by-column kernels at the width the mixture
+// now uses them at: six columns in one pass, against the same six one at a
+// time. A column reads its own eight matrices either way, so what this holds
+// is the indexing — which column's routing a dispatch reads, which row of the
+// intermediate it writes, and which slice of the output it lands in. Getting
+// any of those wrong gives a pass where every column answers the first one's
+// question, which is exactly what the kernels did before they took a column.
+//
+// Bit for bit: same kernel, same order, only the column offset differs.
+func TestVulkanColumnsMatchTokenPath(t *testing.T) {
+	f, m := load26BStack(t)
+	if len(f.Tokens) < 2 {
+		t.Skipf("the fixture is %d tokens", len(f.Tokens))
+	}
+	m.TraceBlocks()
+
+	m.Reset()
+	m.ForwardBatch(f.Tokens, 0)
+	wide := map[int][]float32{}
+	for _, il := range moeBlocks {
+		wide[il] = append([]float32(nil), m.BlockOutput(il)...)
+	}
+
+	m.Reset()
+	for pos, tok := range f.Tokens {
+		m.Forward(tok, pos)
+	}
+	for _, il := range moeBlocks {
+		got := m.BlockOutput(il)
+		if !same(wide[il], got) {
+			compareRelative(t, "l_out-"+itoa(il)+" columns against token", wide[il], got, 0)
+			t.Errorf("block %d answered differently in a pass of %d columns", il, len(f.Tokens))
+		}
 	}
 }

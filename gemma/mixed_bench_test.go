@@ -94,18 +94,14 @@ func TestMixedPrefillCost(t *testing.T) {
 // RX 9070 XT, pass and head both on the card, from 448 positions of context:
 //
 //	conversations    1      2      4      8
-//	pass          11ms   16ms   16ms   22ms
+//	pass          11ms   14ms   14ms   22ms
 //	head           1ms    2ms    5ms    9ms
-//	tokens/s      80.3  110.1  195.0  256.5
+//	tokens/s      82.1  125.9  211.4  255.0
 //
-// Which is 1.37, 2.43 and 3.19 of one conversation. What keeps it from being
-// four and eight is that generation is limited by reading the weights only
-// while there is nothing else to do: by eight columns the arithmetic and the
-// head are what is left. The mixture takes its own cut at two — it answers one
-// column by reading the eight matrices that column routed to, and two or more
-// by reading the whole expert stack once instead, vk/mixture.go's byExpert —
-// which is why the second conversation is worth less than the third and
-// fourth. A dense checkpoint has none of that.
+// Which is 1.53, 2.57 and 3.11 of one conversation. What keeps it from being
+// two, four and eight is that generation is limited by reading the weights
+// only while there is nothing else to do: by eight columns the arithmetic and
+// the head are what is left.
 func TestMixedBatchCostVulkan(t *testing.T) {
 	// Four hundred and forty-eight positions of context, not a handful: a
 	// token drawn at position 64 costs 7.6ms on this model and one drawn at

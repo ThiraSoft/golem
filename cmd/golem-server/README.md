@@ -116,22 +116,29 @@ an RX 9070 XT:
 
 | conversations | pass | head | tokens a second |
 |---|---|---|---|
-| 1 | 11ms | 1ms | 80.3 |
-| 2 | 16ms | 2ms | 110.1 |
-| 4 | 16ms | 5ms | 195.0 |
-| 8 | 22ms | 9ms | 256.5 |
+| 1 | 11ms | 1ms | 82.1 |
+| 2 | 14ms | 2ms | 125.9 |
+| 4 | 14ms | 5ms | 211.4 |
+| 8 | 22ms | 9ms | 255.0 |
 
 Taken from four hundred and forty-eight positions of context, because a token
 drawn at position 64 costs 7.6ms on this model and one drawn at 512 costs
 14.1ms — the attention reads everything before it, and a table taken at the
 shallow end would say a number no server ever sees.
 
-That is 1.37, 2.43 and 3.19 of one conversation. The mixture takes its own cut
-at two: it answers a single column by reading the eight matrices that column
-routed to, and two or more by reading the whole expert stack once instead
-(`vk/mixture.go`'s `byExpert`), so the second conversation pays for the stack
-and is worth less than the third and fourth. A dense checkpoint has none of
-that.
+That is 1.53, 2.57 and 3.11 of one conversation. What keeps it from being two,
+four and eight is that generation is limited by reading the weights only while
+there is nothing else to do: by eight columns the arithmetic and the head are
+what is left.
+
+A mixture had a threshold in the way of this. It answers a single column by
+reading the eight matrices that column routed to, and a prompt by reading each
+expert once for the columns that chose it — and it used to switch to the second
+at two columns, so a token drawn for each of two conversations read a hundred
+and twenty-eight experts to answer sixteen pairs. The two costs cross near
+thirty-two on this checkpoint, which is where `vk/mixture.go`'s `byExpertFrom`
+now sits; the by-column kernels take a column offset so they can answer a
+handful of columns rather than one.
 
 The scores kernel is what limits how a pass may be mixed. It answers
 thirty-two columns to a workgroup off the keys of the union of their ranges,
@@ -163,11 +170,12 @@ tokens and nothing else on the card:
 
 | | prompt | drawn |
 |---|---|---|
-| one client | 3785/s | 74.5/s |
-| two clients, each | ~2150/s | ~50/s |
-| two clients, together | ~4300/s | ~100/s |
+| one client | 4055/s | 75.3/s |
+| two clients, each | ~2130/s | ~57.8/s |
+| two clients, together | ~4260/s | ~115.6/s |
 
-The prompt figure was 804/s before the width followed the device.
+The prompt figure was 804/s before the width followed the device, and two
+clients drew 100/s together before the mixture's threshold moved.
 
 Qwen3.5's GPU pipeline is the exception and still refuses `-parallel` above 1:
 its delta-net blocks keep a state matrix a head rather than a ring, and there

@@ -14,7 +14,7 @@ _No Python. No cgo. No GPU required — but with `-vulkan` it outruns llama.cpp'
 
 A golem is inert matter given a voice. That is what these engines do to a file of weights.
 
-**Golem** is a set of inference engines written in pure Go. Run Gemma 4, Qwen3 and Kyutai Pocket TTS locally with `go build`, a GGUF file, and your CPU — or your Vulkan GPU.
+**Golem** is a set of inference engines written in pure Go. Run Gemma 4, Qwen3, Qwen3.5 and Kyutai Pocket TTS locally with `go build`, a GGUF file, and your CPU — or your Vulkan GPU.
 
 ## ✨ Features
 
@@ -25,6 +25,7 @@ A golem is inert matter given a voice. That is what these engines do to a file o
 - **Verified, not asserted**: no layer is deemed correct until its intermediate activations match llama.cpp or PyTorch, waypoint by waypoint.
 - **Fast on CPU**: keeps pace with `llama.cpp` on tuned AVX2 kernels — ahead reading prompts, level generating.
 - **Vulkan GPU**: _faster_ than `llama.cpp`'s Vulkan build on Gemma — reading prompts and generating — bound through `purego` rather than cgo.
+- **Serves several clients at once**: `-parallel N` holds N conversations and carries a token for each of them through one read of the weights, on the card as well as on the processor.
 
 ## 🚀 Quickstart
 
@@ -46,7 +47,21 @@ go build ./cmd/golem-server
 ./golem-server -model Qwen3-4B-Q4_0.gguf -addr 127.0.0.1:8080
 ```
 
-`-parallel N` cuts the context into N slots, each holding its own conversation, and the ones waiting at the moment a pass is built go through the weights together — llama.cpp's continuous batching. On the card as well as on the processor: Gemma 4 26B A4B on an RX 9070 XT draws 80.3 tokens a second for one conversation and 256.5 for eight of them, out of one read of the weights.
+`-parallel N` cuts the context into N slots, each holding its own conversation.
+
+## 👥 Several conversations, one pass
+
+Whatever is waiting at the moment a pass is built goes into that pass. Four clients each wanting a token are four tokens in one read of a gigabyte of weights, rather than four reads — llama.cpp's continuous batching, and it now works on the card as well as on the processor. The context is cut between the slots rather than multiplied, so `-context 4096 -parallel 4` is four conversations of 1024 and the memory is what it was.
+
+Gemma 4 26B A4B on an RX 9070 XT, drawing a token for each conversation from 448 positions of context:
+
+| conversations | 1 | 2 | 4 | 8 |
+| --- | ---: | ---: | ---: | ---: |
+| tokens a second | 82.1 | **125.9** | **211.4** | **255.0** |
+
+Through the API, with prompts of about five hundred and forty tokens: one client reads 4055 positions a second and draws 75.3; two clients read 4260 between them and draw 115.6.
+
+What made it possible is that a column now says which conversation it belongs to as well as where it sits, so a block's cache on the card is one ring per conversation rather than one ring. `cmd/golem-server/README.md` has the rest.
 
 ## ⚡ Vulkan GPU
 
@@ -67,17 +82,41 @@ The card holds the whole model: 12.8 GiB for the 26B A4B, which is why sixteen i
 
 _(See [ARCHITECTURE.md](ARCHITECTURE.md) for the kernel work behind these numbers.)_
 
+## 🔮 Qwen3.5 drafts its own next token
+
+The Qwen3.5 checkpoint ships a sixty-fifth block: a multi-token-prediction head that guesses the token *after* the one just decided, from the state the trunk has already computed. Guess right and the next pass verifies two tokens for the price of one. Guess wrong and it costs the pass it rode on and nothing else — every token returned is drawn from the model's own distribution, so this needs none of the accept-reject correction that drafting with a *separate* model does. The answer is the same with drafting on and off, and a test asserts it.
+
+Qwen3.5 27B A3B, a seventeen-token prompt, greedy:
+
+| | prompt | a token at a time | drafting | drafts accepted |
+| --- | ---: | ---: | ---: | ---: |
+| RX 9070 XT | 47.6 /s | 30.8 t/s | **45.2 t/s** | 75% |
+| i7-9700K, 8 threads | 0.7 /s | 0.72 t/s | _refused_ | — |
+
+**Drafting is refused on the processor**, and the reason is one measurement. A speculative step costs a draft plus a pass of two columns, against the one-column pass it hopes to replace:
+
+| cost, as a fraction of one token | on the card | on the processor |
+| --- | ---: | ---: |
+| the draft | 0.08 | 0.03 |
+| the pass of two columns | **0.97** | **1.98** |
+| drafts that must be accepted to break even | 5% | 101% |
+
+The card reads a block's weights once whether the pass carries one column or two, so verifying two tokens costs what drawing one did. The processor at this size is bound by arithmetic rather than by reading the weights, so two columns cost two columns — and no acceptance rate can pay for that. `qwen35/cost_test.go` is where both tables come from.
+
 ## 🧠 Supported Models
 
 | Family | What it runs | On CPU, vs its reference |
 | --- | --- | --- |
 | **Gemma 4** | E2B, 12B, 26B A4B (mixture of 128 experts). Text, Vision, Audio. | Reading a prompt ×1.24 (E2B), ×1.33 (12B), ×1.06 (26B A4B). Generating, a tie: ×1.01, ×1.04, ×1.06 — vs llama.cpp |
 | **Qwen3** | Dense models, from a GGUF. | 4B: ×1.13 reading, ×1.00 generating. 0.6B: ×0.99 reading, ×0.85 generating — vs llama.cpp |
+| **Qwen3.5** | 27B A3B: forty-eight gated delta nets and sixteen attentions, three to one, over a mixture of experts — plus the checkpoint's own multi-token-prediction head, which drafts the second token of every pass. | 0.72 t/s on an i7-9700K: a delta net rewrites a 128×128 state a head every token, and that is arithmetic no kernel makes cheaper. On a card, 30.8 a token at a time and **45.2 drafting**, against llama.cpp's Vulkan build at 32.6 |
 | **Pocket TTS** | 13 shipped models across 6 languages, voice cloning included. | ×2.31 and ×1.69 the speed of the PyTorch reference, on the 24- and 6-layer models |
 
 In absolute terms, on an i7-9700K with eight threads and Q4_0 weights: Gemma E2B draws 22.6 tokens a second and reads 204; the 12B, 5.0 and 42; the 26B A4B, 13.1 and 51; Qwen3 4B, 14.6 and 110. Pocket TTS speaks at ×2.94 real time in French, ×6.81 in English.
 
 **The 0.6B is the one this engine loses**, and [`qwen/README.md`](qwen/README.md) says why: at 320 MB the weights fit close enough that the memory bus stops being the limit, and what is left is arithmetic, where llama.cpp's kernels win. This engine is built for the regime where reading the weights is the cost, and it says so where it is not.
+
+**Qwen3.5 reads prompts slowly** — 47.6 positions a second on a card against llama.cpp's 615. Generation is ahead; the prompt is not, because a recurrent block carries state from one position to the next and this engine's pass is two positions wide where it wants five hundred. That is the work left on it, and it is named here rather than left out of the table.
 
 ## 👁️ Multimodal (Vision & Audio)
 
@@ -130,7 +169,7 @@ Every number in this README is a benchmark in this repository, run on the machin
 
 - `cmd/golem-cli`, `cmd/golem-server`, `cmd/pocket-tts` — the three commands.
 - `engine/` — reads the architecture out of a GGUF and opens the engine that implements it.
-- `gemma/`, `qwen/`, `pockettts/` — standalone engine implementations; they do not import one another.
+- `gemma/`, `qwen/`, `qwen35/`, `pockettts/` — standalone engine implementations; they do not import one another.
 - `nn/` & `vk/` — the shared kernels: quantized AVX2 and NEON, and Vulkan compute.
 - `tensors/`, `token/`, `chat/`, `sample/`, `audio/`, `imageio/` — the rest of the shared layer.
 - `ref/` — what recorded each test fixture, and how to record it again.
