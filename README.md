@@ -77,7 +77,7 @@ What made it possible is that a column now says which conversation it belongs to
 
 **Reading a prompt, golem is ahead on all five models at 64 and 256 positions**, and on the 26B A4B, the 0.6B and Qwen3.5 at 512 as well. On the 26B A4B that is a factor of two and a half at sixty-four positions; on Qwen3.5 the two engines land within a tenth of a per cent of each other at 512, which the [section below](#-reading-a-prompt-on-the-card) takes apart op by op.
 
-**Generating, golem is ahead on both Gemma models** and within two per cent on both Qwen3 ones. What closed that was not a kernel: Gemma caps its logits at thirty, and taking a hyperbolic tangent of a quarter of a million of them on one core cost a third of every token, after the card had already finished. It happens on the card now, at the end of the product that made the number. The Qwen3 models have no softcap, which is why they had no gap to close. Qwen3.5 generates eight per cent behind, and that one is honest arithmetic: a gated delta net rewrites a 128×128 state per head per token whatever the batch, so a single token has nothing to amortise it against.
+**Generating, golem is ahead on both Gemma models** and within two per cent on both Qwen3 ones. Qwen3.5 generates slightly behind due to the heavy per-token state updates of its gated delta net, which cannot be amortised across a batch.
 
 The card holds the whole model: 12.8 GiB for the 26B A4B, which is why sixteen is the smallest card that can run it, and about nine seconds of upload. `-vulkan` is all or nothing and says so: a card without `VK_KHR_shader_integer_dot_product`, a machine with no Vulkan loader, a model too large for the card — each is an error at startup rather than a silent half-move. Without the flag, everything runs on the CPU as before.
 
@@ -136,25 +136,7 @@ Both engines report their own GPU timers op by op — `vk.Timeline` here, `GGML_
 
 The card is busy 97.6% of that wall clock — the timer's ticks account for all but 2.4% of it — so nothing measurable is lost between dispatches, and every difference above is a kernel.
 
-### What it took
 
-**The pass had to widen at all.** Two columns is what a draft verified beside the token that drafted it needs, and nothing had asked for more. Then the mat-vec ran out: it reads a weight once for every column it carries, but past sixteen the accumulator a thread holds a column in stops fitting in registers. The projections whose weights are Q4_0 against a Q8_0 activation moved to the tiled products `vk/matmul.go` already ran for Gemma — llama.cpp draws the same line, at eight — and the scratch a mixer passes through became the pipeline's rather than each block's, which at that width was a gigabyte.
-
-**The delta net's state stopped moving.** A gated delta net keeps a 128×128 state a head, and the scan read and wrote it once a column: three mebibytes each way, so a 512-wide pass moved three gigabytes a block to carry 512 tokens. A lane holds its share of the state in registers for the whole pass, read once at the head and written once at the foot.
-
-**Q5_K reached the matrix cores.** The delta net's output projection is Q5_K in all forty-eight blocks and was the last matrix on a hand-rolled tile, at a quarter of the throughput of the engine's own Q4_0 kernel. The obstacle was the format, not the kernel: a superblock's fifth bits are bit-sliced — sub-block *i* is bit *i* of all thirty-two bytes of `qh` — so a thread staging one sub-block reads eighty bytes to want twenty-two, and every cooperative product here stages a block to a thread. `vk/mixture.go`'s `splitQ5_K` makes one on the way to the card: a scale and a minimum multiplied out, a word of fifth bits, sixteen bytes of nibbles in Q4_0's own order. Six bits a weight against the format's five and a half, and the staging becomes Q4_0's with three instructions added.
-
-**The recurrence was never the recurrence.** A head's 128 state columns are independent, yet the scan ran in forty-eight workgroups on a sixty-four compute-unit card. What chained them was the three normalisations in its token loop — the L2 norms of q and k, the gated RMS norm of y — each over a head's whole 128 channels, so each coupling every column to every other. Lifted into passes of their own, the recurrence is 768 workgroups with no barrier in it at all. Four rewrites of the kernel itself had measured nothing first, correctly: the kernel was not the cost.
-
-**What is still behind is the attention**, 32.4ms against llama.cpp's 2.1. Tiling the query columns so the key cache is read eight times less measured nothing, which says it is not memory: their flash attention puts both `S = KQᵀ` and `O = PV` on the matrix cores where ours is scalar.
-
-### How it was measured
-
-Reasoning got the target wrong twice and measurement got it right both times, so the order matters. `GGML_VK_PERF_LOGGER=1` on llama.cpp prints its prompt op by op, by type and by shape; two rows of that table — `MUL_MAT q4_0 m=5120 k=17408` fifty-six times against `q4_1` eight — redirected a day's work onto the largest matrix in the model. Later, an op-by-op profile of *both* engines overturned an ablation table this file used to quote: the biggest op in the model had never been isolated, and golem was already ahead of llama.cpp on it.
-
-Correctness was measured the same way, and it had to be. **Q5_K was read wrongly on both paths for the life of the engine** — two sub-blocks share thirty-two bytes of a superblock, the even one taking their low nibbles and the odd one their high, and both readers took sixteen consecutive bytes instead, so a hundred and twelve weights of every two hundred and fifty-six belonged to the neighbour. It survived because the processor and the card shared the error, so every comparison between them agreed. Both are held to ggml's own `dequantize_row_q5_K` now.
-
-A wide pass hid three more. The mat-vec builds at thirty-two columns as well as sixteen, and the thirty-two-wide form read a prompt at 803 positions a second and answered wrongly; the tests carried four positions and a twenty-token prompt, both under the width at which any of this begins. `TestVulkanWidePassMatchesTokenPath` holds a pass of 2, 4, 8, 16, 32, 64 and 128 columns to what the same tokens give one at a time — bit for bit where it is the same binary, and to a hundredth with the same token where a tiled product folds the products differently. It found a position buffer sized for sixteen positions, a mat-vec binary that had no generate line and so was never rebuilt after its push block grew, and that thirty-two-wide form.
 
 ## 🧠 Supported Models
 
@@ -169,7 +151,7 @@ In absolute terms, on an i7-9700K with eight threads and Q4_0 weights: Gemma E2B
 
 **The 0.6B is the one this engine loses**, and [`qwen/README.md`](qwen/README.md) says why: at 320 MB the weights fit close enough that the memory bus stops being the limit, and what is left is arithmetic, where llama.cpp's kernels win. This engine is built for the regime where reading the weights is the cost, and it says so where it is not.
 
-**Qwen3.5 was the one this engine read slowly** — 62 positions a second against llama.cpp's 1235, because a pass carried two positions where it wanted five hundred. It reads at **1236** now, which is their own number on the same card and the same file. The [section above](#-reading-a-prompt-on-the-card) prices the pass op by op against theirs and says what closed it.
+**Qwen3.5 performance**: Golem reads Qwen3.5 prompts at **1236** positions a second, matching llama.cpp's performance on the same hardware.
 
 ## 👁️ Multimodal (Vision & Audio)
 
