@@ -1,0 +1,57 @@
+#version 450
+
+// What an activation goes through before it meets D4G weights.
+//
+// Two things, and both are the matrix's rather than the block's: every value is
+// multiplied by its column's entry of the site's vector, and then each group of
+// GROUP values is rotated by the normalised Walsh-Hadamard transform. The
+// weights went through the reciprocal of the first and the same second, and the
+// transform is orthogonal, so the product is the one the unrotated weights and
+// the unscaled activation would have given. nn/d4g_prepare.go is the other copy
+// of this, and TestPrepareD4GMatchesCPU holds the two together.
+//
+// One workgroup a group, GROUP threads, one value each. The transform is log2
+// GROUP passes of butterflies through shared memory: at pass l, the thread
+// whose index has bit l clear keeps the sum and the one that has it set keeps
+// the difference — in that order, because the CPU writes a+b at the low index
+// and a-b at the high one and a rotation that disagrees about the sign is a
+// rotation nobody can undo.
+
+#ifndef GROUP
+#define GROUP 128
+#endif
+
+layout(local_size_x = GROUP) in;
+
+layout(std430, binding = 0) buffer X { float x[]; };          // in place
+layout(std430, binding = 1) readonly buffer P { float pre[]; };
+
+layout(push_constant) uniform Push {
+    uint n;       // values a column
+    uint columns;
+} p;
+
+shared float s[GROUP];
+
+void main() {
+    uint perColumn = p.n / GROUP;
+    uint gid = gl_WorkGroupID.x;
+    uint col = gid / perColumn;
+    uint blk = gid - col * perColumn;
+    if (col >= p.columns) return;
+
+    uint t = gl_LocalInvocationID.x;
+    uint at = col * p.n + blk * GROUP + t;
+    s[t] = x[at] * pre[blk * GROUP + t];
+    barrier();
+
+    for (uint l = 1u; l < GROUP; l <<= 1u) {
+        float mine = s[t];
+        float other = s[t ^ l];
+        barrier();
+        s[t] = ((t & l) == 0u) ? (mine + other) : (other - mine);
+        barrier();
+    }
+
+    x[at] = s[t] * inversesqrt(float(GROUP));
+}

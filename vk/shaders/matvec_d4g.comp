@@ -53,10 +53,15 @@ void main() {
     bool live = row < p.dim;
     if (!live) row = 0u;
 
+#ifdef BITS16
+    const uint BLOCKBYTES = 34u;
+#else
+    const uint BLOCKBYTES = 26u;
+#endif
     uint nb = p.ffn / 64u;
-    uint rowBase   = row * nb * 26u;   // bytes; nb is even, so this is a word
+    uint rowBase   = row * nb * BLOCKBYTES; // bytes; nb is even, so this is a word
     uint stepBase  = rowBase;          // two step codes a block
-    uint codeBase  = rowBase + nb * 2u; // nb runs of twenty-four bytes
+    uint codeBase  = rowBase + nb * 2u; // nb runs of codes
 
     float sum[COLUMNS];
     [[unroll]] for (uint c = 0u; c < COLUMNS; c++) sum[c] = 0.0;
@@ -69,15 +74,28 @@ void main() {
         float stepLo = exp2((float(sc0) - 272.0) * 0.0625);
         float stepHi = exp2((float(sc1) - 272.0) * 0.0625);
 
+#ifdef BITS16
+        // Sixteen bits a code is two plain halfwords, so a word is two codes
+        // and the run is eight words rather than six bytes at a time.
+        uint at = (codeBase + 32u * b) >> 2;
+        uint words[8] = uint[8](w[at], w[at + 1u], w[at + 2u], w[at + 3u],
+                                w[at + 4u], w[at + 5u], w[at + 6u], w[at + 7u]);
+#else
         uint at = (codeBase + 24u * b) >> 2;
         uint c0 = w[at], c1 = w[at + 1u], c2 = w[at + 2u];
         uint c3 = w[at + 3u], c4 = w[at + 4u], c5 = w[at + 5u];
         uint words[6] = uint[6](c0, c1, c2, c3, c4, c5);
+#endif
 
         uint xOffset = b * 64u;
 
-        // Sixteen codes over twenty-four bytes, two codes to three bytes.
         [[unroll]] for (uint k = 0u; k < 8u; k++) {
+#ifdef BITS16
+            uint pair = words[k];
+            uint codeA = pair & 0xFFFFu;
+            uint codeB = pair >> 16u;
+#else
+            // Sixteen codes over twenty-four bytes, two codes to three bytes.
             uint o = k * 3u;
             uint b0 = (words[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu;
             uint o1 = o + 1u;
@@ -87,6 +105,7 @@ void main() {
 
             uint codeA = b0 | ((b1 & 0x0Fu) << 8u);
             uint codeB = (b1 >> 4u) | (b2 << 4u);
+#endif
             // Each turn of this loop is eight weights, so the first four turns
             // are the block's first thirty-two and the second four the rest.
             float step = (k < 4u) ? stepLo : stepHi;

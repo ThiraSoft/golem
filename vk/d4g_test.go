@@ -62,7 +62,7 @@ func TestD4GMatVecMatchesCPU(t *testing.T) {
 	want := make([]float32, rows)
 	m.MatVec(b, want)
 
-	gpu, err := NewD4GMatrix(d, data, rows, cols)
+	gpu, err := newHostD4GMatrix(d, data, rows, cols)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,9 +122,9 @@ func benchD4G(b *testing.B, rows, cols int, noTable bool) {
 	}
 	nn.PrepareD4G(x, pre, 128)
 
-	make := NewD4GMatrix
+	make := newHostD4GMatrix
 	if noTable {
-		make = newD4GMatrixNoTable
+		make = newHostD4GMatrixNoTable
 	}
 	gpu, err := make(d, data, rows, cols)
 	if err != nil {
