@@ -4,7 +4,7 @@ Development tools. They run a model under llama.cpp, or under the engine a
 model's template was written for, and write down what it computes. The Go tests
 read those recordings back, so llama.cpp is needed here and nowhere else.
 
-Three of the five C++ recorders are model-neutral, and are meant to stay that
+Three of the six C++ recorders are model-neutral, and are meant to stay that
 way.
 llama.cpp names the waypoints of its graph the same whatever the architecture,
 so what has to change between one model and the next is not the recorder: it is
@@ -37,6 +37,7 @@ what node 1443 was; regenerate it whenever llama.cpp's graph changes, and
 | `dump_layers.cpp` | the engine | a model, an output directory, a `.run` file |
 | `dump_tokens.cpp` | the tokenizer | a model, an output directory, a `.tsv` corpus |
 | `dump_quants.cpp` | the kernels | a model, an output directory |
+| `dump_mrope.cpp` | the interleaved M-RoPE | an output directory |
 | `dump_vision.cpp` | the vision tower | a model, a projector, an output directory, a `.run` file |
 | `dump_audio.cpp` | the audio tower | a model, a projector, an output directory, a `.run` file |
 
@@ -74,6 +75,9 @@ build/ref/dump_layers "$GOLEM_MODEL_12B" testdata/gemma/layers12  ref/gemma/shor
 build/ref/dump_layers "$GOLEM_MODEL_26B" testdata/gemma/moe26     ref/gemma/moe.run
 build/ref/dump_tokens "$GOLEM_MODEL"     testdata/gemma/tokenizer ref/gemma/corpus.tsv
 build/ref/dump_quants "$GOLEM_MODEL"     testdata/gemma/quants
+
+mkdir -p testdata/qwen35/mrope
+build/ref/dump_mrope testdata/qwen35/mrope
 
 build/ref/dump_vision "$GOLEM_MODEL"     "$GOLEM_MMPROJ"     testdata/gemma/vision   ref/gemma/vision.run
 build/ref/dump_vision "$GOLEM_MODEL_12B" "$GOLEM_MMPROJ_12B" testdata/gemma/vision12 ref/gemma/vision12.run
@@ -164,6 +168,21 @@ Three cases, into `testdata/gemma/quants/`:
 
 `index.json` describes each case; `*.w.bin` holds the quantized bytes as they
 sit in the GGUF, `*.x.bin` and `*.y.bin` little-endian float32.
+
+## dump_mrope — recording the interleaved rotation
+
+It takes no model. The rotation depends on the section widths, the base and the
+head geometry, so the cases are written in the recorder itself and the sections
+Qwen3.8 declares are one of them.
+
+Eight cases, into `testdata/qwen35/mrope/`: two whose components agree, which is
+what text produces and what the scalar rotation must still give; four that
+spread them, which is what an image produces; and two on the boundaries where
+`3*sections[i]` cuts a section short. `index.json` names each one's position.
+
+The Go test refuses a case that agrees with the scalar rotation while claiming
+to spread, so a fixture set recorded with equal components cannot pass for
+coverage of the sections.
 
 ## The rule
 

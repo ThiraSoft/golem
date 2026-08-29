@@ -15,6 +15,16 @@ target_link_libraries(dump_quants PRIVATE ggml ggml-base ggml-cpu)
 set_target_properties(dump_quants PROPERTIES
     BUILD_RPATH ${LLAMA_DIR}/build/bin)
 
+# The fifth recorder, and the second that pins a kernel rather than a model:
+# the rotation depends on the sections and the base, not on any checkpoint.
+add_executable(dump_mrope dump_mrope.cpp)
+target_include_directories(dump_mrope PRIVATE
+    ${LLAMA_DIR}/ggml/include)
+target_link_directories(dump_mrope PRIVATE ${LLAMA_DIR}/build/bin)
+target_link_libraries(dump_mrope PRIVATE ggml ggml-base ggml-cpu)
+set_target_properties(dump_mrope PROPERTIES
+    BUILD_RPATH ${LLAMA_DIR}/build/bin)
+
 add_executable(dump_layers dump_layers.cpp)
 target_include_directories(dump_layers PRIVATE
     ${LLAMA_DIR}/include
