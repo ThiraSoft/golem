@@ -42,6 +42,7 @@ func main() {
 	src := flag.String("model", "", "the BF16 checkpoint to convert")
 	dst := flag.String("out", "", "the .golem file to write")
 	alpha := flag.Float64("alpha", 0.5, "salience exponent; 0 leaves the columns alone")
+	clamp := flag.Float64("clamp", 24, "largest factor the salience may scale a column by, either way; 0 lets it run")
 	hadGroup := flag.Int("hadamard", 128, "rotation group; 0 leaves the weights unrotated")
 	beta := flag.Float64("beta", 2, "how far a block is scaled up before rounding")
 	scaleBlk := flag.Int("scale", 32, "weights sharing one step code; 32 is what the format stores")
@@ -87,7 +88,7 @@ func main() {
 		if signs[cols] == nil {
 			signs[cols] = compress.RandomSigns(cols, int64(cols)*7919)
 		}
-		s := saliencyScale(sal, *alpha)
+		s := saliencyScale(sal, *alpha, *clamp)
 		p := make([]float32, cols)
 		q := make([]float32, cols)
 		for j := range s {
@@ -95,6 +96,13 @@ func main() {
 			p[j] = 1 / q[j]
 		}
 		pre[key], weight[key] = p, q
+		if *report {
+			lo, hi := math.Inf(1), 0.0
+			for _, v := range s {
+				lo, hi = math.Min(lo, float64(v)), math.Max(hi, float64(v))
+			}
+			fmt.Printf("  salience %-10s %8.2e to %8.2e, a span of %.0f\n", key, lo, hi, hi/lo)
+		}
 	}
 
 	// The second pass. The Hessian of a site is what says how to spend the
@@ -337,7 +345,16 @@ func hadamardOf(key string, group int, embd string) int {
 
 // saliencyScale turns per-column activation power into the factor the weights
 // are multiplied by, normalised so the matrix keeps its overall size.
-func saliencyScale(sal []float32, alpha float64) []float32 {
+//
+// clamp bounds how far it may go, and it is not a detail: the scale is applied
+// before the rotation, and the rotation mixes a hundred and twenty-eight
+// columns into each other. A column shrunk by two thousand is mixed with one
+// left alone, quantized as if it were the second, and then multiplied back by
+// two thousand on the activation side — so its error comes back two thousand
+// times larger. At an exponent of 0.75 the span reaches eighteen thousand and
+// the model reads at a perplexity of 246 rather than 40. Salience and
+// incoherence do not compose freely, and this is where they are made to.
+func saliencyScale(sal []float32, alpha, clamp float64) []float32 {
 	out := make([]float32, len(sal))
 	if alpha == 0 {
 		for j := range out {
@@ -351,7 +368,11 @@ func saliencyScale(sal []float32, alpha float64) []float32 {
 	}
 	geo = math.Exp(geo / float64(len(sal)))
 	for j, v := range sal {
-		out[j] = float32(math.Pow(math.Max(float64(v), 1e-8)/geo, alpha))
+		s := math.Pow(math.Max(float64(v), 1e-8)/geo, alpha)
+		if clamp > 1 {
+			s = math.Min(math.Max(s, 1/clamp), clamp)
+		}
+		out[j] = float32(s)
 	}
 	return out
 }
