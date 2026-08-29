@@ -1,14 +1,15 @@
 // Command golem-server answers an OpenAI-compatible API over a GGUF, on the
-// CPU.
+// CPU or, with -vulkan, with the model's blocks and logit head on a Vulkan
+// device.
 //
 //	golem-server -model gemma-4-E2B-it-QAT-Q4_0.gguf -addr :8080
 //	golem-server -model Qwen3-4B-Q4_0.gguf -addr :8080
 //
 // Which engine reads the file is read from the file: it declares its own
-// architecture, and gemma4 and qwen3 are the two that are implemented. It
-// serves /v1/chat/completions, streamed or not, tool declarations included,
-// and /v1/models. It reports the calls the model makes; running them is the
-// client's part, as the protocol has it.
+// architecture, and gemma4, qwen3 and qwen35 — which is Qwen3.8 — are the three
+// that are implemented. It serves /v1/chat/completions, streamed or not, tool
+// declarations included, and /v1/models. It reports the calls the model makes;
+// running them is the client's part, as the protocol has it.
 package main
 
 import (
@@ -27,7 +28,7 @@ import (
 )
 
 func main() {
-	model := flag.String("model", os.Getenv("GOLEM_MODEL"), "GGUF file, gemma4 or qwen3 (or GOLEM_MODEL)")
+	model := flag.String("model", os.Getenv("GOLEM_MODEL"), "GGUF file, gemma4, qwen3 or qwen35 (or GOLEM_MODEL)")
 	mmproj := flag.String("mmproj", os.Getenv("GOLEM_MMPROJ"), "projector GGUF, which is what lets a model see (or GOLEM_MMPROJ)")
 	addr := flag.String("addr", "127.0.0.1:8080", "address to listen on")
 	context := flag.Int("context", 4096, "positions to keep; the files declare far more than any machine here would survive")

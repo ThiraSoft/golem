@@ -152,7 +152,7 @@ needs a voice skips when there is none.
 
 ## Languages
 
-The thirteen models Kyutai ships — six languages, at six or twenty-four
+The twelve models Kyutai ships — six languages, at six or twenty-four
 layers — are all supported. Pass `-language`; the default is `french_24l`.
 
 ```bash
@@ -283,7 +283,7 @@ available. The margin disappears.
 | `cmd/pocket-tts` | the command line |
 | `internal/transformer` | the causal layer, shared by both models |
 | `internal/flowlm` | the language model, the flow net, the voices |
-| `internal/mimi` | the audio decoder |
+| `internal/mimi` | the audio codec: the decoder every synthesis runs, and the encoder cloning a voice needs |
 | `internal/text` | text preparation |
 | `internal/reference` | where the fixtures and the weights are found, for the tests |
 | `languages.go` | what differs between the shipped models |
@@ -303,6 +303,7 @@ python ref/dump_pipeline.py testdata/voices/english_2026-01/<voice>.safetensors 
     testdata/pipeline_en english_2026-01 "Hello world."
 python ref/dump_tokens.py   <french_24l/tokenizer.model>  testdata/tokenizer/cases.json    french
 python ref/dump_tokens.py   <tokenizer.model>             testdata/tokenizer/cases_en.json english
+python ref/dump_encoder.py  french_24l                    testdata/encoder
 ```
 
 The same environment runs `ref/bench_python.py`, which is what the table at the

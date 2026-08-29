@@ -10,7 +10,7 @@ import (
 // It is an ordinary full-attention block with a two-input front: the embedding
 // of the token just decided and the trunk's hidden state for the token before
 // it, each under its own norm, concatenated and projected back down to one
-// hidden state. From there it is a Qwen3.5 block and the model's own logit
+// hidden state. From there it is a Qwen3.8 block and the model's own logit
 // head. llama.cpp's models/qwen35.cpp, graph_mtp, is the other copy of this.
 //
 // The hidden state it takes is the one **under the model's output norm** —

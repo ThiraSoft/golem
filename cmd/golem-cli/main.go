@@ -1,10 +1,12 @@
-// Command golem-cli holds a conversation with a GGUF model, on the CPU.
+// Command golem-cli holds a conversation with a GGUF model, on the CPU or, with
+// -vulkan, with its blocks and its logit head on a Vulkan device.
 //
 //	golem-cli -model gemma-4-E2B-it-QAT-Q4_0.gguf
 //	golem-cli -model Qwen3-4B-Q4_0.gguf -p "Explain a mutex in one sentence." -stats
 //
 // Which engine reads the file is read from the file: it declares its own
-// architecture, and gemma4 and qwen3 are the two that are implemented.
+// architecture, and gemma4, qwen3 and qwen35 — which is Qwen3.8 — are the three
+// that are implemented.
 //
 // With -p it answers once and exits; without, it reads turns from the terminal
 // until end of file.
@@ -48,7 +50,7 @@ func readAll(paths []string) ([][]byte, error) {
 }
 
 func main() {
-	model := flag.String("model", os.Getenv("GOLEM_MODEL"), "GGUF file, gemma4 or qwen3 (or GOLEM_MODEL)")
+	model := flag.String("model", os.Getenv("GOLEM_MODEL"), "GGUF file, gemma4, qwen3 or qwen35 (or GOLEM_MODEL)")
 	context := flag.Int("context", 4096, "positions to keep; the files declare far more than any machine here would survive")
 	system := flag.String("system", "", "system message opening the conversation")
 	think := flag.Bool("think", false, "open the system turn with the thinking marker")

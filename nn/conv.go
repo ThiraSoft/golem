@@ -163,7 +163,8 @@ func (c Conv1d) keepTail(input []float32, total int, state *ConvState) {
 	}
 }
 
-// gathered says which of the two arrangements to use.
+// shortRow is the output row below which gathered picks the second of the two
+// arrangements rather than the axpy form.
 //
 // The axpy form above makes one call per (output channel, input channel, tap)
 // and sweeps the output row inside it, so it costs Inputs*Kernel calls per
@@ -189,6 +190,7 @@ func (c Conv1d) keepTail(input []float32, total int, state *ConvState) {
 // projection — on one side and everything nearer the audio rate on the other.
 const shortRow = 32
 
+// gathered says which of the two arrangements to use, by the rule above.
 func (c Conv1d) gathered(outputs int) bool {
 	return outputs > 0 && outputs <= shortRow && outputs < c.Inputs*c.Kernel
 }

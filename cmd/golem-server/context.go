@@ -22,7 +22,8 @@ import (
 	"github.com/ThiraSoft/golem/gemma"
 )
 
-// Vocabulary is the part of bpe.Vocab the server uses.
+// Vocabulary is the part of engine.Vocabulary the server uses — Gemma's
+// tokenizer or Qwen's, whichever the engine loaded.
 type Vocabulary interface {
 	Encode(text string, addBOS, parseSpecial bool) []int32
 	Piece(id int32, special bool) string

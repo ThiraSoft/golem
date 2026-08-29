@@ -12,8 +12,9 @@ import (
 // zero. Type 16 is AT_HWCAP, the first word of capability bits, and bit 20 of
 // it is HWCAP_ASIMDDP — the advanced SIMD dot product, which is what SDOT is.
 //
-// Reading it here rather than through golang.org/x/sys/cpu keeps the promise in
-// README.md that this module needs Go and nothing else.
+// Reading it here rather than through golang.org/x/sys/cpu keeps the module's
+// dependency list where README.md says it is: purego for the Vulkan loader,
+// and three file formats the standard library does not read.
 const (
 	atHWCAP       = 16
 	hwcapASIMDDP  = 1 << 20

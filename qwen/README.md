@@ -1,7 +1,8 @@
 # qwen
 
-Qwen3 dense models from a GGUF, in Go, with no cgo and nothing outside the
-standard library. Checked activation by activation against llama.cpp.
+Qwen3 dense models from a GGUF, in Go, with no cgo — the one thing this engine
+does not do alone is reach a Vulkan device, which `vk` binds through `purego`.
+Checked activation by activation against llama.cpp.
 
 ```bash
 GOLEM_MODEL_QWEN=Qwen3-4B-Q4_0.gguf go test ./qwen
@@ -18,7 +19,9 @@ width 2560 load and run against the same code the 0.6B's twenty-eight of width
 1024 do.
 
 Not here: `qwen35` and its state-space blocks, the mixture-of-experts variants,
-the K quantizations, the multimodal projector.
+the multimodal projector. The K quantizations are `nn`'s to read and load here
+like any other format, but nothing in this package is checked against a K-quant
+checkpoint: the tables below are Q4_0 and bfloat16.
 
 ## The block, mostly in the negative
 
@@ -109,8 +112,8 @@ The bfloat16 checkpoint comes first on purpose. The kernels and the architecture
 are two independent places for a mistake to hide, and bfloat16 removes one of
 them; the Q4_0 run then proves the other half. Make that file with
 `llama-quantize --pure` — the Q4_0 build published alongside the bfloat16 one
-stores `ffn_down` as Q4_1, which `tensors/gguf.go` refuses and should go on
-refusing.
+stores `ffn_down` as Q4_1, which `nn` has since learned to read, and a mixed
+file would put two formats between the fixtures and the kernel being measured.
 
 Where it stands, on the 0.6B against a five-token prompt:
 

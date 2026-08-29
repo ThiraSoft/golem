@@ -137,8 +137,8 @@ func MatVecQ4_0(w []byte, b *Batch, outputs, inputs int, ys [][]float32) {
 // kTile cuts the input: a feed-forward output is twelve kilobytes per column,
 // so a group of them is far past the cache, and the down projection of this
 // model is exactly that shape. Two thousand inputs at a time brings a group
-// back under it. rowTile then cuts the output, so that the slice of weights the columns
-// sweep over stays put while they sweep.
+// back under it. rowTileBytes then cuts the output, so that the slice of
+// weights the columns sweep over stays put while they sweep.
 //
 // The cut is decided by the width alone, never by the size of the batch, so
 // that a batch of sixty-four sums its products in the same order a batch of one

@@ -2,9 +2,10 @@
 // models, in pure Go.
 //
 // The engine loads the weights once — the file is memory-mapped, nothing is
-// copied — then synthesizes as many times as asked. A voice is a precomputed
-// state, produced by the reference Python daemon from a sound excerpt; the Go
-// engine reads it back and therefore has no need for the audio encoder.
+// copied — then synthesizes as many times as asked. A voice is a state the
+// transformer holds after listening to a sound excerpt: LoadVoice reads one
+// back, whether the reference Python daemon wrote it or VoiceFromWAV did, and
+// clone.go is the second of the two — the Mimi encoder listening here.
 //
 //	engine, err := pockettts.Open(pockettts.Options{
 //		Weights:   ".../model.safetensors",

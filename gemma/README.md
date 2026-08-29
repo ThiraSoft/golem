@@ -1,12 +1,12 @@
 # gemma — Gemma 4, in Go
 
-Runs Google's Gemma 4 from a GGUF file: no cgo, no Python, nothing outside the
-standard library. The weights stay mapped and quantized; nothing is converted
-at load time.
+Runs Google's Gemma 4 from a GGUF file: no cgo, no Python. The weights stay
+mapped and quantized; nothing is converted at load time.
 
-Two checkpoints are known to run, and both are checked against llama.cpp here:
-**E2B**, 35 blocks of 1536, and the **12B**, 48 blocks of 3840. They declare the
-same architecture and share almost none of its numbers; the section below says
+Three checkpoints are known to run, and all three are checked against llama.cpp
+here: **E2B**, 35 blocks of 1536, the **12B**, 48 blocks of 3840, and the
+**26B A4B**, whose feed forward is a mixture of 128 experts. They declare the
+same architecture and share almost none of its numbers; the sections below say
 what differs, and none of it is a branch on the model's name.
 
 ## What it does

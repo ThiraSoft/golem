@@ -1,8 +1,9 @@
 # golem-server
 
-An OpenAI-compatible API over a GGUF, on the CPU. Gemma 4 or Qwen3: the file
-declares its own architecture and `engine/` opens whichever implements it, so
-this command names neither, and tools work on both.
+An OpenAI-compatible API over a GGUF, on the CPU or — with `-vulkan` — with the
+model's blocks and logit head on a Vulkan device. Gemma 4, Qwen3 or Qwen3.8:
+the file declares its own architecture and `engine/` opens whichever implements
+it, so this command names none of them, and tools work on all three.
 
 ```bash
 go build ./cmd/golem-server
@@ -268,13 +269,22 @@ With a 400 and OpenAI's error envelope, rather than answering something else:
 with no message, a tool result answering no call, and a prompt longer than
 `-context`.
 
-Not implemented at all: `/v1/completions`, embeddings, images, audio.
+Not implemented at all: `/v1/completions`, embeddings.
+
+Pictures and recordings are served when the model was opened with `-mmproj`,
+and refused by name when it was not. A turn's content may be an array of parts:
+an `image_url` carrying a `data:` URI or a path on the server's own filesystem,
+and an `input_audio` carrying bare base64 or such a path. An `http` URL is
+refused on purpose — a server that fetches what a prompt names is a server that
+can be aimed.
 
 ## Flags
 
 | | |
 |---|---|
 | `-model` | the GGUF, or `GOLEM_MODEL` |
+| `-mmproj` | the projector GGUF, which is what lets a model see and hear, or `GOLEM_MMPROJ` |
+| `-vulkan` | put the blocks and the logit head on a Vulkan device; it fails rather than falling back |
 | `-addr` | what to listen on; `127.0.0.1:8080` by default |
 | `-context` | positions to keep; 4096 by default, cut between the slots |
 | `-parallel` | conversations at once; 1 by default |

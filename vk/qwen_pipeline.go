@@ -1,6 +1,6 @@
 package vk
 
-// Every block of Qwen3.5 on the card, one submission to a token.
+// Every block of Qwen3.8 on the card, one submission to a token.
 //
 // The model is two kinds of block interleaved three to one: forty-eight gated
 // delta nets, whose state is a 128x128 matrix a head rather than a growing
@@ -275,7 +275,7 @@ type attnGQAPush struct {
 const qAttnTile = 8
 
 // QwenShape is the geometry every block of one model shares. It is passed once
-// rather than rediscovered per block because nothing in Qwen3.5 varies from
+// rather than rediscovered per block because nothing in Qwen3.8 varies from
 // block to block except which of the two mixers a block has.
 type QwenShape struct {
 	Dim        int // 5120
@@ -388,7 +388,7 @@ type QwenPipeline struct {
 	d     *Device
 	shape QwenShape
 	// tl is where a recording writes the card's clock, when one is installed.
-	// Qwen3.5 is the only pipeline here that never had one: every number this
+	// Qwen3.8 is the only pipeline here that never had one: every number this
 	// model's performance work has ever rested on came from ablation — remove
 	// a kernel, time the whole pass — which measures a difference and never a
 	// share, and cannot see time that belongs to no kernel at all.
@@ -438,10 +438,10 @@ type QwenPipeline struct {
 	// serves them all. A set a block, at a hundred and twenty-eight columns,
 	// was a gigabyte — enough to push the logit head off the card, which
 	// showed up as a token costing 200ms instead of 34.
-	convOut, qkvBuf    *Buffer
+	convOut, qkvBuf *Buffer
 	// qkNorm is the delta net's q and k for a whole pass, L2 normed: q at the
 	// head of a column and k two thousand and forty-eight floats after it.
-	qkNorm *Buffer
+	qkNorm             *Buffer
 	gateZBuf, ySSM     *Buffer
 	alphaBuf, betaBuf  *Buffer
 	qIn, kIn, vIn      *Buffer
@@ -1098,12 +1098,12 @@ func (p *QwenPipeline) forward(xs [][]float32, positions []int, speculative bool
 	return out, nil
 }
 
-// record lays down one token's whole pass. It is separate from Forward so that
-// the same sequence can be compiled once and replayed, which is what tells a
-// recording's cost apart from the card's.
 // noSnapshot is the snapAt that never matches a column.
 const noSnapshot = ^uint32(0)
 
+// record lays down one token's whole pass. It is separate from Forward so that
+// the same sequence can be compiled once and replayed, which is what tells a
+// recording's cost apart from the card's.
 func (p *QwenPipeline) record(r *Recorder, columns, snapAt int) {
 	s := p.shape
 	dim := uint32(s.Dim)
@@ -1700,7 +1700,7 @@ func (p *QwenPipeline) Close() {
 	}
 }
 
-// The multi-token-prediction block, which is a Qwen3.5 block with a two-input
+// The multi-token-prediction block, which is a Qwen3.8 block with a two-input
 // front: the embedding of the token just decided and the trunk's hidden state
 // for the one before it, each normed, concatenated, and projected back down to
 // one hidden state. It shares the stream buffers with the trunk because the two

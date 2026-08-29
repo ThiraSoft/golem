@@ -149,7 +149,7 @@ Attention is the one line where the gap is a shape rather than a margin: golem d
 | **Gemma 4** | E2B, 12B, 26B A4B (mixture of 128 experts). Text, Vision, Audio. | Reading a prompt ×1.24 (E2B), ×1.33 (12B), ×1.06 (26B A4B). Generating, a tie: ×1.01, ×1.04, ×1.06 — vs llama.cpp |
 | **Qwen3** | Dense models, from a GGUF. | 4B: ×1.13 reading, ×1.00 generating. 0.6B: ×0.99 reading, ×0.85 generating — vs llama.cpp |
 | **Qwen3.8** | 27B: Dense model featuring forty-eight gated delta nets and sixteen attentions (three to one ratio) — plus the checkpoint's own multi-token-prediction head, which drafts the second token of every pass. | 0.72 t/s on an i7-9700K: a delta net rewrites a 128×128 state a head every token, and that is arithmetic no kernel makes cheaper. On a card, 30.1 a token at a time, **46.0 drafting** and **1236** reading a prompt, against llama.cpp's Vulkan build at 32.8 and 1234.7 |
-| **Pocket TTS** | 13 shipped models across 6 languages, voice cloning included. | ×2.31 and ×1.69 the speed of the PyTorch reference, on the 24- and 6-layer models |
+| **Pocket TTS** | 12 shipped models across 6 languages, voice cloning included. | ×2.31 and ×1.69 the speed of the PyTorch reference, on the 24- and 6-layer models |
 
 In absolute terms, on an i7-9700K with eight threads and Q4_0 weights: Gemma E2B draws 22.6 tokens a second and reads 204; the 12B, 5.0 and 42; the 26B A4B, 13.1 and 51; Qwen3 4B, 14.6 and 110. Pocket TTS speaks at ×2.94 real time in French, ×6.81 in English.
 

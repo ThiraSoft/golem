@@ -14,7 +14,7 @@ import (
 // guess the token after next often enough, two tokens can be had for the price
 // of one pass plus the block, and the block is a sixty-fifth of the model.
 //
-// Measured on Qwen3.5-27B: the draft is the token the model itself chooses
+// Measured on Qwen3.8-27B: the draft is the token the model itself chooses
 // 81% of the time.
 //
 // What a recurrent model adds is the rollback. A refused draft leaves a key in

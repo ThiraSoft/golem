@@ -4,7 +4,8 @@ Development tools. They run a model under llama.cpp, or under the engine a
 model's template was written for, and write down what it computes. The Go tests
 read those recordings back, so llama.cpp is needed here and nowhere else.
 
-The three C++ recorders are model-neutral, and are meant to stay that way.
+Three of the five C++ recorders are model-neutral, and are meant to stay that
+way.
 llama.cpp names the waypoints of its graph the same whatever the architecture,
 so what has to change between one model and the next is not the recorder: it is
 which waypoints to keep, on which prompt, with which tokenizer flags. That lives
@@ -60,20 +61,23 @@ cmake --build build/ref -j8
 
 ## Regenerating every fixture
 
-From the repository root, with `GOLEM_MODEL` and `GOLEM_MODEL_12B` set, and
-`GOLEM_MMPROJ` and `GOLEM_MMPROJ_12B` naming each one's projector:
+From the repository root, with `GOLEM_MODEL`, `GOLEM_MODEL_12B` and
+`GOLEM_MODEL_26B` set, and `GOLEM_MMPROJ`, `GOLEM_MMPROJ_12B` and
+`GOLEM_MMPROJ_26B` naming each one's projector:
 
 ```bash
-mkdir -p testdata/gemma/{layers,layers12,window,tokenizer,quants,vision,vision12,audio,audio12}
+mkdir -p testdata/gemma/{layers,layers12,moe26,window,tokenizer,quants,vision,vision12,vision26,audio,audio12}
 
 build/ref/dump_layers "$GOLEM_MODEL"     testdata/gemma/layers    ref/gemma/short.run
 build/ref/dump_layers "$GOLEM_MODEL"     testdata/gemma/window    ref/gemma/window.run
 build/ref/dump_layers "$GOLEM_MODEL_12B" testdata/gemma/layers12  ref/gemma/short.run
+build/ref/dump_layers "$GOLEM_MODEL_26B" testdata/gemma/moe26     ref/gemma/moe.run
 build/ref/dump_tokens "$GOLEM_MODEL"     testdata/gemma/tokenizer ref/gemma/corpus.tsv
 build/ref/dump_quants "$GOLEM_MODEL"     testdata/gemma/quants
 
 build/ref/dump_vision "$GOLEM_MODEL"     "$GOLEM_MMPROJ"     testdata/gemma/vision   ref/gemma/vision.run
 build/ref/dump_vision "$GOLEM_MODEL_12B" "$GOLEM_MMPROJ_12B" testdata/gemma/vision12 ref/gemma/vision12.run
+build/ref/dump_vision "$GOLEM_MODEL_26B" "$GOLEM_MMPROJ_26B" testdata/gemma/vision26 ref/gemma/vision26.run
 
 # The audio fixtures need one recording, which is not committed either:
 #   ffmpeg -i /path/to/llama.cpp/tools/mtmd/test-2.mp3 -ar 16000 -ac 1 \

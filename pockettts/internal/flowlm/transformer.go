@@ -80,7 +80,8 @@ func (e *State) Position() int {
 	return e.Caches[0].Position
 }
 
-// Advance passes one position through the 24 layers. x is modified in place.
+// Advance passes one position through every layer — 24 or 6, depending on the
+// language. x is modified in place.
 func (t *Transformer) Advance(x []float32, state *State) {
 	for i, c := range t.Layers {
 		c.Step(x, state.Caches[i])

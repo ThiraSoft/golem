@@ -719,9 +719,6 @@ func (m *Mixture) AddBlock(gateUpExps, downExps, gate, up, down []byte) error {
 	return nil
 }
 
-// Record puts one block's two branches into a recording without submitting
-// it, which is what running a whole token in one submission needs. The inputs
-// and the routing must already be in the buffers the accessors below name.
 // Profile is Stack.Profile, forwarded: one stamp between the two halves.
 func (m *Mixture) Profile(t *Timeline) { m.tl = t }
 
@@ -738,11 +735,8 @@ func (m *Mixture) mark(r *Recorder, label string) {
 	m.tl.Stamp(r, label)
 }
 
-// Record puts one block's feed-forward half into a recording, for the given
-// number of columns. More than one is a stretch of a prompt, and only the
-// shared branch can take it — see the note beside the wide pipelines above.
 // RecordSharedUp and RecordSharedDown issue the shared branch's two products
-// on their own, and say whether they did.
+// on their own, ahead of the rest of the block, and say whether they did.
 //
 // The shared branch of a mixture block reads what the residual kernel wrote
 // and nothing the routing writes — stack.go binds its quantized input to the
@@ -780,6 +774,13 @@ func (m *Mixture) RecordSharedDown(r *Recorder, block, columns int) bool {
 	return true
 }
 
+// Record puts one block's two branches into a recording without submitting it,
+// which is what running a whole token in one submission needs. The inputs and
+// the routing must already be in the buffers the accessors below name, and
+// columns is the width of the pass: more than one is a stretch of a prompt,
+// and only the shared branch can take it — see the note beside the wide
+// pipelines above.
+//
 // sharedUp and sharedDown say those two products have already been issued by
 // the two calls above, and this recording must not issue them twice.
 func (m *Mixture) Record(r *Recorder, block, columns int, sharedUp, sharedDown bool) {

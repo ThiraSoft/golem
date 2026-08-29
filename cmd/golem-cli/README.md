@@ -1,8 +1,9 @@
 # golem-cli
 
-A conversation with a GGUF model, on the CPU. Gemma 4 or Qwen3: the file
-declares its own architecture and `engine/` opens whichever implements it, so
-this command names neither.
+A conversation with a GGUF model, on the CPU or — with `-vulkan` — with its
+blocks and its logit head on a Vulkan device. Gemma 4, Qwen3 or Qwen3.8: the
+file declares its own architecture and `engine/` opens whichever implements it,
+so this command names none of them.
 
 ```bash
 go build ./cmd/golem-cli

@@ -8,7 +8,7 @@ import (
 
 // ForwardFullAttnToken processes one token through a full attention block.
 //
-// Qwen3.5-27B full attention:
+// Qwen3.8-27B full attention:
 //   - 24 query heads, 4 KV heads (six queries per key)
 //   - HeadDim 256, RoPE over the first 64 elements of each head
 //   - the query projection carries the output gate with it: its 12288 outputs

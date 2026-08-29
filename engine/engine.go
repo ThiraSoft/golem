@@ -22,8 +22,9 @@ import (
 
 // Vocabulary is the part of a tokenizer a conversation drives. The two
 // implementations are not interchangeable and are not chosen by hand: Gemma's
-// vocabulary is SentencePiece, Qwen's is byte-level BPE with the qwen2
-// pre-tokenizer, and each engine loads its own.
+// is token/bpe — BPE over raw UTF-8 with SentencePiece's whitespace escaping —
+// and Qwen's is token/bytebpe, byte-level BPE with the qwen2 pre-tokenizer.
+// Each engine loads its own; qwen35 reads Qwen's.
 type Vocabulary interface {
 	Encode(text string, addBOS, parseSpecial bool) []int32
 	Piece(id int32, special bool) string

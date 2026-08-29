@@ -8,7 +8,7 @@ import (
 // TestVulkanPassProfile is not a test of anything; it is the instrument this
 // model never had.
 //
-// Every performance number Qwen3.5 has ever been changed on came from
+// Every performance number Qwen3.8 has ever been changed on came from
 // ablation: take a kernel out, time the whole pass, call the difference that
 // kernel's cost. That measures a difference and never a share, it cannot see
 // time that belongs to no kernel at all, and it is why four structural

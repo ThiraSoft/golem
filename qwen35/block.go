@@ -4,7 +4,7 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 )
 
-// Block runs one layer of Qwen3.5: a pre-norm, a mixer that is either the
+// Block runs one layer of Qwen3.8: a pre-norm, a mixer that is either the
 // gated delta net or full attention, a residual, a post-attention norm, a
 // SwiGLU feed forward, and a second residual. Both block kinds share the feed
 // forward, and only the mixer differs.

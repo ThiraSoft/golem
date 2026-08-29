@@ -1,5 +1,6 @@
 // Package qwen runs Qwen3 dense language models from a GGUF file, in Go, with
-// no cgo and nothing outside the standard library.
+// no cgo: nothing here calls into C, and the one thing it does not do alone is
+// reach a Vulkan device, which vk binds through purego.
 package qwen
 
 // The geometry of the model, read from the file rather than assumed.

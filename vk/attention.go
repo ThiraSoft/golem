@@ -574,9 +574,6 @@ func (a *Attention) AddBlock(shape BlockShape, q, k, v, o []byte, qnorm, knorm [
 // caches is the pair this block reads, which is its own or an earlier one's.
 func (b *attentionBlock) caches() (*Buffer, *Buffer) { return b.ck, b.cv }
 
-// Record puts one block's attention into a recording without submitting it,
-// which is what running a whole token in one submission needs. The input must
-// already be in the buffers Input names.
 // Profile is Stack.Profile, forwarded: the stamps the attention writes are
 // the four products, the cache and the scores.
 func (a *Attention) Profile(t *Timeline) { a.tl = t }

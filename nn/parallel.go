@@ -190,6 +190,10 @@ func (w *workers) run(n, chunks int, work func(start, end int)) {
 	w.work = nil
 }
 
+// parallelMutex serializes the sections: one is in flight at a time, because
+// the pool is one.
+var parallelMutex sync.Mutex
+
 // InParallel spreads `n` independent tasks over the available cores, provided
 // the total work justifies it. It is offered to the packages that have
 // splittable work to hand off.
@@ -197,8 +201,6 @@ func (w *workers) run(n, chunks int, work func(start, end int)) {
 // The sections are not reentrant: the work function must not itself call
 // InParallel, which nothing in this engine does — the split always happens at
 // the outermost loop of a product.
-var parallelMutex sync.Mutex
-
 func InParallel(n, totalWork int, work func(start, end int)) {
 	// However many workers the pool holds, the runtime decides how many
 	// processors this program may use, and that number can change while it

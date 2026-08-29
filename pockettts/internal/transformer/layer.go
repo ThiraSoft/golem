@@ -209,8 +209,6 @@ func (c *Layer) attention(batch int, cache *Cache) {
 	})
 }
 
-// applyScale multiplies termwise, or does nothing if the layer has no scale.
-// The audio decoder has one, the flow_lm does not.
 // gelWork is what one GELU costs beside the multiply-add the section's weight
 // is counted in. It only decides whether a section is worth splitting.
 const gelWork = 128
@@ -241,6 +239,8 @@ func (c *Layer) finish(l nn.Linear, in, scale, x []float32, batch int, again boo
 	})
 }
 
+// applyScale multiplies termwise, or does nothing if the layer has no scale.
+// The audio decoder has one, the flow_lm does not.
 func applyScale(scale, x []float32) {
 	for i, e := range scale {
 		x[i] *= e

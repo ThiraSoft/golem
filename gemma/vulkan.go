@@ -27,9 +27,9 @@ import (
 // read it there. It fails, and changes nothing, when there is no device, when
 // the head is not Q6_K, or when the tensor does not fit in device memory.
 //
-// A model that has it keeps the CPU path for everything else, including
-// LogitsBatch: the shader scores one activation at a time, and a batch reads
-// the head once for all of its columns already.
+// LogitsBatch keeps the CPU path whatever else is on the card: the shader
+// scores one activation at a time, and a batch reads the head once for all of
+// its columns already.
 func (m *Model) UseVulkanHead() error {
 	if m.head != nil {
 		return nil

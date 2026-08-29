@@ -94,9 +94,6 @@ const (
 // vkApplicationInfo is skipped everywhere: it is optional and an instance
 // without it is a 1.0 instance, which is all a compute dispatch asks for.
 
-// instanceCreateInfo: sType 0, pNext 8, flags 16, pApplicationInfo 24,
-// enabledLayerCount 32, ppEnabledLayerNames 40, enabledExtensionCount 48,
-// ppEnabledExtensionNames 56.
 // applicationInfo is here for one field: a 1.0 instance cannot be handed a
 // shader that declares an extension's capability, and the product kernels
 // declare the integer dot product's.
@@ -208,6 +205,9 @@ type extensionProperties struct {
 	specVersion uint32
 }
 
+// instanceCreateInfo: sType 0, pNext 8, flags 16, pApplicationInfo 24,
+// enabledLayerCount 32, ppEnabledLayerNames 40, enabledExtensionCount 48,
+// ppEnabledExtensionNames 56.
 type instanceCreateInfo struct {
 	sType                   uint32
 	_                       uint32

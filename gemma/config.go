@@ -1,5 +1,10 @@
 // Package gemma runs Google's Gemma 4 language models from a GGUF file, in Go,
-// with no cgo and nothing outside the standard library.
+// with no cgo: E2B, the 12B, and the 26B A4B mixture, text, vision and audio.
+//
+// Nothing here calls into C. What it does not do alone is read a Vulkan device
+// — vk binds libvulkan through purego — nor decode a WebP, an MP3 or a FLAC,
+// which are the three formats the standard library has none of. Those four
+// modules are the whole of what golem depends on.
 package gemma
 
 // The geometry of the model, read from the file rather than assumed.

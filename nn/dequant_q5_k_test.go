@@ -57,7 +57,7 @@ func ggmlDequantQ5K(block []byte, out []float32) {
 // This engine's Q5_K against the definition of Q5_K.
 //
 // It was written after the format had been misread for the whole life of the
-// Qwen3.5 engine, on both paths at once: nn's dequantiser and vk's mat-vec
+// Qwen3.8 engine, on both paths at once: nn's dequantiser and vk's mat-vec
 // made the same wrong assumption, so they agreed with each other and every
 // test that compared one to the other passed. A hundred and twelve of every
 // two hundred and fifty-six weights were somebody else's.

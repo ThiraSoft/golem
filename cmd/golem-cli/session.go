@@ -62,7 +62,8 @@ type speculator interface {
 	Step(token int32, hidden []float32, pos int, pick func([]float32) int32) ([]int32, []float32, error)
 }
 
-// vocabulary is the part of bpe.Vocab a conversation uses.
+// vocabulary is the part of engine.Vocabulary a conversation uses — Gemma's
+// tokenizer or Qwen's, whichever the engine loaded.
 type vocabulary interface {
 	Encode(text string, addBOS, parseSpecial bool) []int32
 	Piece(id int32, special bool) string

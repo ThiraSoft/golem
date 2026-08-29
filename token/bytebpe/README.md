@@ -45,10 +45,12 @@ Three rules are worth reading twice:
   `"a   "` is `"a"`, `"   "`.
 
 `qwen35` — the rules the 27B declares — differs only by adding `\p{M}` to the
-letter and punctuation classes, so this scanner is one predicate away from
-serving it too. `knownPre` refuses a name it has not implemented rather than
-splitting by the wrong rules, which would cost a few tokens a sentence and
-raise nothing.
+letter and punctuation classes, and `knownPre` accepts it, along with
+`qwen3.8` and `deepseek-r1-qwen`: all four go through this one scanner. So the
+combining marks are the one place the 27B is split by the qwen2 rule rather
+than by its own, which shows on text carrying them and nowhere else. Every
+other name is refused at load rather than split by the wrong rules, which would
+cost a few tokens a sentence and raise nothing.
 
 ## What it is checked against
 
