@@ -55,6 +55,7 @@ func main() {
 	sample := flag.Int("sample", 128, "rows a site's salience is chosen on")
 	swin := flag.Int("swin", 256, "how many columns the search's Hessian keeps together")
 	report := flag.Bool("report", false, "print what each matrix's codes cost it")
+	blind := flag.Bool("blind", true, "rotate matrices no calibration site names, with signs alone")
 	keep := flag.String("keep", "", "comma-separated tensor name fragments left in BF16")
 	window := flag.Int("gptq", 0, "error-compensation window in columns; 0 turns it off")
 	damp := flag.Float64("damp", 0.01, "ridge on the Hessian diagonal, as a fraction of its mean")
@@ -71,6 +72,9 @@ func main() {
 		win = *swin
 	}
 	salience, accs := calibrate(*src, text, *ntok, *ctx, win, *scaleBlk)
+	if len(salience) == 0 && !*blind {
+		must(fmt.Errorf("golemquant: nothing calibrated and -blind is off, so nothing would be rotated"))
+	}
 
 	g, err := tensors.OpenGGUF(*src)
 	must(err)
@@ -179,11 +183,39 @@ func main() {
 			*window, *scaleBlk, *damp)
 	}
 
+	// What a matrix with no calibration site was rotated by, one vector each,
+	// written beside it.
+	blindPre := map[string][]float32{}
+	signsFor := func(cols int, name string) ([]float32, []float32) {
+		// The seed is the name, so that a converter run twice writes the same
+		// file and two tensors of the same width do not share a rotation.
+		var h int64 = 1469598103934665603
+		for _, c := range []byte(name) {
+			h = (h ^ int64(c)) * 1099511628211
+		}
+		if h < 0 {
+			h = -h
+		}
+		q := compress.RandomSigns(cols, h)
+		p := make([]float32, cols)
+		for j, v := range q {
+			p[j] = 1 / v
+		}
+		return q, p
+	}
+
 	var out []tensors.OutTensor
 	var bits, count float64
 	t0 := time.Now()
 	for _, name := range names {
 		t := g.Tensors[name]
+		if !encodable(t) {
+			out = append(out, tensors.OutTensor{Name: name, Shape: t.Shape,
+				DType: t.DType, Data: append([]byte(nil), t.Raw...)})
+			bits += float64(len(t.Raw)) * 8
+			count += float64(t.Elems())
+			continue
+		}
 		if kept(name, *keep) {
 			out = append(out, tensors.OutTensor{Name: name, Shape: t.Shape,
 				DType: t.DType, Data: append([]byte(nil), t.Raw...)})
@@ -200,14 +232,17 @@ func main() {
 			count += float64(t.Elems())
 			continue
 		}
-		if t.DType != "BF16" || len(t.Shape) != 2 {
-			out = append(out, tensors.OutTensor{Name: name, Shape: t.Shape,
-				DType: t.DType, Data: append([]byte(nil), t.Raw...)})
-			continue
-		}
 		cols := t.Shape[0]
-		rows := t.Elems() / cols
-		w, err := t.F32()
+		stack := 1
+		if len(t.Shape) == 3 {
+			// A stack of experts: ne2 of them, each ne1 rows of ne0. They are
+			// one tensor in the file and one matrix each here, because a
+			// lattice code spans four weights of a row and a row belongs to
+			// one expert.
+			stack = t.Shape[2]
+		}
+		rows := t.Elems() / cols / stack
+		w, err := expand(t)
 		must(err)
 
 		var q []float32
@@ -224,6 +259,14 @@ func main() {
 			q = weight[headKey]
 		}
 		p := params
+		if q == nil && *blind && cols%*hadGroup == 0 {
+			// A matrix no calibration site names — a mixture's experts, or a
+			// tensor of an architecture this converter has never seen. It
+			// still gets the rotation, because incoherence is most of what
+			// the rotation is for and it needs no statistics: signs alone,
+			// and its own vector written beside it so the reader can undo it.
+			q, blindPre[name] = signsFor(cols, name)
+		}
 		if q == nil {
 			p.HadGroup = 0
 			key = ""
@@ -233,7 +276,11 @@ func main() {
 			q = weight[key]
 		}
 		comp := comps[key]
-		data := compress.EncodeD4G(w, rows, cols, q, p, comp)
+		var data []byte
+		for e := 0; e < stack; e++ {
+			slice := w[e*rows*cols : (e+1)*rows*cols]
+			data = append(data, compress.EncodeD4G(slice, rows, cols, q, p, comp)...)
+		}
 		note := ""
 		if *report {
 			// What the codes cost in the basis they were written in. The
@@ -247,7 +294,28 @@ func main() {
 			DType: dtype, Data: data})
 		bits += float64(len(data)) * 8
 		count += float64(len(w))
-		fmt.Printf("  %-32s %6dx%-6d %s%s\n", name, rows, cols, sizeOf(len(data)), note)
+		what := fmt.Sprintf("%6dx%-6d", rows, cols)
+		if stack > 1 {
+			what = fmt.Sprintf("%3dx%5dx%-6d", stack, rows, cols)
+		}
+		fmt.Printf("  %-32s %s %s%s\n", name, what, sizeOf(len(data)), note)
+	}
+
+	// A vector for every matrix that had no site, under its own name.
+	blindNames := make([]string, 0, len(blindPre))
+	for k := range blindPre {
+		blindNames = append(blindNames, k)
+	}
+	sort.Strings(blindNames)
+	for _, k := range blindNames {
+		v := blindPre[k]
+		raw := make([]byte, len(v)*4)
+		for i, x := range v {
+			binary.LittleEndian.PutUint32(raw[4*i:], math.Float32bits(x))
+		}
+		out = append(out, tensors.OutTensor{Name: k + ".pre", Shape: []int{len(v)},
+			DType: "F32", Data: raw})
+		bits += float64(len(raw)) * 8
 	}
 
 	// The vectors, one a site, as plain F32 tensors the loader binds by name.
@@ -296,7 +364,14 @@ func main() {
 // makes one long text into many independent samples.
 func runCalib(path, text string, ntok, ctx int, hook func(int, string, [][]float32)) int {
 	m, err := qwen.Open(path, ctx)
-	must(err)
+	if err != nil {
+		// A checkpoint this converter cannot run. Everything it writes is
+		// still writable — the rotation needs no statistics, only the
+		// salience does — so the conversion goes ahead with signs alone and
+		// says so rather than stopping.
+		fmt.Printf("no calibration: %v\n  every matrix will be rotated with signs alone, and none scaled\n", err)
+		return 0
+	}
 	defer m.Close()
 	v, err := bytebpe.Load(m.File())
 	must(err)
@@ -454,6 +529,59 @@ func saliencyScale(sal []float32, alpha, clamp float64) []float32 {
 		out[j] = float32(s)
 	}
 	return out
+}
+
+// encodable says whether a tensor is one this format has anything to say about:
+// a matrix, or a stack of them, of a type that can be read back as floats. The
+// norms, the vectors and the scalars are none of those and travel unchanged.
+func encodable(t tensors.Tensor) bool {
+	if len(t.Shape) != 2 && len(t.Shape) != 3 {
+		return false
+	}
+	if t.Shape[0]%nn.D4Block != 0 {
+		return false
+	}
+	if t.DType == "BF16" {
+		return true
+	}
+	if t.DType == "F32" {
+		// Never. A float tensor in one of these files is a norm's gain, a
+		// scale, or the router's own matrix, and the router is the one thing
+		// in a mixture that must not be approximated: a model that picks the
+		// wrong experts answers fluently and wrongly, which gemma/moe.go says
+		// at more length.
+		return false
+	}
+	_, ok := nn.QuantOf(t.DType)
+	return ok
+}
+
+// expand reads a tensor back as floats whatever it is stored as. A checkpoint
+// that arrives already quantized can be converted — the arithmetic works — but
+// what comes out is a quantization of a quantization, and the second one cannot
+// undo what the first threw away. The right input is bf16.
+func expand(t tensors.Tensor) ([]float32, error) {
+	if t.DType == "BF16" || t.DType == "F32" {
+		return t.F32()
+	}
+	q, ok := nn.QuantOf(t.DType)
+	if !ok {
+		return nil, fmt.Errorf("golemquant: %s is a type this cannot read", t.DType)
+	}
+	cols := t.Shape[0]
+	rows := t.Elems() / cols
+	m := nn.Matrix{Data: t.Raw, Quant: q, Rows: rows, Cols: cols}
+	if want := rows * m.RowBytes(); len(t.Raw) != want {
+		return nil, fmt.Errorf("golemquant: a %s tensor of %dx%d wants %d bytes, the file has %d",
+			t.DType, rows, cols, want, len(t.Raw))
+	}
+	out := make([]float32, t.Elems())
+	compress.Parallel(rows, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			m.Row(r, out[r*cols:(r+1)*cols])
+		}
+	})
+	return out, nil
 }
 
 // kept says whether a tensor is one of those a probe is leaving alone, so that
