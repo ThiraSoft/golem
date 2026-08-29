@@ -3,6 +3,7 @@ package qwen35
 import (
 	"fmt"
 
+	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/sample"
 	"github.com/ThiraSoft/golem/tensors"
 )
@@ -45,6 +46,12 @@ type Config struct {
 	MaxContext int
 	Blocks     []BlockConfig
 	Sampling   sample.Params
+
+	// RoPESections are the four M-RoPE section widths the file declares. A
+	// text-only conversation never depends on them — its positions agree on
+	// every axis — but an image does, and reading them at load is what makes
+	// that a fact about the file rather than a constant here.
+	RoPESections nn.Sections
 
 	// NextN is how many of the trailing blocks are multi-token-prediction
 	// blocks rather than part of the trunk. The checkpoint counts them in
@@ -115,13 +122,23 @@ func LoadConfig(g *tensors.GGUF, maxContext int) (*Config, error) {
 
 	nextN, _ := g.Uint32(key("nextn_predict_layers"))
 
+	// The M-RoPE section widths. A file that declares none leaves them at
+	// zero, which nn reads as the ordinary scalar rotation.
+	var sections nn.Sections
+	if raw, err := g.Uint32Slice(key("rope.dimension_sections")); err == nil {
+		for i := 0; i < len(raw) && i < 4; i++ {
+			sections[i] = int(raw[i])
+		}
+	}
+
 	cfg := &Config{
-		Arch:       arch,
-		NextN:      int(nextN),
-		Sampling:   loadSampling(g),
-		Dim:        int(dim),
-		Eps:        eps,
-		MaxContext: maxContext,
+		Arch:         arch,
+		NextN:        int(nextN),
+		RoPESections: sections,
+		Sampling:     loadSampling(g),
+		Dim:          int(dim),
+		Eps:          eps,
+		MaxContext:   maxContext,
 	}
 
 	embd, ok := g.Tensors["token_embd.weight"]

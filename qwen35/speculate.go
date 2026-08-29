@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/ThiraSoft/golem/nn"
+	"github.com/ThiraSoft/golem/vk"
 )
 
 // Speculative decoding with the checkpoint's own prediction block.
@@ -90,6 +91,14 @@ func (m *Model) NewSpeculator() (*Speculator, error) {
 // It returns the tokens decided after `token`, and the hidden state belonging
 // to the last of them.
 func (s *Speculator) Step(token int32, hidden []float32, pos int, pick func([]float32) int32) ([]int32, []float32, error) {
+	return s.StepAt(token, hidden, Place{Pos: pos, T: pos, H: pos, W: pos}, pick)
+}
+
+// StepAt is Step for a conversation whose axes do not follow the cache index.
+// The drafted column sits one further on every axis, which is what a text token
+// after an image does: the picture is behind it, and what follows a picture
+// advances the way text always has.
+func (s *Speculator) StepAt(token int32, hidden []float32, at Place, pick func([]float32) int32) ([]int32, []float32, error) {
 	m := s.m
 	dim := m.Cfg.Dim
 
@@ -99,7 +108,7 @@ func (s *Speculator) Step(token int32, hidden []float32, pos int, pick func([]fl
 	copy(s.eh[dim:], hidden)
 	nn.RMSNormPlain(s.eh[dim:], m.W.MTP.HNorm, m.Cfg.Eps)
 
-	h, err := m.gpuPipe.DraftMTP(s.eh, pos)
+	h, err := m.gpuPipe.DraftMTPAt(s.eh, at.gpu())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -110,7 +119,9 @@ func (s *Speculator) Step(token int32, hidden []float32, pos int, pick func([]fl
 	//    the weights answers both, which is the whole of the bargain.
 	m.W.TokenEmbd.Row(int(token), s.embed[0])
 	m.W.TokenEmbd.Row(int(guess), s.embed[1])
-	out, err := m.gpuPipe.ForwardSpeculative([][]float32{s.embed[0], s.embed[1]}, []int{pos, pos + 1})
+	next := at.Next()
+	out, err := m.gpuPipe.ForwardSpeculativeAt(
+		[][]float32{s.embed[0], s.embed[1]}, []vk.QwenPlace{at.gpu(), next.gpu()})
 	if err != nil {
 		return nil, nil, err
 	}

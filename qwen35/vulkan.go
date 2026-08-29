@@ -85,6 +85,9 @@ func (m *Model) UseVulkanStack() error {
 		FFN:        cfg.Blocks[0].FFN,
 		MaxContext: cfg.MaxContext,
 		Eps:        cfg.Eps,
+		// vk takes the widths as a plain array: it has no reason to import nn
+		// for a type, and this is the one place the two spellings meet.
+		RoPESections: [4]int(cfg.RoPESections),
 	}
 	for _, bc := range cfg.Blocks[:numBlocks] {
 		if bc.Type == BlockFullAttn && shape.Heads == 0 {

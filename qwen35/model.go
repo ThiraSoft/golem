@@ -167,12 +167,13 @@ func (m *Model) ForwardBatch(tokens []int32, startPos int) [][]float32 {
 		}
 		for t := 0; t < len(tokens); {
 			n := m.gpuPipe.WidthFor(len(tokens) - t)
-			positions := make([]int, n)
+			at := make([]vk.QwenPlace, n)
 			for c := 0; c < n; c++ {
 				m.W.TokenEmbd.Row(int(tokens[t+c]), embeds[c])
-				positions[c] = startPos + t + c
+				p := startPos + t + c
+				at[c] = vk.QwenPlace{Pos: p, T: p, H: p, W: p}
 			}
-			hs, err := m.gpuPipe.ForwardColumns(embeds[:n], positions)
+			hs, err := m.gpuPipe.ForwardPlaces(embeds[:n], at)
 			if err != nil {
 				panic(fmt.Sprintf("qwen35: the GPU pipeline failed at position %d: %v", startPos+t, err))
 			}
@@ -184,18 +185,31 @@ func (m *Model) ForwardBatch(tokens []int32, startPos int) [][]float32 {
 		}
 		return out
 	}
+	places := Run(m.slot, startPos, len(tokens))
 	for t, tok := range tokens {
-		out[t] = m.step(tok, startPos+t)
+		out[t] = m.step(tok, places[t])
 	}
 	return out
 }
 
 // ForwardSlots processes tokens across arbitrary slots and positions.
 func (m *Model) ForwardSlots(tokens []int32, slots, positions []int) [][]float32 {
+	at := make([]Place, len(tokens))
+	for t := range tokens {
+		p := positions[t]
+		at[t] = Place{Slot: slots[t], Pos: p, T: p, H: p, W: p}
+	}
+	return m.ForwardPlaces(tokens, at)
+}
+
+// ForwardPlaces is ForwardSlots for a caller whose positions do not agree on
+// every axis, which is what an image gives. Everything else arrives through
+// Run, and gets places whose axes follow the cache index.
+func (m *Model) ForwardPlaces(tokens []int32, at []Place) [][]float32 {
 	out := make([][]float32, len(tokens))
 	for t, tok := range tokens {
-		m.UseSlot(slots[t])
-		out[t] = m.step(tok, positions[t])
+		m.UseSlot(at[t].Slot)
+		out[t] = m.step(tok, at[t])
 	}
 	return out
 }
@@ -203,22 +217,22 @@ func (m *Model) ForwardSlots(tokens []int32, slots, positions []int) [][]float32
 // step is one token through the trunk. The hidden state it returns is a fresh
 // slice, because a caller holds on to it across the next token — the
 // multi-token-prediction path holds two at once.
-func (m *Model) step(token int32, pos int) []float32 {
+func (m *Model) step(token int32, at Place) []float32 {
 	m.W.TokenEmbd.Row(int(token), m.x)
 
 	if m.gpuPipe != nil {
-		h, err := m.gpuPipe.Forward(m.x, pos)
+		h, err := m.gpuPipe.ForwardPlaces([][]float32{m.x}, []vk.QwenPlace{at.gpu()})
 		if err != nil {
-			panic(fmt.Sprintf("qwen35: the GPU pipeline failed at position %d: %v", pos, err))
+			panic(fmt.Sprintf("qwen35: the GPU pipeline failed at position %d: %v", at.Pos, err))
 		}
 		// The un-normed state comes back too: it is what the MTP block reads,
 		// and it is the residual the next token would continue from.
 		copy(m.x, m.gpuPipe.Hidden())
-		return append([]float32(nil), h...)
+		return append([]float32(nil), h[0]...)
 	}
 
 	for i, n := 0, m.trunk(); i < n; i++ {
-		Block(m.Cfg, m.Cfg.Blocks[i], &m.W.Blocks[i], &m.cache.Blocks[i], m.rope, pos, m.x, m.scratch)
+		Block(m.Cfg, m.Cfg.Blocks[i], &m.W.Blocks[i], &m.cache.Blocks[i], m.rope, at, m.x, m.scratch)
 	}
 
 	h := make([]float32, m.Cfg.Dim)

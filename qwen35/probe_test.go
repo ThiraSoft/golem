@@ -21,7 +21,7 @@ func hasNaN(v []float32) int {
 func (m *Model) cpuTrunk(token int32, pos, blocks int) []float32 {
 	m.W.TokenEmbd.Row(int(token), m.x)
 	for i := 0; i < blocks; i++ {
-		Block(m.Cfg, m.Cfg.Blocks[i], &m.W.Blocks[i], &m.cache.Blocks[i], m.rope, pos, m.x, m.scratch)
+		Block(m.Cfg, m.Cfg.Blocks[i], &m.W.Blocks[i], &m.cache.Blocks[i], m.rope, Place{Pos: pos, T: pos, H: pos, W: pos}, m.x, m.scratch)
 	}
 	return append([]float32(nil), m.x...)
 }
@@ -29,7 +29,7 @@ func (m *Model) cpuTrunk(token int32, pos, blocks int) []float32 {
 func (m *Model) cpuMixer(token int32, pos, block int) ([]float32, []float32) {
 	m.W.TokenEmbd.Row(int(token), m.x)
 	for i := 0; i < block; i++ {
-		Block(m.Cfg, m.Cfg.Blocks[i], &m.W.Blocks[i], &m.cache.Blocks[i], m.rope, pos, m.x, m.scratch)
+		Block(m.Cfg, m.Cfg.Blocks[i], &m.W.Blocks[i], &m.cache.Blocks[i], m.rope, Place{Pos: pos, T: pos, H: pos, W: pos}, m.x, m.scratch)
 	}
 	bc, bw := m.Cfg.Blocks[block], &m.W.Blocks[block]
 	normed := make([]float32, m.Cfg.Dim)
@@ -38,7 +38,7 @@ func (m *Model) cpuMixer(token int32, pos, block int) ([]float32, []float32) {
 	m.scratch.SetInput(normed)
 	out := make([]float32, m.Cfg.Dim)
 	if bc.Type == BlockFullAttn {
-		ForwardFullAttnToken(m.Cfg, bc, bw, &m.cache.Blocks[block], m.rope, pos, normed, out, m.scratch)
+		ForwardFullAttnToken(m.Cfg, bc, bw, &m.cache.Blocks[block], m.rope, Place{Pos: pos, T: pos, H: pos, W: pos}, normed, out, m.scratch)
 	} else {
 		ForwardSSMToken(m.Cfg, bc, bw, &m.cache.Blocks[block], normed, out, m.scratch)
 	}

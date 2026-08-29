@@ -10,7 +10,7 @@ import (
 // forward, and only the mixer differs.
 func Block(
 	cfg *Config, bc BlockConfig, bw *BlockWeights,
-	cache *BlockCache, rope *nn.RoPETable, pos int,
+	cache *BlockCache, rope *nn.RoPETable, at Place,
 	x []float32, scratch *Scratch,
 ) {
 	dim := cfg.Dim
@@ -22,7 +22,7 @@ func Block(
 	scratch.SetInput(normed)
 
 	if bc.Type == BlockFullAttn {
-		ForwardFullAttnToken(cfg, bc, bw, cache, rope, pos, normed, subOut, scratch)
+		ForwardFullAttnToken(cfg, bc, bw, cache, rope, at, normed, subOut, scratch)
 	} else {
 		ForwardSSMToken(cfg, bc, bw, cache, normed, subOut, scratch)
 	}

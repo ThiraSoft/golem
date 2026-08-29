@@ -21,9 +21,12 @@ import (
 //   - the mix is scaled by sigmoid(gate) before the output projection
 func ForwardFullAttnToken(
 	cfg *Config, bc BlockConfig, bw *BlockWeights,
-	cache *BlockCache, rope *nn.RoPETable, pos int,
+	cache *BlockCache, rope *nn.RoPETable, at Place,
 	x []float32, out []float32, scratch *Scratch,
 ) {
+	// The cache index. The rotation reads the other three axes, and only it
+	// does — place.go says why the two are not one number.
+	pos := at.Pos
 	headDim := bc.HeadDim
 	heads := bc.Heads
 	kvHeads := bc.KVHeads
@@ -41,7 +44,7 @@ func ForwardFullAttnToken(
 
 	// Query norm, then RoPE, head by head inside the interleaving.
 	if rope != nil {
-		rope.Prepare(bc.RoPEDims, pos, bc.RoPEBase, nil)
+		rope.PrepareMulti(bc.RoPEDims, at.at(), bc.RoPEBase, cfg.RoPESections, nil)
 	}
 	for h := 0; h < heads; h++ {
 		head := qFull[h*pair : h*pair+headDim]

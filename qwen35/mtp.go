@@ -73,6 +73,13 @@ func (m *Model) ResetMTP() {
 // output-normed state for the token before it. draftLogits receives the
 // distribution over the token that would follow `token`.
 func (m *Model) ForwardMTP(token int32, hidden []float32, pos int, draftLogits []float32) []float32 {
+	return m.ForwardMTPAt(token, hidden, Place{Slot: m.slot, Pos: pos, T: pos, H: pos, W: pos}, draftLogits)
+}
+
+// ForwardMTPAt is ForwardMTP for a draft whose axes do not follow the cache
+// index — a token drafted straight after an image, whose h and w carry the
+// grid's last patch rather than its own position.
+func (m *Model) ForwardMTPAt(token int32, hidden []float32, at Place, draftLogits []float32) []float32 {
 	if !m.HasMTP() {
 		return nil
 	}
@@ -91,7 +98,7 @@ func (m *Model) ForwardMTP(token int32, hidden []float32, pos int, draftLogits [
 	nn.RMSNormPlain(s.eh[dim:], m.W.MTP.HNorm, cfg.Eps)
 
 	if m.gpuPipe != nil && m.gpuPipe.HasMTP() {
-		h, err := m.gpuPipe.DraftMTP(s.eh, pos)
+		h, err := m.gpuPipe.DraftMTPAt(s.eh, at.gpu())
 		if err != nil {
 			panic("qwen35: the prediction block failed on the card: " + err.Error())
 		}
@@ -107,7 +114,9 @@ func (m *Model) ForwardMTP(token int32, hidden []float32, pos int, draftLogits [
 	}
 	m.W.MTP.EHProj.MatVec(s.batch, s.x)
 
-	Block(cfg, cfg.Blocks[il], &m.W.Blocks[il], s.cache, m.rope, pos, s.x, s.inner)
+	// The prediction block rotates by the same rule the trunk does, at the
+	// place it drafts for.
+	Block(cfg, cfg.Blocks[il], &m.W.Blocks[il], s.cache, m.rope, at, s.x, s.inner)
 
 	copy(s.h, s.x)
 	norm := m.W.MTP.SharedHeadNorm
