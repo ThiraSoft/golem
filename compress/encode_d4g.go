@@ -30,13 +30,22 @@ func nearestInShell(x, out []float32) {
 	}
 	// Past the shell. Pulling x towards the origin lands on points that are
 	// coded, but the first one that fits is not the closest one that fits —
-	// the ray does not pass through the best point of a lattice — so every
-	// pull that lands somewhere codeable is a candidate and the nearest of
-	// them wins. About one subvector in twenty-five comes through here, and
-	// they are the ones carrying the largest errors.
+	// the ray does not pass through the best point of a lattice — so a handful
+	// of pulls are tried and the nearest of them wins.
+	//
+	// The handful starts where the geometry says it should: the pull that puts
+	// x exactly on the shell. Scanning down from one instead would be a dozen
+	// wasted roundings for a subvector far outside, and the step search asks
+	// for this on every subvector of every candidate step, which is where an
+	// encoder's afternoon goes.
 	var tmp, best [4]float32
 	bestD := float32(math.MaxFloat32)
-	for s := float32(0.97); s > 0.05; s *= 0.97 {
+	s0 := float32(math.Sqrt(float64(nn.D4Radius) / float64(norm2(x))))
+	if s0 > 1 {
+		s0 = 1
+	}
+	for k := 0; k < 10; k++ {
+		s := s0 * (1 - 0.04*float32(k))
 		for i := range x {
 			tmp[i] = x[i] * s
 		}
@@ -52,10 +61,6 @@ func nearestInShell(x, out []float32) {
 		if d < bestD {
 			bestD = d
 			copy(best[:], out)
-		}
-		if s < 0.5 {
-			// Far enough in that nothing closer is going to turn up.
-			break
 		}
 	}
 	if bestD == float32(math.MaxFloat32) {
@@ -97,12 +102,15 @@ func chooseStep(blk []float32, lo, hi float32, beta float32, buf, pt []float32) 
 	}
 	rms := float32(math.Sqrt(ss / float64(len(blk))))
 	base := rms / beta
-	first, last := nn.D4StepCode(base*lo), nn.D4StepCode(base*hi)
+	first, last := int(nn.D4StepCode(base*lo)), int(nn.D4StepCode(base*hi))
 	best, bestStep := float32(math.MaxFloat32), float32(0)
-	for c := int(first); c <= int(last); c++ {
+	// The RMS itself first, so that the bound below has something to work with
+	// from the start: it is where the answer usually is, and every candidate
+	// after it can be abandoned as soon as it is worse.
+	try := func(c int) {
 		step := nn.D4Step(byte(c))
 		if step <= 0 {
-			continue
+			return
 		}
 		var err float32
 		for i := 0; i*4 < len(blk); i++ {
@@ -115,10 +123,22 @@ func chooseStep(blk []float32, lo, hi float32, beta float32, buf, pt []float32) 
 				d := x[j] - pt[j]*step
 				err += d * d
 			}
+			if err >= best {
+				// Already worse than something we have, and the error only
+				// grows. A step far from the right one is abandoned after two
+				// or three subvectors instead of thirty-two.
+				return
+			}
 		}
 		if err < best {
 			best, bestStep = err, step
 		}
+	}
+	if mid := int(nn.D4StepCode(base)); mid >= first && mid <= last {
+		try(mid)
+	}
+	for c := first; c <= last; c++ {
+		try(c)
 	}
 	if bestStep == 0 {
 		// A block of zeros, or one no step could fit: the origin is a lattice
