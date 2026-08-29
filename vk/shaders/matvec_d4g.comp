@@ -1,0 +1,110 @@
+#version 450
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// y = W * x for a D4G matrix against float activations.
+//
+// A block is sixty-four weights: one fp16 step, and sixteen twelve-bit codes
+// naming points of the D4 lattice. Expanding a code is a lookup — which is the
+// whole reason the lattice is D4 and not E8, whose shell at this rate would
+// need two hundred megabytes of table where this one needs sixteen kibibytes,
+// four signed bytes a point, small enough to stay in L2 for the life of the
+// dispatch. The table is the lattice, so the same one serves every matrix of
+// every model.
+//
+// The row is two planes, scales then codes, because a block of twenty-six bytes
+// would otherwise start on a two-byte boundary and this reads words.
+//
+// Workgroup: 128 threads -> 16 output rows, 8 lanes per row, which is
+// matvec_q5k.comp's shape. COLUMNS is how many activations one reading of the
+// weights answers.
+
+#ifndef COLUMNS
+#define COLUMNS 1
+#endif
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly  buffer W { uint  w[]; };
+layout(std430, binding = 1) readonly  buffer T { uint  table[]; }; // four int8 a point
+layout(std430, binding = 2) readonly  buffer X { float x[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint dim; // outputs
+    uint ffn; // inputs
+    uint col; // the first column of the pass this dispatch answers
+} p;
+
+const uint LANES = 8u;
+const uint OUTS  = 16u;
+
+// sext8 sign-extends one of the four bytes of a packed point.
+float sext8(uint word, uint i) {
+    return float(int(bitfieldExtract(int(word), int(i * 8u), 8)));
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x * OUTS + (gl_LocalInvocationID.x / LANES);
+    uint lane = gl_LocalInvocationID.x % LANES;
+    bool live = row < p.dim;
+    if (!live) row = 0u;
+
+    uint nb = p.ffn / 64u;
+    uint rowBase   = row * nb * 26u;   // bytes; nb is even, so this is a word
+    uint scaleBase = rowBase;          // nb fp16
+    uint codeBase  = rowBase + nb * 2u; // nb runs of twenty-four bytes
+
+    float sum[COLUMNS];
+    [[unroll]] for (uint c = 0u; c < COLUMNS; c++) sum[c] = 0.0;
+
+    for (uint b = lane; live && b < nb; b += LANES) {
+        vec2 pair = unpackHalf2x16(w[(scaleBase + 2u * b) >> 2]);
+        float step = ((b & 1u) == 0u) ? pair.x : pair.y;
+
+        uint at = (codeBase + 24u * b) >> 2;
+        uint c0 = w[at], c1 = w[at + 1u], c2 = w[at + 2u];
+        uint c3 = w[at + 3u], c4 = w[at + 4u], c5 = w[at + 5u];
+        uint words[6] = uint[6](c0, c1, c2, c3, c4, c5);
+
+        uint xOffset = b * 64u;
+
+        // Sixteen codes over twenty-four bytes, two codes to three bytes.
+        [[unroll]] for (uint k = 0u; k < 8u; k++) {
+            uint o = k * 3u;
+            uint b0 = (words[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu;
+            uint o1 = o + 1u;
+            uint b1 = (words[o1 >> 2u] >> ((o1 & 3u) * 8u)) & 0xFFu;
+            uint o2 = o + 2u;
+            uint b2 = (words[o2 >> 2u] >> ((o2 & 3u) * 8u)) & 0xFFu;
+
+            uint codeA = b0 | ((b1 & 0x0Fu) << 8u);
+            uint codeB = (b1 >> 4u) | (b2 << 4u);
+#ifdef NOTABLE
+            // Not a decoder: the same traffic in weights and the same
+            // arithmetic, with the lookup replaced by nonsense of the right
+            // shape. It exists only to price the lookup.
+            uint ptA = codeA * 0x01010101u;
+            uint ptB = codeB * 0x01010101u;
+#else
+            uint ptA = table[codeA];
+            uint ptB = table[codeB];
+#endif
+
+            [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+                uint xc = (p.col + c) * p.ffn + xOffset + k * 8u;
+                float acc = 0.0;
+                [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                    acc += sext8(ptA, i) * x[xc + i];
+                    acc += sext8(ptB, i) * x[xc + 4u + i];
+                }
+                sum[c] += acc * step;
+            }
+        }
+    }
+
+    [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+        float total = subgroupClusteredAdd(sum[c], LANES);
+        if (lane == 0u && live) y[(p.col + c) * p.dim + row] = total;
+    }
+}

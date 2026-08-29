@@ -181,6 +181,7 @@ type Opts struct {
 	// dictionary, and a rate set by the shell radius rather than by k.
 	UseLattice bool
 	Lat        Lattice
+	UseBox     bool // D4 confined to a box, so a decoder needs no table
 	MaxNorm2   float32
 	Beta       float64 // how far the normalised subvector is scaled up before rounding
 
@@ -194,7 +195,11 @@ type Opts struct {
 func (o Opts) BPW() float64 {
 	b := 0.0
 	if o.UseLattice {
-		b = math.Log2(float64(shellSize(o.Lat, o.MaxNorm2))) / float64(o.Lat.Dim())
+		n := shellSize(o.Lat, o.MaxNorm2)
+		if o.UseBox {
+			n = boxSize()
+		}
+		b = math.Log2(float64(n)) / float64(o.Lat.Dim())
 		if o.ScaleBlock > 0 {
 			b += 16.0 / float64(o.ScaleBlock)
 		}
@@ -215,7 +220,11 @@ func (o Opts) Name() string {
 		fmt.Fprintf(&sb, "HAD%d+", o.HadGroup)
 	}
 	if o.UseLattice {
-		fmt.Fprintf(&sb, "%s(r%g,b%.2f)", o.Lat, o.MaxNorm2, o.Beta)
+		if o.UseBox {
+			fmt.Fprintf(&sb, "BOX(b%.2f)", o.Beta)
+		} else {
+			fmt.Fprintf(&sb, "%s(r%g,b%.2f)", o.Lat, o.MaxNorm2, o.Beta)
+		}
 		if o.ScaleBlock > 0 {
 			fmt.Fprintf(&sb, "/s%d", o.ScaleBlock)
 		} else {
@@ -417,7 +426,11 @@ func VQ(w []float32, rows, cols int, o Opts, seed int64) []float32 {
 						for i := range x {
 							buf[i] = x[i] * beta / mu
 						}
-						quantizeLattice(o.Lat, buf, pt, tmp, o.MaxNorm2)
+						if o.UseBox {
+							quantizeBox(buf, pt)
+						} else {
+							quantizeLattice(o.Lat, buf, pt, tmp, o.MaxNorm2)
+						}
 						for i := range x {
 							q := buf[i] * mu / beta
 							e := x[i] - q

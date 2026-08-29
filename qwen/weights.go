@@ -29,12 +29,25 @@ type BlockWeights struct {
 
 	Q, K, V, O     nn.Matrix
 	Gate, Up, Down nn.Matrix
+
+	// What the activations of each site meet before they reach a D4G matrix:
+	// the reciprocal of the per-column scale the weights were quantized under,
+	// with the rotation's sign flips folded in. Empty for every other format.
+	// nn/d4g.go says why the scheme is split this way.
+	PreQKV, PreO, PreGateUp, PreDown []float32
+
+	// HadGroup is the width of that rotation, zero when there is none.
+	HadGroup int
 }
 
 type Weights struct {
 	TokenEmbd  nn.Matrix
 	OutputNorm []float32
 	Blocks     []BlockWeights
+
+	// HadGroup is the width of the rotation a D4G checkpoint's activations go
+	// through, and zero for every other format.
+	HadGroup int
 
 	// ActBF16 says the activations must be rounded to bfloat16 before they
 	// meet these weights. ggml converts an activation to whatever the weight's
@@ -167,6 +180,40 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 					bind.name, m.Rows, m.Cols, bind.rows, bind.cols)
 			}
 			*bind.dst = m
+		}
+	}
+
+	// A .golem file carries one vector a site. Any other file has none, and
+	// the blocks are left with nil ones — which is what the products check.
+	if w.Blocks[0].Q.Quant == nn.D4G {
+		group, err := g.Uint32("golem.d4.hadamard_group")
+		if err != nil {
+			return nil, fmt.Errorf("a D4G checkpoint without golem.d4.hadamard_group: %w", err)
+		}
+		w.HadGroup = int(group)
+		for i := range cfg.Blocks {
+			b := &w.Blocks[i]
+			for _, bind := range []struct {
+				dst  *[]float32
+				site string
+				want int
+			}{
+				{&b.PreQKV, "qkv", b.Q.Cols},
+				{&b.PreO, "o", b.O.Cols},
+				{&b.PreGateUp, "gateup", b.Gate.Cols},
+				{&b.PreDown, "down", b.Down.Cols},
+			} {
+				name := fmt.Sprintf("blk.%d.%s.pre", i, bind.site)
+				v, err := floats(g, name)
+				if err != nil {
+					return nil, err
+				}
+				if len(v) != bind.want {
+					return nil, fmt.Errorf("%s is %d wide, not %d", name, len(v), bind.want)
+				}
+				*bind.dst = v
+			}
+			b.HadGroup = w.HadGroup
 		}
 	}
 

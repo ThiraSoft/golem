@@ -19,6 +19,9 @@ const (
 	Q5_K
 	Q6_K
 	Q8_0
+	// D4G is golem's own: 64 weights in 26 bytes, a lattice code every four.
+	// nn/d4g.go describes it.
+	D4G
 )
 
 func (q Quant) String() string {
@@ -41,6 +44,8 @@ func (q Quant) String() string {
 		return "Q6_K"
 	case Q8_0:
 		return "Q8_0"
+	case D4G:
+		return "D4G"
 	}
 	return "unknown"
 }
@@ -66,6 +71,8 @@ func QuantOf(dtype string) (Quant, bool) {
 		return Q6_K, true
 	case "Q8_0":
 		return Q8_0, true
+	case "D4G":
+		return D4G, true
 	}
 	return 0, false
 }

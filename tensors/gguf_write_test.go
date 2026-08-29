@@ -1,0 +1,79 @@
+package tensors
+
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+)
+
+// A file written and read back has to be the file that went in. The converter
+// carries a checkpoint's whole metadata across — vocabulary, merges, chat
+// template — and a value that changes type on the way through is a model that
+// tokenizes differently for no visible reason.
+func TestGGUFRoundTrip(t *testing.T) {
+	meta := map[string]any{
+		"general.architecture":     "qwen3",
+		"general.alignment":        uint32(32),
+		"qwen3.block_count":        uint32(36),
+		"qwen3.rope.freq_base":     float32(1000000),
+		"qwen3.attention.eps":      float32(1e-6),
+		"tokenizer.ggml.tokens":    []any{"a", "b", "cc"},
+		"tokenizer.ggml.bos_id":    int32(11),
+		"tokenizer.ggml.add_bos":   true,
+		"tokenizer.ggml.scores":    []any{float32(1), float32(-2)},
+		"golem.d4.hadamard_group":  uint32(128),
+		"golem.d4.radius":          uint32(40),
+		"general.quantization_ver": uint64(2),
+	}
+	tensors := []OutTensor{
+		{Name: "output_norm.weight", Shape: []int{4}, DType: "F32",
+			Data: []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}},
+		{Name: "blk.0.attn_q.weight", Shape: []int{64, 2}, DType: "D4G",
+			Data: make([]byte, 2*26)},
+	}
+	for i := range tensors[1].Data {
+		tensors[1].Data[i] = byte(i * 7)
+	}
+
+	path := filepath.Join(t.TempDir(), "round.golem")
+	if err := WriteGGUF(path, meta, tensors); err != nil {
+		t.Fatal(err)
+	}
+	g, err := OpenGGUF(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+
+	if !reflect.DeepEqual(g.Meta, meta) {
+		for k, want := range meta {
+			if got := g.Meta[k]; !reflect.DeepEqual(got, want) {
+				t.Errorf("%s: read %#v, wrote %#v", k, got, want)
+			}
+		}
+		for k := range g.Meta {
+			if _, ok := meta[k]; !ok {
+				t.Errorf("%s appeared from nowhere", k)
+			}
+		}
+	}
+	for _, want := range tensors {
+		got, err := g.Get(want.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.DType != want.DType {
+			t.Errorf("%s is %s, wrote %s", want.Name, got.DType, want.DType)
+		}
+		if !reflect.DeepEqual(got.Shape, want.Shape) {
+			t.Errorf("%s has shape %v, wrote %v", want.Name, got.Shape, want.Shape)
+		}
+		if !reflect.DeepEqual([]byte(got.Raw), want.Data) {
+			t.Errorf("%s: %d bytes back, wrote %d", want.Name, len(got.Raw), len(want.Data))
+		}
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+}

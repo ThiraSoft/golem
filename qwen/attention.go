@@ -127,6 +127,13 @@ func Attention(
 	})
 
 	calib(bc.Index, "o", set.F[:batch])
+	if bw.PreO != nil {
+		nn.InParallel(batch, batch*cfg.Dim, func(first, last int) {
+			for t := first; t < last; t++ {
+				nn.PrepareD4G(set.F[t], bw.PreO, bw.HadGroup)
+			}
+		})
+	}
 	bw.O.MatVecBatch(set, out)
 }
 

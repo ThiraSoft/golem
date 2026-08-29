@@ -34,6 +34,9 @@ func main() {
 	out := flag.String("out", "", "where to write the report")
 	dump := flag.String("dump", "", "where to write the raw logits of the held-out text")
 	prompt := flag.String("prompt", "The three laws of thermodynamics are", "greedy prompt")
+	corpus := flag.String("corpus", "", "a text file to measure perplexity over, in windows")
+	ctx := flag.Int("ctx", 512, "window size for the corpus")
+	limit := flag.Int("limit", 4096, "how many corpus tokens to read")
 	steps := flag.Int("steps", 40, "greedy steps")
 	flag.Parse()
 
@@ -43,6 +46,35 @@ func main() {
 	v, err := bytebpe.Load(m.File())
 	must(err)
 	t0 := time.Now()
+
+	if *corpus != "" {
+		text, err := os.ReadFile(*corpus)
+		must(err)
+		ids := v.Encode(string(text), true, false)
+		if len(ids) > *limit {
+			ids = ids[:*limit]
+		}
+		logits := make([]float32, m.Cfg.Vocab)
+		var sum float64
+		var n int
+		for start := 0; start+*ctx <= len(ids); start += *ctx {
+			m.Reset()
+			window := ids[start : start+*ctx]
+			h := m.ForwardBatch(window, 0)
+			// The first token of a window has nothing before it, so it is not
+			// predicted and does not count.
+			for i := 0; i < len(window)-1; i++ {
+				m.Logits(h[i], logits)
+				sum += logSoftmaxAt(logits, window[i+1])
+				n++
+			}
+			fmt.Printf("  window %d: running perplexity %.4f over %d tokens\n",
+				start / *ctx, math.Exp(-sum/float64(n)), n)
+		}
+		fmt.Printf("%s\n  corpus perplexity %.4f over %d tokens in %s\n",
+			*model, math.Exp(-sum/float64(n)), n, time.Since(t0).Round(time.Second))
+		return
+	}
 
 	// Teacher-forced perplexity on the held-out text.
 	ids := v.Encode(heldOut, true, false)

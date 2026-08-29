@@ -5,6 +5,10 @@ import "math"
 // floatToHalf rounds a float32 to the nearest IEEE binary16, ties to even.
 // The Q8_0 scale is stored as an fp16 in ggml, so an activation quantized here
 // must lose the same precision, or the products disagree in the fourth digit.
+// FloatToHalf is floatToHalf, for the converter in compress: the encoder has to
+// write the same fp16 the kernels will read back.
+func FloatToHalf(f float32) uint16 { return floatToHalf(f) }
+
 func floatToHalf(f float32) uint16 {
 	bits := math.Float32bits(f)
 	sign := uint16(bits >> 16 & 0x8000)

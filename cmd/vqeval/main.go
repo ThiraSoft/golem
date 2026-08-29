@@ -127,12 +127,16 @@ func buildSchemes() []compress.Scheme {
 			UseLattice: true, Lat: l, MaxNorm2: r, Beta: beta,
 			ScaleBlock: 64, HadGroup: 128, SearchScale: true}}
 	}
-	var out []compress.Scheme
-	for _, b := range []float64{1.8, 2.6, 3.6, 5.0, 7.0, 10.0} {
-		out = append(out, lat(compress.LatE8, 42, b))
+	box := func(beta float64) compress.Scheme {
+		return compress.Scheme{Alpha: 0.5, Outliers: 32, VQ: compress.Opts{
+			UseLattice: true, Lat: compress.LatD4, UseBox: true, Beta: beta,
+			ScaleBlock: 64, HadGroup: 128, SearchScale: true}}
 	}
-	for _, b := range []float64{4.4, 6.0, 8.0, 11.0, 15.0} {
-		out = append(out, lat(compress.LatD4, 40, b))
+	var out []compress.Scheme
+	out = append(out, lat(compress.LatD4, 40, 8))   // the shell, 12 bits, 31 KiB table
+	out = append(out, lat(compress.LatD4, 20, 5.7)) // a shell of 11 bits, to match the box
+	for _, b := range []float64{1.5, 2.2, 3.0, 4.0, 5.5} {
+		out = append(out, box(b))
 	}
 	return out
 }

@@ -1,0 +1,116 @@
+package compress
+
+import (
+	"math"
+	"math/rand"
+	"testing"
+
+	"github.com/ThiraSoft/golem/nn"
+)
+
+// The encoder and the kernel have to agree about what a file means. This holds
+// one to the other on the only thing that matters: the product.
+//
+// It is the test that catches a scheme that is self-consistent and wrong — the
+// rotation applied to the weights but not the activations, a reciprocal taken
+// once too often, a scale folded into the wrong side. Each of those leaves the
+// weights looking plausible and the answer somebody else's.
+func TestD4GProductSurvivesTheRoundTrip(t *testing.T) {
+	const rows, cols = 96, 256
+	r := rand.New(rand.NewSource(5))
+
+	w := make([]float32, rows*cols)
+	for i := range w {
+		w[i] = float32(r.NormFloat64()) * 0.02
+	}
+	x := make([]float32, cols)
+	for i := range x {
+		x[i] = float32(r.NormFloat64())
+	}
+
+	// The per-column vector, signs and a salience scale together.
+	q := make([]float32, cols)
+	pre := make([]float32, cols)
+	for j := range q {
+		s := float32(0.5 + r.Float64())
+		if r.Intn(2) == 0 {
+			s = -s
+		}
+		q[j] = s
+		pre[j] = 1 / s
+	}
+
+	var unrotated float64
+	for _, group := range []int{0, 128} {
+		params := D4Params{Beta: 2, ScaleBlock: 64, HadGroup: group, SearchScale: true}
+		data := EncodeD4G(w, rows, cols, q, params)
+		if want := rows * cols / nn.D4Block * 26; len(data) != want {
+			t.Fatalf("group %d: %d bytes, want %d", group, len(data), want)
+		}
+
+		// What the kernel does: prepare the activation, then the product.
+		xp := make([]float32, cols)
+		copy(xp, x)
+		nn.PrepareD4G(xp, pre, group)
+
+		m := nn.Matrix{Data: data, Quant: nn.D4G, Rows: rows, Cols: cols}
+		b := nn.NewBatch(cols, 1)
+		copy(b.F[0], xp)
+		got := make([]float32, rows)
+		m.MatVec(b, got)
+
+		// What it should have been.
+		var num, den float64
+		for i := 0; i < rows; i++ {
+			var want float64
+			for j := 0; j < cols; j++ {
+				want += float64(w[i*cols+j]) * float64(x[j])
+			}
+			d := want - float64(got[i])
+			num += d * d
+			den += want * want
+		}
+		rel := math.Sqrt(num / den)
+		// This is a wiring check, not a quality bar. The per-column vector here
+		// is random rather than a real salience, which is the worst case for it
+		// — the error on a column the weights were shrunk into comes back
+		// multiplied. What it has to catch is a scheme that is self-consistent
+		// and wrong, and those miss by a factor, not by a few percent.
+		if rel > 0.30 {
+			t.Errorf("group %d: the product is %.4f away from the real one", group, rel)
+		}
+		if group == 0 {
+			unrotated = rel
+		} else if rel > unrotated {
+			t.Errorf("the rotation made it worse: %.4f rotated against %.4f plain", rel, unrotated)
+		}
+		t.Logf("group %d: relative error %.4f", group, rel)
+	}
+}
+
+// A matrix with no vector and no rotation is the plain case the embedding
+// table takes, and it has to work on its own.
+func TestD4GWithoutRotationOrScaling(t *testing.T) {
+	const rows, cols = 32, 128
+	r := rand.New(rand.NewSource(9))
+	w := make([]float32, rows*cols)
+	for i := range w {
+		w[i] = float32(r.NormFloat64()) * 0.05
+	}
+	data := EncodeD4G(w, rows, cols, nil, D4Params{Beta: 2, ScaleBlock: 64, SearchScale: true})
+
+	out := make([]float32, cols)
+	m := nn.Matrix{Data: data, Quant: nn.D4G, Rows: rows, Cols: cols}
+	var num, den float64
+	for i := 0; i < rows; i++ {
+		m.Row(i, out)
+		for j := 0; j < cols; j++ {
+			d := float64(w[i*cols+j] - out[j])
+			num += d * d
+			den += float64(w[i*cols+j]) * float64(w[i*cols+j])
+		}
+	}
+	if rel := math.Sqrt(num / den); rel > 0.18 {
+		t.Errorf("a row read back is %.4f away from the one written", rel)
+	}
+}

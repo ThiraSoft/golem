@@ -160,3 +160,71 @@ func sigmaOdd(n int) int {
 	}
 	return s
 }
+
+// The box: D4 without a table.
+//
+// A shell is the densest set of lattice points of a given count, which is why
+// it quantizes best — but it is an arbitrary set, so a code is an index into an
+// enumeration and decoding one means a table lookup. Constraining each
+// coordinate to a fixed range instead gives a set a shader decodes with shifts
+// alone: four coordinates of three bits, and D4's even-sum rule recovers the
+// fourth's low bit, so 8⁴/2 = 2048 points fit in eleven bits and no table is
+// read at all.
+//
+// It packs a little worse than the shell of the same size. Whether that costs
+// anything the model notices is a question for the corpus.
+const boxLow, boxHigh = -4, 3
+
+// quantizeBox puts x on the nearest D4 point whose coordinates all lie within
+// the box, writing the result back over x.
+func quantizeBox(x, out []float32) {
+	nearestDn(x, out)
+	// Rounding first and clamping after can leave an odd sum, so a clamp that
+	// broke the parity is repaired the way nearestDn repairs its own: move the
+	// coordinate that was rounded furthest, among those still free to move.
+	sum := 0
+	clamped := false
+	for i, v := range out {
+		if v < boxLow {
+			v, clamped = boxLow, true
+		} else if v > boxHigh {
+			v, clamped = boxHigh, true
+		}
+		out[i] = v
+		sum += int(v)
+	}
+	if clamped && sum&1 != 0 {
+		worst, wdist := -1, float32(-1)
+		for i := range x {
+			up := x[i] > out[i]
+			if (up && out[i] >= boxHigh) || (!up && out[i] <= boxLow) {
+				continue
+			}
+			if d := absf(x[i] - out[i]); d > wdist {
+				worst, wdist = i, d
+			}
+		}
+		if worst >= 0 {
+			if x[worst] > out[worst] {
+				out[worst]++
+			} else {
+				out[worst]--
+			}
+		}
+	}
+	copy(x, out)
+}
+
+func absf(v float32) float32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// boxSize is how many points the box holds: every assignment of the four
+// coordinates whose sum is even, which is exactly half of them.
+func boxSize() int {
+	span := boxHigh - boxLow + 1
+	return span * span * span * span / 2
+}

@@ -42,6 +42,7 @@ func main() {
 	alpha := flag.Float64("alpha", 0.5, "salience exponent")
 	outliers := flag.Int("outliers", 32, "columns held at 8 bits")
 	search := flag.Bool("search", false, "search each block's scale instead of taking its RMS")
+	hadGroup := flag.Int("hadamard", 128, "rotation group; 0 leaves the weights unrotated")
 	ntok := flag.Int("tokens", 256, "calibration tokens")
 	roles := flag.String("roles", "all", "which matrices to compress; the rest stay BF16")
 	flag.Parse()
@@ -140,7 +141,7 @@ func main() {
 		}
 		lv := table[levelOf(role)]
 		opts := compress.Opts{UseLattice: true, Lat: lat,
-			MaxNorm2: float32(lv.r), Beta: lv.beta, ScaleBlock: *scaleBlk, HadGroup: 128,
+			MaxNorm2: float32(lv.r), Beta: lv.beta, ScaleBlock: *scaleBlk, HadGroup: *hadGroup,
 			SearchScale: *search}
 		sc := compress.Scheme{Alpha: *alpha, Outliers: *outliers, VQ: opts}
 		var s []float32
@@ -151,7 +152,7 @@ func main() {
 			// it goes through the quantizer alone
 			sc.Alpha, sc.Outliers = 0, 0
 		}
-		if cols%opts.HadGroup != 0 {
+		if opts.HadGroup > 0 && cols%opts.HadGroup != 0 {
 			sc.VQ.HadGroup = 0
 		}
 		rec := sc.Apply(w, rows, cols, s, 1234)

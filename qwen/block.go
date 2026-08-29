@@ -47,6 +47,9 @@ func Block(
 		for t := first; t < last; t++ {
 			copy(normed.F[t], xs[t])
 			nn.RMSNormPlain(normed.F[t], bw.AttnNorm, cfg.Eps)
+			if bw.PreQKV != nil {
+				nn.PrepareD4G(normed.F[t], bw.PreQKV, bw.HadGroup)
+			}
 			normed.QuantizeColumnRange(t, 0, cfg.Dim)
 		}
 	})
@@ -64,6 +67,9 @@ func Block(
 			}
 			copy(normed.F[t], xs[t])
 			nn.RMSNormPlain(normed.F[t], bw.FFNNorm, cfg.Eps)
+			if bw.PreGateUp != nil {
+				nn.PrepareD4G(normed.F[t], bw.PreGateUp, bw.HadGroup)
+			}
 			normed.QuantizeColumnRange(t, 0, cfg.Dim)
 		}
 	})
@@ -96,6 +102,16 @@ func Block(
 
 	ffn := s.ffn[:batch]
 	calib(bc.Index, "down", gate.F[:batch])
+	// The rotation spans a hundred and twenty-eight values, and the section
+	// above hands out ranges of thirty-two, so this cannot be folded into it:
+	// a group would straddle two workers.
+	if bw.PreDown != nil {
+		nn.InParallel(batch, batch*bc.FFN, func(first, last int) {
+			for t := first; t < last; t++ {
+				nn.PrepareD4G(gate.F[t], bw.PreDown, bw.HadGroup)
+			}
+		})
+	}
 	bw.Down.MatVecBatch(gate, ffn)
 
 	nn.InParallel(batch, batch*cfg.Dim*perPosition, func(first, last int) {
