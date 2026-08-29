@@ -116,6 +116,9 @@ func denseHalf(cfg *Config, bc BlockConfig, bw *BlockWeights, s *Scratch, xs [][
 	// barriers.
 	gate := s.Batch(bc.FFN, batch)
 	up := s.up[:batch]
+	if bw.Gate.WantsQ8K() || bw.Up.WantsQ8K() {
+		normed.QuantizeK()
+	}
 	blocks := bc.FFN / nn.QuantBlock
 	nn.InParallel(blocks, 2*bc.FFN*cfg.Dim*batch, func(first, last int) {
 		from, to := first*nn.QuantBlock, last*nn.QuantBlock
@@ -161,6 +164,9 @@ func denseHalf(cfg *Config, bc BlockConfig, bw *BlockWeights, s *Scratch, xs [][
 func moeHalf(cfg *Config, bc BlockConfig, bw *BlockWeights, s *Scratch, xs [][]float32, normed *nn.Batch, batch int) {
 	gate := s.Batch(bc.FFN, batch)
 	up := s.up[:batch]
+	if bw.Gate.WantsQ8K() || bw.Up.WantsQ8K() {
+		normed.QuantizeK()
+	}
 	blocks := bc.FFN / nn.QuantBlock
 	nn.InParallel(blocks, 2*bc.FFN*cfg.Dim*batch, func(first, last int) {
 		from, to := first*nn.QuantBlock, last*nn.QuantBlock

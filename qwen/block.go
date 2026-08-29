@@ -76,6 +76,9 @@ func Block(
 	//
 	// SiLU on the gate, times the up projection, in one pass — ggml's
 	// swiglu, where Gemma has a tabulated GELU.
+	if bw.Gate.WantsQ8K() || bw.Up.WantsQ8K() {
+		normed.QuantizeK()
+	}
 	gate := s.Batch(bc.FFN, batch)
 	up := s.up[:batch]
 	blocks := bc.FFN / nn.QuantBlock

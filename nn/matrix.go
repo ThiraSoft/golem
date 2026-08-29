@@ -84,14 +84,25 @@ func (m Matrix) MatVec(x *Batch, y []float32) {
 // arithmetic. So the row is the outer loop and the batch the inner one: the row
 // stays in the first-level cache while every column of the batch meets it.
 func (m Matrix) MatVecBatch(b *Batch, ys [][]float32) {
+	if m.WantsQ8K() {
+		b.QuantizeK()
+	}
 	InParallel(m.Rows, m.Rows*m.Cols*b.Size, func(start, end int) {
 		m.rows(b, ys, start, end)
 	})
 }
 
+// WantsQ8K says the product reads the activation in its Q8_K form rather than
+// its Q8_0 one. Only Q6_K does, and building that form is the caller's job when
+// it calls MatVecRows: QuantizeK writes three slices into the batch, so a
+// worker that started it while another worker read it would hand out one that
+// is allocated and two that are not.
+func (m Matrix) WantsQ8K() bool { return m.Quant == Q6_K }
+
 // MatVecRows computes rows [start, end) of the product on the caller's thread,
 // for a caller that is already inside a parallel section and wants to finish
-// what it produced before the section ends.
+// what it produced before the section ends. A Q6_K matrix wants QuantizeK on
+// the batch first, outside the section — see WantsQ8K.
 func (m Matrix) MatVecRows(b *Batch, ys [][]float32, start, end int) {
 	m.rows(b, ys, start, end)
 }
@@ -133,8 +144,8 @@ func (m Matrix) rows(b *Batch, ys [][]float32, start, end int) {
 	case Q5_K:
 		matVecQ5_KRows(m.Data, b, m.Cols, ys, start, end)
 	case Q6_K:
-		if b.QK == nil {
-			b.QuantizeK()
+		if len(b.QK) == 0 {
+			panic("nn: a Q6_K product wants QuantizeK on the batch before the section")
 		}
 		matVecQ6_KRows(m.Data, b, m.Cols, ys, start, end)
 	case Q8_0:

@@ -121,6 +121,9 @@ func ExpertFFN(cfg *Config, bw *BlockWeights, s *Scratch, in *nn.Batch, out [][]
 			one := s.ExpertIn(t)
 			copy(one.F[0], in.F[t])
 			one.QuantizeColumnRange(0, 0, cfg.Dim)
+			if bw.GateUpExps.Quant == nn.Q6_K {
+				one.QuantizeK()
+			}
 		}
 	})
 
@@ -156,6 +159,9 @@ func ExpertFFN(cfg *Config, bw *BlockWeights, s *Scratch, in *nn.Batch, out [][]
 				mid.F[0][i] = gate[i] * up[i]
 			}
 			mid.QuantizeColumnRange(0, 0, cfg.ExpertFFN)
+			if d := bw.DownExps.At(int(id)); d.WantsQ8K() {
+				mid.QuantizeK()
+			}
 
 			d := bw.DownExps.At(int(id))
 			d.MatVecRows(mid, s.expPartialRow[u], 0, d.Rows)

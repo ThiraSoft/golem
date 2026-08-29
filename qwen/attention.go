@@ -53,6 +53,10 @@ func Attention(
 	// kernel converts the other operand to fp16 to do it. The same rounding has
 	// to happen here, or the scores differ in the fourth digit — which is the
 	// size of a real mistake.
+	if bw.Q.WantsQ8K() || bw.K.WantsQ8K() || bw.V.WantsQ8K() {
+		normed.QuantizeK()
+	}
+
 	units := bc.Heads + bc.KVHeads
 	nn.InParallel(units, units*bc.HeadDim*cfg.Dim*batch, func(start, end int) {
 		for u := start; u < end; u++ {
