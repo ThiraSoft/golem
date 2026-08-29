@@ -20,6 +20,17 @@ import (
 //go:embed shaders/prepare_d4g.spv
 var prepareD4GSPIRV []byte
 
+//go:generate glslc -O -DFROMQ8 --target-env=vulkan1.1 -fshader-stage=compute shaders/prepare_d4g.comp -o shaders/prepare_d4g_q8.spv
+
+// prepareD4GQ8SPIRV is the same transform reading a Q8_0 activation instead of
+// a float one. The attention's mix arrives that way — every other kernel in the
+// engine reads activations in that form — and dequantizing it inside this pass
+// is one multiply where a pass of its own would be another dispatch and another
+// buffer.
+//
+//go:embed shaders/prepare_d4g_q8.spv
+var prepareD4GQ8SPIRV []byte
+
 type prepareD4GPush struct {
 	n       uint32
 	columns uint32
@@ -36,11 +47,21 @@ type PrepareD4G struct {
 	set   *Set
 }
 
-// NewPrepareD4G binds a site's vector to an activation buffer. pre is what the
-// activation is multiplied by, one entry a column, and group is the width of
-// the rotation that follows — the shader is built for 128, which is what the
-// converter writes.
+// NewPrepareD4G binds a site's vector to an activation buffer, transformed in
+// place. pre is what the activation is multiplied by, one entry a column, and
+// group is the width of the rotation that follows — the shader is built for
+// 128, which is what the converter writes.
 func NewPrepareD4G(d *Device, act *Buffer, pre []float32, group int) (*PrepareD4G, error) {
+	return newPrepareD4G(d, pre, group, prepareD4GSPIRV, []*Buffer{act, nil})
+}
+
+// NewPrepareD4GFromQ8 reads a Q8_0 activation — values and scales, the form the
+// attention's mix arrives in — and writes the transformed floats into out.
+func NewPrepareD4GFromQ8(d *Device, out, values, scales *Buffer, pre []float32, group int) (*PrepareD4G, error) {
+	return newPrepareD4G(d, pre, group, prepareD4GQ8SPIRV, []*Buffer{out, nil, values, scales})
+}
+
+func newPrepareD4G(d *Device, pre []float32, group int, spirv []byte, bufs []*Buffer) (*PrepareD4G, error) {
 	if group != prepareD4GGroup {
 		return nil, fmt.Errorf("vk: the prepare kernel is built for a rotation of %d, asked for %d", prepareD4GGroup, group)
 	}
@@ -52,8 +73,9 @@ func NewPrepareD4G(d *Device, act *Buffer, pre []float32, group int) (*PrepareD4
 	if p.pre, err = d.Upload(asBytes(pre)); err != nil {
 		return nil, err
 	}
-	buffers := []*Buffer{act, p.pre}
-	if p.pipe, err = d.NewPipeline(prepareD4GSPIRV, len(buffers), uint32(unsafe.Sizeof(prepareD4GPush{}))); err != nil {
+	buffers := append([]*Buffer(nil), bufs...)
+	buffers[1] = p.pre // the vector is always the second binding
+	if p.pipe, err = d.NewPipeline(spirv, len(buffers), uint32(unsafe.Sizeof(prepareD4GPush{}))); err != nil {
 		p.Close()
 		return nil, err
 	}

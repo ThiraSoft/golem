@@ -23,8 +23,17 @@
 
 layout(local_size_x = GROUP) in;
 
-layout(std430, binding = 0) buffer X { float x[]; };          // in place
+layout(std430, binding = 0) buffer X { float x[]; };          // in place, or the answer
 layout(std430, binding = 1) readonly buffer P { float pre[]; };
+#ifdef FROMQ8
+// The attention's mix arrives in the Q8_0 form every other kernel here reads:
+// one signed byte a value, packed four to a word, and per block of thirty-two
+// a scale — the scales of a column first, then their corrections, which this
+// does not need. Reading it here rather than dequantizing it in a pass of its
+// own saves the pass, and the arithmetic is one multiply either way.
+layout(std430, binding = 2) readonly buffer Q { uint qv[]; };
+layout(std430, binding = 3) readonly buffer S { float qs[]; };
+#endif
 
 layout(push_constant) uniform Push {
     uint n;       // values a column
@@ -41,8 +50,17 @@ void main() {
     if (col >= p.columns) return;
 
     uint t = gl_LocalInvocationID.x;
-    uint at = col * p.n + blk * GROUP + t;
-    s[t] = x[at] * pre[blk * GROUP + t];
+    uint j = blk * GROUP + t;
+    uint at = col * p.n + j;
+#ifdef FROMQ8
+    uint word = qv[at >> 2u];
+    int packed = int(bitfieldExtract(int(word), int((at & 3u) * 8u), 8));
+    uint blocks = p.n >> 5u;
+    float scale = qs[col * 2u * blocks + (j >> 5u)];
+    s[t] = float(packed) * scale * pre[j];
+#else
+    s[t] = x[at] * pre[j];
+#endif
     barrier();
 
     for (uint l = 1u; l < GROUP; l <<= 1u) {
