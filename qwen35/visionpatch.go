@@ -138,7 +138,6 @@ func (cfg *VisionConfig) Patches(w *VisionWeights, im *imageio.Image) []float32 
 	}
 
 	out := make([]float32, len(order)*cfg.Dim)
-	patch := nn.NewBatch(taps, 1)
 	gathered := make([]float32, taps)
 	rowA := make([]float32, cfg.Dim)
 	rowB := make([]float32, cfg.Dim)
@@ -146,9 +145,8 @@ func (cfg *VisionConfig) Patches(w *VisionWeights, im *imageio.Image) []float32 
 	for slot, raster := range order {
 		py, px := raster/cols, raster%cols
 		gatherPatch(gathered, pixels, im.W, im.H, px, py, cfg.Patch)
-		patch.Set(0, gathered)
-		w.PatchA.MatVec(patch, rowA)
-		w.PatchB.MatVec(patch, rowB)
+		nn.MatVecF16(w.PatchA.Data, gathered, w.PatchA.Rows, w.PatchA.Cols, rowA)
+		nn.MatVecF16(w.PatchB.Data, gathered, w.PatchB.Rows, w.PatchB.Cols, rowB)
 		dst := out[slot*cfg.Dim : (slot+1)*cfg.Dim]
 		for d := range dst {
 			dst[d] = rowA[d] + rowB[d] + w.PatchBias[d]

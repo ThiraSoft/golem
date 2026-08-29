@@ -14,9 +14,32 @@ type VisionNorm struct{ Gain, Bias []float32 }
 
 // VisionLinear is a projection with a bias, which every product in this tower
 // has and no product in the text model does.
+//
+// The weights stay the file's bytes and the product goes through nn.MatVecF16
+// rather than through nn.Matrix. A Matrix multiplies against a Batch, and a
+// Batch carries quantized forms it insists on aligning to the block size —
+// this tower's feed forward is 4304 wide, which is not a multiple of it, and
+// an fp16 product wants none of those forms anyway.
 type VisionLinear struct {
 	W    nn.Matrix
 	Bias []float32
+}
+
+// Apply computes y = W*x + bias.
+func (l VisionLinear) Apply(x, y []float32) {
+	nn.MatVecF16(l.W.Data, x, l.W.Rows, l.W.Cols, y)
+	for i := range y {
+		y[i] += l.Bias[i]
+	}
+}
+
+// ApplyRows is the same over rows [start, end), for a caller already inside a
+// parallel section.
+func (l VisionLinear) ApplyRows(x, y []float32, start, end int) {
+	nn.MatVecF16Rows(l.W.Data, x, l.W.Cols, y, start, end)
+	for i := start; i < end; i++ {
+		y[i] += l.Bias[i]
+	}
 }
 
 // VisionBlock is one block's weights, in the order the pass reads them.

@@ -41,6 +41,27 @@ func MatVecBF16Rows(w []byte, x []float32, inputs int, y []float32, start, end i
 	}
 }
 
+// MatVecF16 computes y = W*x, with W stored row-major in little-endian IEEE
+// binary16 — which is what a clip projector holds its matrices as.
+//
+// It takes a plain activation rather than a Batch, as its bfloat16 twin does.
+// A Batch carries quantized forms and insists its width divide the block size,
+// and this tower's feed forward is 4304 wide, which does not. Nothing here
+// wants those forms: an fp16 product reads the floats.
+func MatVecF16(w []byte, x []float32, outputs, inputs int, y []float32) {
+	InParallel(outputs, outputs*inputs, func(start, end int) {
+		MatVecF16Rows(w, x, inputs, y, start, end)
+	})
+}
+
+// MatVecF16Rows computes rows [start, end) on the caller's thread.
+func MatVecF16Rows(w []byte, x []float32, inputs int, y []float32, start, end int) {
+	weights := unsafe.Slice((*uint16)(unsafe.Pointer(&w[0])), len(w)/2)
+	for o := start; o < end; o++ {
+		y[o] = DotF32Half(x, weights[o*inputs:(o+1)*inputs])
+	}
+}
+
 // dotBF16 is one row of bfloat16 weights against one activation.
 func dotBF16(row []uint16, x []float32) float32 {
 	if len(row) == 0 {
