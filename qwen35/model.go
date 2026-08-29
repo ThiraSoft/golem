@@ -30,6 +30,10 @@ type Model struct {
 	gpuPipe *vk.QwenPipeline
 	head    *vk.Q40Head
 	headQ6K *vk.Q6KHead
+
+	// vision is nil until a projector is opened. The tower runs once per
+	// image and shares nothing with the text path.
+	vision *VisionTower
 }
 
 func Open(path string, maxContext int) (*Model, error) {
@@ -65,6 +69,10 @@ func New(g *tensors.GGUF, maxContext int) (*Model, error) {
 
 func (m *Model) Close() error {
 	m.closeVulkan()
+	if m.vision != nil {
+		m.vision.Close()
+		m.vision = nil
+	}
 	if m.file != nil {
 		return m.file.Close()
 	}
