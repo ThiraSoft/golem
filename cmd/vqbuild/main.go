@@ -37,6 +37,7 @@ func main() {
 	src := flag.String("model", "", "BF16 GGUF to compress")
 	dst := flag.String("out", "", "where to write the reconstructed copy")
 	plan := flag.String("plan", "default:3", "bit levels per role, e.g. default:3,token_embd:6,ffn_down:4")
+	lattice := flag.String("lattice", "E8", "E8 or D4; D4 is the one whose decode table fits a workgroup")
 	scaleBlk := flag.Int("scale", 64, "weights per fp16 scale")
 	alpha := flag.Float64("alpha", 0.5, "salience exponent")
 	outliers := flag.Int("outliers", 32, "columns held at 8 bits")
@@ -133,8 +134,12 @@ func main() {
 		w, err := t.F32()
 		must(err)
 
-		lv := levels[levelOf(role)]
-		opts := compress.Opts{UseLattice: true, Lat: compress.LatE8,
+		lat, table := compress.LatE8, e8Levels
+		if *lattice == "D4" {
+			lat, table = compress.LatD4, d4Levels
+		}
+		lv := table[levelOf(role)]
+		opts := compress.Opts{UseLattice: true, Lat: lat,
 			MaxNorm2: float32(lv.r), Beta: lv.beta, ScaleBlock: *scaleBlk, HadGroup: 128,
 			SearchScale: *search}
 		sc := compress.Scheme{Alpha: *alpha, Outliers: *outliers, VQ: opts}
@@ -172,15 +177,30 @@ func main() {
 	fmt.Printf("rewritten in %s\n", time.Since(t0).Round(time.Second))
 }
 
-// levels are the (shell, resolution) pairs that trace the rate-distortion
-// curve of the E8 quantizer: each step up costs roughly a third of a bit.
-var levels = []struct {
-	r    float64
-	beta float64
-}{
-	{10, 0.8}, {16, 1.1}, {26, 1.4}, {42, 1.8}, {62, 2.2},
-	{100, 2.8}, {156, 3.5}, {260, 4.5}, {460, 6.0}, {820, 8.0},
+// The (shell, resolution) pairs that trace each lattice's rate-distortion
+// curve. A step up costs roughly a third of a bit. The shell is set so that it
+// holds what the resolution produces: a normalised subvector has ‖βx‖² ≈ dβ²,
+// and the shell is about 1.6 times that.
+type level struct{ r, beta float64 }
+
+// The resolution is deliberately past the point where it still matters. With
+// the block scale searched rather than taken, β and that scale do the same job,
+// and the error stops moving once β is large enough to use the whole shell —
+// what sets the rate is the shell, and nothing else.
+var e8Levels = []level{
+	{10, 2.4}, {16, 3.1}, {26, 3.9}, {42, 5.0}, {62, 6.1},
+	{100, 7.7}, {156, 9.6}, {260, 12.4}, {460, 16.5}, {820, 22.1},
 }
+
+// D4 at the same budget: half the dimension, so the same rate needs a quarter
+// of the squared radius, and the shell stays small enough to enumerate into a
+// table a shader can hold — 3961 points at r²=40, thirty-one kibibytes.
+var d4Levels = []level{
+	{6, 3.1}, {10, 4.0}, {20, 5.7}, {40, 8.0}, {60, 9.8},
+	{100, 12.6}, {160, 16.0}, {260, 20.4}, {460, 27.1}, {820, 36.2},
+}
+
+var levels = e8Levels
 
 // parsePlan reads "default:3,token_embd:6" into a lookup from role to level.
 func parsePlan(spec string) func(string) int {

@@ -122,29 +122,18 @@ func main() {
 }
 
 func buildSchemes() []compress.Scheme {
-	vq := func(dim int, stages []int, sb, had int) compress.Opts {
-		return compress.Opts{Dim: dim, Stages: stages, ScaleBlock: sb, HadGroup: had,
-			TrainMax: 1 << 17, Iters: 15}
-	}
-	full := func(o compress.Opts) compress.Scheme {
-		return compress.Scheme{Alpha: 0.5, Outliers: 32, VQ: o}
-	}
-	lat := func(l compress.Lattice, r float32, beta float64, sb int) compress.Opts {
-		return compress.Opts{UseLattice: true, Lat: l, MaxNorm2: r, Beta: beta,
-			ScaleBlock: sb, HadGroup: 128}
+	lat := func(l compress.Lattice, r float32, beta float64) compress.Scheme {
+		return compress.Scheme{Alpha: 0.5, Outliers: 32, VQ: compress.Opts{
+			UseLattice: true, Lat: l, MaxNorm2: r, Beta: beta,
+			ScaleBlock: 64, HadGroup: 128, SearchScale: true}}
 	}
 	var out []compress.Scheme
-	out = append(out, compress.Scheme{Scalar: 2, Block: 32},
-		compress.Scheme{Scalar: 3, Block: 32}, compress.Scheme{Scalar: 4, Block: 32})
-	// beta sets the resolution, the shell must then be wide enough to hold what
-	// beta produced: E[||beta x||^2] = 8 beta^2 for a normalised subvector.
-	for _, p := range [][2]float64{
-		{0.8, 10}, {1.1, 16}, {1.4, 26}, {1.8, 42}, {2.2, 62},
-		{2.8, 100}, {3.5, 156}, {4.5, 260}, {6.0, 460},
-	} {
-		out = append(out, full(lat(compress.LatE8, float32(p[1]), p[0], 64)))
+	for _, b := range []float64{1.8, 2.6, 3.6, 5.0, 7.0, 10.0} {
+		out = append(out, lat(compress.LatE8, 42, b))
 	}
-	out = append(out, full(vq(4, []int{256}, 64, 128)))
+	for _, b := range []float64{4.4, 6.0, 8.0, 11.0, 15.0} {
+		out = append(out, lat(compress.LatD4, 40, b))
+	}
 	return out
 }
 
