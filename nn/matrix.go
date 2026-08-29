@@ -50,7 +50,7 @@ func (m Matrix) RowBytes() int {
 	switch m.Quant {
 	case F32:
 		return m.Cols * 4
-	case BF16:
+	case BF16, F16:
 		return m.Cols * 2
 	case Q4_0:
 		return m.Cols / QuantBlock * q4_0BlockBytes
@@ -131,6 +131,17 @@ func (m Matrix) rows(b *Batch, ys [][]float32, start, end int) {
 				ys[c][r] = dotBF16(row, b.F[c])
 			}
 		}
+	case F16:
+		// IEEE binary16, which is what a clip projector stores its matrices
+		// as. DotF32Half is the kernel nn already had for the key-value cache;
+		// this is the first thing to multiply by a whole matrix of them.
+		weights := unsafe.Slice((*uint16)(unsafe.Pointer(&m.Data[0])), len(m.Data)/2)
+		for r := start; r < end; r++ {
+			row := weights[r*m.Cols : (r+1)*m.Cols]
+			for c := 0; c < b.Size; c++ {
+				ys[c][r] = DotF32Half(b.F[c], row)
+			}
+		}
 	case F32:
 		weights := unsafe.Slice((*float32)(unsafe.Pointer(&m.Data[0])), len(m.Data)/4)
 		for r := start; r < end; r++ {
@@ -183,6 +194,10 @@ func (m Matrix) Row(index int, out []float32) {
 	case BF16:
 		for i := 0; i < m.Cols; i++ {
 			out[i] = bf16ToFloat(row[i*2:])
+		}
+	case F16:
+		for i := 0; i < m.Cols; i++ {
+			out[i] = halfToFloat(uint16(row[i*2]) | uint16(row[i*2+1])<<8)
 		}
 	case Q4_0:
 		dequantizeQ4_0Row(row, m.Cols, out)

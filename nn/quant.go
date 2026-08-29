@@ -12,6 +12,7 @@ type Quant uint8
 const (
 	F32 Quant = iota
 	BF16
+	F16
 	Q4_0
 	Q4_1
 	Q4_K
@@ -26,6 +27,8 @@ func (q Quant) String() string {
 		return "F32"
 	case BF16:
 		return "BF16"
+	case F16:
+		return "F16"
 	case Q4_0:
 		return "Q4_0"
 	case Q4_1:
@@ -49,6 +52,8 @@ func QuantOf(dtype string) (Quant, bool) {
 		return F32, true
 	case "BF16":
 		return BF16, true
+	case "F16":
+		return F16, true
 	case "Q4_0":
 		return Q4_0, true
 	case "Q4_1":
