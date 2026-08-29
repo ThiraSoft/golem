@@ -55,6 +55,17 @@ func main() {
 			ids = ids[:*limit]
 		}
 		logits := make([]float32, m.Cfg.Vocab)
+		// The corpus is the evaluation set, so it is the one whose opinions are
+		// worth comparing between two models. Perplexity says whether a model
+		// still predicts language; these say whether it still says the same
+		// thing as the model it was made from, which is a different question
+		// and the one a compression has to answer.
+		var cf *os.File
+		if *dump != "" {
+			cf, err = os.Create(*dump)
+			must(err)
+			defer cf.Close()
+		}
 		var sum float64
 		var n int
 		for start := 0; start+*ctx <= len(ids); start += *ctx {
@@ -65,6 +76,9 @@ func main() {
 			// predicted and does not count.
 			for i := 0; i < len(window)-1; i++ {
 				m.Logits(h[i], logits)
+				if cf != nil {
+					must(binary.Write(cf, binary.LittleEndian, logits))
+				}
 				sum += logSoftmaxAt(logits, window[i+1])
 				n++
 			}
