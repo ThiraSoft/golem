@@ -4,8 +4,9 @@ Development tools. They run a model under llama.cpp, or under the engine a
 model's template was written for, and write down what it computes. The Go tests
 read those recordings back, so llama.cpp is needed here and nowhere else.
 
-Three of the six C++ recorders are model-neutral, and are meant to stay that
-way.
+Three of the seven C++ recorders take a model at all; the other four pin a
+kernel, and the three that pin one take no checkpoint whatever. The model-neutral
+ones are meant to stay that way.
 llama.cpp names the waypoints of its graph the same whatever the architecture,
 so what has to change between one model and the next is not the recorder: it is
 which waypoints to keep, on which prompt, with which tokenizer flags. That lives
@@ -37,7 +38,8 @@ what node 1443 was; regenerate it whenever llama.cpp's graph changes, and
 | `dump_layers.cpp` | the engine | a model, an output directory, a `.run` file |
 | `dump_tokens.cpp` | the tokenizer | a model, an output directory, a `.tsv` corpus |
 | `dump_quants.cpp` | the kernels | a model, an output directory |
-| `dump_mrope.cpp` | the interleaved M-RoPE | an output directory |
+| `dump_mrope.cpp` | the interleaved M-RoPE, and the tower's | one or two output directories |
+| `dump_interpolate.cpp` | ggml's antialiased bilinear | an output directory |
 | `dump_vision.cpp` | the vision tower | a model, a projector, an output directory, a `.run` file |
 | `dump_audio.cpp` | the audio tower | a model, a projector, an output directory, a `.run` file |
 
@@ -193,6 +195,25 @@ the two rules agree.
 ```bash
 mkdir -p testdata/qwen35/{mrope,vrope}
 build/ref/dump_mrope testdata/qwen35/mrope testdata/qwen35/vrope
+```
+
+## dump_interpolate — recording the antialiased resize
+
+clip.cpp resizes a learned position table whenever the patch grid is not the one
+the table was trained at, which for a tower with dynamic resolution is nearly
+always. It does it with `GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS`,
+and two things there are worth pinning: the filter's support widens as the grid
+shrinks, and the weights are divided by what was gathered rather than by their
+nominal sum.
+
+Five cases into `testdata/qwen35/interp/`, from a 48×48 grid: the identity, two
+shrinks with the axes scaling together and apart, one enlargement, and one at a
+ratio that divides evenly into nothing. The last is the one that matters — it is
+where a coordinate computed a decimal too precisely stops agreeing.
+
+```bash
+mkdir -p testdata/qwen35/interp
+build/ref/dump_interpolate testdata/qwen35/interp
 ```
 
 ## The rule

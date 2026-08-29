@@ -38,6 +38,7 @@
 # merged.
 /testdata/qwen35/mrope/
 /testdata/qwen35/vrope/
+/testdata/qwen35/interp/
 
 # The Mimi encoder fixtures, same rule as the others.
 /testdata/encoder/
