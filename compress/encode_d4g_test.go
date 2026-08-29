@@ -123,3 +123,34 @@ func TestD4GWithoutRotationOrScaling(t *testing.T) {
 		t.Errorf("a row read back is %.4f away from the one written", rel)
 	}
 }
+
+// The wide tier has to cost what it says and buy what it costs. Sixteen bits a
+// code against twelve is 34 bytes a block against 26, a whole bit a weight, and
+// a bit a weight is six decibels — so anything much under a factor of two on
+// the error means the shell of 65536 points is not being reached into.
+func TestWideTierCostsAndBuys(t *testing.T) {
+	const rows, cols = 64, 512
+	r := rand.New(rand.NewSource(13))
+	w := make([]float32, rows*cols)
+	for i := range w {
+		w[i] = float32(r.NormFloat64()) * 0.02
+	}
+	base := D4Params{Beta: 2, ScaleBlock: 32, SearchScale: true}
+	var errs [2]float64
+	for i, bits := range []int{nn.D4Bits, nn.D4Bits16} {
+		p := base
+		p.Bits = bits
+		data := EncodeD4G(w, rows, cols, nil, p, nil)
+		want := rows * cols / nn.D4Block * nn.D4BlockBytes(bits)
+		if len(data) != want {
+			t.Fatalf("%d bits: %d bytes, want %d", bits, len(data), want)
+		}
+		errs[i] = RelErrD4G(w, rows, cols, nil, p, data)
+	}
+	gain := 20 * math.Log10(errs[0]/errs[1])
+	t.Logf("relative error %.4f at twelve bits, %.4f at sixteen — %.2f dB for one bit a weight",
+		errs[0], errs[1], gain)
+	if gain < 4 {
+		t.Errorf("the wide tier bought %.2f dB for a whole bit, which is not enough to be worth it", gain)
+	}
+}

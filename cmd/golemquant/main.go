@@ -45,6 +45,7 @@ func main() {
 	clamp := flag.Float64("clamp", 24, "largest factor the salience may scale a column by, either way; 0 lets it run")
 	hadGroup := flag.Int("hadamard", 128, "rotation group; 0 leaves the weights unrotated")
 	beta := flag.Float64("beta", 2, "how far a block is scaled up before rounding")
+	codeBits := flag.Int("bits", 12, "code width: 12 for the ordinary tier, 16 for the wide one")
 	scaleBlk := flag.Int("scale", 32, "weights sharing one step code; 32 is what the format stores")
 	ntok := flag.Int("tokens", 8192, "calibration tokens")
 	ctx := flag.Int("ctx", 512, "calibration window")
@@ -82,7 +83,11 @@ func main() {
 	sort.Strings(names)
 
 	params := compress.D4Params{Beta: *beta, ScaleBlock: *scaleBlk,
-		HadGroup: *hadGroup, SearchScale: true}
+		HadGroup: *hadGroup, Bits: *codeBits, SearchScale: true}
+	dtype := "D4G"
+	if *codeBits == nn.D4Bits16 {
+		dtype = "D4G16"
+	}
 
 	// One vector a site: the sign flips of the rotation over the salience
 	// scale. The weights are multiplied by it, the activations by its
@@ -239,7 +244,7 @@ func main() {
 			note = fmt.Sprintf("  rel %.4f  %.2f dB", e, -20*math.Log10(float64(e)))
 		}
 		out = append(out, tensors.OutTensor{Name: name, Shape: t.Shape,
-			DType: "D4G", Data: data})
+			DType: dtype, Data: data})
 		bits += float64(len(data)) * 8
 		count += float64(len(w))
 		fmt.Printf("  %-32s %6dx%-6d %s%s\n", name, rows, cols, sizeOf(len(data)), note)
@@ -277,6 +282,7 @@ func main() {
 	meta["golem.d4.hadamard_group"] = uint32(*hadGroup)
 	meta["golem.d4.radius"] = uint32(nn.D4Radius)
 	meta["golem.d4.scale_block"] = uint32(*scaleBlk)
+	meta["golem.d4.code_bits"] = uint32(*codeBits)
 	meta["general.file_type"] = uint32(1000)
 
 	must(tensors.WriteGGUF(*dst, meta, out))

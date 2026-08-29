@@ -19,10 +19,24 @@ const (
 	Q5_K
 	Q6_K
 	Q8_0
-	// D4G is golem's own: 64 weights in 26 bytes, a lattice code every four.
-	// nn/d4g.go describes it.
+	// D4G is golem's own: 64 weights in 26 bytes, a twelve-bit lattice code
+	// every four. nn/d4g.go describes it.
 	D4G
+	// D4G16 is the same format with sixteen-bit codes — 34 bytes a block, a
+	// whole bit a weight more, and a table sixteen times larger.
+	D4G16
 )
+
+// D4Width is the code width of a D4G format, and zero for anything else.
+func (q Quant) D4Width() int {
+	switch q {
+	case D4G:
+		return D4Bits
+	case D4G16:
+		return D4Bits16
+	}
+	return 0
+}
 
 func (q Quant) String() string {
 	switch q {
@@ -46,6 +60,8 @@ func (q Quant) String() string {
 		return "Q8_0"
 	case D4G:
 		return "D4G"
+	case D4G16:
+		return "D4G16"
 	}
 	return "unknown"
 }
@@ -73,6 +89,8 @@ func QuantOf(dtype string) (Quant, bool) {
 		return Q8_0, true
 	case "D4G":
 		return D4G, true
+	case "D4G16":
+		return D4G16, true
 	}
 	return 0, false
 }

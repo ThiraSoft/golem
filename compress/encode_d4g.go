@@ -23,9 +23,9 @@ import (
 // towards the origin until it does not. Only the point is kept: it has a code,
 // and the block's own step multiplies it. The pull is a way of finding a
 // representable point, not a scale anybody stores.
-func nearestInShell(x, out []float32) {
+func nearestInShell(x, out []float32, bits int) {
 	nearestDn(x, out)
-	if coded(out) {
+	if coded(out, bits) {
 		return
 	}
 	// Past the shell. Pulling x towards the origin lands on points that are
@@ -40,7 +40,8 @@ func nearestInShell(x, out []float32) {
 	// encoder's afternoon goes.
 	var tmp, best [4]float32
 	bestD := float32(math.MaxFloat32)
-	s0 := float32(math.Sqrt(float64(nn.D4Radius) / float64(norm2(x))))
+	full, _ := nn.D4TierNorms(bits)
+	s0 := float32(math.Sqrt(float64(full) / float64(norm2(x))))
 	if s0 > 1 {
 		s0 = 1
 	}
@@ -50,7 +51,7 @@ func nearestInShell(x, out []float32) {
 			tmp[i] = x[i] * s
 		}
 		nearestDn(tmp[:], out)
-		if !coded(out) {
+		if !coded(out, bits) {
 			continue
 		}
 		var d float32
@@ -72,17 +73,26 @@ func nearestInShell(x, out []float32) {
 	copy(out, best[:])
 }
 
-func coded(p []float32) bool {
-	return nn.D4Has([4]int8{int8(p[0]), int8(p[1]), int8(p[2]), int8(p[3])})
+func coded(p []float32, bits int) bool {
+	return nn.D4Has([4]int8{int8(p[0]), int8(p[1]), int8(p[2]), int8(p[3])}, bits)
 }
 
 // D4Params is what the converter chose, and what the file then no longer needs
 // to say.
 type D4Params struct {
 	Beta        float64 // how far a normalised block is scaled up before rounding
-	ScaleBlock  int     // weights sharing one fp16 step; must be a multiple of 64
+	ScaleBlock  int     // weights sharing one step code; must be a multiple of 32
 	HadGroup    int     // 0 leaves the matrix unrotated
+	Bits        int     // code width; zero means the ordinary twelve
 	SearchScale bool
+}
+
+// Width is the code width the parameters ask for.
+func (p D4Params) Width() int {
+	if p.Bits == 0 {
+		return nn.D4Bits
+	}
+	return p.Bits
 }
 
 // chooseStep picks the one number a block of weights stores besides its codes.
@@ -95,7 +105,7 @@ type D4Params struct {
 // multiples that fall on the same code are one candidate tried twice. The span
 // is a little over two octaves around the RMS, which is where the answer is for
 // a block of outliers and for a flat one alike.
-func chooseStep(blk []float32, lo, hi float32, beta float32, buf, pt []float32) float32 {
+func chooseStep(blk []float32, lo, hi float32, beta float32, buf, pt []float32, bits int) float32 {
 	var ss float64
 	for _, v := range blk {
 		ss += float64(v) * float64(v)
@@ -118,7 +128,7 @@ func chooseStep(blk []float32, lo, hi float32, beta float32, buf, pt []float32) 
 			for j := range x {
 				buf[j] = x[j] / step
 			}
-			nearestInShell(buf, pt)
+			nearestInShell(buf, pt, bits)
 			for j := 0; j < 4; j++ {
 				d := x[j] - pt[j]*step
 				err += d * d
@@ -160,7 +170,9 @@ func EncodeD4G(w []float32, rows, cols int, q []float32, p D4Params, comp *Comp)
 	if sb <= 0 || sb%nn.D4SubBlock != 0 {
 		panic("compress: the scale block must be a multiple of 32")
 	}
-	rowBytes := cols / nn.D4Block * 26
+	bits := p.Width()
+	run := nn.D4Block / 4 * bits / 8
+	rowBytes := cols / nn.D4Block * nn.D4BlockBytes(bits)
 	out := make([]byte, rows*rowBytes)
 
 	// A block of outliers wants a coarse step and a flat one wants a fine step,
@@ -197,7 +209,7 @@ func EncodeD4G(w []float32, rows, cols int, q []float32, p D4Params, comp *Comp)
 				}
 				for off := 0; off < m; off += sb {
 					blk := row[a+off : a+off+sb]
-					step := chooseStep(blk, spanLo, spanHi, beta, buf, pt)
+					step := chooseStep(blk, spanLo, spanHi, beta, buf, pt, bits)
 					code := nn.D4StepCode(step)
 					step = nn.D4Step(code)
 					for i := 0; i*nn.D4SubBlock < sb; i++ {
@@ -209,14 +221,14 @@ func EncodeD4G(w []float32, rows, cols int, q []float32, p D4Params, comp *Comp)
 						for j := range x {
 							buf[j] = x[j] / step
 						}
-						nearestInShell(buf, pt)
+						nearestInShell(buf, pt, bits)
 						var p4 [4]int8
 						for j := 0; j < 4; j++ {
 							p4[j] = int8(pt[j])
 						}
-						c, ok := nn.D4Code(p4)
+						c, ok := nn.D4CodeN(p4, bits)
 						if !ok {
-							c, _ = nn.D4Code([4]int8{})
+							c, _ = nn.D4CodeN([4]int8{}, bits)
 							pt[0], pt[1], pt[2], pt[3] = 0, 0, 0, 0
 						}
 						codes[(a+col)/4] = c
@@ -257,10 +269,10 @@ func EncodeD4G(w []float32, rows, cols int, q []float32, p D4Params, comp *Comp)
 				a += m
 			}
 
-			scales, codes24 := nn.D4Planes(out[r*rowBytes:(r+1)*rowBytes], cols)
+			scales, run24 := nn.D4PlanesN(out[r*rowBytes:(r+1)*rowBytes], cols, bits)
 			copy(scales, steps)
 			for b := 0; b*nn.D4Block < cols; b++ {
-				nn.PutD4Codes(codes24[b*24:], codes[b*16:(b+1)*16])
+				nn.PutD4CodesN(run24[b*run:], codes[b*16:(b+1)*16], bits)
 			}
 		}
 	})
@@ -272,7 +284,7 @@ func EncodeD4G(w []float32, rows, cols int, q []float32, p D4Params, comp *Comp)
 // quantizer's own error and nothing else's, which is what says whether there is
 // room left in the quantizer or only in what surrounds it.
 func RelErrD4G(w []float32, rows, cols int, q []float32, p D4Params, data []byte) float64 {
-	stride := cols / nn.D4Block * 26
+	stride := cols / nn.D4Block * nn.D4BlockBytes(p.Width())
 	var num, den float64
 	row := make([]float32, cols)
 	rec := make([]float32, cols)
@@ -281,7 +293,7 @@ func RelErrD4G(w []float32, rows, cols int, q []float32, p D4Params, data []byte
 		if q != nil {
 			nn.PrepareD4G(row, q, p.HadGroup)
 		}
-		nn.DequantizeD4G(data[r*stride:(r+1)*stride], cols, rec)
+		nn.DequantizeD4GN(data[r*stride:(r+1)*stride], cols, p.Width(), rec)
 		for j := range row {
 			d := float64(row[j] - rec[j])
 			num += d * d
@@ -300,7 +312,7 @@ func RelErrD4G(w []float32, rows, cols int, q []float32, p D4Params, data []byte
 // where the Hessian lives. Which is also why pre is needed and not just q: the
 // two are reciprocal, and undoing a rotation is not the same as applying it.
 func EnergyD4G(w []float32, rows, cols int, q, pre []float32, p D4Params, data []byte, a *Acc) (float64, float64) {
-	stride := cols / nn.D4Block * 26
+	stride := cols / nn.D4Block * nn.D4BlockBytes(p.Width())
 	nums := make([]float64, rows)
 	dens := make([]float64, rows)
 	Parallel(rows, func(lo, hi int) {
@@ -312,7 +324,7 @@ func EnergyD4G(w []float32, rows, cols int, q, pre []float32, p D4Params, data [
 			if q != nil {
 				nn.PrepareD4G(row, q, p.HadGroup)
 			}
-			nn.DequantizeD4G(data[r*stride:(r+1)*stride], cols, rec)
+			nn.DequantizeD4GN(data[r*stride:(r+1)*stride], cols, p.Width(), rec)
 			for j := range d {
 				d[j] = row[j] - rec[j]
 			}

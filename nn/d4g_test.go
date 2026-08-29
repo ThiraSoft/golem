@@ -52,7 +52,7 @@ func TestD4ShellIsTheLattice(t *testing.T) {
 				t.Fatalf("point %d has norm %d after one of norm %d", i, n2, m2)
 			}
 		}
-		if !D4Has(p) {
+		if !D4Has(p, D4Bits) {
 			t.Fatalf("point %v has a code but D4Has says it has none", p)
 		}
 		if c, ok := D4Code(p); !ok || int(c) != i {
@@ -72,7 +72,7 @@ func TestD4CodePacking(t *testing.T) {
 		}
 		PutD4Codes(buf, codes)
 		for i, want := range codes {
-			if got := d4CodeAt(buf, i); got != want {
+			if got := d4CodeAt(buf, i, D4Bits); got != want {
 				t.Fatalf("code %d came back %d, want %d", i, got, want)
 			}
 		}
