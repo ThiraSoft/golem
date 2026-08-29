@@ -1,0 +1,37 @@
+#version 450
+
+// The gate between a D4G feed forward's two halves.
+//
+// The gate and the up projection read the same activation through the same
+// vector, so they are one matrix of twice the rows and one dispatch, and their
+// answers arrive stacked: for a column, the gate's outputs then the up's. This
+// takes the two apart, puts a SiLU on the first and multiplies.
+//
+// It works on floats because everything on this path does. The Q8_0 form the
+// rest of the engine carries between its stages exists so a Q4_0 kernel can
+// read an activation cheaply; a D4G kernel reads floats, and the transform that
+// precedes it — a scale and a rotation — has to happen in floats anyway.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer G { float g[]; }; // 2*ffn a column
+layout(std430, binding = 1) writeonly buffer A { float a[]; }; // ffn a column
+
+layout(push_constant) uniform Push {
+    uint ffn;
+    uint columns;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = p.ffn * p.columns;
+    if (i >= total) return;
+    uint col = i / p.ffn;
+    uint j = i - col * p.ffn;
+    uint base = col * 2u * p.ffn;
+    float gate = g[base + j];
+    float up = g[base + p.ffn + j];
+    // SiLU, which is what Qwen's feed forward gates with. Gemma's tabulated
+    // GELU is a different kernel and a different model.
+    a[i] = (gate / (1.0 + exp(-gate))) * up;
+}
