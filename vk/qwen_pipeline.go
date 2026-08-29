@@ -257,6 +257,13 @@ type attnPrepPush struct {
 	RoPEBase   float32
 	Eps        float32
 	RoPEDims   uint32
+	// The M-RoPE section widths, in the order the shader reads them. A field
+	// out of place here is not a compile error on either side: the kernel
+	// reads whatever integer lands at the offset it expects.
+	Sect0 uint32
+	Sect1 uint32
+	Sect2 uint32
+	Sect3 uint32
 }
 
 type attnGQAPush struct {
@@ -287,6 +294,10 @@ type QwenShape struct {
 	HeadDim  int // 256
 	RoPEDims int // 64
 	RoPEBase float32
+	// RoPESections are the four M-RoPE section widths the file declares, all
+	// zero for a checkpoint that declares none. They decide which of a
+	// position's axes each pair of a head turns by.
+	RoPESections [4]int
 
 	ConvDim   int // 10240, the delta net's q+k+v channels
 	Inner     int // 6144, its value width
@@ -430,7 +441,11 @@ type QwenPipeline struct {
 	// be laid down again for it: see shaders/qwen_attn_prep.comp.
 	posIn  *Buffer
 	posBuf *Buffer
-	pass   map[int]*Program
+	// The rotation's three axes, beside the cache index rather than folded
+	// into it. shaders/qwen_attn_prep.comp says why they cannot be one number.
+	mposIn  *Buffer
+	mposBuf *Buffer
+	pass    map[int]*Program
 
 	// The scratch a block passes through, which is the pipeline's and not the
 	// block's: sixty-four blocks go through one command buffer with a barrier
@@ -529,7 +544,7 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		{&p.pipeScan, ssmScanSPIRV, 9, unsafe.Sizeof(ssmScanPush{})},
 		{&p.pipeQKNorm, ssmQKNormSPIRV, 2, unsafe.Sizeof(ssmQKNormPush{})},
 		{&p.pipeGate, ssmGateSPIRV, 3, unsafe.Sizeof(ssmGatePush{})},
-		{&p.pipeAttnPrep, qwenAttnPrepSPIRV, 9, unsafe.Sizeof(attnPrepPush{})},
+		{&p.pipeAttnPrep, qwenAttnPrepSPIRV, 10, unsafe.Sizeof(attnPrepPush{})},
 		{&p.pipeAttnGQA, qwenAttnGQASPIRV, 6, unsafe.Sizeof(attnGQAPush{})},
 	} {
 		if *b.into, err = d.NewPipeline(b.spirv, b.binds, uint32(b.pushSz)); err != nil {
@@ -631,6 +646,13 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 	// the device's. That answered rather than failing: every wide pass read
 	// somebody else's positions.
 	if p.posIn, err = d.Host(qwenWide*4, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
+		return nil, err
+	}
+	// Four uints a column, against the position's one.
+	if p.mposIn, err = d.Host(qwenWide*16, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
+		return nil, err
+	}
+	if p.mposBuf, err = d.Local(qwenWide*16, bufferUsageStorage|bufferUsageTransferDst); err != nil {
 		return nil, err
 	}
 	if p.posBuf, err = d.Local(qwenWide*4, bufferUsageStorage); err != nil {
@@ -868,7 +890,7 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 	if b.setV, err = p.pipeMatvec.NewSet([]*Buffer{b.wV, p.normedQ, p.normedS, p.vIn}); err != nil {
 		return nil, err
 	}
-	if b.setPrep, err = p.pipeAttnPrep.NewSet([]*Buffer{p.qIn, p.kIn, p.vIn, b.qNorm, b.kNorm, p.qOut, b.kCache, b.vCache, p.posBuf}); err != nil {
+	if b.setPrep, err = p.pipeAttnPrep.NewSet([]*Buffer{p.qIn, p.kIn, p.vIn, b.qNorm, b.kNorm, p.qOut, b.kCache, b.vCache, p.posBuf, p.mposBuf}); err != nil {
 		return nil, err
 	}
 	if b.setGQA, err = p.pipeAttnGQA.NewSet([]*Buffer{p.qOut, b.kCache, b.vCache, p.qIn, p.attnOut, p.posBuf}); err != nil {
@@ -1033,7 +1055,31 @@ func (p *QwenPipeline) Forward(x []float32, pos int) ([]float32, error) {
 // attention's cache are both walked in the order given, and a column reads the
 // keys the columns before it wrote.
 func (p *QwenPipeline) ForwardColumns(xs [][]float32, positions []int) ([][]float32, error) {
-	return p.forward(xs, positions, false)
+	return p.forward(xs, RunColumns(positions), false)
+}
+
+// QwenPlace is one column's cache index and the three axes its rotation reads.
+// Pos is what the cache and the visible range count in; the triple is the
+// rotation's alone, and an image is what makes the two differ.
+type QwenPlace struct {
+	Pos     int
+	T, H, W int
+}
+
+// RunColumns is the places of a run of text, where every axis follows the
+// cache index. It is what every caller but an image gives.
+func RunColumns(positions []int) []QwenPlace {
+	at := make([]QwenPlace, len(positions))
+	for i, q := range positions {
+		at[i] = QwenPlace{Pos: q, T: q, H: q, W: q}
+	}
+	return at
+}
+
+// ForwardPlaces is ForwardColumns for a pass whose axes do not all follow the
+// cache index.
+func (p *QwenPipeline) ForwardPlaces(xs [][]float32, at []QwenPlace) ([][]float32, error) {
+	return p.forward(xs, at, false)
 }
 
 // ForwardSpeculative is ForwardColumns for a pass whose last column is a draft:
@@ -1041,29 +1087,42 @@ func (p *QwenPipeline) ForwardColumns(xs [][]float32, positions []int) ([][]floa
 // columns into the drafted one, so that RestoreState can put it back if the
 // draft is refused.
 func (p *QwenPipeline) ForwardSpeculative(xs [][]float32, positions []int) ([][]float32, error) {
-	return p.forward(xs, positions, true)
+	return p.forward(xs, RunColumns(positions), true)
 }
 
-func (p *QwenPipeline) forward(xs [][]float32, positions []int, speculative bool) ([][]float32, error) {
+// ForwardSpeculativeAt is ForwardSpeculative for places whose axes do not
+// follow the cache index.
+func (p *QwenPipeline) ForwardSpeculativeAt(xs [][]float32, at []QwenPlace) ([][]float32, error) {
+	return p.forward(xs, at, true)
+}
+
+func (p *QwenPipeline) forward(xs [][]float32, at []QwenPlace, speculative bool) ([][]float32, error) {
 	s := p.shape
 	columns := len(xs)
 	if columns == 0 || columns > qwenWide {
 		return nil, fmt.Errorf("vk: a qwen pass carries one to %d columns, given %d", qwenWide, columns)
 	}
-	if len(positions) != columns {
-		return nil, fmt.Errorf("vk: %d columns need %d positions, given %d", columns, columns, len(positions))
+	if len(at) != columns {
+		return nil, fmt.Errorf("vk: %d columns need %d positions, given %d", columns, columns, len(at))
 	}
 	stream := p.xin.Floats()
 	pos := unsafe.Slice((*uint32)(unsafe.Pointer(&p.posIn.Bytes()[0])), qwenWide)
+	mpos := unsafe.Slice((*uint32)(unsafe.Pointer(&p.mposIn.Bytes()[0])), qwenWide*4)
 	for c, x := range xs {
-		if positions[c] >= s.MaxContext {
-			return nil, fmt.Errorf("vk: position %d is past the %d the pipeline was built for", positions[c], s.MaxContext)
+		if at[c].Pos >= s.MaxContext {
+			return nil, fmt.Errorf("vk: position %d is past the %d the pipeline was built for", at[c].Pos, s.MaxContext)
 		}
-		if c > 0 && positions[c] != positions[c-1]+1 {
-			return nil, fmt.Errorf("vk: a pass needs consecutive positions, given %v", positions)
+		// The cache index is what must be consecutive. The rotation's axes
+		// need not be, and an image is exactly the case where they are not.
+		if c > 0 && at[c].Pos != at[c-1].Pos+1 {
+			return nil, fmt.Errorf("vk: a pass needs consecutive cache positions, given %v", at)
 		}
 		copy(stream[c*s.Dim:(c+1)*s.Dim], x)
-		pos[c] = uint32(positions[c])
+		pos[c] = uint32(at[c].Pos)
+		mpos[4*c+0] = uint32(at[c].T)
+		mpos[4*c+1] = uint32(at[c].H)
+		mpos[4*c+2] = uint32(at[c].W)
+		mpos[4*c+3] = 0
 	}
 
 	snapAt := int(noSnapshot)
@@ -1122,6 +1181,7 @@ func (p *QwenPipeline) record(r *Recorder, columns, snapAt int) {
 	}
 	r.Copy(p.xs, 0, p.xin, s.Dim*columns*4)
 	r.Copy(p.posBuf, 0, p.posIn, 4*columns)
+	r.Copy(p.mposBuf, 0, p.mposIn, 16*columns)
 	r.Barrier()
 
 	for i := 0; i < blocks; i++ {
@@ -1274,6 +1334,7 @@ func (p *QwenPipeline) Probe(x []float32, pos, blocks int) ([]float32, error) {
 	err := p.d.Submit(func(r *Recorder) {
 		r.Copy(p.xs, 0, p.xin, s.Dim*4)
 		r.Copy(p.posBuf, 0, p.posIn, 4)
+		r.Copy(p.mposBuf, 0, p.mposIn, 16)
 		r.Barrier()
 		for i := 0; i < blocks; i++ {
 			push := &normAttn
@@ -1320,6 +1381,7 @@ func (p *QwenPipeline) ProbeMixer(x []float32, pos, block int) ([]float32, error
 	err := p.d.Submit(func(r *Recorder) {
 		r.Copy(p.xs, 0, p.xin, s.Dim*4)
 		r.Copy(p.posBuf, 0, p.posIn, 4)
+		r.Copy(p.mposBuf, 0, p.mposIn, 16)
 		r.Barrier()
 		for i := 0; i <= block; i++ {
 			push := &normAttn
@@ -1362,6 +1424,7 @@ func (p *QwenPipeline) ProbeNormed(x []float32, pos, block int) ([]float32, erro
 	err := p.d.Submit(func(r *Recorder) {
 		r.Copy(p.xs, 0, p.xin, s.Dim*4)
 		r.Copy(p.posBuf, 0, p.posIn, 4)
+		r.Copy(p.mposBuf, 0, p.mposIn, 16)
 		r.Barrier()
 		r.Dispatch(p.setProbeNorms[block], 1, unsafe.Pointer(&normAttn))
 		r.Barrier()
@@ -1447,6 +1510,7 @@ func (p *QwenPipeline) ProbeRaw(x []float32, pos, block int, what string) ([]flo
 	err := p.d.Submit(func(r *Recorder) {
 		r.Copy(p.xs, 0, p.xin, s.Dim*4)
 		r.Copy(p.posBuf, 0, p.posIn, 4)
+		r.Copy(p.mposBuf, 0, p.mposIn, 16)
 		r.Barrier()
 		r.Dispatch(p.setProbeNorms[block], 1, unsafe.Pointer(&normAttn))
 		r.Barrier()
@@ -1464,9 +1528,23 @@ func (p *QwenPipeline) ProbeRaw(x []float32, pos, block int, what string) ([]flo
 	return dst.Floats()[:n], n, nil
 }
 
+// setPos writes the single column of a one-token pass, on every axis at once.
+// It is the probes' and the prediction block's entry, and all of them are text:
+// a draft sits at the position it drafts for, and a probe replays a text token.
+// setPlace is what an image would use.
 func (p *QwenPipeline) setPos(pos int) {
+	p.setPlace(QwenPlace{Pos: pos, T: pos, H: pos, W: pos})
+}
+
+// setPlace writes one column's cache index and its three rotation axes. Both
+// buffers are written together on purpose: a pass that set one and not the
+// other would rotate by whatever the pass before it left, which is a wrong
+// answer that nothing would report.
+func (p *QwenPipeline) setPlace(at QwenPlace) {
 	w := unsafe.Slice((*uint32)(unsafe.Pointer(&p.posIn.Bytes()[0])), qwenWide)
-	w[0] = uint32(pos)
+	w[0] = uint32(at.Pos)
+	m := unsafe.Slice((*uint32)(unsafe.Pointer(&p.mposIn.Bytes()[0])), qwenWide*4)
+	m[0], m[1], m[2], m[3] = uint32(at.T), uint32(at.H), uint32(at.W), 0
 }
 
 // Hidden is the last pass's state before the output norm. The
@@ -1564,6 +1642,10 @@ func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
 		RoPEBase:   s.RoPEBase,
 		Eps:        s.Eps,
 		RoPEDims:   uint32(s.RoPEDims),
+		Sect0:      uint32(s.RoPESections[0]),
+		Sect1:      uint32(s.RoPESections[1]),
+		Sect2:      uint32(s.RoPESections[2]),
+		Sect3:      uint32(s.RoPESections[3]),
 	}
 	gqa := attnGQAPush{
 		MaxContext: uint32(s.MaxContext),
@@ -1688,6 +1770,9 @@ func (p *QwenPipeline) Close() {
 	}
 	if p.posIn != nil {
 		p.posIn.Close()
+	}
+	if p.mposIn != nil {
+		p.mposIn.Close()
 	}
 	for _, pl := range []*Pipeline{
 		p.pipeNorm, p.pipeMatvec, p.pipeMatQ40, p.pipeMatQ41, p.pipeMatQ5K,
@@ -1821,7 +1906,14 @@ func (p *QwenPipeline) WidthFor(n int) int {
 // thousand floats — nothing beside the two hundred and sixty megabytes of
 // weights this reads — and doing them here would mean a second buffer across
 // the bus for the hidden state the caller already has.
+// DraftMTP drafts at a text position. DraftMTPAt is the same for a draft whose
+// axes do not follow the cache index.
 func (p *QwenPipeline) DraftMTP(eh []float32, pos int) ([]float32, error) {
+	return p.DraftMTPAt(eh, QwenPlace{Pos: pos, T: pos, H: pos, W: pos})
+}
+
+func (p *QwenPipeline) DraftMTPAt(eh []float32, at QwenPlace) ([]float32, error) {
+	pos := at.Pos
 	s := p.shape
 	if p.mtp == nil {
 		return nil, fmt.Errorf("vk: the pipeline carries no prediction block")
@@ -1833,7 +1925,7 @@ func (p *QwenPipeline) DraftMTP(eh []float32, pos int) ([]float32, error) {
 		return nil, fmt.Errorf("vk: position %d is past the %d the pipeline was built for", pos, s.MaxContext)
 	}
 	copy(p.mtp.ehIn.Floats(), eh)
-	p.setPos(pos)
+	p.setPlace(at)
 
 	if p.mtp.pass == nil {
 		prog, err := p.d.Compile(p.recordMTP)
@@ -1860,6 +1952,7 @@ func (p *QwenPipeline) recordMTP(r *Recorder) {
 
 	r.Copy(b.ehBuf, 0, b.ehIn, s.Dim*2*4)
 	r.Copy(p.posBuf, 0, p.posIn, 4)
+	r.Copy(p.mposBuf, 0, p.mposIn, 16)
 	r.Barrier()
 
 	r.Dispatch(b.setEH, matvecGroups(s.Dim), unsafe.Pointer(&eh))

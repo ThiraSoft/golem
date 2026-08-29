@@ -30,6 +30,11 @@ layout(std430, binding = 7)           buffer VCache { float vCache[]; };
 // for every token cost 2.4 milliseconds of a 36-millisecond token, on the CPU,
 // with the card waiting.
 layout(std430, binding = 8) readonly buffer Pos { uint posv[]; };
+// The rotation's axes, one uvec4 a column: t, h, w, and the axis a vision
+// encoder would turn by. It is a second buffer rather than a widening of Pos,
+// because Pos is the cache index and the two are not the same number — an
+// image gives several columns one t while Pos goes on rising.
+layout(std430, binding = 9) readonly buffer MPos { uvec4 mposv[]; };
 
 layout(push_constant) uniform Push {
     uint maxContext;
@@ -38,6 +43,10 @@ layout(push_constant) uniform Push {
     float ropeBase;
     float eps;
     uint ropeDims;   // 64
+    uint sect0;      // the M-RoPE section widths; all zero means none
+    uint sect1;
+    uint sect2;
+    uint sect3;
 } p;
 
 // One workgroup a head, one column of the pass on the second axis. Every
@@ -47,6 +56,27 @@ layout(push_constant) uniform Push {
 
 shared float partial[8];
 shared float invRMS;
+
+// Which of the four axes pair `pair` turns by, and the position it reads.
+//
+// This is ggml_mrope_cache_init under GGML_ROPE_TYPE_IMROPE: the pairs take
+// the axes in turn — t, h, w, t, h, w — each section stopping once it has had
+// its share. The frequency is not part of the choice: pair i turns at
+// base^(-2i/ropeDims) whichever axis it reads, which is what makes equal axes
+// give exactly the scalar rotation rather than nearly.
+//
+// Sections that sum to zero mean a checkpoint that declares none, and take the
+// cache index the way this shader always did.
+float mropeAt(uint pair, uint scalarPos) {
+    uint sect = p.sect0 + p.sect1 + p.sect2 + p.sect3;
+    if (sect == 0u) return float(scalarPos);
+    uvec4 mp = mposv[COL];
+    uint sector = pair % sect;
+    if      (sector % 3u == 1u && sector < 3u * p.sect1) return float(mp.y);
+    else if (sector % 3u == 2u && sector < 3u * p.sect2) return float(mp.z);
+    else if (sector % 3u == 0u && sector < 3u * p.sect0) return float(mp.x);
+    else                                                 return float(mp.w);
+}
 
 // rmsOf folds the squares of a 256-wide head across the workgroup.
 float rmsOf(float val, float eps) {
@@ -73,7 +103,7 @@ void main() {
 
         if (j < p.ropeDims) {
             uint pair = j % half_;
-            float angle = float(pos) * pow(p.ropeBase, -float(pair * 2u) / float(p.ropeDims));
+            float angle = mropeAt(pair, pos) * pow(p.ropeBase, -float(pair * 2u) / float(p.ropeDims));
             float cosA = cos(angle);
             float sinA = sin(angle);
             uint otherJ = (j < half_) ? (j + half_) : (j - half_);
@@ -91,7 +121,7 @@ void main() {
 
         if (j < p.ropeDims) {
             uint pair = j % half_;
-            float angle = float(pos) * pow(p.ropeBase, -float(pair * 2u) / float(p.ropeDims));
+            float angle = mropeAt(pair, pos) * pow(p.ropeBase, -float(pair * 2u) / float(p.ropeDims));
             float cosA = cos(angle);
             float sinA = sin(angle);
             uint otherJ = (j < half_) ? (j + half_) : (j - half_);
