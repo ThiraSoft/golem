@@ -45,6 +45,7 @@ func main() {
 	clamp := flag.Float64("clamp", 24, "largest factor the salience may scale a column by, either way; 0 lets it run")
 	hadGroup := flag.Int("hadamard", 128, "rotation group; 0 leaves the weights unrotated")
 	beta := flag.Float64("beta", 2, "how far a block is scaled up before rounding")
+	codebook := flag.String("codebook", "d4", "d4 for the lattice in a table, lloyd for eight levels in registers")
 	codeBits := flag.Int("bits", 12, "code width: 12 for the ordinary tier, 16 for the wide one")
 	scaleBlk := flag.Int("scale", 32, "weights sharing one step code; 32 is what the format stores")
 	ntok := flag.Int("tokens", 8192, "calibration tokens")
@@ -91,6 +92,18 @@ func main() {
 	dtype := "D4G"
 	if *codeBits == nn.D4Bits16 {
 		dtype = "D4G16"
+	}
+	lloyd := *codebook == "lloyd"
+	if lloyd {
+		dtype = "L8G"
+		if !flagWasSet("beta") {
+			// The levels are a unit Gaussian's, so a block's step is its RMS
+			// rather than a fraction of it. The lattice wants the block scaled
+			// up into its shell; this wants it left where it is.
+			params.Beta = 1
+		}
+	} else if *codebook != "d4" {
+		must(fmt.Errorf("golemquant: %q is not a codebook", *codebook))
 	}
 
 	// One vector a site: the sign flips of the rotation over the salience
@@ -279,7 +292,11 @@ func main() {
 		var data []byte
 		for e := 0; e < stack; e++ {
 			slice := w[e*rows*cols : (e+1)*rows*cols]
-			data = append(data, compress.EncodeD4G(slice, rows, cols, q, p, comp)...)
+			if lloyd {
+				data = append(data, compress.EncodeL8G(slice, rows, cols, q, p)...)
+			} else {
+				data = append(data, compress.EncodeD4G(slice, rows, cols, q, p, comp)...)
+			}
 		}
 		note := ""
 		if *report {
@@ -287,7 +304,9 @@ func main() {
 			// theoretical floor for a memoryless Gaussian at this rate is
 			// about seventeen decibels, so this says how much of the gap is
 			// the quantizer's own and how much is everything else.
-			e := compress.RelErrD4G(w, rows, cols, q, p, data)
+			// The first expert of a stack, or the whole of a plain matrix.
+			kind, _ := nn.QuantOf(dtype)
+			e := compress.RelErr(w[:rows*cols], rows, cols, q, p, data[:len(data)/stack], kind)
 			note = fmt.Sprintf("  rel %.4f  %.2f dB", e, -20*math.Log10(float64(e)))
 		}
 		out = append(out, tensors.OutTensor{Name: name, Shape: t.Shape,
@@ -582,6 +601,18 @@ func expand(t tensors.Tensor) ([]float32, error) {
 		}
 	})
 	return out, nil
+}
+
+// flagWasSet says whether the command line named a flag, so that a default
+// chosen for one codebook is not imposed on a caller who chose another.
+func flagWasSet(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }
 
 // kept says whether a tensor is one of those a probe is leaving alone, so that

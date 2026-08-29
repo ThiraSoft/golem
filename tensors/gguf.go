@@ -214,6 +214,7 @@ var ggmlTypes = map[uint32]string{
 	30: "BF16",
 	// golem's own, which llama.cpp will not recognise and is not meant to.
 	1000: "D4G",
+	1001: "L8G",
 	1002: "D4G16",
 }
 
@@ -231,6 +232,7 @@ var blockGeometry = map[string][2]int{
 	"Q6_K":  {256, 210}, // 128 low nibbles, 64 high pairs, 16 scales, one fp16
 	"D4G":   {64, 26},   // two step codes, then sixteen twelve-bit lattice codes
 	"D4G16": {64, 34},   // the same with sixteen-bit codes
+	"L8G":   {64, 26},   // two step codes, then sixty-four three-bit levels
 }
 
 // rowBytes is the size on disk of one row of `n` weights of the given type.

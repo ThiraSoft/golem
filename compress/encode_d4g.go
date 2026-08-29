@@ -284,7 +284,16 @@ func EncodeD4G(w []float32, rows, cols int, q []float32, p D4Params, comp *Comp)
 // quantizer's own error and nothing else's, which is what says whether there is
 // room left in the quantizer or only in what surrounds it.
 func RelErrD4G(w []float32, rows, cols int, q []float32, p D4Params, data []byte) float64 {
-	stride := cols / nn.D4Block * nn.D4BlockBytes(p.Width())
+	kind := nn.D4G
+	if p.Width() == nn.D4Bits16 {
+		kind = nn.D4G16
+	}
+	return RelErr(w, rows, cols, q, p, data, kind)
+}
+
+// RelErr is the same for whichever of the formats wrote the bytes.
+func RelErr(w []float32, rows, cols int, q []float32, p D4Params, data []byte, kind nn.Quant) float64 {
+	m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols}
 	var num, den float64
 	row := make([]float32, cols)
 	rec := make([]float32, cols)
@@ -293,7 +302,7 @@ func RelErrD4G(w []float32, rows, cols int, q []float32, p D4Params, data []byte
 		if q != nil {
 			nn.PrepareD4G(row, q, p.HadGroup)
 		}
-		nn.DequantizeD4GN(data[r*stride:(r+1)*stride], cols, p.Width(), rec)
+		m.Row(r, rec)
 		for j := range row {
 			d := float64(row[j] - rec[j])
 			num += d * d
