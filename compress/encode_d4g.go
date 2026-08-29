@@ -28,19 +28,43 @@ func nearestInShell(x, out []float32) {
 	if coded(out) {
 		return
 	}
-	var tmp [4]float32
-	for s := float32(0.92); s > 0.05; s *= 0.92 {
+	// Past the shell. Pulling x towards the origin lands on points that are
+	// coded, but the first one that fits is not the closest one that fits —
+	// the ray does not pass through the best point of a lattice — so every
+	// pull that lands somewhere codeable is a candidate and the nearest of
+	// them wins. About one subvector in twenty-five comes through here, and
+	// they are the ones carrying the largest errors.
+	var tmp, best [4]float32
+	bestD := float32(math.MaxFloat32)
+	for s := float32(0.97); s > 0.05; s *= 0.97 {
 		for i := range x {
 			tmp[i] = x[i] * s
 		}
 		nearestDn(tmp[:], out)
-		if coded(out) {
-			return
+		if !coded(out) {
+			continue
+		}
+		var d float32
+		for i := range x {
+			e := x[i] - out[i]
+			d += e * e
+		}
+		if d < bestD {
+			bestD = d
+			copy(best[:], out)
+		}
+		if s < 0.5 {
+			// Far enough in that nothing closer is going to turn up.
+			break
 		}
 	}
-	for i := range out {
-		out[i] = 0
+	if bestD == float32(math.MaxFloat32) {
+		for i := range out {
+			out[i] = 0
+		}
+		return
 	}
+	copy(out, best[:])
 }
 
 func coded(p []float32) bool {

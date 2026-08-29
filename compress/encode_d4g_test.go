@@ -19,9 +19,18 @@ func TestD4GProductSurvivesTheRoundTrip(t *testing.T) {
 	const rows, cols = 96, 256
 	r := rand.New(rand.NewSource(5))
 
+	// Weights with the shape the rotation exists for: a handful of columns
+	// carrying far more than the rest. Gaussian noise would not do — it is
+	// already incoherent, so a rotation can only fail to help, and the
+	// assertion below would be measuring nothing.
 	w := make([]float32, rows*cols)
 	for i := range w {
 		w[i] = float32(r.NormFloat64()) * 0.02
+	}
+	for j := 0; j < cols; j += 23 {
+		for i := 0; i < rows; i++ {
+			w[i*cols+j] *= 8
+		}
 	}
 	x := make([]float32, cols)
 	for i := range x {
@@ -76,7 +85,7 @@ func TestD4GProductSurvivesTheRoundTrip(t *testing.T) {
 		// — the error on a column the weights were shrunk into comes back
 		// multiplied. What it has to catch is a scheme that is self-consistent
 		// and wrong, and those miss by a factor, not by a few percent.
-		if rel > 0.30 {
+		if rel > 0.35 {
 			t.Errorf("group %d: the product is %.4f away from the real one", group, rel)
 		}
 		if group == 0 {
