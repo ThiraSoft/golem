@@ -219,8 +219,17 @@ func openQwen35(g *tensors.GGUF, maxContext int) (*Model, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The three identifiers a picture is written with. The vocabulary is opened
+	// here and not inside the engine, so this is where the engine is told.
+	if start, ok := vocab.ID(qwen35.VisionStart); ok {
+		if pad, ok := vocab.ID(qwen35.ImagePad); ok {
+			if end, ok := vocab.ID(qwen35.VisionEnd); ok {
+				inner.SetVisionMarkers(start, pad, end)
+			}
+		}
+	}
 	return &Model{
-		Forward: inner, Vocab: vocab, Template: qwen.NewTemplate(&qwen.Config{}),
+		Forward: inner, Vocab: vocab, Template: qwen35.NewTemplate(),
 		Window: 0, Vocabulary: inner.Cfg.Vocab,
 		Blocks: len(inner.Cfg.Blocks), Sampling: inner.Cfg.Sampling,
 		closer: inner,

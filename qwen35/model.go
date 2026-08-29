@@ -33,6 +33,17 @@ type Model struct {
 
 	// vision is nil until a projector is opened. The tower runs once per
 	// image and shares nothing with the text path.
+	// imagePadID is the vocabulary's placeholder for one row of a picture,
+	// which the engine is told rather than looks up: the vocabulary is opened
+	// beside the model and not inside it.
+	visionStartID int32
+	imagePadID    int32
+	visionEndID   int32
+
+	// grids are the shapes the pictures encoded since the last prompt came
+	// from, in that order. A row count does not say which way round a grid was.
+	grids [][2]int
+
 	vision *VisionTower
 }
 
@@ -220,6 +231,29 @@ func (m *Model) ForwardPlaces(tokens []int32, at []Place) [][]float32 {
 		out[t] = m.step(tok, at[t])
 	}
 	return out
+}
+
+// stepEmbedded is step for a position whose embedding is given rather than
+// looked up, which is how a picture's rows reach the model.
+func (m *Model) stepEmbedded(row []float32, at Place) []float32 {
+	copy(m.x, row)
+
+	if m.gpuPipe != nil {
+		h, err := m.gpuPipe.ForwardPlaces([][]float32{m.x}, []vk.QwenPlace{at.gpu()})
+		if err != nil {
+			panic(fmt.Sprintf("qwen35: the GPU pipeline failed at position %d: %v", at.Pos, err))
+		}
+		copy(m.x, m.gpuPipe.Hidden())
+		return append([]float32(nil), h[0]...)
+	}
+
+	for i, n := 0, m.trunk(); i < n; i++ {
+		Block(m.Cfg, m.Cfg.Blocks[i], &m.W.Blocks[i], &m.cache.Blocks[i], m.rope, at, m.x, m.scratch)
+	}
+	h := make([]float32, m.Cfg.Dim)
+	copy(h, m.x)
+	nn.RMSNormPlain(h, m.W.OutputNorm, m.Cfg.Eps)
+	return h
 }
 
 // step is one token through the trunk. The hidden state it returns is a fresh

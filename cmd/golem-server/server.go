@@ -18,7 +18,6 @@ import (
 
 	"github.com/ThiraSoft/golem/chat"
 	"github.com/ThiraSoft/golem/engine"
-	"github.com/ThiraSoft/golem/gemma"
 	"github.com/ThiraSoft/golem/sample"
 )
 
@@ -141,7 +140,7 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 
 	// The rendered conversation carries an empty pair of markers where each
 	// picture and each recording goes, and the rows go between them.
-	built := &gemma.Prompt{Tokens: ids}
+	built := engine.TextPrompt(ids)
 	if seen, heard := carriesImages(req.Messages), carriesAudio(req.Messages); seen || heard {
 		if seen && (s.vision == nil || !s.vision.CanSee()) {
 			refuse(w, http.StatusBadRequest, "invalid_request_error",
@@ -173,7 +172,7 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 			refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
-		ids = built.Tokens
+		ids = built.Tokens()
 	}
 	slot, waited, err := s.pool.Acquire(r.Context(), ids)
 	if err != nil {

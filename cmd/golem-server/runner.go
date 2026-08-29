@@ -65,13 +65,15 @@ type pass struct {
 	positions []int
 	logits    []float32     // where to score the last token, or nil for a chunk
 	reply     chan struct{} // closed once the pass has run
-	// A conversation carrying a picture brings three more things: the rows to
-	// use instead of the embedding table, the identifiers the per-layer inputs
-	// are looked up with, and how far forward each position may attend. They
-	// are nil for text, and a batch with none of them takes the plain path.
+	// A conversation carrying a picture brings more than its tokens: the rows
+	// to use instead of the embedding table, and then whatever its engine
+	// needs beside them — Gemma's per-layer identifiers and how far forward
+	// each position may attend, or Qwen3.8's three rotation axes. They are nil
+	// for text, and a batch with none of them takes the plain path.
 	embeds [][]float32
 	ple    []int32
 	until  []int
+	axes   [][3]int
 }
 
 // aside is anything else the model has to do, which cannot overlap a pass:
@@ -171,9 +173,9 @@ func (r *Runner) Forward(slot int, tokens []int32, positions []int, logits []flo
 
 // ForwardEmbedded is the same, for a chunk that carries a picture.
 func (r *Runner) ForwardEmbedded(slot int, tokens []int32, embeds [][]float32, ple []int32,
-	positions, until []int, logits []float32) {
+	positions, until []int, axes [][3]int, logits []float32) {
 	p := &pass{slot: slot, tokens: tokens, positions: positions, logits: logits,
-		embeds: embeds, ple: ple, until: until, reply: make(chan struct{})}
+		embeds: embeds, ple: ple, until: until, axes: axes, reply: make(chan struct{})}
 	r.passes <- p
 	<-p.reply
 }
@@ -253,6 +255,7 @@ func (r *Runner) run(batch []*pass) {
 	var slots, at, until []int
 	var embeds [][]float32
 	var ple []int32
+	var axes [][3]int
 	pictures := false
 	for _, p := range batch {
 		tokens = append(tokens, p.tokens...)
@@ -265,6 +268,13 @@ func (r *Runner) run(batch []*pass) {
 			embeds = append(embeds, p.embeds...)
 			ple = append(ple, p.ple...)
 			until = append(until, p.until...)
+			if p.axes != nil {
+				axes = append(axes, p.axes...)
+			} else {
+				for _, q := range p.positions {
+					axes = append(axes, [3]int{q, q, q})
+				}
+			}
 			continue
 		}
 		// A pass with no picture still has to fill the three parallel slices,
@@ -273,6 +283,7 @@ func (r *Runner) run(batch []*pass) {
 			embeds = append(embeds, nil)
 			ple = append(ple, p.tokens[i])
 			until = append(until, p.positions[i])
+			axes = append(axes, [3]int{p.positions[i], p.positions[i], p.positions[i]})
 		}
 	}
 	if debugBatches {
@@ -282,7 +293,10 @@ func (r *Runner) run(batch []*pass) {
 	start := time.Now()
 	var states [][]float32
 	if pictures {
-		states = r.vision.ForwardEmbeddedSlots(tokens, embeds, ple, slots, at, until)
+		states = r.vision.ForwardChunk(engine.Chunk{
+			Tokens: tokens, Embeds: embeds, Slots: slots, Positions: at,
+			PLE: ple, Until: until, Axes: axes,
+		})
 	} else {
 		states = r.engine.ForwardSlots(tokens, slots, at)
 	}

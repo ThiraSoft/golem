@@ -108,7 +108,7 @@ func ask(t *testing.T, m *Model, media Media, sound []byte, question string, mos
 	hidden := media.ForwardPrompt(p, 0)
 	last := hidden[len(hidden)-1]
 	logits := make([]float32, m.Vocabulary)
-	pos := len(p.Tokens)
+	pos := p.Len()
 	var b strings.Builder
 	for i := 0; i < most; i++ {
 		m.Forward.Logits(last, logits)

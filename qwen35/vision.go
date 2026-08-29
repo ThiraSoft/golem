@@ -171,6 +171,12 @@ func (m *Model) Vision() *VisionTower { return m.vision }
 
 // EncodeImage decodes one encoded image and runs the tower over it. What comes
 // back is one row per output token, each as wide as the model's embedding.
+//
+// The grid each picture came from is kept beside the rows, because a row count
+// does not say what shape it was — two hundred and sixty rows is twenty by
+// thirteen or thirteen by twenty, and the positions differ. GridOf reads them
+// back in the order they were encoded, and BuildPrompt clears the list once it
+// has used them.
 func (m *Model) EncodeImage(data []byte) ([][]float32, error) {
 	if m.vision == nil {
 		return nil, fmt.Errorf("qwen35: this model was opened without a projector")
@@ -179,5 +185,18 @@ func (m *Model) EncodeImage(data []byte) ([][]float32, error) {
 	if err != nil {
 		return nil, err
 	}
-	return m.vision.Encode(im), nil
+	cfg := m.vision.Cfg
+	width, height := cfg.TargetSize(im.W, im.H)
+	rows := m.vision.Encode(im)
+	m.grids = append(m.grids, [2]int{width / cfg.Patch / cfg.Merge, height / cfg.Patch / cfg.Merge})
+	return rows, nil
+}
+
+// GridOf is the merged grid the i-th picture encoded since the last prompt was
+// built came from.
+func (m *Model) GridOf(i int) ([2]int, bool) {
+	if i < 0 || i >= len(m.grids) {
+		return [2]int{}, false
+	}
+	return m.grids[i], true
 }

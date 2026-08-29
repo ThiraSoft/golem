@@ -14,11 +14,11 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ThiraSoft/golem/gemma"
+	"github.com/ThiraSoft/golem/engine"
 	"github.com/ThiraSoft/golem/sample"
 )
 
-func (s *Server) stream(ctx context.Context, w http.ResponseWriter, gen *Generator, id string, prompt *gemma.Prompt, p sample.Params, stop []string) {
+func (s *Server) stream(ctx context.Context, w http.ResponseWriter, gen *Generator, id string, prompt engine.Prompt, p sample.Params, stop []string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		refuse(w, http.StatusInternalServerError, "server_error", "this connection cannot be streamed to")

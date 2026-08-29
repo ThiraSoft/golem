@@ -18,7 +18,6 @@ import (
 
 	"github.com/ThiraSoft/golem/chat"
 	"github.com/ThiraSoft/golem/engine"
-	"github.com/ThiraSoft/golem/gemma"
 	"github.com/ThiraSoft/golem/qwen35"
 	"github.com/ThiraSoft/golem/sample"
 )
@@ -201,13 +200,13 @@ func (s *Session) AskWithMedia(text string, images, audio [][]byte, w io.Writer)
 	// The rendered conversation carries an empty pair of markers where each
 	// picture goes; the soft tokens go between them, and what comes back is
 	// the prompt the model actually reads.
-	var prompt *gemma.Prompt
+	var prompt engine.Prompt
 	if s.vision != nil {
 		p, err := s.vision.Prompt(ids, s.encoded, s.heard)
 		if err != nil {
 			return Turn{}, err
 		}
-		prompt, ids = p, p.Tokens
+		prompt, ids = p, p.Tokens()
 	}
 	if len(ids) >= s.maxContext {
 		return Turn{}, fmt.Errorf("the conversation no longer fits in %d positions: pass a larger -context, or start again", s.maxContext)

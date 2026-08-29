@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ThiraSoft/golem/gemma"
+	"github.com/ThiraSoft/golem/engine"
 )
 
 // Vocabulary is the part of engine.Vocabulary the server uses — Gemma's
@@ -81,13 +81,13 @@ func (c *Context) Pos() int { return len(c.held) }
 // Prefill brings the cache up to ids, scores the last position into logits,
 // and returns how many positions it had to feed.
 func (c *Context) Prefill(ids []int32, logits []float32) (int, error) {
-	return c.PrefillPrompt(&gemma.Prompt{Tokens: ids}, logits)
+	return c.PrefillPrompt(engine.TextPrompt(ids), logits)
 }
 
 // PrefillPrompt is the same for a prompt that may hold pictures: the rows go
 // in where the soft tokens are, and a batch is never cut inside one.
-func (c *Context) PrefillPrompt(p *gemma.Prompt, logits []float32) (int, error) {
-	ids := p.Tokens
+func (c *Context) PrefillPrompt(p engine.Prompt, logits []float32) (int, error) {
+	ids := p.Tokens()
 	if len(ids) == 0 {
 		return 0, fmt.Errorf("serve: an empty prompt")
 	}
@@ -126,12 +126,13 @@ func (c *Context) PrefillPrompt(p *gemma.Prompt, logits []float32) (int, error) 
 		if to == len(ids) {
 			out = logits
 		}
-		if len(p.Spans) == 0 {
+		if p.Embeds() == nil {
 			c.runner.Forward(c.slot, ids[at:to], span(at, to-at), out)
 		} else {
 			chunk := p.Slice(at, to)
-			c.runner.ForwardEmbedded(c.slot, chunk.Tokens, chunk.Embeds, chunk.PLE,
-				span(at, to-at), chunk.Until(at), out)
+			ple, until, axes := chunk.Extras(at)
+			c.runner.ForwardEmbedded(c.slot, chunk.Tokens(), chunk.Embeds(), ple,
+				span(at, to-at), until, axes, out)
 		}
 		at = to
 	}
