@@ -40,6 +40,8 @@ type ssmGatePush struct {
 	Eps   float32
 }
 
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q4k.comp -o shaders/matvec_q4k.spv
+
 //go:embed shaders/matvec_q4k.spv
 var matvecQ4KSPIRV []byte
 

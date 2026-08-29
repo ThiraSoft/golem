@@ -87,21 +87,26 @@ void main() {
         // qs: 128 bytes = 32 uints (offsets +4 .. +35)
         uint qsOffset = sbOffset + 4u;
 
+        // Two sub-blocks share thirty-two bytes — eight words — of qs: the
+        // even one takes their low nibbles and the odd one their high
+        // nibbles, each with its own scale and minimum. Reading sixteen bytes
+        // a sub-block and giving both nibbles of a byte to the same scale, as
+        // this did, is a different sixteen weights and the wrong scale for
+        // half of them. nn/dequant_q4_k.go is the same format read the same
+        // way, and TestQ4_KMatchesGGML holds that one to ggml's own.
         for (uint i = 0u; i < 8u; i++) {
             float d1 = d * float(sc[i]);
             float m1 = dmin * float(m[i]);
-            uint chunkBase = qsOffset + i * 4u;
+            uint chunkBase = qsOffset + (i / 2u) * 8u;
+            uint shift = (i & 1u) * 4u;
             uint chunkX = xOffset + i * 32u;
 
-            for (uint l = 0u; l < 4u; l++) {
+            for (uint l = 0u; l < 8u; l++) {
                 uint word = w[chunkBase + l];
                 for (uint b = 0u; b < 4u; b++) {
                     uint byteVal = (word >> (b * 8u)) & 0xFFu;
-                    float low = float(byteVal & 0x0Fu) * d1 - m1;
-                    float high = float(byteVal >> 4u) * d1 - m1;
-
-                    sum += low * x[chunkX + (l * 4u + b)];
-                    sum += high * x[chunkX + (l * 4u + b) + 16u];
+                    float q = float((byteVal >> shift) & 0x0Fu) * d1 - m1;
+                    sum += q * x[chunkX + (l * 4u + b)];
                 }
             }
         }

@@ -38,15 +38,25 @@ func DequantizeQ4_K(w []byte, n int, out []float32) {
 			m[j] = (scalesRaw[j+4] >> 4) | ((scalesRaw[j] >> 6) << 4)
 		}
 
+		// Two sub-blocks share thirty-two bytes of qs: the even one takes
+		// their low nibbles and the odd one their high nibbles, over the same
+		// thirty-two positions and with its own scale and minimum.
+		//
+		// This used to read sixteen consecutive bytes a sub-block and give
+		// both nibbles of each byte to the same scale, which is a different
+		// sixteen weights and the wrong scale for half of them. Q5_K carried
+		// the identical mistake until a test held it to the reference;
+		// dequant_q5_k.go still says so. Q4_K had no test, so it kept it.
+		// ggml-quants.c's dequantize_row_q4_K is the definition and
+		// TestQ4_KMatchesGGML holds this to it.
 		for i := 0; i < 8; i++ {
 			d1 := d * float32(sc[i])
 			m1 := dmin * float32(m[i])
-			qSub := qs[i*16 : (i+1)*16]
-			for l := 0; l < 16; l++ {
-				low := qSub[l] & 0xF
-				high := qSub[l] >> 4
-				dst[i*32+l] = float32(low)*d1 - m1
-				dst[i*32+l+16] = float32(high)*d1 - m1
+			qSub := qs[(i/2)*32 : (i/2)*32+32]
+			shift := uint(4 * (i & 1))
+			base := i * 32
+			for l := 0; l < 32; l++ {
+				dst[base+l] = float32((qSub[l]>>shift)&0xF)*d1 - m1
 			}
 		}
 	}
