@@ -290,3 +290,44 @@ func RelErrD4G(w []float32, rows, cols int, q []float32, p D4Params, data []byte
 	}
 	return math.Sqrt(num / den)
 }
+
+// EnergyD4G is what a matrix's quantization costs the product it sits in,
+// relative to what the product is: ‖(W-Ŵ)X‖² over ‖WX‖², estimated from the
+// activations the accumulator saw.
+//
+// The difference is measured in the basis the weights were written in and then
+// carried back to the one the activations were measured in, because that is
+// where the Hessian lives. Which is also why pre is needed and not just q: the
+// two are reciprocal, and undoing a rotation is not the same as applying it.
+func EnergyD4G(w []float32, rows, cols int, q, pre []float32, p D4Params, data []byte, a *Acc) (float64, float64) {
+	stride := cols / nn.D4Block * 26
+	nums := make([]float64, rows)
+	dens := make([]float64, rows)
+	Parallel(rows, func(lo, hi int) {
+		row := make([]float32, cols)
+		rec := make([]float32, cols)
+		d := make([]float32, cols)
+		for r := lo; r < hi; r++ {
+			copy(row, w[r*cols:(r+1)*cols])
+			if q != nil {
+				nn.PrepareD4G(row, q, p.HadGroup)
+			}
+			nn.DequantizeD4G(data[r*stride:(r+1)*stride], cols, rec)
+			for j := range d {
+				d[j] = row[j] - rec[j]
+			}
+			if pre != nil {
+				nn.UnprepareD4G(d, pre, p.HadGroup)
+			}
+			nums[r] = a.Energy(d)
+			copy(d, w[r*cols:(r+1)*cols])
+			dens[r] = a.Energy(d)
+		}
+	})
+	var num, den float64
+	for r := range nums {
+		num += nums[r]
+		den += dens[r]
+	}
+	return num, den
+}

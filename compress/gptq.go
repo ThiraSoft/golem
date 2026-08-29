@@ -114,7 +114,10 @@ func (a *Acc) Comp(damp float64) *Comp {
 	Parallel(len(a.blocks), func(lo, hi int) {
 		for k := lo; k < hi; k++ {
 			m := a.sizes[k]
-			h := a.blocks[k]
+			// A copy, because only the upper triangle was accumulated and
+			// Energy still wants it that way.
+			h := make([]float32, m*m)
+			copy(h, a.blocks[k])
 			for i := 0; i < m; i++ {
 				for j := 0; j < i; j++ {
 					h[i*m+j] = h[j*m+i]
@@ -272,3 +275,43 @@ func cholUpper(a []float32, n int) bool {
 	}
 	return true
 }
+
+// Energy is what one row's error costs the product: dᵀHd summed over the
+// windows, where d is the difference between the row and what was stored, in
+// the basis the activations were measured in.
+//
+// This is the number the salience is chosen against. Weight error is not: the
+// whole point of scaling a column is to move error from where the activations
+// are large to where they are small, and a metric that weighs every column
+// alike cannot see that happening. The windows drop the correlation between
+// columns more than a few hundred apart, which is the same approximation the
+// compensation makes and for the same reason.
+func (a *Acc) Energy(d []float32) float64 {
+	var total float64
+	for k := range a.blocks {
+		m := a.sizes[k]
+		h := a.blocks[k]
+		v := d[k*a.window : k*a.window+m]
+		var s float64
+		for i := 0; i < m; i++ {
+			vi := float64(v[i])
+			if vi == 0 {
+				continue
+			}
+			hi := h[i*m : i*m+m]
+			// The upper triangle is what was accumulated; the diagonal counts
+			// once and everything above it twice.
+			s += vi * float64(hi[i]) * vi
+			var off float64
+			for j := i + 1; j < m; j++ {
+				off += float64(hi[j]) * float64(v[j])
+			}
+			s += 2 * vi * off
+		}
+		total += s
+	}
+	return total
+}
+
+// Rows is how many activations went into the Hessian.
+func (a *Acc) Rows() int { return a.rows }

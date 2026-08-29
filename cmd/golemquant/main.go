@@ -50,6 +50,9 @@ func main() {
 	ctx := flag.Int("ctx", 512, "calibration window")
 	calibFile := flag.String("calib", "", "text to calibrate on; a built-in paragraph when empty")
 	embd := flag.String("embd", "rot", "how to store token_embd: rot, plain or bf16")
+	search := flag.Bool("search", false, "choose the salience of each site by the output error it leaves")
+	sample := flag.Int("sample", 128, "rows a site's salience is chosen on")
+	swin := flag.Int("swin", 256, "how many columns the search's Hessian keeps together")
 	report := flag.Bool("report", false, "print what each matrix's codes cost it")
 	keep := flag.String("keep", "", "comma-separated tensor name fragments left in BF16")
 	window := flag.Int("gptq", 0, "error-compensation window in columns; 0 turns it off")
@@ -62,7 +65,11 @@ func main() {
 		must(err)
 		text = string(b)
 	}
-	salience := calibrate(*src, text, *ntok, *ctx)
+	win := *window
+	if *search && win < *swin {
+		win = *swin
+	}
+	salience, accs := calibrate(*src, text, *ntok, *ctx, win, *scaleBlk)
 
 	g, err := tensors.OpenGGUF(*src)
 	must(err)
@@ -83,26 +90,77 @@ func main() {
 	signs := map[int][]float32{}
 	pre := map[string][]float32{}    // what the activations meet
 	weight := map[string][]float32{} // its reciprocal, what the weights meet
-	for key, sal := range salience {
+	build := func(key string, alpha, clamp float64) ([]float32, []float32) {
+		sal := salience[key]
 		cols := len(sal)
 		if signs[cols] == nil {
 			signs[cols] = compress.RandomSigns(cols, int64(cols)*7919)
 		}
-		s := saliencyScale(sal, *alpha, *clamp)
+		sc := saliencyScale(sal, alpha, clamp)
 		p := make([]float32, cols)
 		q := make([]float32, cols)
-		for j := range s {
-			q[j] = signs[cols][j] * s[j]
+		for j := range sc {
+			q[j] = signs[cols][j] * sc[j]
 			p[j] = 1 / q[j]
 		}
-		pre[key], weight[key] = p, q
-		if *report {
-			lo, hi := math.Inf(1), 0.0
-			for _, v := range s {
-				lo, hi = math.Min(lo, float64(v)), math.Max(hi, float64(v))
-			}
-			fmt.Printf("  salience %-10s %8.2e to %8.2e, a span of %.0f\n", key, lo, hi, hi/lo)
+		return p, q
+	}
+	for key := range salience {
+		pre[key], weight[key] = build(key, *alpha, *clamp)
+	}
+
+	// A site's salience is a guess at how to move error away from the columns
+	// the activations use most, and a guess can be checked. With -search each
+	// site tries a few exponents and bounds on a sample of one of its matrices
+	// and keeps the one that leaves the product closest — measured against the
+	// activations themselves, because weight error cannot see the trade the
+	// scaling is making.
+	//
+	// It is off, because it does not work. Over six settings of the sample and
+	// the window — 32, 128 and 512 rows against Hessians 256 and 1024 columns
+	// wide — Qwen3-0.6B reads 39.20, 40.23, 39.64, 39.75, 39.94 and 39.64, a
+	// mean of 39.73 either side of the 39.80 that one bound chosen for the
+	// whole model gives. The spread is the choosing, not the choice: a metric
+	// that ranks candidates by a windowed Hessian over a sample of rows is
+	// noisier than the differences between the candidates, so the search picks
+	// a different winner each time and lands where it started. The first run
+	// read 39.20 and it would have been easy to keep only that one.
+	//
+	// What survives is the machinery — Acc.Energy and EnergyD4G measure what a
+	// matrix costs the product rather than what it costs the weights, and that
+	// is the right question whatever asks it next.
+	type cand struct{ alpha, clamp float64 }
+	// A narrow grid on purpose. Widening it to eighteen candidates reaching an
+	// exponent of 1 and bounds of 4 and 96 makes the answer worse — 40.42
+	// against 39.20 on Qwen3-0.6B, and 41.30 with three times the sample, so
+	// it is not the sample. The windowed Hessian cannot see what an aggressive
+	// scaling moves beyond its own window, so it ranks the extremes too well
+	// and the search believes it. The grid is kept to the range the metric can
+	// be trusted over.
+	cands := []cand{{0.5, 0}, {0.35, 24}, {0.5, 12}, {0.5, 24}, {0.5, 48}, {0.65, 12}, {0.65, 24}, {0.8, 8}}
+	searched := map[string]bool{}
+	pickSalience := func(key string, w []float32, rows, cols int) {
+		if !*search || searched[key] || accs[key] == nil {
+			return
 		}
+		searched[key] = true
+		n := *sample
+		if n > rows {
+			n = rows
+		}
+		p := params
+		best, bestAt := math.Inf(1), cand{*alpha, *clamp}
+		for _, c := range cands {
+			pv, qv := build(key, c.alpha, c.clamp)
+			data := compress.EncodeD4G(w[:n*cols], n, cols, qv, p, nil)
+			num, den := compress.EnergyD4G(w[:n*cols], n, cols, qv, pv, p, data, accs[key])
+			if e := num / den; e < best {
+				best, bestAt = e, c
+			}
+		}
+		pre[key], weight[key] = build(key, bestAt.alpha, bestAt.clamp)
+		fmt.Printf("  salience %-10s alpha %.2f bound %4.0f, output error %.4f\n",
+			key, bestAt.alpha, bestAt.clamp, math.Sqrt(best))
 	}
 
 	// The second pass. The Hessian of a site is what says how to spend the
@@ -164,6 +222,10 @@ func main() {
 		if q == nil {
 			p.HadGroup = 0
 			key = ""
+		}
+		pickSalience(key, w, rows, cols)
+		if key != "" {
+			q = weight[key]
 		}
 		comp := comps[key]
 		data := compress.EncodeD4G(w, rows, cols, q, p, comp)
@@ -250,12 +312,13 @@ func runCalib(path, text string, ntok, ctx int, hook func(int, string, [][]float
 // calibrate keeps, for each site, the per-column power of the activations that
 // reach it. That is all the salience scaling needs, and it is what the second
 // pass has to know before it can build anything.
-func calibrate(path, text string, ntok, ctx int) map[string][]float32 {
+func calibrate(path, text string, ntok, ctx, win, block int) (map[string][]float32, map[string]*compress.Acc) {
 	sums := map[string][]float64{}
 	seen := map[string]int{}
+	accs := map[string]*compress.Acc{}
 	t0 := time.Now()
-	n := runCalib(path, text, ntok, ctx, func(block int, site string, rows [][]float32) {
-		key := fmt.Sprintf("%d/%s", block, site)
+	n := runCalib(path, text, ntok, ctx, func(blk int, site string, rows [][]float32) {
+		key := fmt.Sprintf("%d/%s", blk, site)
 		s := sums[key]
 		if s == nil {
 			s = make([]float64, len(rows[0]))
@@ -267,6 +330,16 @@ func calibrate(path, text string, ntok, ctx int) map[string][]float32 {
 			}
 		}
 		seen[key] += len(rows)
+		if win > 0 {
+			// The Hessian in the basis the activations arrive in, which is the
+			// one an error has to be brought back to before it is weighed.
+			a := accs[key]
+			if a == nil {
+				a = compress.NewAcc(len(rows[0]), fitWindow(len(rows[0]), win, block))
+				accs[key] = a
+			}
+			a.AddRows(rows)
+		}
 	})
 	out := map[string][]float32{}
 	for k, s := range sums {
@@ -278,7 +351,7 @@ func calibrate(path, text string, ntok, ctx int) map[string][]float32 {
 	}
 	fmt.Printf("calibrated on %d tokens in %s, %d sites\n",
 		n, time.Since(t0).Round(time.Millisecond), len(out))
-	return out
+	return out, accs
 }
 
 // hessians is the second pass: the same text again, with each activation put
