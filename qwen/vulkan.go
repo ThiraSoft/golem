@@ -136,12 +136,28 @@ func (m *Model) UseVulkanStack() error {
 		}
 	}
 
+	// A .golem checkpoint reads through a different set of kernels and a
+	// different activation: floats through a scale and a rotation, rather than
+	// Q8_0. The lattice table belongs to the device and is uploaded once for
+	// the model, whatever a block does with it.
+	var d4g *vk.D4GKernels
+	if bits := m.W.Blocks[0].Q.Quant.D4Width(); bits > 0 {
+		if d4g, err = vk.NewD4GKernels(d, bits); err != nil {
+			stack.Close()
+			return err
+		}
+	}
+
 	for i := range cfg.Blocks {
 		bc, bw := cfg.Blocks[i], &m.W.Blocks[i]
+		want := nn.Q4_0
+		if d4g != nil {
+			want = bw.Q.Quant
+		}
 		for _, q := range []nn.Quant{bw.Q.Quant, bw.K.Quant, bw.V.Quant, bw.O.Quant, bw.Gate.Quant, bw.Up.Quant, bw.Down.Quant} {
-			if q != nn.Q4_0 {
+			if q != want {
 				stack.Close()
-				return fmt.Errorf("qwen: the kernels read Q4_0, block %d has a %s", i, q)
+				return fmt.Errorf("qwen: the kernels read %s, block %d has a %s", want, i, q)
 			}
 		}
 		shape := vk.BlockShape{
@@ -152,13 +168,26 @@ func (m *Model) UseVulkanStack() error {
 			// query; qwen/attention.go is the other copy.
 			Scale: float32(1 / sqrtOf(bc.HeadDim)),
 		}
-		if err := attn.AddBlock(shape, bw.Q.Data, bw.K.Data, bw.V.Data, bw.O.Data, bw.QNorm, bw.KNorm); err != nil {
-			stack.Close()
-			return err
-		}
-		if err := mix.AddBlock(nil, nil, bw.Gate.Data, bw.Up.Data, bw.Down.Data); err != nil {
-			stack.Close()
-			return err
+		if d4g != nil {
+			if err := attn.AddBlockD4G(d4g, shape, bw.Q.Data, bw.K.Data, bw.V.Data, bw.O.Data,
+				bw.QNorm, bw.KNorm, bw.PreQKV, bw.PreO); err != nil {
+				stack.Close()
+				return err
+			}
+			if err := mix.AddBlockD4G(d4g, bw.Gate.Data, bw.Up.Data, bw.Down.Data,
+				bw.PreGateUp, bw.PreDown); err != nil {
+				stack.Close()
+				return err
+			}
+		} else {
+			if err := attn.AddBlock(shape, bw.Q.Data, bw.K.Data, bw.V.Data, bw.O.Data, bw.QNorm, bw.KNorm); err != nil {
+				stack.Close()
+				return err
+			}
+			if err := mix.AddBlock(nil, nil, bw.Gate.Data, bw.Up.Data, bw.Down.Data); err != nil {
+				stack.Close()
+				return err
+			}
 		}
 		if err := stack.AddBlock(vk.BlockNorms{
 			Attn: bw.AttnNorm, FFN: bw.FFNNorm, OutScale: 1, Layout: vk.LayoutPreNorm,

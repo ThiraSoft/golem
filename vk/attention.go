@@ -130,6 +130,10 @@ type Attention struct {
 	slots       int // how many conversations the caches are cut into
 
 	matvec, prepare, scores *Pipeline
+	// scoresFloat is the same kernel with a float copy of the mix beside its
+	// Q8_0 one, for the blocks whose output projection reads floats. Built
+	// only when one is added.
+	scoresFloat *Pipeline
 	// rope fills the angle tables from the position buffer, at the head of a
 	// pass. shaders/rope_table.comp says what it replaced.
 	rope *Pipeline
@@ -143,6 +147,9 @@ type Attention struct {
 	// One position's traffic. Only the two ends of it cross the bus: the
 	// normed stream in, and the output projection's answer back.
 	xq, xs, out *Buffer
+	// xf and af are the D4G path's: the normed stream as floats, and the mix
+	// as floats. Both are nil until a D4G block is added.
+	xf, af *Buffer
 	rcos, rsin  []*Buffer // one pair per rotation geometry
 	rinv        []*Buffer // its inverse frequencies, written once
 	ropeSets    []*Set
@@ -168,6 +175,10 @@ type attentionBlock struct {
 	setPrepare   *Set
 	setScores    *Set
 	setOParts    *Set // the output projection when its shared dimension is split
+
+	// d4g is the block's D4G side when its projections are in that format,
+	// and nil when they are Q4_0. vk/attention_d4g.go is all of it.
+	d4g *d4gAttn
 }
 
 // maxBlocks is how many entries the position buffer holds, which caps the
@@ -562,7 +573,13 @@ func (a *Attention) AddBlock(shape BlockShape, q, k, v, o []byte, qnorm, knorm [
 	}); err != nil {
 		return fail(err)
 	}
-	if b.setScores, err = a.scores.NewSet([]*Buffer{
+	if a.scoresFloat != nil {
+		if b.setScores, err = a.scoresFloat.NewSet([]*Buffer{
+			a.qh, ck, cv, a.scoreRows, a.aq, a.as, a.where, a.af,
+		}); err != nil {
+			return fail(err)
+		}
+	} else if b.setScores, err = a.scores.NewSet([]*Buffer{
 		a.qh, ck, cv, a.scoreRows, a.aq, a.as, a.where,
 	}); err != nil {
 		return fail(err)
@@ -680,12 +697,16 @@ func (a *Attention) Record(r *Recorder, block, columns int, runs []span) {
 		r.DispatchWide(set, width, a.productGroups(width, outs), push)
 	}
 
-	product(b.setQ, heads, unsafe.Pointer(&project))
-	if b.setK != nil {
-		product(b.setK, kv, unsafe.Pointer(&kvProject))
-	}
-	if b.setV != nil {
-		product(b.setV, kv, unsafe.Pointer(&kvProject))
+	if b.d4g != nil {
+		a.recordD4GInput(r, b, columns)
+	} else {
+		product(b.setQ, heads, unsafe.Pointer(&project))
+		if b.setK != nil {
+			product(b.setK, kv, unsafe.Pointer(&kvProject))
+		}
+		if b.setV != nil {
+			product(b.setV, kv, unsafe.Pointer(&kvProject))
+		}
 	}
 	r.Barrier()
 	a.tl.Stamp(r, "attn qkv")
@@ -704,6 +725,10 @@ func (a *Attention) Record(r *Recorder, block, columns int, runs []span) {
 	}
 	r.Barrier()
 	a.tl.Stamp(r, "attn scores")
+	if b.d4g != nil {
+		a.recordD4GOutput(r, b, columns)
+		return
+	}
 	if b.setOParts != nil && width >= tiledColumns {
 		// The split product, and the pass that adds its slices. See
 		// matmulSplit: this matrix is the stack's row-poorest, and eighty
@@ -751,6 +776,12 @@ func (a *Attention) Close() {
 	for _, b := range a.blocks {
 		b.close()
 	}
+	for _, b := range []*Buffer{a.xf, a.af} {
+		if b != nil {
+			b.Close()
+		}
+	}
+	a.xf, a.af = nil, nil
 	a.blocks = nil
 	for _, set := range a.ropeSets {
 		if set != nil {
@@ -771,7 +802,7 @@ func (a *Attention) Close() {
 		a.reduceSet.Close()
 		a.reduceSet = nil
 	}
-	for _, p := range []**Pipeline{&a.scores, &a.prepare, &a.matvec, &a.reduce, &a.rope} {
+	for _, p := range []**Pipeline{&a.scoresFloat, &a.scores, &a.prepare, &a.matvec, &a.reduce, &a.rope} {
 		if *p != nil {
 			(*p).Close()
 			*p = nil
@@ -789,6 +820,8 @@ func pointers(bs []*Buffer) []**Buffer {
 }
 
 func (b *attentionBlock) close() {
+	b.d4g.close()
+	b.d4g = nil
 	for _, s := range []**Set{&b.setScores, &b.setPrepare, &b.setOParts, &b.setO, &b.setV, &b.setK, &b.setQ} {
 		if *s != nil {
 			(*s).Close()
@@ -802,6 +835,11 @@ func (b *attentionBlock) close() {
 		}
 	}
 }
+
+//go:generate glslc -O -DFLOATOUT --target-env=vulkan1.1 -fshader-stage=compute shaders/attn_scores.comp -o shaders/attn_scores_float.spv
+
+//go:embed shaders/attn_scores_float.spv
+var scoresFloatSPIRV []byte
 
 // scoresSPIRV is the scores kernel built for this card: the block of scores on
 // the matrix cores where there are any, and the scalar dot products where

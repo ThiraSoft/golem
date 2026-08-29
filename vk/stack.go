@@ -466,10 +466,22 @@ func (s *Stack) AddBlock(n BlockNorms) error {
 		fromAttn = s.attn.Output()
 	}
 
+	// A D4G block reads its two inputs as floats rather than in their Q8_0
+	// form, so the two norms write the float half of what they can write and
+	// not the quantized one. Nothing else about them changes, and the flags
+	// in record follow the same two questions.
+	attnY, shY := s.none, s.none
+	if s.attn.D4G() {
+		attnY, attnQ, attnS = s.attn.FloatInput(), s.none, s.none
+	}
+	if s.mix.D4G() {
+		shY, shQ, shS = s.mix.SharedFloatInput(), s.none, s.none
+	}
+
 	// a, b, gain, vscale, sum, y, yq, ys
 	specs := []setSpec{
-		{&b.setAttnNorm, s.norm, []*Buffer{s.xs, s.none, b.gains[0], s.none, s.none, s.none, attnQ, attnS}},
-		{&b.setResid, s.norm, []*Buffer{s.xs, fromAttn, b.gains[2], s.none, s.resid, s.none, shQ, shS}},
+		{&b.setAttnNorm, s.norm, []*Buffer{s.xs, s.none, b.gains[0], s.none, s.none, attnY, attnQ, attnS}},
+		{&b.setResid, s.norm, []*Buffer{s.xs, fromAttn, b.gains[2], s.none, s.resid, shY, shQ, shS}},
 		{&b.setCombine, s.combine, []*Buffer{shOut, expOut, s.resid, b.gains[4], b.gains[5], b.gains[6], s.xs}},
 	}
 	if n.Layout != LayoutPreNorm {
@@ -650,8 +662,14 @@ func shapeKey(runs []span) string {
 func (s *Stack) record(r *Recorder, experts, used, columns int, runs []span) {
 	cols := uint32(columns)
 	quant := normPush{n: uint32(s.dim), flags: normGain | normQuant, eps: s.eps, scalar: 1}
+	if s.attn.D4G() {
+		quant.flags = normGain | normFloat
+	}
 	post := normPush{n: uint32(s.dim), flags: normGain | normFloat, eps: s.eps, scalar: 1}
 	resid := normPush{n: uint32(s.dim), flags: normAdd | normSum | normGain | normQuant, eps: s.eps, scalar: 1}
+	if s.mix.D4G() {
+		resid.flags = normAdd | normSum | normGain | normFloat
+	}
 	route := routerPush{
 		n: uint32(s.dim), experts: uint32(experts), used: uint32(used), columns: uint32(columns),
 		eps: s.eps, scalar: float32(1 / sqrtOf(s.dim)),

@@ -230,6 +230,9 @@ type Mixture struct {
 
 	// The shared branch's, which is the same shape with one expert.
 	dxq, dxs, dout *Buffer
+	// dxf is the shared branch's input as floats, which only a D4G branch
+	// reads, and which is nil until one is added.
+	dxf *Buffer
 	doutParts      *Buffer // the slices of a split down projection
 	daq, das       *Buffer
 
@@ -238,6 +241,10 @@ type Mixture struct {
 
 // A mixtureBlock is one block's matrices and the bindings that read them.
 type mixtureBlock struct {
+	// d4g is the shared branch when it is in that format, and nil when it is
+	// Q4_0. vk/mixture_d4g.go is all of it.
+	d4g *D4GFFN
+
 	gateUp, down           *Buffer
 	denseGateUp, denseDown *Buffer
 	setGateUp, setDown     *Set
@@ -757,7 +764,9 @@ func (m *Mixture) mark(r *Recorder, label string) {
 // One column only. A prompt's shared branch is a tiled product with a barrier
 // inside it, and the prompt is not the side that needs this.
 func (m *Mixture) RecordSharedUp(r *Recorder, block, columns int) bool {
-	if passWidth(columns) != 1 {
+	if m.blocks[block].d4g != nil || passWidth(columns) != 1 {
+		// A D4G branch is one recording, not two halves with the experts
+		// between them: there are no experts to put there.
 		return false
 	}
 	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act), split: 1}
@@ -766,7 +775,7 @@ func (m *Mixture) RecordSharedUp(r *Recorder, block, columns int) bool {
 }
 
 func (m *Mixture) RecordSharedDown(r *Recorder, block, columns int) bool {
-	if passWidth(columns) != 1 {
+	if m.blocks[block].d4g != nil || passWidth(columns) != 1 {
 		return false
 	}
 	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act), split: 1}
@@ -784,6 +793,12 @@ func (m *Mixture) RecordSharedDown(r *Recorder, block, columns int) bool {
 // sharedUp and sharedDown say those two products have already been issued by
 // the two calls above, and this recording must not issue them twice.
 func (m *Mixture) Record(r *Recorder, block, columns int, sharedUp, sharedDown bool) {
+	if b := m.blocks[block]; b.d4g != nil {
+		if err := m.recordD4G(r, block, columns); err != nil {
+			panic(fmt.Sprintf("vk: the D4G feed forward refused a pass of %d: %v", columns, err))
+		}
+		return
+	}
 	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed, act: uint32(m.act),
 		cap: uint32(maxColumns), split: 1}
 	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act), split: 1}
@@ -928,6 +943,16 @@ func (m *Mixture) Routing() (*Buffer, *Buffer) { return m.ids, m.cw }
 func (m *Mixture) Outputs() (shared, experts *Buffer) { return m.dout, m.out }
 
 func (m *Mixture) Close() {
+	if m.dxf != nil {
+		m.dxf.Close()
+		m.dxf = nil
+	}
+	for _, b := range m.blocks {
+		if b.d4g != nil {
+			b.d4g.Close()
+			b.d4g = nil
+		}
+	}
 	for _, b := range m.blocks {
 		b.close()
 	}
