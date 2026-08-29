@@ -34,7 +34,7 @@ func d4gMatrix(tb testing.TB, rows, cols int) ([]byte, []float32) {
 		}
 	}
 	data := compress.EncodeD4G(w, rows, cols, q, compress.D4Params{
-		Beta: 2, ScaleBlock: 64, HadGroup: 128, SearchScale: true})
+		Beta: 2, ScaleBlock: 64, HadGroup: 128, SearchScale: true}, nil)
 	return data, q
 }
 

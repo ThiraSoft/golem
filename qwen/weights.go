@@ -45,6 +45,11 @@ type Weights struct {
 	OutputNorm []float32
 	Blocks     []BlockWeights
 
+	// PreHead is the head's own vector, and the head is the embedding table:
+	// the logit product meets it like any other site, and the input path undoes
+	// it a row at a time. Nil for a table stored plain.
+	PreHead []float32
+
 	// HadGroup is the width of the rotation a D4G checkpoint's activations go
 	// through, and zero for every other format.
 	HadGroup int
@@ -185,24 +190,27 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 
 	// A .golem file carries one vector a site. Any other file has none, and
 	// the blocks are left with nil ones — which is what the products check.
-	if w.Blocks[0].Q.Quant == nn.D4G {
-		group, err := g.Uint32("golem.d4.hadamard_group")
-		if err != nil {
-			return nil, fmt.Errorf("a D4G checkpoint without golem.d4.hadamard_group: %w", err)
-		}
+	if group, err := g.Uint32("golem.d4.hadamard_group"); err == nil {
 		w.HadGroup = int(group)
 		for i := range cfg.Blocks {
 			b := &w.Blocks[i]
+			// A vector belongs to a matrix, not to a block: a checkpoint that
+			// left some tensors alone has vectors for the others and none for
+			// those, and a matrix that is not D4G must not meet one.
 			for _, bind := range []struct {
 				dst  *[]float32
 				site string
 				want int
+				m    nn.Matrix
 			}{
-				{&b.PreQKV, "qkv", b.Q.Cols},
-				{&b.PreO, "o", b.O.Cols},
-				{&b.PreGateUp, "gateup", b.Gate.Cols},
-				{&b.PreDown, "down", b.Down.Cols},
+				{&b.PreQKV, "qkv", b.Q.Cols, b.Q},
+				{&b.PreO, "o", b.O.Cols, b.O},
+				{&b.PreGateUp, "gateup", b.Gate.Cols, b.Gate},
+				{&b.PreDown, "down", b.Down.Cols, b.Down},
 			} {
+				if bind.m.Quant != nn.D4G {
+					continue
+				}
 				name := fmt.Sprintf("blk.%d.%s.pre", i, bind.site)
 				v, err := floats(g, name)
 				if err != nil {
@@ -214,6 +222,12 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 				*bind.dst = v
 			}
 			b.HadGroup = w.HadGroup
+		}
+		if v, err := floats(g, "output.pre"); err == nil && w.TokenEmbd.Quant == nn.D4G {
+			if len(v) != w.TokenEmbd.Cols {
+				return nil, fmt.Errorf("output.pre is %d wide, not %d", len(v), w.TokenEmbd.Cols)
+			}
+			w.PreHead = v
 		}
 	}
 

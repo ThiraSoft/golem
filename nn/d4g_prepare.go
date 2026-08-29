@@ -42,3 +42,36 @@ func PrepareD4G(x, pre []float32, group int) {
 		}
 	}
 }
+
+// UnprepareD4G recovers a weight row from its rotated, scaled form: it is
+// PrepareD4G run backwards, and the order matters. The normalised transform is
+// its own inverse, so the rotation is undone by applying it again — but the
+// scaling was applied first, so it must be undone last. pre here is the
+// activation-side vector, the reciprocal of what the weights met, which is
+// exactly the factor a row has to be multiplied by to come back.
+//
+// This is what a tied head costs the input path: the embedding table is stored
+// the way the logit product wants it, and reading one token's row means one
+// transform of the model's width. That is nothing beside the row itself.
+func UnprepareD4G(x, pre []float32, group int) {
+	if group > 1 {
+		inv := float32(1 / math.Sqrt(float64(group)))
+		for base := 0; base+group <= len(x); base += group {
+			blk := x[base : base+group]
+			for l := 1; l < group; l <<= 1 {
+				for i := 0; i < group; i += l << 1 {
+					for j := i; j < i+l; j++ {
+						a, b := blk[j], blk[j+l]
+						blk[j], blk[j+l] = a+b, a-b
+					}
+				}
+			}
+			for i := range blk {
+				blk[i] *= inv
+			}
+		}
+	}
+	for i := range x {
+		x[i] *= pre[i]
+	}
+}

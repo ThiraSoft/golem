@@ -121,6 +121,11 @@ func (m *Model) Reset() { m.cache.Reset() }
 // belongs to Gemma.
 func Embed(w *Weights, token int32, out []float32) {
 	w.TokenEmbd.Row(int(token), out)
+	if w.PreHead != nil {
+		// The table is stored the way the logit product wants it, rotated and
+		// scaled. The input path wants the row itself.
+		nn.UnprepareD4G(out, w.PreHead, w.HadGroup)
+	}
 }
 
 // Forward advances the model by one token and returns the hidden state after
@@ -234,6 +239,7 @@ func (m *Model) ForwardMixed(tokens []int32, at []Place) [][]float32 {
 		copy(hidden[t], xs[t])
 		nn.RMSNormPlain(hidden[t], w.OutputNorm, cfg.Eps)
 	}
+	calib(-1, "head", hidden)
 	return hidden
 }
 
@@ -255,6 +261,9 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 	}
 	v := m.scratch.Batch(m.Cfg.Dim, 1)
 	copy(v.F[0], hidden)
+	if m.W.PreHead != nil {
+		nn.PrepareD4G(v.F[0], m.W.PreHead, m.W.HadGroup)
+	}
 	// Rounds to bfloat16 when the head is bfloat16, and builds the Q8_0 form
 	// otherwise.
 	v.QuantizeColumnRange(0, 0, m.Cfg.Dim)
@@ -290,6 +299,9 @@ func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
 	v := m.scratch.Batch(m.Cfg.Dim, len(hidden))
 	for i := range hidden {
 		copy(v.F[i], hidden[i])
+		if m.W.PreHead != nil {
+			nn.PrepareD4G(v.F[i], m.W.PreHead, m.W.HadGroup)
+		}
 		v.QuantizeColumnRange(i, 0, m.Cfg.Dim)
 	}
 	v.QuantizeK()

@@ -4,7 +4,8 @@
 
 // y = W * x for a D4G matrix against float activations.
 //
-// A block is sixty-four weights: one fp16 step, and sixteen twelve-bit codes
+// A block is sixty-four weights: two eight-bit step codes, one per thirty-two,
+// and sixteen twelve-bit codes
 // naming points of the D4 lattice. Expanding a code is a lookup — which is the
 // whole reason the lattice is D4 and not E8, whose shell at this rate would
 // need two hundred megabytes of table where this one needs sixteen kibibytes,
@@ -12,8 +13,10 @@
 // dispatch. The table is the lattice, so the same one serves every matrix of
 // every model.
 //
-// The row is two planes, scales then codes, because a block of twenty-six bytes
-// would otherwise start on a two-byte boundary and this reads words.
+// The row is two planes, steps then codes, because a block of twenty-six bytes
+// would otherwise start on a two-byte boundary and this reads words. A step
+// code names a power of two a sixteenth apart, so expanding it is one exp2 and
+// no table at all.
 //
 // Workgroup: 128 threads -> 16 output rows, 8 lanes per row, which is
 // matvec_q5k.comp's shape. COLUMNS is how many activations one reading of the
@@ -52,15 +55,19 @@ void main() {
 
     uint nb = p.ffn / 64u;
     uint rowBase   = row * nb * 26u;   // bytes; nb is even, so this is a word
-    uint scaleBase = rowBase;          // nb fp16
+    uint stepBase  = rowBase;          // two step codes a block
     uint codeBase  = rowBase + nb * 2u; // nb runs of twenty-four bytes
 
     float sum[COLUMNS];
     [[unroll]] for (uint c = 0u; c < COLUMNS; c++) sum[c] = 0.0;
 
     for (uint b = lane; live && b < nb; b += LANES) {
-        vec2 pair = unpackHalf2x16(w[(scaleBase + 2u * b) >> 2]);
-        float step = ((b & 1u) == 0u) ? pair.x : pair.y;
+        uint stepAt = stepBase + 2u * b;
+        uint stepWord = w[stepAt >> 2u];
+        uint sc0 = (stepWord >> ((stepAt & 3u) * 8u)) & 0xFFu;
+        uint sc1 = (stepWord >> (((stepAt + 1u) & 3u) * 8u)) & 0xFFu;
+        float stepLo = exp2((float(sc0) - 272.0) * 0.0625);
+        float stepHi = exp2((float(sc1) - 272.0) * 0.0625);
 
         uint at = (codeBase + 24u * b) >> 2;
         uint c0 = w[at], c1 = w[at + 1u], c2 = w[at + 2u];
@@ -80,6 +87,9 @@ void main() {
 
             uint codeA = b0 | ((b1 & 0x0Fu) << 8u);
             uint codeB = (b1 >> 4u) | (b2 << 4u);
+            // Each turn of this loop is eight weights, so the first four turns
+            // are the block's first thirty-two and the second four the rest.
+            float step = (k < 4u) ? stepLo : stepHi;
 #ifdef NOTABLE
             // Not a decoder: the same traffic in weights and the same
             // arithmetic, with the lookup replaced by nonsense of the right

@@ -43,7 +43,7 @@ func TestD4GProductSurvivesTheRoundTrip(t *testing.T) {
 	var unrotated float64
 	for _, group := range []int{0, 128} {
 		params := D4Params{Beta: 2, ScaleBlock: 64, HadGroup: group, SearchScale: true}
-		data := EncodeD4G(w, rows, cols, q, params)
+		data := EncodeD4G(w, rows, cols, q, params, nil)
 		if want := rows * cols / nn.D4Block * 26; len(data) != want {
 			t.Fatalf("group %d: %d bytes, want %d", group, len(data), want)
 		}
@@ -97,7 +97,7 @@ func TestD4GWithoutRotationOrScaling(t *testing.T) {
 	for i := range w {
 		w[i] = float32(r.NormFloat64()) * 0.05
 	}
-	data := EncodeD4G(w, rows, cols, nil, D4Params{Beta: 2, ScaleBlock: 64, SearchScale: true})
+	data := EncodeD4G(w, rows, cols, nil, D4Params{Beta: 2, ScaleBlock: 64, SearchScale: true}, nil)
 
 	out := make([]float32, cols)
 	m := nn.Matrix{Data: data, Quant: nn.D4G, Rows: rows, Cols: cols}

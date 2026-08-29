@@ -9,7 +9,8 @@ package qwen
 
 // Calib, when set, is called with every batch of activations just before it
 // meets a weight matrix. site names the matrix the batch feeds: "qkv", "o",
-// "gateup" or "down".
+// "gateup" or "down" inside a block, and "head" for the tied output head,
+// whose block number is -1 because it belongs to no block.
 var Calib func(block int, site string, rows [][]float32)
 
 func calib(block int, site string, rows [][]float32) {
