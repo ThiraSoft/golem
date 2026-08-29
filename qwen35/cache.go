@@ -7,6 +7,14 @@
 // keep a recurrent state rather than a ring of keys, and the checkpoint carries
 // a sixty-fifth block that drafts the token after next. See mtp.go and
 // speculate.go for that half.
+//
+// Positions here have three axes. The file declares rope.dimension_sections
+// and llama.cpp turns this architecture with interleaved M-RoPE, so a token's
+// angle comes from a time, a height and a width rather than from one number.
+// Text sets the three to the same value and the rotation collapses into the
+// ordinary one, which is why a scalar position served until a picture needed
+// to hold several tokens at one time while the cache index went on rising.
+// place.go holds the two apart, and nn.PrepareMulti is the rotation itself.
 package qwen35
 
 // BlockCache holds either a KV cache (a full-attention block) or the recurrent
