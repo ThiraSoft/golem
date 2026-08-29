@@ -3,6 +3,7 @@ package qwen35
 import (
 	"bytes"
 	"fmt"
+	"math"
 
 	"github.com/ThiraSoft/golem/imageio"
 	"github.com/ThiraSoft/golem/nn"
@@ -15,6 +16,24 @@ type VisionTower struct {
 	W   *VisionWeights
 
 	file *tensors.GGUF
+
+	// trace keeps the intermediates a reference test stands on, under the
+	// names models/qwen3vl.cpp gives its nodes. It is nil unless Trace was
+	// called, because keeping them costs a copy of the grid per block.
+	trace map[string][]float32
+}
+
+// Trace makes the next Encode keep its waypoints, under llama.cpp's own names
+// for them. It is for the reference tests and costs a copy a block.
+func (v *VisionTower) Trace() { v.trace = map[string][]float32{} }
+
+// Waypoint is what the last traced Encode left under that name, or nil.
+func (v *VisionTower) Waypoint(name string) []float32 { return v.trace[name] }
+
+func (v *VisionTower) keep(name string, xs []float32) {
+	if v.trace != nil {
+		v.trace[name] = append([]float32(nil), xs...)
+	}
 }
 
 // NewVisionTower binds a configuration to its weights.
@@ -40,16 +59,15 @@ func (v *VisionTower) Encode(im *imageio.Image) [][]float32 {
 	cfg, w := v.Cfg, v.W
 
 	width, height := cfg.TargetSize(im.W, im.H)
-	if im.W != width || im.H != height {
-		im = im.ResizeBilinear(width, height)
-	}
+	im = cfg.Fit(im, width, height)
 	cols, rows := width/cfg.Patch, height/cfg.Patch
 
-	xs := cfg.Patches(w, im)
 	at := cfg.PatchPositions(cols, rows)
+	xs := cfg.PatchesTraced(w, im, v)
 	s := newVisionScratch(cfg, len(at))
 	for i := 0; i < cfg.Blocks; i++ {
 		cfg.VisionBlockForward(w, i, xs, at, s)
+		v.keep(fmt.Sprintf("layer_out-%d", i), xs)
 	}
 
 	// The tower's own last norm, then the merger.
@@ -57,6 +75,39 @@ func (v *VisionTower) Encode(im *imageio.Image) [][]float32 {
 		nn.LayerNormGGML(xs[p*cfg.Dim:(p+1)*cfg.Dim], w.PostLN.Gain, w.PostLN.Bias, cfg.Eps)
 	}
 	return v.merge(xs, len(at), s)
+}
+
+// Fit puts an image on the canvas the tower reads, the way img_tool::resize
+// does under PAD_CEIL — which is the padding style every Qwen-VL projector
+// leaves at its default, because its branch of clip.cpp sets the algorithm and
+// not the padding.
+//
+// It is not a stretch to the target. The image is scaled by whichever of the
+// two ratios is smaller, so its own shape is kept, and what is left over
+// becomes a black border with the image centred in it. Stretching instead
+// moves every pixel of a picture whose aspect ratio does not already match,
+// which is most of them.
+//
+// The scale is float32 because it is float32 there, and the ceiling is taken
+// of the product: at a ratio that lands within a rounding of a whole pixel the
+// two widths differ by one, and one column of border is one column of patches.
+func (cfg *VisionConfig) Fit(im *imageio.Image, width, height int) *imageio.Image {
+	if im.W == width && im.H == height {
+		return im
+	}
+	scale := float32(width) / float32(im.W)
+	if s := float32(height) / float32(im.H); s < scale {
+		scale = s
+	}
+	inner := min(int(math.Ceil(float64(float32(im.W)*scale))), width)
+	tall := min(int(math.Ceil(float64(float32(im.H)*scale))), height)
+	if im.W != inner || im.H != tall {
+		im = im.ResizeBilinear(inner, tall)
+	}
+	if inner == width && tall == height {
+		return im
+	}
+	return im.PadInto(width, height, [3]uint8{0, 0, 0})
 }
 
 // merge folds each square of Merge by Merge patches into one row of the

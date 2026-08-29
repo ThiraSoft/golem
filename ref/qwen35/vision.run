@@ -1,0 +1,33 @@
+# The waypoints kept for one image through Qwen3.8's tower. The names are the
+# ones models/qwen3vl.cpp gives its nodes through cb(), so this file changes
+# when that graph does and nothing else has to.
+image       testdata/gemma/shapes.png
+prompt      Describe this image.
+n_predict   8
+
+# Twenty-seven blocks is short enough to keep all of them, and a divergence
+# then says which one it began in rather than that there was one.
+blocks all
+
+# The two waypoints before any block: the patches with their bias, and the same
+# with the resized learned positions added. If the first differs the patch
+# convolutions or their order are wrong; if only the second does, it is the
+# interpolation or the reordering of the table.
+# The pixels the tower is actually handed, which splits a wrong resize from a
+# wrong convolution.
+global inp_raw
+global patch_bias
+global inp_pos_emb
+
+require ln1
+# Qcur, Kcur and Vcur are strided views of the fused projection and cannot be
+# written as they lie. What follows the rotation is a tensor of its own, and it
+# is the waypoint that matters anyway: it pins the projection and the rotation
+# together.
+require Qcur_rope
+require Kcur_rope
+require attn_out
+require ffn_inp
+require ffn_inp_normed
+require ffn_out
+require layer_out

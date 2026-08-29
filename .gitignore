@@ -39,6 +39,7 @@
 /testdata/qwen35/mrope/
 /testdata/qwen35/vrope/
 /testdata/qwen35/interp/
+/testdata/qwen35/vision/
 
 # The Mimi encoder fixtures, same rule as the others.
 /testdata/encoder/

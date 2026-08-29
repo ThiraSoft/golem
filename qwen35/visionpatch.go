@@ -125,6 +125,15 @@ func (cfg *VisionConfig) Positions(w *VisionWeights, cols, rows int) []float32 {
 // same frame twice — so both meet the same pixels and the sum is what a video
 // of one frame would give.
 func (cfg *VisionConfig) Patches(w *VisionWeights, im *imageio.Image) []float32 {
+	return cfg.PatchesTraced(w, im, nil)
+}
+
+// PatchesTraced is Patches with the two waypoints before any block kept, when
+// a tower asks: the projection with its bias, and the same with the positions
+// added. If the first differs from the reference the convolutions or the patch
+// order are wrong; if only the second does, it is the interpolation or the
+// reordering of the table.
+func (cfg *VisionConfig) PatchesTraced(w *VisionWeights, im *imageio.Image, v *VisionTower) []float32 {
 	cols, rows := im.W/cfg.Patch, im.H/cfg.Patch
 	taps := cfg.Patch * cfg.Patch * 3
 	order := cfg.PatchOrder(cols, rows)
@@ -153,9 +162,15 @@ func (cfg *VisionConfig) Patches(w *VisionWeights, im *imageio.Image) []float32 
 		}
 	}
 
+	if v != nil {
+		v.keep("patch_bias", out)
+	}
 	positions := cfg.Positions(w, cols, rows)
 	for i := range out {
 		out[i] += positions[i]
+	}
+	if v != nil {
+		v.keep("inp_pos_emb", out)
 	}
 	return out
 }

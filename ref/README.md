@@ -85,6 +85,9 @@ build/ref/dump_vision "$GOLEM_MODEL"     "$GOLEM_MMPROJ"     testdata/gemma/visi
 build/ref/dump_vision "$GOLEM_MODEL_12B" "$GOLEM_MMPROJ_12B" testdata/gemma/vision12 ref/gemma/vision12.run
 build/ref/dump_vision "$GOLEM_MODEL_26B" "$GOLEM_MMPROJ_26B" testdata/gemma/vision26 ref/gemma/vision26.run
 
+mkdir -p testdata/qwen35/vision
+build/ref/dump_vision "$GOLEM_MODEL_QWEN35" "$GOLEM_MMPROJ_QWEN35" testdata/qwen35/vision ref/qwen35/vision.run
+
 # The audio fixtures need one recording, which is not committed either:
 #   ffmpeg -i /path/to/llama.cpp/tools/mtmd/test-2.mp3 -ar 16000 -ac 1 \
 #       testdata/audio/speech.wav
