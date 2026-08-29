@@ -23,6 +23,17 @@ package compress
 // weights have already been rotated, which spreads what the Hessian knows and
 // leaves most of the correlation local. A window of a few hundred columns buys
 // nearly all of what the full matrix would, for a hundredth of the arithmetic.
+//
+// And it is off by default, because on this format it is worth almost nothing.
+// On activations correlated the way a test can make them, it halves the output
+// error — TestCompensationUnderRotation says 51% of it left, with the rotation
+// in place. On Qwen3-0.6B it moves the perplexity by 0.15 of a point out of a
+// nine-point gap. The two are the same fact seen twice: incoherence processing
+// pushes the Hessian towards a multiple of the identity, and against a diagonal
+// Hessian the columns no longer overlap, so there is no error to pass on and
+// this reduces to rounding each column on its own. It stays because the
+// measurement is worth being able to repeat, and because a format that stopped
+// rotating would want it back.
 
 import (
 	"math"
