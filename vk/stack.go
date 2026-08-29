@@ -36,6 +36,7 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/combine.comp -o shaders/combine.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_q6k.comp -o shaders/embed_q6k.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_q40.comp -o shaders/embed_q40.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_d4g.comp -o shaders/embed_d4g.spv
 
 //go:embed shaders/norm.spv
 var normSPIRV []byte
@@ -54,6 +55,9 @@ var combineSPIRV []byte
 
 //go:embed shaders/embed_q6k.spv
 var embedQ6KSPIRV []byte
+
+//go:embed shaders/embed_d4g.spv
+var embedD4GSPIRV []byte
 
 //go:embed shaders/embed_q40.spv
 var embedQ40SPIRV []byte
@@ -137,6 +141,11 @@ type Stack struct {
 	// embed reads one row of the token embedding into the stream, when the
 	// caller gave the stack a table to read it from.
 	embed, embedQ40 *Pipeline
+	// embedD4G is the same for a .golem table, which is a lattice to expand
+	// and a rotation to undo rather than a nibble to shift.
+	embedD4G *Pipeline
+	// embedPre is the head's vector, uploaded when that table is bound.
+	embedPre *Buffer
 	embedSet        *Set
 	ids             *Buffer // one identifier a column, negative where the caller wrote its own
 	embedOf         embedPush
@@ -296,6 +305,42 @@ func (s *Stack) SetEmbedding(table *Buffer, cols int, scale float32) error {
 }
 
 // SetEmbeddingQ40 gives the stack a Q4_0 token embedding table to read on-card.
+// SetEmbeddingD4G points the stack at a .golem embedding table, so that a token
+// crosses the bus as an identifier rather than as a row of floats. pre is the
+// head's vector, which this undoes along with the rotation.
+func (s *Stack) SetEmbeddingD4G(table, lattice *Buffer, cols int, pre []float32) error {
+	if cols != s.dim {
+		return fmt.Errorf("vk: the embedding is %d wide and the stream is %d", cols, s.dim)
+	}
+	if cols%prepareD4GGroup != 0 {
+		return fmt.Errorf("vk: a rotated row needs a multiple of %d columns, given %d", prepareD4GGroup, cols)
+	}
+	if len(pre) != cols {
+		return fmt.Errorf("vk: the head's vector is %d wide, the row is %d", len(pre), cols)
+	}
+	if s.embedSet != nil {
+		return fmt.Errorf("vk: the embedding is already set")
+	}
+	var err error
+	if s.embedD4G, err = s.d.NewPipeline(embedD4GSPIRV, 5, uint32(unsafe.Sizeof(embedPush{}))); err != nil {
+		return err
+	}
+	if s.ids, err = s.d.Host(maxColumns*4, bufferUsageStorage); err != nil {
+		return err
+	}
+	if s.embedPre, err = s.d.Upload(asBytes(pre)); err != nil {
+		return err
+	}
+	if s.embedSet, err = s.embedD4G.NewSet([]*Buffer{table, lattice, s.ids, s.embedPre, s.xs}); err != nil {
+		return err
+	}
+	// One workgroup a group of the rotation, and a column has cols/group of
+	// them: the dispatch is per column times that, which record multiplies in.
+	s.embedOf = embedPush{cols: uint32(cols), superblocks: uint32(cols / prepareD4GGroup), scale: 1}
+	s.programs = nil
+	return nil
+}
+
 func (s *Stack) SetEmbeddingQ40(table *Buffer, cols int, scale float32) error {
 	if cols != s.dim {
 		return fmt.Errorf("vk: the embedding is %d wide and the stream is %d", cols, s.dim)
@@ -688,7 +733,12 @@ func (s *Stack) record(r *Recorder, experts, used, columns int, runs []span) {
 	if s.embedSet != nil {
 		// The embedding before anything, since the stream is what the first
 		// block norms.
-		r.Dispatch(s.embedSet, cols, unsafe.Pointer(&s.embedOf))
+		groups := cols
+		if s.embedD4G != nil {
+			// A workgroup a group of the rotation rather than a column.
+			groups = cols * s.embedOf.superblocks
+		}
+		r.Dispatch(s.embedSet, groups, unsafe.Pointer(&s.embedOf))
 		r.Barrier()
 		tl.Stamp(r, "embed")
 	} else {
@@ -797,6 +847,14 @@ func (s *Stack) Close() {
 	if s.embedSet != nil {
 		s.embedSet.Close()
 		s.embedSet = nil
+	}
+	if s.embedD4G != nil {
+		s.embedD4G.Close()
+		s.embedD4G = nil
+	}
+	if s.embedPre != nil {
+		s.embedPre.Close()
+		s.embedPre = nil
 	}
 	if s.ids != nil {
 		s.ids.Close()

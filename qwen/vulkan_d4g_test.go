@@ -70,12 +70,61 @@ func TestVulkanD4GMatchesCPU(t *testing.T) {
 		}
 	}
 	t.Logf("%d positions, worst gap %.3g of the largest value in the hidden state", len(ids), worst)
+
+	// And the head, which is the largest tensor in the model and the last
+	// thing that was still on the processor.
+	cpu := make([]float32, m.Cfg.Vocab)
+	m.Logits(want[len(want)-1], cpu)
+	if err := m.UseVulkanHead(); err != nil {
+		t.Fatalf("the device head: %v", err)
+	}
+	dev := make([]float32, m.Cfg.Vocab)
+	m.Logits(want[len(want)-1], dev)
+	if g := worstGap(cpu, dev); g > 3e-3 {
+		t.Errorf("the card's logits are %g away from the processor's", g)
+	} else {
+		t.Logf("logits: worst gap %.3g, argmax %d against %d", g, pick(dev), pick(cpu))
+	}
+	if pick(dev) != pick(cpu) {
+		t.Errorf("the card and the processor pick different tokens")
+	}
+
+	// With the head on the card the stack looks the embedding up for itself,
+	// which means undoing the rotation a row at a time on the device. A token
+	// then crosses the bus as an identifier and the answer comes back as one
+	// hidden state, and nothing else moves.
+	if !m.VulkanEmbedding() {
+		t.Fatal("the head is on the card and the embedding is still not")
+	}
+	m.Reset()
+	again := m.ForwardBatch(ids, 0)
+	worst = 0
+	for i := range again {
+		if d := worstGap(want[i], again[i]); d > worst {
+			worst = d
+		}
+	}
+	t.Logf("with the embedding on the card too: worst gap %.3g", worst)
+	if worst > 3e-3 {
+		t.Errorf("the device embedding moved the answer by %g", worst)
+	}
 	// What is left is the fp16 rounding of the queries and the scores, which
 	// the two sides do in a different order. It was 2.4e-2 while the output
 	// projection read the mix in its Q8_0 form.
 	if worst > 3e-3 {
 		t.Errorf("the card's answer is %g away from the processor's", worst)
 	}
+}
+
+// pick is the token a set of logits chooses.
+func pick(v []float32) int {
+	best := 0
+	for i, x := range v {
+		if x > v[best] {
+			best = i
+		}
+	}
+	return best
 }
 
 // worstGap is the largest difference between two vectors, over the largest

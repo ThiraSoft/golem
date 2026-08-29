@@ -1,0 +1,76 @@
+#version 450
+
+// The token embedding of a .golem, read on the card.
+//
+// The table is the logit head, stored the way the logit product wants it: its
+// columns scaled by the site's vector and rotated. A row of it is not the row
+// anybody wants, so this undoes both — and undoing them is not applying them
+// again in the same order. The normalised Walsh-Hadamard transform is its own
+// inverse, so the rotation comes off by applying it a second time; the scaling
+// was applied first, so it comes off last. nn.UnprepareD4G is the other copy of
+// that, and it is one line either way and the wrong one is silent.
+//
+// One workgroup a group of the rotation, one thread a weight: the thread
+// expands its own code, and then the group turns the transform around together.
+//
+// A column whose identifier is negative is left alone, the way embed_q40.comp
+// leaves one: the caller wrote that column itself.
+
+#ifndef GROUP
+#define GROUP 128
+#endif
+
+layout(local_size_x = GROUP) in;
+
+layout(std430, binding = 0) readonly  buffer W  { uint  w[];     }; // the table
+layout(std430, binding = 1) readonly  buffer T  { uint  lat[];   }; // the lattice
+layout(std430, binding = 2) readonly  buffer ID { int   ids[];   };
+layout(std430, binding = 3) readonly  buffer P  { float pre[];   };
+layout(std430, binding = 4) writeonly buffer Y  { float y[];     };
+
+layout(push_constant) uniform Push {
+    uint cols;
+} p;
+
+shared float s[GROUP];
+
+uint byteAt(uint at) { return (w[at >> 2u] >> ((at & 3u) * 8u)) & 0xFFu; }
+
+void main() {
+    uint perColumn = p.cols / GROUP;
+    uint gid = gl_WorkGroupID.x;
+    uint col = gid / perColumn;
+    uint blk = gid - col * perColumn;
+    int id = ids[col];
+    uint t = gl_LocalInvocationID.x;
+    if (id < 0) return;
+
+    uint j = blk * GROUP + t;
+    uint nb = p.cols / 64u;
+    uint rowBase = uint(id) * nb * 26u;
+
+    uint b = j >> 6u;            // which block of sixty-four
+    uint within = j & 63u;
+    uint stepAt = rowBase + 2u * b + (within >> 5u);
+    float step = exp2((float(byteAt(stepAt)) - 272.0) * 0.0625);
+
+    uint codeBase = rowBase + nb * 2u;
+    uint k = within >> 2u;       // which of the sixteen codes
+    uint o = codeBase + 24u * b + (k >> 1u) * 3u;
+    uint b0 = byteAt(o), b1 = byteAt(o + 1u), b2 = byteAt(o + 2u);
+    uint code = ((k & 1u) == 0u) ? (b0 | ((b1 & 0x0Fu) << 8u))
+                                 : ((b1 >> 4u) | (b2 << 4u));
+    uint pt = lat[code];
+    s[t] = float(int(bitfieldExtract(int(pt), int((within & 3u) * 8u), 8))) * step;
+    barrier();
+
+    for (uint l = 1u; l < GROUP; l <<= 1u) {
+        float mine = s[t];
+        float other = s[t ^ l];
+        barrier();
+        s[t] = ((t & l) == 0u) ? (mine + other) : (other - mine);
+        barrier();
+    }
+
+    y[col * p.cols + j] = s[t] * inversesqrt(float(GROUP)) * pre[j];
+}

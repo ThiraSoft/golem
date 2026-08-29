@@ -40,6 +40,9 @@ type Model struct {
 	dev       *vk.Device
 	stack     *vk.Stack
 	head      *vk.Q40Head
+	// d4gHead is the same tensor when the file is a .golem, which needs its
+	// own kernel and its own transform. Only one of the two is ever set.
+	d4gHead *vk.D4GHead
 	rotations []rotation
 }
 
@@ -259,6 +262,14 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 	if len(out) != m.Cfg.Vocab {
 		panic(fmt.Sprintf("qwen: logits need %d entries, given %d", m.Cfg.Vocab, len(out)))
 	}
+	if m.d4gHead != nil {
+		// The card does the transform as well as the product, so the hidden
+		// state goes over as the final norm left it.
+		if err := m.d4gHead.Logits(hidden, out); err != nil {
+			panic(fmt.Sprintf("qwen: the device head failed: %v", err))
+		}
+		return
+	}
 	v := m.scratch.Batch(m.Cfg.Dim, 1)
 	copy(v.F[0], hidden)
 	if m.W.PreHead != nil {
@@ -289,7 +300,7 @@ func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
 			panic(fmt.Sprintf("qwen: logits need %d entries, given %d", m.Cfg.Vocab, len(o)))
 		}
 	}
-	if m.head != nil {
+	if m.head != nil || m.d4gHead != nil {
 		for i := range hidden {
 			m.Logits(hidden[i], out[i])
 		}

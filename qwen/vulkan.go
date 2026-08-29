@@ -30,7 +30,32 @@ import (
 // read it there. It fails, and changes nothing, when there is no device, when
 // the head is not Q4_0, or when the tensor does not fit in device memory.
 func (m *Model) UseVulkanHead() error {
-	if m.head != nil {
+	if m.head != nil || m.d4gHead != nil {
+		return nil
+	}
+	if bits := m.W.TokenEmbd.Quant.D4Width(); bits > 0 {
+		if m.W.PreHead == nil {
+			return fmt.Errorf("qwen: a %s head without output.pre — the checkpoint was written with the table left plain", m.W.TokenEmbd.Quant)
+		}
+		d, err := m.device()
+		if err != nil {
+			return err
+		}
+		k, err := vk.NewD4GKernels(d, bits)
+		if err != nil {
+			return err
+		}
+		h, err := vk.NewD4GHead(k, m.W.TokenEmbd.Data, m.W.TokenEmbd.Rows, m.W.TokenEmbd.Cols, m.W.PreHead)
+		if err != nil {
+			k.Close()
+			return err
+		}
+		m.d4gHead = h
+		if m.stack != nil {
+			if err := m.useVulkanEmbedding(); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	if m.W.TokenEmbd.Quant != nn.Q4_0 {
@@ -53,9 +78,17 @@ func (m *Model) UseVulkanHead() error {
 	return nil
 }
 
-// useVulkanEmbedding points the stack at the head's Q4_0 table.
+// useVulkanEmbedding points the stack at whichever head table is on the card,
+// so that a token crosses the bus as an identifier rather than as a row.
 func (m *Model) useVulkanEmbedding() error {
-	if m.head == nil || m.stack == nil || m.stack.Embedding() {
+	if m.stack == nil || m.stack.Embedding() {
+		return nil
+	}
+	if m.d4gHead != nil {
+		table, lattice, cols := m.d4gHead.Table()
+		return m.stack.SetEmbeddingD4G(table, lattice, cols, m.W.PreHead)
+	}
+	if m.head == nil {
 		return nil
 	}
 	table, cols := m.head.Table()
@@ -264,7 +297,7 @@ func (m *Model) NewStackTimeline() (*vk.Timeline, error) {
 func (m *Model) VulkanStack() bool { return m.stack != nil }
 
 // VulkanHead says whether the head is on a device.
-func (m *Model) VulkanHead() bool { return m.head != nil }
+func (m *Model) VulkanHead() bool { return m.head != nil || m.d4gHead != nil }
 
 // device opens the Vulkan device the model shares between its parts, or
 // returns the one it already has. The head and the blocks sit on the same card
