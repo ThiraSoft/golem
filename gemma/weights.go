@@ -61,11 +61,17 @@ type ExpertStack struct {
 	Quant      nn.Quant
 	Rows, Cols int // one expert's shape: Rows outputs, each reading Cols inputs
 	Count      int
+
+	// Pre and HadGroup are the D4G transform every expert of the stack
+	// shares, because they all read the same activation. Nil and zero for
+	// every other format. See nn/d4g_prepare.go.
+	Pre      []float32
+	HadGroup int
 }
 
 // At is one expert's matrix, as a view over the mapping.
 func (e ExpertStack) At(i int) nn.Matrix {
-	m := nn.Matrix{Quant: e.Quant, Rows: e.Rows, Cols: e.Cols}
+	m := nn.Matrix{Quant: e.Quant, Rows: e.Rows, Cols: e.Cols, Pre: e.Pre, HadGroup: e.HadGroup}
 	size := m.RowBytes() * e.Rows
 	m.Data = e.Data[i*size : (i+1)*size]
 	return m
@@ -122,7 +128,35 @@ func matrix(g *tensors.GGUF, name string) (nn.Matrix, error) {
 	if !ok {
 		return nn.Matrix{}, fmt.Errorf("tensor %q is %s, which is not a weight format", name, t.DType)
 	}
-	return nn.Matrix{Data: t.Raw, Quant: q, Rows: t.Shape[1], Cols: t.Shape[0]}, nil
+	m := nn.Matrix{Data: t.Raw, Quant: q, Rows: t.Shape[1], Cols: t.Shape[0]}
+	bindD4G(g, &m.Pre, &m.HadGroup, name, m.Cols)
+	return m, nil
+}
+
+// bindD4G gives a D4G matrix the vector its activation must go through, and
+// the rotation that follows it. Both are the file's, under a name
+// nn.D4GVectorNames knows; a matrix in any other format has neither and this
+// leaves it alone.
+//
+// The product does the transform itself, on a copy of the activation, which is
+// a thousandth of what the product costs and is why nothing else in this
+// package has to know the format exists.
+func bindD4G(g *tensors.GGUF, pre *[]float32, group *int, name string, cols int) {
+	if pre == nil {
+		return
+	}
+	width, err := g.Uint32("golem.d4.hadamard_group")
+	if err != nil || width == 0 {
+		return
+	}
+	for _, at := range nn.D4GVectorNames(name) {
+		v, err := floats(g, at)
+		if err != nil || len(v) != cols {
+			continue
+		}
+		*pre, *group = v, int(width)
+		return
+	}
 }
 
 // experts binds a three-dimensional tensor. GGUF writes the fastest dimension
@@ -140,6 +174,7 @@ func experts(g *tensors.GGUF, name string) (ExpertStack, error) {
 		return ExpertStack{}, fmt.Errorf("tensor %q is %s, which is not a weight format", name, t.DType)
 	}
 	e := ExpertStack{Data: t.Raw, Quant: q, Rows: t.Shape[1], Cols: t.Shape[0], Count: t.Shape[2]}
+	bindD4G(g, &e.Pre, &e.HadGroup, name, e.Cols)
 	row := nn.Matrix{Quant: q, Cols: e.Cols}
 	if want := row.RowBytes() * e.Rows * e.Count; want != len(t.Raw) {
 		return ExpertStack{}, fmt.Errorf("tensor %q holds %d bytes for %d experts of %dx%d, expected %d",

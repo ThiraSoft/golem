@@ -30,6 +30,18 @@ type Matrix struct {
 	// It is what the products read when it is there; the rows past the last
 	// whole group of eight are not in it and keep reading Data.
 	Packed []byte
+
+	// Pre is the per-column vector this matrix's activation has to go through
+	// before the product, and HadGroup the width of the rotation that follows
+	// it. Both belong to a D4G matrix and are nil and zero for every other
+	// format — see nn/d4g_prepare.go for what they are and why the weights do
+	// not carry them.
+	//
+	// A product finds them here and does the transform itself, on a copy. A
+	// caller reading one activation with several matrices of the same site can
+	// leave them unset and do the transform once, which is what qwen does.
+	Pre      []float32
+	HadGroup int
 }
 
 // Repack builds the interleaved form of a Q4_0 matrix, which nn/pack_q4_0.go
@@ -113,6 +125,9 @@ func (m Matrix) MatVecRows(b *Batch, ys [][]float32, start, end int) {
 // the caller's thread. The format is decided once for the whole call, and the
 // batch is the innermost loop so that a row is read from memory once.
 func (m Matrix) rows(b *Batch, ys [][]float32, start, end int) {
+	if m.Pre != nil {
+		b = m.prepare(b)
+	}
 	switch m.Quant {
 	case Q4_0:
 		if packed := m.Rows / PackedRows * PackedRows; m.Packed != nil && start < packed {
@@ -177,6 +192,29 @@ func (m Matrix) rows(b *Batch, ys [][]float32, start, end int) {
 
 // Row expands one row into out, which holds Cols floats. This is how embedding
 // tables are read: one row per token, never a product.
+// prepare is the activation this matrix's kernel should read: the caller's
+// batch put through the site's vector and rotation, in a copy of its own.
+//
+// A copy because the batch is one and the matrices reading it are several —
+// the three attention projections read the stream, and undoing the scheme in
+// place for the first would hand the second something already transformed. It
+// costs a pass over the activation where the product costs a pass over the
+// matrix, which is a thousandth of it and buys a caller that needs to know
+// nothing about the format.
+//
+// A caller that reads one activation with several matrices of the same site
+// can do better by transforming it once itself, which is what qwen/block.go
+// does. This is for the callers that would rather not.
+func (m Matrix) prepare(b *Batch) *Batch {
+	out := &Batch{Size: b.Size, Width: b.Width, F: make([][]float32, b.Size)}
+	for c := 0; c < b.Size; c++ {
+		out.F[c] = make([]float32, b.Width)
+		copy(out.F[c], b.F[c])
+		PrepareD4G(out.F[c], m.Pre, m.HadGroup)
+	}
+	return out
+}
+
 func (m Matrix) Row(index int, out []float32) {
 	if index < 0 || index >= m.Rows {
 		panic(fmt.Sprintf("nn: row %d out of %d", index, m.Rows))

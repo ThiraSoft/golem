@@ -49,6 +49,7 @@ package nn
 import (
 	"math"
 	"sort"
+	"strings"
 )
 
 const (
@@ -297,4 +298,39 @@ func matVecD4GRows(w []byte, b *Batch, cols, bits int, ys [][]float32, start, en
 			ys[c][r] = DotF32(row, b.F[c])
 		}
 	}
+}
+
+// d4gSites says which activation a matrix reads, by the name of the tensor.
+// Matrices sharing a site share the vector and the rotation, because they read
+// the same activation — the three attention projections read the stream, the
+// gate and the up read the feed forward's norm, and a mixture's two stacks read
+// neither of those.
+var d4gSites = map[string]string{
+	"attn_q": "qkv", "attn_k": "qkv", "attn_v": "qkv",
+	"attn_output": "o",
+	"ffn_gate":    "gateup", "ffn_up": "gateup",
+	"ffn_down":         "down",
+	"ffn_gate_up_exps": "gateup_exps",
+	"ffn_down_exps":    "down_exps",
+}
+
+// D4GVectorNames is where to look for the vector a matrix's activation must go
+// through, most specific first. A converter writes one of these and a reader
+// takes the first it finds, so that the two cannot drift apart: the naming is
+// part of the format and lives here rather than in either of them.
+//
+// A block's matrix is filed under its site — blk.7.attn_k.weight reads
+// blk.7.qkv.pre — and anything else under its own name. The tied head is both:
+// output.pre when the converter had activations to measure it from, and its own
+// name when it did not.
+func D4GVectorNames(tensor string) []string {
+	if tensor == "token_embd.weight" {
+		return []string{"output.pre", tensor + ".pre"}
+	}
+	if parts := strings.Split(tensor, "."); len(parts) == 4 && parts[0] == "blk" {
+		if site, ok := d4gSites[parts[2]]; ok {
+			return []string{parts[0] + "." + parts[1] + "." + site + ".pre", tensor + ".pre"}
+		}
+	}
+	return []string{tensor + ".pre"}
 }

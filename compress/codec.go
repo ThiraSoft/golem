@@ -38,7 +38,12 @@ func Fp16round(x float32) float32 {
 }
 
 func Parallel(n int, fn func(lo, hi int)) {
-	w := runtime.NumCPU()
+	// GOMAXPROCS and not NumCPU: they are the same until somebody sets the
+	// first, and somebody setting it means they wanted fewer cores busy —
+	// a laptop that throttles, a machine doing something else. NumCPU would
+	// spawn the goroutines anyway and let the scheduler sort it out, which
+	// works and says the wrong thing.
+	w := runtime.GOMAXPROCS(0)
 	if n < w {
 		w = n
 	}
