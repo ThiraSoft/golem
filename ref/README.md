@@ -184,6 +184,17 @@ The Go test refuses a case that agrees with the scalar rotation while claiming
 to spread, so a fixture set recorded with equal components cannot pass for
 coverage of the sections.
 
+Given a second directory it also records the **vision tower's** rotation, into
+`testdata/qwen35/vrope/`: the same op under `GGML_ROPE_TYPE_VISION`, which is a
+different rule — the frequency starts again at every section where the trunk's
+never resets. Five cases over a patch grid, and a Go test that refuses to let
+the two rules agree.
+
+```bash
+mkdir -p testdata/qwen35/{mrope,vrope}
+build/ref/dump_mrope testdata/qwen35/mrope testdata/qwen35/vrope
+```
+
 ## The rule
 
 The recordings are not committed — they are the models' output, and this

@@ -82,6 +82,81 @@ func (t *RoPETable) PrepareMulti(dims int, at [4]int, base float64, sections Sec
 	t.dims, t.at, t.sections, t.base, t.factors, t.ready = dims, at, sections, base, factors, true
 }
 
+// PrepareVision is the rotation a vision tower turns its patches by:
+// GGML_ROPE_TYPE_VISION, where the sections are contiguous and each starts its
+// frequency again from the top.
+//
+// That last part is the whole difference from PrepareMulti, and it is not a
+// flag. There, pair i turns at base^(-2i/dims) whichever axis it reads, which
+// is what makes equal axes collapse into the scalar rotation. Here the ladder
+// restarts, so the first pair of the second section turns as fast as the first
+// pair of the first. Two rules, two functions.
+//
+// at is the patch's row and column. VISION ignores the last two sections, so a
+// tower declares four and only the first two are ever selected.
+//
+// head is the whole head, not the n_dims a graph passes to ggml_rope_multi.
+// For VISION ggml rotates ne0 — every element — and uses n_dims as the offset
+// that pairs element i with element i+n_dims, which is half the head. So a
+// head of 72 gives 36 pairs covering all of it, and the frequency ladder is
+// taken over 72. Reading n_dims as a count instead builds half the table and
+// leaves the second section unrotated, which is right at the origin and wrong
+// everywhere else.
+func (t *RoPETable) PrepareVision(head int, at [2]int, base float64, sections Sections, factors []float32) {
+	dims := head
+	if dims%2 != 0 {
+		panic("nn: RoPE needs an even head dimension")
+	}
+	if factors != nil && len(factors) != dims/2 {
+		panic("nn: RoPE frequency factors must number half the head dimension")
+	}
+	sect := sections[0] + sections[1] + sections[2] + sections[3]
+	if sect == 0 {
+		panic("nn: the vision rotation needs sections")
+	}
+	// The two rules share a table and therefore a cache key. The negative
+	// marker is what keeps a vision table from being handed back for a
+	// PrepareMulti with the same numbers: no position is negative.
+	key := [4]int{at[0], at[1], -1, -1}
+	if t.ready && t.dims == dims && t.at == key && t.sections == sections &&
+		t.base == base && sameSlice(t.factors, factors) {
+		return
+	}
+	half := dims / 2
+	if cap(t.Cos) < half {
+		t.Cos = make([]float32, half)
+		t.Sin = make([]float32, half)
+	}
+	t.Cos, t.Sin = t.Cos[:half], t.Sin[:half]
+	for i := 0; i < half; i++ {
+		axis, within := visionSection(i%sect, sections)
+		// within, not i: this is the reset, and it is the whole of the rule.
+		//
+		// The denominator is half the head, not the head. ggml takes
+		// theta_scale as freq_base^(-2/n_dims), and for VISION ggml.h requires
+		// n_dims to be head_size/2 — so the ladder is steeper than the number
+		// of pairs would suggest, and the two numbers being equal here is a
+		// constraint of the type rather than a coincidence.
+		theta := float64(at[axis]) * math.Pow(base, -2*float64(within)/float64(half))
+		if factors != nil {
+			theta /= float64(factors[i])
+		}
+		t.Cos[i] = float32(math.Cos(theta))
+		t.Sin[i] = float32(math.Sin(theta))
+	}
+	t.dims, t.at, t.sections, t.base, t.factors, t.ready = dims, key, sections, base, factors, true
+}
+
+// visionSection is which axis a sector reads and how far into that section it
+// sits, which is the index its frequency is taken from. VISION ignores the
+// last two sections, so anything past the second reads the second.
+func visionSection(sector int, sections Sections) (axis, within int) {
+	if sector < sections[0] {
+		return 0, sector
+	}
+	return 1, sector - sections[0]
+}
+
 // section is which of the four components pair i turns by. A model with no
 // sections turns everything by the first, which is the scalar rotation.
 func section(i, sect int, sections Sections) int {

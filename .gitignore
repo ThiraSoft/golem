@@ -37,6 +37,7 @@
 # a diff, and one that drifts from its recorder should be rewritten and not
 # merged.
 /testdata/qwen35/mrope/
+/testdata/qwen35/vrope/
 
 # The Mimi encoder fixtures, same rule as the others.
 /testdata/encoder/

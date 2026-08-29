@@ -6,7 +6,13 @@
 // width and the position, and on nothing a checkpoint holds — so the cases are
 // written here, and the sections Qwen3.8-27B declares are one of them.
 //
-// Usage: dump_mrope <out_dir>
+// Usage: dump_mrope <mrope_out_dir> [vision_out_dir]
+//
+// The second directory takes the vision tower's rotation, which is the same op
+// under GGML_ROPE_TYPE_VISION and a different rule: there the frequency starts
+// again at every section, where the trunk's never resets. Given one argument
+// only the trunk's cases are written, so the command in ref/README.md that
+// predates the tower goes on working.
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -39,36 +45,17 @@ struct Case {
     int t, h, w, e;
 };
 
-int main(int argc, char ** argv) {
-    if (argc != 2) { fprintf(stderr, "usage: dump_mrope <out_dir>\n"); return 1; }
-    const std::string out = argv[1];
-
-    // Qwen3.8-27B: 64 rotated dimensions of a 256-wide head, sections summing
-    // to 32, base ten million.
-    const int head_size = 256;
-    const int n_dims    = 64;
-    const int n_head    = 2;
-    const float base    = 1e7f;
-    int sections[GGML_MROPE_SECTIONS] = { 11, 11, 10, 0 };
-
-    // Degenerate cases pin the claim text depends on. The spread ones pin the
-    // round robin. The boundary ones sit where 3*sections[i] cuts a section
-    // off, which is the arithmetic a transcription gets wrong silently.
-    const std::vector<Case> cases = {
-        { "degenerate_0",   0,   0,   0, 0 },
-        { "degenerate_37", 37,  37,  37, 0 },
-        { "spread_small",   4,   1,   2, 0 },
-        { "spread_grid",   12,   3,   7, 0 },
-        { "boundary_low",   1,   0,   0, 0 },
-        { "boundary_high", 40,  31,  29, 0 },
-        { "image_row",      9,   0,  15, 0 },
-        { "image_col",      9,  15,   0, 0 },
-    };
-
+// record writes one set of cases under one rotation type into one directory.
+static void record(const std::string & out, int head_size, int n_dims, int n_head,
+                   float base, int sections[GGML_MROPE_SECTIONS], int rope_type,
+                   const std::vector<Case> & cases) {
     std::string index = "{\n  \"head_size\": " + std::to_string(head_size) +
                         ",\n  \"n_dims\": " + std::to_string(n_dims) +
                         ",\n  \"n_head\": " + std::to_string(n_head) +
-                        ",\n  \"base\": 10000000.0,\n  \"sections\": [11, 11, 10, 0],\n  \"cases\": [\n";
+                        ",\n  \"base\": " + std::to_string(base) +
+                        ",\n  \"sections\": [" + std::to_string(sections[0]) + ", " +
+                        std::to_string(sections[1]) + ", " + std::to_string(sections[2]) + ", " +
+                        std::to_string(sections[3]) + "],\n  \"cases\": [\n";
 
     for (size_t ci = 0; ci < cases.size(); ++ci) {
         const Case & c = cases[ci];
@@ -80,14 +67,10 @@ int main(int argc, char ** argv) {
         };
         struct ggml_context * ctx = ggml_init(ip);
 
-        // One token, n_head heads of head_size. ne2 is the token axis, which
-        // is what the position tensor is indexed by.
         struct ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_size, n_head, 1);
         std::vector<float> x = activation(ggml_nelements(a));
         memcpy(a->data, x.data(), x.size()*sizeof(float));
 
-        // Four positions per token, laid out t, h, w, e — one block of
-        // n_tokens each, which is how ggml reads pos[i2 + ne2*k].
         struct ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
         ((int32_t *) b->data)[0] = c.t;
         ((int32_t *) b->data)[1] = c.h;
@@ -96,7 +79,7 @@ int main(int argc, char ** argv) {
 
         struct ggml_tensor * r = ggml_rope_multi(
             ctx, a, b, NULL,
-            n_dims, sections, GGML_ROPE_TYPE_IMROPE,
+            n_dims, sections, rope_type,
             /*n_ctx_orig =*/ 0,
             /*freq_base  =*/ base,
             /*freq_scale =*/ 1.0f,
@@ -123,5 +106,47 @@ int main(int argc, char ** argv) {
 
     index += "  ]\n}\n";
     write_file(out + "/index.json", index.data(), index.size());
+}
+
+int main(int argc, char ** argv) {
+    if (argc < 2 || argc > 3) {
+        fprintf(stderr, "usage: dump_mrope <mrope_out_dir> [vision_out_dir]\n");
+        return 1;
+    }
+    const std::string out = argv[1];
+
+    // Qwen3.8-27B's trunk: 64 rotated dimensions of a 256-wide head, sections
+    // summing to 32, base ten million. The frequency never resets.
+    int sections[GGML_MROPE_SECTIONS] = { 11, 11, 10, 0 };
+
+    // Degenerate cases pin the claim text depends on. The spread ones pin the
+    // round robin. The boundary ones sit where 3*sections[i] cuts a section
+    // off, which is the arithmetic a transcription gets wrong silently.
+    const std::vector<Case> cases = {
+        { "degenerate_0",   0,   0,   0, 0 },
+        { "degenerate_37", 37,  37,  37, 0 },
+        { "spread_small",   4,   1,   2, 0 },
+        { "spread_grid",   12,   3,   7, 0 },
+        { "boundary_low",   1,   0,   0, 0 },
+        { "boundary_high", 40,  31,  29, 0 },
+        { "image_row",      9,   0,  15, 0 },
+        { "image_col",      9,  15,   0, 0 },
+    };
+    record(out, 256, 64, 2, 1e7f, sections, GGML_ROPE_TYPE_IMROPE, cases);
+
+    if (argc == 3) {
+        // The vision tower: a head of 72 of which 36 rotate, four equal
+        // sections, base ten thousand. VISION reads only the first two — the
+        // row and the column — and restarts the frequency at each.
+        int v_sections[GGML_MROPE_SECTIONS] = { 18, 18, 18, 18 };
+        const std::vector<Case> v_cases = {
+            { "v_origin",   0,  0, 0, 0 },
+            { "v_row",      3,  0, 0, 0 },
+            { "v_col",      0,  5, 0, 0 },
+            { "v_grid",     7, 11, 0, 0 },
+            { "v_far",     47, 47, 0, 0 },
+        };
+        record(argv[2], 72, 36, 2, 10000.0f, v_sections, GGML_ROPE_TYPE_VISION, v_cases);
+    }
     return 0;
 }
