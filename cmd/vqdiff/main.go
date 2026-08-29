@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/qwen"
+	"github.com/ThiraSoft/golem/qwen35"
+	"github.com/ThiraSoft/golem/tensors"
 	"github.com/ThiraSoft/golem/token/bytebpe"
 )
 
@@ -40,7 +42,7 @@ func main() {
 	steps := flag.Int("steps", 40, "greedy steps")
 	flag.Parse()
 
-	m, err := qwen.Open(*model, 4096)
+	m, err := open(*model, 4096)
 	must(err)
 	defer m.Close()
 	v, err := bytebpe.Load(m.File())
@@ -54,7 +56,7 @@ func main() {
 		if len(ids) > *limit {
 			ids = ids[:*limit]
 		}
-		logits := make([]float32, m.Cfg.Vocab)
+		logits := make([]float32, m.Vocab())
 		// The corpus is the evaluation set, so it is the one whose opinions are
 		// worth comparing between two models. Perplexity says whether a model
 		// still predicts language; these say whether it still says the same
@@ -93,7 +95,7 @@ func main() {
 	// Teacher-forced perplexity on the held-out text.
 	ids := v.Encode(heldOut, true, false)
 	h := m.ForwardBatch(ids, 0)
-	logits := make([]float32, m.Cfg.Vocab)
+	logits := make([]float32, m.Vocab())
 	var df *os.File
 	if *dump != "" {
 		df, err = os.Create(*dump)
@@ -164,6 +166,39 @@ func argmax(l []float32) int32 {
 		}
 	}
 	return bi
+}
+
+// A model is as much of one as this tool reads, so that a checkpoint of either
+// architecture can be measured by the same instrument. The two packages have
+// the same shape here and no interface of their own; naming one is cheaper than
+// a second copy of the loop.
+type model interface {
+	Close() error
+	File() *tensors.GGUF
+	Vocab() int
+	Reset()
+	ForwardBatch(tokens []int32, startPos int) [][]float32
+	Logits(hidden, out []float32)
+}
+
+type qwenModel struct{ *qwen.Model }
+
+func (m qwenModel) Vocab() int { return m.Cfg.Vocab }
+
+type qwen35Model struct{ *qwen35.Model }
+
+func (m qwen35Model) Vocab() int { return m.Cfg.Vocab }
+
+// open reads a checkpoint with whichever engine claims it. qwen refuses an
+// architecture it does not know, which is how the second gets its turn.
+func open(path string, ctx int) (model, error) {
+	if m, err := qwen.Open(path, ctx); err == nil {
+		return qwenModel{m}, nil
+	} else if m2, err2 := qwen35.Open(path, ctx); err2 == nil {
+		return qwen35Model{m2}, nil
+	} else {
+		return nil, fmt.Errorf("neither engine reads it: %v; %v", err, err2)
+	}
 }
 
 func must(err error) {

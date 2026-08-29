@@ -110,5 +110,6 @@ func ForwardFullAttnToken(
 	})
 
 	load(scratch.batchAttn, attnOut)
+	calib(bc.Index, "o", attnOut)
 	bw.O.MatVec(scratch.batchAttn, out)
 }

@@ -312,6 +312,13 @@ var d4gSites = map[string]string{
 	"ffn_down":         "down",
 	"ffn_gate_up_exps": "gateup_exps",
 	"ffn_down_exps":    "down_exps",
+	// A hybrid's linear-attention block. Its four input projections read the
+	// same normed stream a full attention's three do, and its output
+	// projection stands where the attention's does — and no block is both
+	// kinds, so the two sites are free to be the same two names.
+	"attn_qkv": "qkv", "attn_gate": "qkv",
+	"ssm_alpha": "qkv", "ssm_beta": "qkv",
+	"ssm_out": "o",
 }
 
 // D4GVectorNames is where to look for the vector a matrix's activation must go

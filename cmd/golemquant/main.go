@@ -21,6 +21,7 @@ import (
 	"github.com/ThiraSoft/golem/compress"
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/qwen"
+	"github.com/ThiraSoft/golem/qwen35"
 	"github.com/ThiraSoft/golem/tensors"
 	"github.com/ThiraSoft/golem/token/bytebpe"
 )
@@ -382,31 +383,53 @@ func main() {
 // cache is forgotten between windows: each is its own context, which is what
 // makes one long text into many independent samples.
 func runCalib(path, text string, ntok, ctx int, hook func(int, string, [][]float32)) int {
-	m, err := qwen.Open(path, ctx)
-	if err != nil {
-		// A checkpoint this converter cannot run. Everything it writes is
-		// still writable — the rotation needs no statistics, only the
-		// salience does — so the conversion goes ahead with signs alone and
-		// says so rather than stopping.
-		fmt.Printf("no calibration: %v\n  every matrix will be rotated with signs alone, and none scaled\n", err)
+	// Whichever engine claims the checkpoint. The salience is worth twenty
+	// points of perplexity on Qwen3-0.6B — 39.80 against 60.01 with the
+	// columns left alone — so a conversion that cannot calibrate is not a
+	// conversion worth doing, and it says so rather than quietly writing one.
+	var run func(func(int, string, [][]float32)) (int, error)
+	if m, err := qwen.Open(path, ctx); err == nil {
+		run = func(h func(int, string, [][]float32)) (int, error) {
+			defer m.Close()
+			qwen.Calib = h
+			defer func() { qwen.Calib = nil }()
+			return sweep(m.File(), text, ntok, ctx, m.Reset, m.ForwardBatch)
+		}
+	} else if m2, err2 := qwen35.Open(path, ctx); err2 == nil {
+		run = func(h func(int, string, [][]float32)) (int, error) {
+			defer m2.Close()
+			qwen35.Calib = h
+			defer func() { qwen35.Calib = nil }()
+			return sweep(m2.File(), text, ntok, ctx, m2.Reset, m2.ForwardBatch)
+		}
+	} else {
+		fmt.Printf("no calibration: %v; %v\n  every matrix will be rotated with signs alone, and none scaled —\n  which is worth twenty points of perplexity, so do not ship this\n", err, err2)
 		return 0
 	}
-	defer m.Close()
-	v, err := bytebpe.Load(m.File())
+	n, err := run(hook)
 	must(err)
+	return n
+}
+
+// sweep walks the text through a model in windows, forgetting the cache between
+// them so each is its own context and one long text becomes many samples.
+func sweep(g *tensors.GGUF, text string, ntok, ctx int,
+	reset func(), forward func([]int32, int) [][]float32) (int, error) {
+	v, err := bytebpe.Load(g)
+	if err != nil {
+		return 0, err
+	}
 	ids := v.Encode(text, true, false)
 	if len(ids) > ntok {
 		ids = ids[:ntok]
 	}
-	qwen.Calib = hook
-	defer func() { qwen.Calib = nil }()
 	n := 0
 	for start := 0; start+ctx <= len(ids); start += ctx {
-		m.Reset()
-		m.ForwardBatch(ids[start:start+ctx], 0)
+		reset()
+		forward(ids[start:start+ctx], 0)
 		n += ctx
 	}
-	return n
+	return n, nil
 }
 
 // calibrate keeps, for each site, the per-column power of the activations that

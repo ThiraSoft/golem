@@ -93,6 +93,10 @@ func (m *Model) Close() error {
 	return nil
 }
 
+// File is the mapping the weights live in, so that a caller wanting the
+// vocabulary beside them need not open it twice. qwen/model.go has the same.
+func (m *Model) File() *tensors.GGUF { return m.file }
+
 func (m *Model) Reset() {
 	m.cache.Reset()
 	m.ResetMTP()

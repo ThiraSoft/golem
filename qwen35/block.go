@@ -20,6 +20,7 @@ func Block(
 	copy(normed, x)
 	nn.RMSNormPlain(normed, bw.AttnNorm, cfg.Eps)
 	scratch.SetInput(normed)
+	calib(bc.Index, "qkv", normed)
 
 	if bc.Type == BlockFullAttn {
 		ForwardFullAttnToken(cfg, bc, bw, cache, rope, at, normed, subOut, scratch)
@@ -34,6 +35,7 @@ func Block(
 	copy(normed, x)
 	nn.RMSNormPlain(normed, bw.FFNNorm, cfg.Eps)
 	scratch.SetInput(normed)
+	calib(bc.Index, "gateup", normed)
 
 	gate := scratch.batchFFN.F[0][:bc.FFN]
 	up := scratch.ffnUp[:bc.FFN]
@@ -45,6 +47,7 @@ func Block(
 		gate[i] *= up[i]
 	}
 	quantize(scratch.batchFFN)
+	calib(bc.Index, "down", gate)
 
 	ffnOut := scratch.ffnDown[:dim]
 	bw.Down.MatVec(scratch.batchFFN, ffnOut)

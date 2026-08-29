@@ -71,6 +71,7 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 		Rows:  cfg.Vocab,
 		Cols:  cfg.Dim,
 	}
+	bindD4G(g, &w.TokenEmbd, "token_embd.weight")
 
 	outNorm, ok := g.Tensors["output_norm.weight"]
 	if !ok {
@@ -89,6 +90,7 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 			Rows:  cfg.Vocab,
 			Cols:  cfg.Dim,
 		}
+		bindD4G(g, &w.OutputHead, "output.weight")
 	} else {
 		w.OutputHead = w.TokenEmbd
 	}
@@ -171,4 +173,28 @@ func bindMatrix(g *tensors.GGUF, name string, m *nn.Matrix, rows, cols int) {
 	m.Quant = q
 	m.Rows = rows
 	m.Cols = cols
+	bindD4G(g, m, name)
+}
+
+// bindD4G gives a D4G matrix the vector its activation must go through and the
+// rotation that follows it, both from the file under a name nn.D4GVectorNames
+// knows. A matrix in any other format has neither and this leaves it alone; the
+// product does the transform itself, so nothing else in this package changes.
+func bindD4G(g *tensors.GGUF, m *nn.Matrix, name string) {
+	width, err := g.Uint32("golem.d4.hadamard_group")
+	if err != nil || width == 0 || m.Quant.D4Width() == 0 {
+		return
+	}
+	for _, at := range nn.D4GVectorNames(name) {
+		t, ok := g.Tensors[at]
+		if !ok {
+			continue
+		}
+		v, err := t.F32()
+		if err != nil || len(v) != m.Cols {
+			continue
+		}
+		m.Pre, m.HadGroup = v, int(width)
+		return
+	}
 }
