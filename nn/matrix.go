@@ -219,6 +219,26 @@ func (m Matrix) prepare(b *Batch) *Batch {
 	return out
 }
 
+// unrotate recovers a weight row from the form the file holds it in.
+//
+// A D4G matrix is stored as A·(q ⊙ W), and a product never undoes that: it
+// puts the activation through the reciprocal instead, which is the whole
+// bargain of the scheme. But a row read on its own is not a product. The
+// embedding table is the case that matters — every engine here reads a token's
+// row out of it — and a row handed back rotated is a token entering the model
+// as somebody else's vector.
+//
+// It is done here rather than at each of the eleven call sites because a
+// matrix that carries its own transform should carry it: qwen/model.go undoes
+// it by hand, qwen35 did not, and the model answered fluently and wrongly for
+// a day. Nothing in this repository reads a row wanting the stored form; the
+// products read Data.
+func (m Matrix) unrotate(out []float32) {
+	if m.Pre != nil && m.HadGroup > 0 {
+		UnprepareD4G(out, m.Pre, m.HadGroup)
+	}
+}
+
 func (m Matrix) Row(index int, out []float32) {
 	if index < 0 || index >= m.Rows {
 		panic(fmt.Sprintf("nn: row %d out of %d", index, m.Rows))
@@ -235,8 +255,10 @@ func (m Matrix) Row(index int, out []float32) {
 		DequantizeQ4_K(row, m.Cols, out)
 	case L8G:
 		DequantizeL8G(row, m.Cols, out)
+		m.unrotate(out)
 	case D4G, D4G16:
 		DequantizeD4GN(row, m.Cols, m.Quant.D4Width(), out)
+		m.unrotate(out)
 	case F32:
 		for i := 0; i < m.Cols; i++ {
 			out[i] = float32FromBytes(row[i*4:])

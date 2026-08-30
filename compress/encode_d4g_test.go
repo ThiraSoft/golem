@@ -154,3 +154,69 @@ func TestWideTierCostsAndBuys(t *testing.T) {
 		t.Errorf("the wide tier bought %.2f dB for a whole bit, which is not enough to be worth it", gain)
 	}
 }
+
+// A row read back is the row that went in.
+//
+// This is the check nothing had: RelErr compares the codes against the matrix
+// already put through the site's scale and rotation, which is the basis they
+// were written in, and every reader of a *product* meets them in that basis.
+// A row read on its own does not — the embedding table is read a token at a
+// time and the row has to be the embedding — and between the two lives a fault
+// that changes no shape, no name and no size, and that a card-against-processor
+// comparison cannot see because both sides read it the same wrong way.
+func TestARowReadsBackAsTheRowThatWentIn(t *testing.T) {
+	const rows, cols, group = 48, 512, 128
+	r := rand.New(rand.NewSource(21))
+	w := make([]float32, rows*cols)
+	for i := range w {
+		w[i] = float32(r.NormFloat64() * 0.02)
+	}
+	// A site's vector: signs over a scale, which is what a calibration writes.
+	pre := make([]float32, cols)
+	q := make([]float32, cols)
+	for j := range pre {
+		s := float32(0.4 + r.Float64())
+		if r.Intn(2) == 0 {
+			s = -s
+		}
+		q[j] = s
+		pre[j] = 1 / s
+	}
+	p := D4Params{Beta: 2, ScaleBlock: nn.D4SubBlock, HadGroup: group,
+		Bits: nn.D4Bits, SearchScale: true}
+	data := EncodeD4G(w, rows, cols, q, p, nil)
+
+	// Bound the way a loader binds it: the vector the file carries beside it.
+	m := nn.Matrix{Data: data, Quant: nn.D4G, Rows: rows, Cols: cols, Pre: pre, HadGroup: group}
+	got := make([]float32, cols)
+	var num, den float64
+	for i := 0; i < rows; i++ {
+		m.Row(i, got)
+		for j, x := range w[i*cols : (i+1)*cols] {
+			d := float64(got[j] - x)
+			num += d * d
+			den += float64(x) * float64(x)
+		}
+	}
+	rel := math.Sqrt(num / den)
+	if rel > 0.25 {
+		t.Errorf("a row reads back %.4f away from the row that went in; the format's own error is about 0.15, and 1.4 is a row still rotated", rel)
+	}
+
+	// And a matrix with no vector hands back what it holds, because that is
+	// what a product wants.
+	plain := nn.Matrix{Data: data, Quant: nn.D4G, Rows: rows, Cols: cols}
+	stored := make([]float32, cols)
+	plain.Row(0, stored)
+	m.Row(0, got)
+	same := true
+	for j := range got {
+		if got[j] != stored[j] {
+			same = false
+			break
+		}
+	}
+	if same {
+		t.Error("a bound matrix and an unbound one gave the same row, so nothing was undone")
+	}
+}
