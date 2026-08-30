@@ -52,6 +52,7 @@ func main() {
 	search := flag.Bool("search", false, "search each block's scale instead of taking its RMS")
 	hadGroup := flag.Int("hadamard", 128, "rotation group; 0 leaves the weights unrotated")
 	ntok := flag.Int("tokens", 256, "calibration tokens")
+	window := flag.Int("window", 0, "measure the sites in windows of this many tokens; 0 is one pass over the lot, which measures better")
 	calibCard := flag.Bool("calib-vulkan", false, "measure the sites by running the model on a Vulkan device; on the processor this is most of a conversion's wall clock")
 	calibFile := flag.String("calib", "", "text to calibrate on; the built-in paragraph is 173 tokens, which is few enough to overfit")
 	roles := flag.String("roles", "all", "which matrices to compress; the rest stay BF16")
@@ -90,11 +91,31 @@ func main() {
 	// the activations that meet each matrix.
 	sal := map[string][]float64{}
 	cnt := map[string]int{}
-	// The context has to hold the calibration, or the forward pass walks off
-	// the end of the cache — a panic in the attention, a long way from the flag
-	// that caused it.
+	// The context has to hold what one pass reads, or the forward pass walks
+	// off the end of the cache — a panic in the attention, a long way from the
+	// flag that caused it.
+	//
+	// Windows are offered and are not the default, which is the opposite of
+	// what this file assumed. Running eight thousand tokens as one pass makes
+	// the attention quadratic and costs thirty-five minutes against ten, so
+	// sweeping in windows the way cmd/golemquant does looked like the free
+	// correction — and the guess behind it, that the sites should be measured
+	// in the regime the evaluation reads them in, was wrong. On Qwen3-4B, at
+	// the same eight thousand tokens: one pass reads 19.7004 and 0.0550,
+	// sixteen windows of 512 read 19.7808 and 0.0566. Worse on both.
+	//
+	// What the same three runs say about the token count is stranger and is
+	// left as an observation rather than a rule, being two points on one model:
+	// 2048 tokens in one pass reads 19.7285 and **0.0510**, which is worse
+	// perplexity than 8192 and better divergence. More calibration appears to
+	// buy average likelihood and sell per-token agreement — which would be the
+	// salience fitting its proxy, activation power, better and better while the
+	// thing that proxy stands for drifts.
 	ctx := 4096
-	for ctx < *ntok {
+	for ctx < *ntok && *window == 0 {
+		ctx *= 2
+	}
+	for ctx < *window {
 		ctx *= 2
 	}
 	m, err := qwen.Open(*src, ctx)
@@ -120,7 +141,11 @@ func main() {
 	// stays as the fallback and as what the card is checked against.
 	var salience map[string][]float32
 	if *calibCard {
-		if s, ok := calibrateOnCard(*src, text, *ntok, ctx); ok {
+		win := *window
+		if win == 0 {
+			win = *ntok
+		}
+		if s, ok := calibrateOnCard(*src, text, *ntok, win); ok {
 			salience = s
 		}
 	}
@@ -141,7 +166,16 @@ func main() {
 	}
 	t0 := time.Now()
 	if salience == nil {
-		m.ForwardBatch(ids, 0)
+		if *window == 0 {
+			m.ForwardBatch(ids, 0)
+		} else {
+			// Whole windows only, which is what cmd/golemquant's sweep does: a
+			// short tail would measure the sites in a third regime.
+			for at := 0; at+*window <= len(ids); at += *window {
+				m.Reset()
+				m.ForwardBatch(ids[at:at+*window], 0)
+			}
+		}
 		qwen.Calib = nil
 		fmt.Printf("calibrated on %d tokens in %s, %d sites\n",
 			len(ids), time.Since(t0).Round(time.Millisecond), len(sal))
@@ -376,12 +410,12 @@ const calibText = `The quick brown fox jumps over the lazy dog. ` +
 // The site keys are "block/site" with the same four names the processor's tap
 // uses — vk/qwen_calib.go names them qkv, o, gateup and down — so what comes
 // back drops straight into the map the rest of this command already reads.
-func calibrateOnCard(path, text string, ntok, ctx int) (map[string][]float32, bool) {
+func calibrateOnCard(path, text string, ntok, win int) (map[string][]float32, bool) {
 	give := func(err error) (map[string][]float32, bool) {
 		fmt.Printf("no calibration on the card (%v); the processor then\n", err)
 		return nil, false
 	}
-	m, err := qwen35.Open(path, ctx)
+	m, err := qwen35.Open(path, win)
 	if err != nil {
 		return give(err)
 	}
@@ -401,14 +435,10 @@ func calibrateOnCard(path, text string, ntok, ctx int) (map[string][]float32, bo
 		ids = ids[:ntok]
 	}
 	t0 := time.Now()
-	for at := 0; at < len(ids); at += ctx {
-		end := at + ctx
-		if end > len(ids) {
-			end = len(ids)
-		}
+	for at := 0; at+win <= len(ids); at += win {
 		m.Reset()
-		m.ForwardBatch(ids[at:end], 0)
-		m.CountVulkanCalibration(end - at)
+		m.ForwardBatch(ids[at:at+win], 0)
+		m.CountVulkanCalibration(win)
 	}
 	sums, rows, err := m.VulkanCalibrationSums()
 	if err != nil {
