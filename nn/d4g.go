@@ -321,6 +321,16 @@ var d4gSites = map[string]string{
 	"ssm_out": "o",
 }
 
+// D4GSite names the activation a block's matrix reads, given the field of the
+// tensor's name that says which matrix it is — attn_k of blk.7.attn_k.weight.
+// A converter needs it to decide which site's statistics a matrix is quantized
+// against, and it is the same table D4GVectorNames files the result under, so
+// that the two answers cannot be given differently.
+func D4GSite(matrix string) (string, bool) {
+	site, ok := d4gSites[matrix]
+	return site, ok
+}
+
 // D4GVectorNames is where to look for the vector a matrix's activation must go
 // through, most specific first. A converter writes one of these and a reader
 // takes the first it finds, so that the two cannot drift apart: the naming is
@@ -331,7 +341,11 @@ var d4gSites = map[string]string{
 // output.pre when the converter had activations to measure it from, and its own
 // name when it did not.
 func D4GVectorNames(tensor string) []string {
-	if tensor == "token_embd.weight" {
+	// The logit head, whether it is the table read the other way round or a
+	// matrix of its own. Both read what the final norm made, so both are the
+	// same site, and a model with an untied head has the two of them filed
+	// under it. output.pre is what a converter calls that site.
+	if tensor == "token_embd.weight" || tensor == "output.weight" {
 		return []string{"output.pre", tensor + ".pre"}
 	}
 	if parts := strings.Split(tensor, "."); len(parts) == 4 && parts[0] == "blk" {

@@ -28,3 +28,45 @@ func TestD4GVectorNames(t *testing.T) {
 		t.Errorf("no fallback: %v", n)
 	}
 }
+
+// The converter asks which site a matrix reads and the loader asks what that
+// site's vector is called; both questions go to the same table, so a matrix
+// the converter treats as siteless can never be one the loader files under a
+// site. A hybrid's linear-attention block is where the two drifted apart.
+func TestD4GSiteAgreesWithTheNames(t *testing.T) {
+	for _, c := range []struct{ matrix, site string }{
+		{"attn_qkv", "qkv"}, {"attn_gate", "qkv"},
+		{"ssm_alpha", "qkv"}, {"ssm_beta", "qkv"},
+		{"ssm_out", "o"},
+		{"attn_q", "qkv"}, {"attn_output", "o"},
+		{"ffn_up", "gateup"}, {"ffn_down", "down"},
+	} {
+		site, ok := D4GSite(c.matrix)
+		if !ok || site != c.site {
+			t.Errorf("D4GSite(%q) = %q, %v; want %q", c.matrix, site, ok, c.site)
+		}
+		want := "blk.5." + c.site + ".pre"
+		if got := D4GVectorNames("blk.5." + c.matrix + ".weight"); got[0] != want {
+			t.Errorf("%s is filed under %s but read from %s", c.matrix, want, got[0])
+		}
+	}
+	if _, ok := D4GSite("ssm_conv1d"); ok {
+		t.Error("ssm_conv1d is not a matrix with a site")
+	}
+}
+
+// The logit head is one site whether the model ties it to the table or keeps a
+// matrix of its own. Both read what the final norm made, so both are filed
+// under output.pre — and an untied model has the two of them there.
+func TestTheHeadIsOneSiteTiedOrNot(t *testing.T) {
+	for _, tensor := range []string{"token_embd.weight", "output.weight"} {
+		got := D4GVectorNames(tensor)
+		if len(got) != 2 || got[0] != "output.pre" || got[1] != tensor+".pre" {
+			t.Errorf("%s reads %v, want [output.pre %s.pre]", tensor, got, tensor)
+		}
+	}
+	// And output_norm.weight is not the head, however much its name looks it.
+	if got := D4GVectorNames("output_norm.weight"); got[0] != "output_norm.weight.pre" {
+		t.Errorf("output_norm.weight reads %v", got)
+	}
+}

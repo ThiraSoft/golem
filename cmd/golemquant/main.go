@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"sort"
@@ -24,20 +25,12 @@ import (
 	"github.com/ThiraSoft/golem/qwen35"
 	"github.com/ThiraSoft/golem/tensors"
 	"github.com/ThiraSoft/golem/token/bytebpe"
+	"github.com/ThiraSoft/golem/vk"
 )
 
 // headKey is the calibration site of the tied output head, which belongs to no
 // block and so is filed under -1.
 const headKey = "-1/head"
-
-// feeds says which site's activations reach each matrix, and so which vector it
-// shares.
-var feeds = map[string]string{
-	"attn_q": "qkv", "attn_k": "qkv", "attn_v": "qkv",
-	"attn_output": "o",
-	"ffn_gate":    "gateup", "ffn_up": "gateup",
-	"ffn_down": "down",
-}
 
 func main() {
 	src := flag.String("model", "", "the BF16 checkpoint to convert")
@@ -61,6 +54,8 @@ func main() {
 	keep := flag.String("keep", "", "comma-separated tensor name fragments left in BF16")
 	window := flag.Int("gptq", 0, "error-compensation window in columns; 0 turns it off")
 	damp := flag.Float64("damp", 0.01, "ridge on the Hessian diagonal, as a fraction of its mean")
+	vulkan := flag.Bool("vulkan", true, "encode the matrices on a Vulkan device when there is one")
+	calibSrc := flag.String("calib-model", "", "the checkpoint to calibrate on, when it is not the one being converted")
 	flag.Parse()
 
 	text := calibText
@@ -73,7 +68,16 @@ func main() {
 	if *search && win < *swin {
 		win = *swin
 	}
-	salience, accs := calibrate(*src, text, *ntok, *ctx, win, *scaleBlk)
+	// What a site is fed does not depend on which of llama.cpp's four-bit
+	// forms the weights that fed it were stored in, so a calibration may read
+	// a different build of the same model from the one being converted — which
+	// is what -calib-model is for, and what lets the pass run on a card when
+	// the converter's input is a type no kernel here reads.
+	calibFrom := *src
+	if *calibSrc != "" {
+		calibFrom = *calibSrc
+	}
+	salience, accs := calibrate(calibFrom, text, *ntok, *ctx, win, *scaleBlk, *vulkan)
 	if len(salience) == 0 && !*blind {
 		must(fmt.Errorf("golemquant: nothing calibrated and -blind is off, so nothing would be rotated"))
 	}
@@ -81,6 +85,32 @@ func main() {
 	g, err := tensors.OpenGGUF(*src)
 	must(err)
 	defer g.Close()
+
+	// The two halves of a conversion are not alike. The calibration runs the
+	// model, so it needs the engine and stays on the processor. The encoding
+	// needs nothing but the matrix — eight hundred million scale blocks, each
+	// searching its own step over forty candidates, none of them looking at
+	// another — and on this machine that was sixty-eight minutes of eight
+	// cores against under two of a card. The kernel writes the same bytes:
+	// vk.TestEncodeD4GMatchesCPU holds it to this encoder byte for byte,
+	// because a file quantized half one way and half the other would be two
+	// formats sharing a name.
+	var gpu *vk.D4GEncoder
+	if *vulkan {
+		if d, err := vk.Open(); err != nil {
+			fmt.Printf("no device (%v); the matrices are encoded on the processor\n", err)
+		} else {
+			defer d.Close()
+			// Nine and a quarter bytes a weight across the six buffers, so
+			// thirty-two million of them is three hundred megabytes and the
+			// widest row in any checkpoint fits a pass many times over.
+			if gpu, err = vk.NewD4GEncoder(d, *codeBits, 32<<20); err != nil {
+				fmt.Printf("no encoder on the device (%v); the matrices are encoded on the processor\n", err)
+			} else {
+				defer gpu.Close()
+			}
+		}
+	}
 
 	names := make([]string, 0, len(g.Tensors))
 	for n := range g.Tensors {
@@ -193,7 +223,7 @@ func main() {
 	// of its own and not a tally kept during the first.
 	comps := map[string]*compress.Comp{}
 	if *window > 0 {
-		comps = hessians(*src, text, *ntok, *ctx, pre, *hadGroup, *embd,
+		comps = hessians(calibFrom, text, *ntok, *ctx, pre, *hadGroup, *embd,
 			*window, *scaleBlk, *damp)
 	}
 
@@ -218,107 +248,244 @@ func main() {
 		return q, p
 	}
 
-	var out []tensors.OutTensor
+	// plan is what a tensor will be, decided before any of it is encoded.
+	type plan struct {
+		name     string
+		t        tensors.Tensor
+		passthru bool
+		dtype    string
+		cols     int
+		rows     int // rows of one matrix; a stack has that many each
+		stack    int
+		key      string // the site this matrix is filed under, or nothing
+		params   compress.D4Params
+		size     int
+	}
+
+	// encodeInto writes one matrix, a run of rows at a time.
+	//
+	// A run and not the whole of it, because expanding a matrix to floats is
+	// four bytes a weight: a vocabulary table of 248320 rows by 5120 is five
+	// gigabytes of them, and there are two such tensors in a model with an
+	// untied head. The rows of a matrix are independent — the rotation is a
+	// row's own business and so is its step search — so a chunk is the same
+	// bytes as the whole, produced in a bounded amount of memory.
+	encodeInto := func(w io.Writer, pl plan) error {
+		// The vector this matrix is quantized against, taken from the very map
+		// that is written out — pre for a site, blindPre for a matrix that has
+		// none. There is no second copy to drift from it.
+		//
+		// It is read here rather than settled when the tensor was planned
+		// because -search may still replace a measured site's vector, and the
+		// file gets whatever the map holds at the end.
+		var av []float32
+		if pl.key != "" {
+			av = pre[pl.key]
+		} else {
+			av = blindPre[pl.name]
+		}
+		q := reciprocal(av)
+		comp := comps[pl.key]
+		kind, _ := nn.QuantOf(pl.dtype)
+		stride := rowBytes(pl.cols, pl.dtype)
+		perChunk := max(1, expandBudget/(pl.cols*4))
+		var relerr float64
+		for e := 0; e < pl.stack; e++ {
+			for at := 0; at < pl.rows; at += perChunk {
+				n := min(perChunk, pl.rows-at)
+				rows, err := expandRows(pl.t, e*pl.rows+at, e*pl.rows+at+n)
+				if err != nil {
+					return err
+				}
+				if e == 0 && at == 0 {
+					pickSalience(pl.key, rows, n, pl.cols)
+					if pl.key != "" {
+						q = reciprocal(pre[pl.key])
+					}
+				}
+				var data []byte
+				switch {
+				case lloyd:
+					data = compress.EncodeL8G(rows, n, pl.cols, q, pl.params)
+				case onDevice(gpu, pl.params, comp, q):
+					data = encodeOnDevice(gpu, rows, n, pl.cols, q, pl.params)
+				default:
+					data = compress.EncodeD4G(rows, n, pl.cols, q, pl.params, comp)
+				}
+				if e == 0 && at == 0 {
+					// What the codes cost in the basis they were written in.
+					// The theoretical floor for a memoryless Gaussian at this
+					// rate is about seventeen decibels, so this says how much
+					// of the gap is the quantizer's own and how much is
+					// everything else.
+					//
+					// It is measured on every matrix and not only under
+					// -report, because it is also the only thing that notices
+					// a matrix quantized against a vector that is not the one
+					// written beside it. That mistake changes no shape and no
+					// name — the file loads, every tensor is the size it
+					// should be — and it takes this number from 0.15 to 1.4,
+					// which is a matrix with nothing left of the one it stands
+					// for. Twice now: a hybrid's linear-attention projections,
+					// and the token table of a model whose engine taps no head
+					// site.
+					//
+					// It is measured against the vector the FILE holds, not
+					// the one the encoder happened to hold, and that is the
+					// whole of its value. A guard that asks the encoder to
+					// check its own arithmetic cannot see the mistake this
+					// format keeps making, which is a matrix quantized against
+					// one vector and read back through another: both halves
+					// agree with themselves and disagree with each other.
+					//
+					// A sample of rows, because the whole of a 248320-row
+					// table would cost more than the encoding did, and the
+					// error is the same in every row.
+					sample := min(n, 64)
+					relerr = compress.RelErr(rows[:sample*pl.cols], sample, pl.cols, q, pl.params, data[:sample*stride], kind)
+					if relerr > relErrCeiling {
+						return fmt.Errorf("golemquant: %s came back at %.4f of its own size, so it was not quantized against the vector written beside it",
+							pl.name, relerr)
+					}
+				}
+				if _, err := w.Write(data); err != nil {
+					return err
+				}
+			}
+		}
+		note := ""
+		if *report {
+			note = fmt.Sprintf("  rel %.4f  %.2f dB", relerr, -20*math.Log10(relerr))
+		}
+		what := fmt.Sprintf("%6dx%-6d", pl.rows, pl.cols)
+		if pl.stack > 1 {
+			what = fmt.Sprintf("%3dx%5dx%-6d", pl.stack, pl.rows, pl.cols)
+		}
+		fmt.Printf("  %-32s %s %s%s\n", pl.name, what, sizeOf(pl.size), note)
+		return nil
+	}
+
+	// A conversion is planned before it is written. Every tensor's name, shape,
+	// type and size are known before a single code is chosen — and they have
+	// to be, because a GGUF's table carries offsets into the data and the
+	// table is written first.
+	//
+	// The alternative is what this did: encode all of it, then write it. Ten
+	// gigabytes of output held beside the sixteen gigabyte checkpoint it was
+	// read from, on a machine with thirty-one. The kernel ended that run.
+	// The vector each encoded matrix was rotated by, under the name it is
+	// written as. checkVectors reads it back the way the loader will.
+	rotatedBy := map[string]string{}
+	// A site nothing was measured at still has one vector, shared by every
+	// matrix that reads it, written under the site's own name. sitePre is what
+	// the activations meet — the same thing pre holds for a measured site —
+	// and blindSite is the half of it that has to be written out.
+	sitePre := map[string][]float32{}
+	blindSite := map[string][]float32{}
+	plans := make([]plan, 0, len(names))
 	var bits, count float64
-	t0 := time.Now()
 	for _, name := range names {
 		t := g.Tensors[name]
-		if !encodable(t) {
-			out = append(out, tensors.OutTensor{Name: name, Shape: t.Shape,
-				DType: t.DType, Data: append([]byte(nil), t.Raw...)})
+		// A tensor this format has nothing to say about, one a probe is
+		// leaving alone, or the table of a probe that wants it in bf16: all
+		// three travel unchanged.
+		if !encodable(t) || kept(name, *keep) || (name == "token_embd.weight" && *embd == "bf16") {
+			plans = append(plans, plan{name: name, t: t, passthru: true,
+				dtype: t.DType, size: len(t.Raw)})
 			bits += float64(len(t.Raw)) * 8
 			count += float64(t.Elems())
 			continue
 		}
-		if kept(name, *keep) {
-			out = append(out, tensors.OutTensor{Name: name, Shape: t.Shape,
-				DType: t.DType, Data: append([]byte(nil), t.Raw...)})
-			bits += float64(len(t.Raw)) * 8
-			count += float64(t.Elems())
-			continue
-		}
-		if name == "token_embd.weight" && *embd == "bf16" {
-			// The probe: what the head alone costs. It is also the input
-			// table, so it is the one tensor whose error is felt twice.
-			out = append(out, tensors.OutTensor{Name: name, Shape: t.Shape,
-				DType: t.DType, Data: append([]byte(nil), t.Raw...)})
-			bits += float64(len(t.Raw)) * 8
-			count += float64(t.Elems())
-			continue
-		}
-		cols := t.Shape[0]
-		stack := 1
+		pl := plan{name: name, t: t, dtype: dtype, cols: t.Shape[0], stack: 1, params: params}
 		if len(t.Shape) == 3 {
 			// A stack of experts: ne2 of them, each ne1 rows of ne0. They are
 			// one tensor in the file and one matrix each here, because a
 			// lattice code spans four weights of a row and a row belongs to
 			// one expert.
-			stack = t.Shape[2]
+			pl.stack = t.Shape[2]
 		}
-		rows := t.Elems() / cols / stack
-		w, err := expand(t)
-		must(err)
+		pl.rows = t.Elems() / pl.cols / pl.stack
 
 		var q []float32
-		key := ""
 		if blk, mat, ok := parse(name); ok {
-			key = fmt.Sprintf("%d/%s", blk, feeds[mat])
-			q = weight[key]
-		} else if name == "token_embd.weight" && *embd == "rot" {
-			key = headKey
+			// Which site's activations reach this matrix, asked of nn, which
+			// is also where the reader asks what to file the answer under. A
+			// copy of the table here is how a hybrid's four input projections
+			// came to be rotated blind while the reader bound them to the
+			// site vector the three of a full attention share — a file that
+			// loads and answers nonsense.
+			if site, known := nn.D4GSite(mat); known {
+				pl.key = fmt.Sprintf("%d/%s", blk, site)
+				q = weight[pl.key]
+			}
+		} else if name == "output.weight" || (name == "token_embd.weight" && *embd == "rot") {
+			pl.key = headKey
 			// The table is also the logit head, and the head is a site like any
 			// other: it has activations, so it has a salience and a rotation.
 			// What the input path pays for that is one transform of the model's
 			// width per token, which is nothing beside reading the row.
 			q = weight[headKey]
 		}
-		p := params
-		if q == nil && *blind && cols%*hadGroup == 0 {
-			// A matrix no calibration site names — a mixture's experts, or a
-			// tensor of an architecture this converter has never seen. It
-			// still gets the rotation, because incoherence is most of what
-			// the rotation is for and it needs no statistics: signs alone,
-			// and its own vector written beside it so the reader can undo it.
-			q, blindPre[name] = signsFor(cols, name)
-		}
-		if q == nil {
-			p.HadGroup = 0
-			key = ""
-		}
-		pickSalience(key, w, rows, cols)
-		if key != "" {
-			q = weight[key]
-		}
-		comp := comps[key]
-		var data []byte
-		for e := 0; e < stack; e++ {
-			slice := w[e*rows*cols : (e+1)*rows*cols]
-			if lloyd {
-				data = append(data, compress.EncodeL8G(slice, rows, cols, q, p)...)
+		if q == nil && *blind && pl.cols%*hadGroup == 0 {
+			// No statistics for this matrix. It still gets the rotation,
+			// because incoherence is most of what the rotation is for and it
+			// needs none: signs alone, and a vector written beside it so the
+			// reader can undo them.
+			//
+			// Where that vector goes is the whole of what went wrong twice.
+			// The reader asks nn.D4GVectorNames, which offers a site's name
+			// before the tensor's own — so a matrix that HAS a site must be
+			// rotated by the site's vector whether or not anything was
+			// measured there, and the matrices of one site must all get the
+			// same one. A prediction block lies past the trunk a corpus walks,
+			// so nothing measures it; its attention was rotated with three
+			// different vectors and read back with one, and it drafted a token
+			// the model agreed with zero times in twenty-four.
+			if pl.key != "" {
+				at := siteTensor(pl.key, *embd)
+				if sitePre[pl.key] == nil {
+					_, blindSite[pl.key] = signsFor(pl.cols, at)
+					sitePre[pl.key] = blindSite[pl.key]
+				} else if len(sitePre[pl.key]) != pl.cols {
+					must(fmt.Errorf("golemquant: %s reads %d columns at a site whose vector is %d wide",
+						name, pl.cols, len(sitePre[pl.key])))
+				}
 			} else {
-				data = append(data, compress.EncodeD4G(slice, rows, cols, q, p, comp)...)
+				_, blindPre[name] = signsFor(pl.cols, name)
 			}
+		} else if q == nil {
+			// Neither a site nor a rotation: the matrix is quantized as it
+			// stands, and the reader must find no vector for it at all.
+			pl.key = ""
 		}
-		note := ""
-		if *report {
-			// What the codes cost in the basis they were written in. The
-			// theoretical floor for a memoryless Gaussian at this rate is
-			// about seventeen decibels, so this says how much of the gap is
-			// the quantizer's own and how much is everything else.
-			// The first expert of a stack, or the whole of a plain matrix.
-			kind, _ := nn.QuantOf(dtype)
-			e := compress.RelErr(w[:rows*cols], rows, cols, q, p, data[:len(data)/stack], kind)
-			note = fmt.Sprintf("  rel %.4f  %.2f dB", e, -20*math.Log10(float64(e)))
+		switch {
+		case pl.key != "":
+			rotatedBy[name] = siteTensor(pl.key, *embd)
+		case blindPre[name] != nil:
+			rotatedBy[name] = name + ".pre"
+		default:
+			pl.params.HadGroup = 0
+			rotatedBy[name] = ""
 		}
-		out = append(out, tensors.OutTensor{Name: name, Shape: t.Shape,
-			DType: dtype, Data: data})
-		bits += float64(len(data)) * 8
-		count += float64(len(w))
-		what := fmt.Sprintf("%6dx%-6d", rows, cols)
-		if stack > 1 {
-			what = fmt.Sprintf("%3dx%5dx%-6d", stack, rows, cols)
+		pl.size = pl.stack * pl.rows * rowBytes(pl.cols, dtype)
+		plans = append(plans, pl)
+		bits += float64(pl.size) * 8
+		count += float64(t.Elems())
+	}
+
+	var out []tensors.OutStream
+	for i := range plans {
+		pl := plans[i]
+		if pl.passthru {
+			raw := pl.t.Raw
+			out = append(out, tensors.OutStream{Name: pl.name, Shape: pl.t.Shape,
+				DType: pl.dtype, Size: len(raw),
+				Write: func(w io.Writer) error { _, err := w.Write(raw); return err }})
+			continue
 		}
-		fmt.Printf("  %-32s %s %s%s\n", name, what, sizeOf(len(data)), note)
+		out = append(out, tensors.OutStream{Name: pl.name, Shape: pl.t.Shape,
+			DType: pl.dtype, Size: pl.size,
+			Write: func(w io.Writer) error { return encodeInto(w, pl) }})
 	}
 
 	// A vector for every matrix that had no site, under its own name.
@@ -328,13 +495,10 @@ func main() {
 	}
 	sort.Strings(blindNames)
 	for _, k := range blindNames {
-		v := blindPre[k]
-		raw := make([]byte, len(v)*4)
-		for i, x := range v {
-			binary.LittleEndian.PutUint32(raw[4*i:], math.Float32bits(x))
-		}
-		out = append(out, tensors.OutTensor{Name: k + ".pre", Shape: []int{len(v)},
-			DType: "F32", Data: raw})
+		raw := f32Bytes(blindPre[k])
+		out = append(out, tensors.OutStream{Name: k + ".pre", Shape: []int{len(blindPre[k])},
+			DType: "F32", Size: len(raw),
+			Write: func(w io.Writer) error { _, err := w.Write(raw); return err }})
 		bits += float64(len(raw)) * 8
 	}
 
@@ -343,26 +507,30 @@ func main() {
 	for k := range pre {
 		preNames = append(preNames, k)
 	}
+	for k, v := range blindSite {
+		if pre[k] != nil {
+			must(fmt.Errorf("golemquant: site %s has both a measured vector and a blind one", k))
+		}
+		pre[k] = v
+	}
+	preNames = preNames[:0]
+	for k := range pre {
+		preNames = append(preNames, k)
+	}
 	sort.Strings(preNames)
 	for _, k := range preNames {
-		parts := strings.SplitN(k, "/", 2)
-		name := fmt.Sprintf("blk.%s.%s.pre", parts[0], parts[1])
-		if k == headKey {
-			if *embd != "rot" {
-				continue
-			}
-			name = "output.pre"
+		name := siteTensor(k, *embd)
+		if name == "" {
+			continue
 		}
-		v := pre[k]
-		raw := make([]byte, len(v)*4)
-		for i, x := range v {
-			binary.LittleEndian.PutUint32(raw[4*i:], math.Float32bits(x))
-		}
-		out = append(out, tensors.OutTensor{Name: name, Shape: []int{len(v)},
-			DType: "F32", Data: raw})
+		raw := f32Bytes(pre[k])
+		out = append(out, tensors.OutStream{Name: name, Shape: []int{len(pre[k])},
+			DType: "F32", Size: len(raw),
+			Write: func(w io.Writer) error { _, err := w.Write(raw); return err }})
 		bits += float64(len(raw)) * 8
 	}
 
+	t0 := time.Now()
 	meta := map[string]any{}
 	for k, v := range g.Meta {
 		meta[k] = v
@@ -373,10 +541,107 @@ func main() {
 	meta["golem.d4.code_bits"] = uint32(*codeBits)
 	meta["general.file_type"] = uint32(1000)
 
-	must(tensors.WriteGGUF(*dst, meta, out))
+	must(checkVectors(out, rotatedBy))
+
+	must(tensors.WriteGGUFStream(*dst, meta, out))
 	fmt.Printf("\n%.0f M weights at %.3f bits each — %s\n",
 		count/1e6, bits/count, sizeOf(int(bits/8)))
 	fmt.Printf("written to %s in %s\n", *dst, time.Since(t0).Round(time.Second))
+}
+
+// onDevice says whether the card's encoder answers this matrix. It writes the
+// same bytes as the sweep for the format as the converter's defaults produce
+// it, and nothing else: the compensation is a sequential pass over the columns
+// of a row and belongs on a processor, and the kernel is built for the scale
+// block and the rotation the format stores.
+func onDevice(gpu *vk.D4GEncoder, p compress.D4Params, comp *compress.Comp, q []float32) bool {
+	if gpu == nil || comp != nil {
+		return false
+	}
+	if p.ScaleBlock != nn.D4SubBlock {
+		return false
+	}
+	return q == nil || p.HadGroup == 0 || p.HadGroup == vk.PrepareD4GGroup
+}
+
+// encodeOnDevice is EncodeD4G with the search on the card: the codes and the
+// steps come back wide, and the packing into the file's twelve-bit planes is
+// compress.PackD4G, which is the same call the sweep makes at the end of a row.
+func encodeOnDevice(gpu *vk.D4GEncoder, w []float32, rows, cols int, q []float32, p compress.D4Params) []byte {
+	codes := make([]uint16, rows*cols/4)
+	steps := make([]byte, rows*cols/nn.D4SubBlock)
+	lo, hi := compress.D4SearchSpan(p)
+	must(gpu.Encode(w, rows, cols, q, vk.D4GEncodeParams{
+		HadGroup: p.HadGroup, Beta: float32(p.Beta), SpanLo: lo, SpanHi: hi,
+	}, codes, steps))
+	return compress.PackD4G(codes, steps, rows, cols, p.Width())
+}
+
+// relErrCeiling is what a matrix may differ from its original by and still be
+// this format doing its job. The quantizer reads 0.15 on every tensor of every
+// model it has been pointed at, ±0.005; a matrix given the wrong vector reads
+// 1.4, which is √2 — an encoding with nothing in common with what it stands
+// for. Nothing lands between, so the line can sit anywhere between them.
+const relErrCeiling = 0.5
+
+// rowBytes is what one row of a matrix takes in the format named, so that a
+// sample of rows can be cut out of the bytes without decoding them.
+func rowBytes(cols int, dtype string) int {
+	kind, _ := nn.QuantOf(dtype)
+	return nn.Matrix{Quant: kind, Cols: cols}.RowBytes()
+}
+
+// siteTensor names the F32 tensor a site's vector is written as.
+//
+// The head's site is written whenever anything is filed under it. A model with
+// an untied head files its output matrix there whatever -embd says; -embd only
+// decides whether the table joins it, because a table stored plain is not
+// rotated at all.
+func siteTensor(key, embd string) string {
+	if key == headKey {
+		return "output.pre"
+	}
+	parts := strings.SplitN(key, "/", 2)
+	return fmt.Sprintf("blk.%s.%s.pre", parts[0], parts[1])
+}
+
+// checkVectors reads the file back the way the loader will and insists that
+// every matrix finds the vector it was rotated by.
+//
+// The loader takes the first name nn.D4GVectorNames offers that the file has, a
+// site's before a tensor's own. So a matrix quantized blind, under its own
+// name, is silently given the site's vector instead whenever that site exists —
+// which is what happened to a hybrid's four input projections when this
+// converter kept its own table of sites and did not know theirs. The file
+// loaded, every shape agreed, and the model answered nonsense. Nothing here
+// notices that by arithmetic, so it is asked outright.
+func checkVectors(out []tensors.OutStream, rotatedBy map[string]string) error {
+	have := map[string]int{}
+	for _, t := range out {
+		if t.DType == "F32" && strings.HasSuffix(t.Name, ".pre") {
+			have[t.Name] = t.Shape[0]
+		}
+	}
+	for _, t := range out {
+		want, encoded := rotatedBy[t.Name]
+		if !encoded {
+			continue
+		}
+		got := ""
+		for _, at := range nn.D4GVectorNames(t.Name) {
+			// The loader also refuses a vector that is not the width of the
+			// row, so this asks the same question it does.
+			if n, ok := have[at]; ok && n == t.Shape[0] {
+				got = at
+				break
+			}
+		}
+		if got != want {
+			return fmt.Errorf("golemquant: %s was rotated by %q and the loader would read %q",
+				t.Name, want, got)
+		}
+	}
+	return nil
 }
 
 // runCalib walks a text through the model in windows, with the tap set. The
@@ -435,7 +700,57 @@ func sweep(g *tensors.GGUF, text string, ntok, ctx int,
 // calibrate keeps, for each site, the per-column power of the activations that
 // reach it. That is all the salience scaling needs, and it is what the second
 // pass has to know before it can build anything.
-func calibrate(path, text string, ntok, ctx, win, block int) (map[string][]float32, map[string]*compress.Acc) {
+// calibrateVulkan is the same measurement with the model on a card: the
+// accumulators live beside the activations and the host never sees a row.
+//
+// It answers only the salience, which is the per-column power of a site. A
+// compensation pass wants the whole Hessian of a site, and that is rows —
+// there is no summary of them — so -gptq keeps to the processor.
+func calibrateVulkan(path, text string, ntok, ctx int) (map[string][]float32, bool) {
+	m, err := qwen35.Open(path, ctx)
+	if err != nil {
+		return nil, false
+	}
+	defer m.Close()
+	if err := m.UseVulkanStack(); err != nil {
+		fmt.Printf("no calibration on the card (%v); the processor then\n", err)
+		return nil, false
+	}
+	if err := m.StartVulkanCalibration(); err != nil {
+		fmt.Printf("no calibration on the card (%v); the processor then\n", err)
+		return nil, false
+	}
+	t0 := time.Now()
+	n, err := sweep(m.File(), text, ntok, ctx, m.Reset, func(ids []int32, at int) [][]float32 {
+		out := m.ForwardBatch(ids, at)
+		m.CountVulkanCalibration(len(ids))
+		return out
+	})
+	must(err)
+	sums, rows, err := m.VulkanCalibrationSums()
+	must(err)
+	if rows == 0 {
+		return nil, false
+	}
+	out := make(map[string][]float32, len(sums))
+	for k, v := range sums {
+		u := make([]float32, len(v))
+		for j, x := range v {
+			u[j] = float32(math.Sqrt(float64(x) / float64(rows)))
+		}
+		out[k] = u
+	}
+	fmt.Printf("calibrated on %d tokens in %s on the card, %d sites\n",
+		n, time.Since(t0).Round(time.Millisecond), len(out))
+	return out, true
+}
+
+func calibrate(path, text string, ntok, ctx, win, block int, useVulkan bool) (map[string][]float32, map[string]*compress.Acc) {
+	if useVulkan && win == 0 {
+		if sal, ok := calibrateVulkan(path, text, ntok, ctx); ok {
+			return sal, nil
+		}
+	}
 	sums := map[string][]float64{}
 	seen := map[string]int{}
 	accs := map[string]*compress.Acc{}
@@ -598,6 +913,79 @@ func encodable(t tensors.Tensor) bool {
 	return ok
 }
 
+// expandBudget is how many bytes of floats one chunk of a matrix may take.
+// Bounded, because the number that matters is not the tensor's size but the
+// machine's: 248320 rows of 5120 is five gigabytes expanded, and a converter
+// that asks for that beside the checkpoint it is reading is a converter the
+// kernel stops.
+const expandBudget = 64 << 20
+
+// expandRows reads a run of a tensor's rows back as floats, whatever the
+// tensor is stored as. from and to count rows of the whole tensor, a stack of
+// experts included, because that is how its bytes are laid out.
+func expandRows(t tensors.Tensor, from, to int) ([]float32, error) {
+	cols := t.Shape[0]
+	n := to - from
+	switch t.DType {
+	case "F32":
+		out := make([]float32, n*cols)
+		for i := range out {
+			out[i] = math.Float32frombits(binary.LittleEndian.Uint32(t.Raw[(from*cols+i)*4:]))
+		}
+		return out, nil
+	case "BF16":
+		// A brain float is the top half of a float, so widening is a shift.
+		// Done here rather than through Tensor.F32 because that expands the
+		// whole tensor, which for a vocabulary table is the five gigabytes
+		// this function exists to avoid.
+		out := make([]float32, n*cols)
+		for i := range out {
+			out[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(t.Raw[(from*cols+i)*2:])) << 16)
+		}
+		return out, nil
+	}
+	q, ok := nn.QuantOf(t.DType)
+	if !ok {
+		return nil, fmt.Errorf("golemquant: %s is a type this cannot read", t.DType)
+	}
+	rows := t.Elems() / cols
+	m := nn.Matrix{Data: t.Raw, Quant: q, Rows: rows, Cols: cols}
+	if want := rows * m.RowBytes(); len(t.Raw) != want {
+		return nil, fmt.Errorf("golemquant: a %s tensor of %dx%d wants %d bytes, the file has %d",
+			t.DType, rows, cols, want, len(t.Raw))
+	}
+	out := make([]float32, n*cols)
+	compress.Parallel(n, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			m.Row(from+r, out[r*cols:(r+1)*cols])
+		}
+	})
+	return out, nil
+}
+
+// reciprocal is the weights' half of a vector given the activations', which is
+// what nn.PrepareD4G undoes. The two are elementwise reciprocal by definition
+// of the scheme; compress/encode_d4g.go says why.
+func reciprocal(v []float32) []float32 {
+	if v == nil {
+		return nil
+	}
+	out := make([]float32, len(v))
+	for i, x := range v {
+		out[i] = 1 / x
+	}
+	return out
+}
+
+// f32Bytes is a vector as the file holds it.
+func f32Bytes(v []float32) []byte {
+	raw := make([]byte, len(v)*4)
+	for i, x := range v {
+		binary.LittleEndian.PutUint32(raw[4*i:], math.Float32bits(x))
+	}
+	return raw
+}
+
 // expand reads a tensor back as floats whatever it is stored as. A checkpoint
 // that arrives already quantized can be converted — the arithmetic works — but
 // what comes out is a quantization of a quantization, and the second one cannot
@@ -640,12 +1028,33 @@ func flagWasSet(name string) bool {
 
 // kept says whether a tensor is one of those a probe is leaving alone, so that
 // what the others cost can be read off on its own.
+//
+// A fragment with a dot in it names a tensor and matches whole fields from the
+// end: output.weight is the head and not blk.3.attn_output.weight, which a
+// plain substring test made it — seventeen attention projections left in Q4_K
+// beside sixty-five blocks of codes, and a stack that refuses the file rather
+// than reading half of it one way and half the other. A fragment without a dot
+// is a substring, which is how ssm_alpha names forty-eight of them.
 func kept(name, list string) bool {
 	if list == "" {
 		return false
 	}
+	fields := strings.Split(name, ".")
 	for _, frag := range strings.Split(list, ",") {
-		if frag != "" && strings.Contains(name, frag) {
+		if frag == "" {
+			continue
+		}
+		if !strings.Contains(frag, ".") {
+			if strings.Contains(name, frag) {
+				return true
+			}
+			continue
+		}
+		want := strings.Split(frag, ".")
+		if len(want) > len(fields) {
+			continue
+		}
+		if strings.Join(fields[len(fields)-len(want):], ".") == frag {
 			return true
 		}
 	}
