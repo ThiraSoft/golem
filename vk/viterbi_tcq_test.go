@@ -1,6 +1,7 @@
 package vk
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"testing"
@@ -27,6 +28,12 @@ import (
 // None of it is visible in the answer: the two reconstructions land within a
 // few parts in a hundred million of each other, which is what this asserts.
 func TestViterbiMatchesCPU(t *testing.T) {
+	for _, k := range []int{TrellisGPUK, TrellisGPUK5} {
+		t.Run(fmt.Sprintf("k%d", k), func(t *testing.T) { viterbiAgainstCPU(t, k) })
+	}
+}
+
+func viterbiAgainstCPU(t *testing.T, kbits int) {
 	d, err := Open()
 	if err != nil {
 		t.Skip(err)
@@ -43,7 +50,7 @@ func TestViterbiMatchesCPU(t *testing.T) {
 
 	want := append([]float32(nil), src...)
 	compress.QuantizeTrellis(want, compress.TrellisOpts{
-		K: TrellisGPUK, L: TrellisGPUL, Seq: TrellisGPUSeq,
+		K: kbits, L: TrellisGPUL, Seq: TrellisGPUSeq,
 		Gain: gain, Code: compress.Code1MAD})
 
 	e, err2 := NewTrellisEncoder(d, n)
@@ -51,6 +58,9 @@ func TestViterbiMatchesCPU(t *testing.T) {
 		t.Fatal(err2)
 	}
 	defer e.Close()
+	if err := e.UseK(kbits); err != nil {
+		t.Fatal(err)
+	}
 	got := append([]float32(nil), src...)
 	if err := e.Quantize(got, gain); err != nil {
 		t.Fatal(err)

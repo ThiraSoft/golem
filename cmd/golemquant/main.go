@@ -41,6 +41,7 @@ func main() {
 	hadGroup := flag.Int("hadamard", 128, "rotation group; 0 leaves the weights unrotated")
 	beta := flag.Float64("beta", 2, "how far a block is scaled up before rounding")
 	codebook := flag.String("codebook", "d4", "d4 for the lattice in a table, lloyd for eight levels in registers")
+	headBits := flag.Int("head", 5, "trellis: bits a weight for the logit head, 4 or 5. It is a tenth of the weights and it is what makes the logits, and llama.cpp's K-quant mixes spend 6.56 bits on it where they spend 4.95 on the rest")
 	codec := flag.String("codec", "lattice", "lattice or trellis; the trellis has no decode table at all, and reaches four bits where the lattice's shell stops fitting a workgroup")
 	codeBits := flag.Int("bits", 12, "code width: 12 for the ordinary tier, 16 for the wide one")
 	scaleBlk := flag.Int("scale", 32, "weights sharing one step code; 32 is what the format stores")
@@ -64,6 +65,9 @@ func main() {
 	trellis := *codec == "trellis"
 	if !trellis && *codec != "lattice" {
 		must(fmt.Errorf("golemquant: %q is not a codec", *codec))
+	}
+	if trellis && *headBits != nn.T4GK && *headBits != nn.T5GK {
+		must(fmt.Errorf("golemquant: the head is %d or %d bits, not %d", nn.T4GK, nn.T5GK, *headBits))
 	}
 	if trellis {
 		// The step is one per sixty-four weights and the format says so; the
@@ -148,10 +152,14 @@ func main() {
 					defer enc.Close()
 					var onCard, offCard int64
 					compress.TrellisPathAccel = func(norm []float32, o compress.TrellisOpts, states []uint16) bool {
-						// The kernel is compiled for one shape. Anything else
-						// falls back rather than quietly answering a different
-						// question.
-						if o.K != vk.TrellisGPUK || o.L != vk.TrellisGPUL || o.Seq != vk.TrellisGPUSeq {
+						// The kernels are compiled for two rates and one
+						// shape. Anything else falls back rather than quietly
+						// answering a different question.
+						if !vk.TrellisGPUHasK(o.K) || o.L != vk.TrellisGPUL || o.Seq != vk.TrellisGPUSeq {
+							offCard += int64(len(norm))
+							return false
+						}
+						if err := enc.UseK(o.K); err != nil {
 							offCard += int64(len(norm))
 							return false
 						}
@@ -386,7 +394,7 @@ func main() {
 				var data []byte
 				switch {
 				case trellis:
-					data = compress.EncodeT4G(rows, n, pl.cols, q, pl.params)
+					data = compress.EncodeT4GAs(rows, n, pl.cols, q, pl.params, kind)
 				case lloyd:
 					data = compress.EncodeL8G(rows, n, pl.cols, q, pl.params)
 				case onDevice(gpu, pl.params, comp, q):
@@ -479,6 +487,16 @@ func main() {
 			continue
 		}
 		pl := plan{name: name, t: t, dtype: dtype, cols: t.Shape[0], stack: 1, params: params}
+		// The logit head, which is the table when the two are tied. It is not
+		// a hidden layer whose error the layers after it absorb; it is the
+		// thing that makes the logits, and a bit a weight over a tenth of the
+		// model is a tenth of a bit over the file. On Qwen3-0.6B, leaving it
+		// in bf16 is worth half a point of perplexity and a fifth of the
+		// divergence, which is most of what this format still owes Q4_K_M.
+		if trellis && *headBits == nn.T5GK &&
+			(name == "output.weight" || (name == "token_embd.weight" && *embd != "bf16")) {
+			pl.dtype = "T5G"
+		}
 		if len(t.Shape) == 3 {
 			// A stack of experts: ne2 of them, each ne1 rows of ne0. They are
 			// one tensor in the file and one matrix each here, because a
@@ -549,7 +567,7 @@ func main() {
 			pl.params.HadGroup = 0
 			rotatedBy[name] = ""
 		}
-		pl.size = pl.stack * pl.rows * rowBytes(pl.cols, dtype)
+		pl.size = pl.stack * pl.rows * rowBytes(pl.cols, pl.dtype)
 		plans = append(plans, pl)
 		bits += float64(pl.size) * 8
 		count += float64(t.Elems())

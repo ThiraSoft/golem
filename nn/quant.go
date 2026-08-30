@@ -32,6 +32,12 @@ const (
 	// T4G is the trellis: 128 weights in 67 bytes, 4.1875 bits each, and a
 	// codebook that is computed rather than looked up. nn/t4g.go describes it.
 	T4G
+	// T5G is the same trellis a bit a weight wider — 128 weights in 83 bytes,
+	// 5.1875 bits each. It exists for the logit head, which is not a hidden
+	// layer whose error is absorbed downstream but the thing that makes the
+	// logits, and which llama.cpp's K-quant mixes have always given more bits
+	// than the rest of the model.
+	T5G
 )
 
 // Golem says the format is one of golem's own — a matrix stored as A·(q ⊙ W),
@@ -43,7 +49,7 @@ const (
 // format that has no lattice code at all came to need a name for the question.
 func (q Quant) Golem() bool {
 	switch q {
-	case D4G, D4G16, L8G, T4G:
+	case D4G, D4G16, L8G, T4G, T5G:
 		return true
 	}
 	return false
@@ -90,6 +96,8 @@ func (q Quant) String() string {
 		return "L8G"
 	case T4G:
 		return "T4G"
+	case T5G:
+		return "T5G"
 	}
 	return "unknown"
 }
@@ -123,6 +131,8 @@ func QuantOf(dtype string) (Quant, bool) {
 		return L8G, true
 	case "T4G":
 		return T4G, true
+	case "T5G":
+		return T5G, true
 	}
 	return 0, false
 }

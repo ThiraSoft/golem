@@ -32,8 +32,15 @@ import (
 // and by what a workgroup's sixty-four kibibytes hold, and the codebook's gain
 // is one because any departure from one costs — measured, and recorded among
 // the closed questions.
-func T4GOpts() TrellisOpts {
-	return TrellisOpts{K: nn.T4GK, L: nn.T4GL, Seq: nn.T4GSeq, Gain: 1, Code: Code1MAD}
+func T4GOpts() TrellisOpts { return T4GOptsFor(nn.T4G) }
+
+// T4GOptsFor is the same for whichever tier.
+func T4GOptsFor(q nn.Quant) TrellisOpts {
+	k := nn.T4GK
+	if q == nn.T5G {
+		k = nn.T5GK
+	}
+	return TrellisOpts{K: k, L: nn.T4GL, Seq: nn.T4GSeq, Gain: 1, Code: Code1MAD}
 }
 
 // EncodeT4G writes one matrix. q is the per-column vector the weights are
@@ -45,6 +52,14 @@ func T4GOpts() TrellisOpts {
 // million weights is what pays for the round trip. compress.TrellisPathAccel is
 // where it hooks in, and the processor takes any shape the card refuses.
 func EncodeT4G(w []float32, rows, cols int, q []float32, p D4Params) []byte {
+	return EncodeT4GAs(w, rows, cols, q, p, nn.T4G)
+}
+
+// EncodeT4GAs is the same in whichever tier. The wide one is for the logit
+// head and nothing else: a bit a weight over a tenth of a model is a tenth of
+// a bit, and it is the tensor that makes the logits rather than one whose
+// error the layers after it absorb.
+func EncodeT4GAs(w []float32, rows, cols int, q []float32, p D4Params, kind nn.Quant) []byte {
 	if cols%nn.T4GSeq != 0 {
 		panic("compress: a T4G row must be a multiple of 128 wide")
 	}
@@ -52,7 +67,8 @@ func EncodeT4G(w []float32, rows, cols int, q []float32, p D4Params) []byte {
 		panic("compress: a T4G block is 64 weights and its step is not negotiable")
 	}
 	n := rows * cols
-	rowBytes := nn.T4GRowBytes(cols)
+	rowBytes := nn.T4GRowBytesN(cols, kind)
+	seqBytes := nn.T4GSeqBytesN(kind)
 	out := make([]byte, rows*rowBytes)
 
 	// The weights in the basis they are coded in: the site's vector, then the
@@ -91,7 +107,7 @@ func EncodeT4G(w []float32, rows, cols int, q []float32, p D4Params) []byte {
 
 	// The path. norm comes back holding what it reconstructs, at unit scale.
 	states := make([]uint16, n)
-	QuantizeTrellisPath(norm, T4GOpts(), states)
+	QuantizeTrellisPath(norm, T4GOptsFor(kind), states)
 
 	// The step, per block, fitted to the path and then rounded onto the grid
 	// the eight bits name.
@@ -111,11 +127,11 @@ func EncodeT4G(w []float32, rows, cols int, q []float32, p D4Params) []byte {
 
 	Parallel(rows, func(lo, hi int) {
 		for r := lo; r < hi; r++ {
-			plane, codes := nn.T4GPlanes(out[r*rowBytes:(r+1)*rowBytes], cols)
+			plane, codes := nn.T4GPlanesN(out[r*rowBytes:(r+1)*rowBytes], cols, kind)
 			copy(plane, steps[r*cols/nn.T4GBlock:(r+1)*cols/nn.T4GBlock])
 			for s := 0; s*nn.T4GSeq < cols; s++ {
 				at := r*cols + s*nn.T4GSeq
-				nn.PutT4GStates(codes[s*nn.T4GSeqBytes:], states[at:at+nn.T4GSeq])
+				nn.PutT4GStatesN(codes[s*seqBytes:], states[at:at+nn.T4GSeq], kind)
 			}
 		}
 	})

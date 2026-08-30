@@ -51,6 +51,23 @@ var matvecT4G4SPIRV []byte
 //go:embed shaders/matvec_t4g_8.spv
 var matvecT4G8SPIRV []byte
 
+//go:generate glslc -O -DKBITS=5 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t5g.spv
+//go:generate glslc -O -DKBITS=5 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t5g_2.spv
+//go:generate glslc -O -DKBITS=5 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t5g_4.spv
+//go:generate glslc -O -DKBITS=5 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t5g_8.spv
+
+//go:embed shaders/matvec_t5g.spv
+var matvecT5GSPIRV []byte
+
+//go:embed shaders/matvec_t5g_2.spv
+var matvecT5G2SPIRV []byte
+
+//go:embed shaders/matvec_t5g_4.spv
+var matvecT5G4SPIRV []byte
+
+//go:embed shaders/matvec_t5g_8.spv
+var matvecT5G8SPIRV []byte
+
 //go:embed shaders/matvec_d4g.spv
 var matvecD4GSPIRV []byte
 
@@ -158,6 +175,8 @@ func golemSPIRV(q nn.Quant) (map[int][]byte, bool) {
 		return map[int][]byte{1: matvecD4G16SPIRV, 2: matvecD4G16_2SPIRV, 4: matvecD4G16_4SPIRV, 8: matvecD4G16_8SPIRV}, true
 	case nn.T4G:
 		return map[int][]byte{1: matvecT4GSPIRV, 2: matvecT4G2SPIRV, 4: matvecT4G4SPIRV, 8: matvecT4G8SPIRV}, true
+	case nn.T5G:
+		return map[int][]byte{1: matvecT5GSPIRV, 2: matvecT5G2SPIRV, 4: matvecT5G4SPIRV, 8: matvecT5G8SPIRV}, true
 	}
 	return nil, false
 }
@@ -166,7 +185,7 @@ func golemSPIRV(q nn.Quant) (map[int][]byte, bool) {
 // trellis the step grid, which is the only table that format has. Both are
 // uploaded once for the device and serve every matrix of every model.
 func golemTable(q nn.Quant) []byte {
-	if q == nn.T4G {
+	if q == nn.T4G || q == nn.T5G {
 		out := make([]byte, 256*4)
 		for c := 0; c < 256; c++ {
 			binary.LittleEndian.PutUint32(out[c*4:], math.Float32bits(nn.T4GStep(byte(c))))
@@ -232,7 +251,7 @@ type D4GMatrix struct {
 // visible to the host.
 func NewD4GMatrixOn(k *D4GKernels, data []byte, rows, cols int, act, out *Buffer) (*D4GMatrix, error) {
 	unit := nn.D4Block
-	if k.q == nn.T4G {
+	if k.q == nn.T4G || k.q == nn.T5G {
 		// A path is the unit, not a block: a row that held half of one would
 		// have a step with no codes under it.
 		unit = nn.T4GSeq
@@ -240,7 +259,7 @@ func NewD4GMatrixOn(k *D4GKernels, data []byte, rows, cols int, act, out *Buffer
 	if cols%unit != 0 {
 		return nil, fmt.Errorf("vk: a %s row needs a multiple of %d columns, given %d", k.q, unit, cols)
 	}
-	if k.q != nn.T4G && (cols/nn.D4Block)%2 != 0 {
+	if unit == nn.D4Block && (cols/nn.D4Block)%2 != 0 {
 		return nil, fmt.Errorf("vk: %d columns give %d blocks a row, and the shader reads words", cols, cols/nn.D4Block)
 	}
 	if want := rows * (nn.Matrix{Quant: k.q, Cols: cols}).RowBytes(); len(data) != want {

@@ -221,6 +221,7 @@ var ggmlTypes = map[uint32]string{
 	// that loads and answers nonsense, which is the mistake this format has
 	// already made twice by other routes.
 	1003: "T4G",
+	1004: "T5G",
 }
 
 // blockGeometry gives, per type, how many weights sit in one block and how many
@@ -239,6 +240,7 @@ var blockGeometry = map[string][2]int{
 	"D4G16": {64, 34},   // the same with sixteen-bit codes
 	"L8G":   {64, 26},   // two step codes, then sixty-four three-bit levels
 	"T4G":   {128, 67},  // two step codes, then a 520-bit trellis path
+	"T5G":   {128, 83},  // the same at five bits a weight, 648 of them
 }
 
 // rowBytes is the size on disk of one row of `n` weights of the given type.

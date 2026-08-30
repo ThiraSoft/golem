@@ -26,9 +26,15 @@
 //     cheap to compute is not a detail of this format, it is the reason the
 //     format has no table at all.
 //
-// k = 4 only. At k = 3 the prefix count doubles and the backpointers no longer
-// fit beside the costs; that shape wants its own sizing and does not have it
-// yet. The processor side refuses anything else rather than compute nonsense.
+// k = 4 and k = 5. Widening k narrows the trellis rather than the planes: the
+// prefix count is 2^(L−k), so five bits halves the backpointers where three
+// would double them. What changes is how a backpointer is stored — a nibble
+// holds four bits and not five — so the wide tier spends a byte each and 16
+// KiB rather than 8. Both fit beside the 32 KiB of costs; k = 3 does not, and
+// the processor side refuses it rather than compute nonsense.
+#ifndef KBITS
+#define KBITS 4
+#endif
 
 layout(local_size_x = 256) in;
 
@@ -46,7 +52,7 @@ layout(push_constant) uniform Push {
     float gain; // the source is scaled by this before rounding, and back after
 } p;
 
-const uint K = 4u;
+const uint K = uint(KBITS);
 const uint L = 12u;
 const uint T = 128u;
 const uint NSTATES = 1u << L;       // 4096
@@ -54,10 +60,18 @@ const uint NPREFIX = 1u << (L - K); // 256
 const uint FAN = 1u << K;           // 16
 const uint SHIFT = L - K;
 
-// 32 KiB of costs, 16 KiB of backpointers at a nibble each, and the small
-// change: 50 KiB against the 64 the card allows.
+// 32 KiB of costs and 16 KiB of backpointers — a nibble each over 256 prefixes
+// at four bits, a byte each over 128 at five — plus the small change: 50 KiB
+// against the 64 the card allows, either way.
+#if KBITS == 5
+#define BPPERWORD 4u
+#define BPWIDTH   8u
+#else
+#define BPPERWORD 8u
+#define BPWIDTH   4u
+#endif
 shared float cost[2u * NSTATES];
-shared uint bp[T * NPREFIX / 8u];
+shared uint bp[T * NPREFIX / BPPERWORD];
 shared float zs[T];
 shared float redVal[256];
 shared uint redAt[256];
@@ -82,7 +96,7 @@ void main() {
     uint base = seq * T;
 
     for (uint i = tid; i < T; i += 256u) zs[i] = z[base + i] * p.gain;
-    for (uint i = tid; i < T * NPREFIX / 8u; i += 256u) bp[i] = 0u;
+    for (uint i = tid; i < T * NPREFIX / BPPERWORD; i += 256u) bp[i] = 0u;
     barrier();
 
     // t = 0: every window is a legal start, so the cost is the distortion.
@@ -106,11 +120,11 @@ void main() {
                 float c = cost[prev * NSTATES + ((j << SHIFT) | pre)];
                 if (c < best) { best = c; bj = j; }
             }
-            // One nibble a prefix, so eight prefixes to a word and no field
-            // ever straddles one. Different threads share a word, hence the
-            // atomic; the same field is never written twice.
+            // One field a prefix, a whole number of them to a word and no
+            // field ever straddles one. Different threads share a word, hence
+            // the atomic; the same field is never written twice.
             uint at = t * NPREFIX + pre;
-            atomicOr(bp[at >> 3u], bj << ((at & 7u) * 4u));
+            atomicOr(bp[at / BPPERWORD], bj << ((at % BPPERWORD) * BPWIDTH));
 
             uint sb = pre << K;
             // `precise` and the temporary are not decoration. Without them the
@@ -166,7 +180,7 @@ void main() {
             path[base + t] = s;
             if (t > 0u) {
                 uint a = t * NPREFIX + (s >> K);
-                uint j = (bp[a >> 3u] >> ((a & 7u) * 4u)) & 0xfu;
+                uint j = (bp[a / BPPERWORD] >> ((a % BPPERWORD) * BPWIDTH)) & ((1u << BPWIDTH) - 1u);
                 s = (j << SHIFT) | (s >> K);
             }
         }

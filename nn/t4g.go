@@ -60,15 +60,39 @@ const (
 	T4GSeq = 128
 	// T4GBlock is how many weights share one step code.
 	T4GBlock = 64
-	// T4GK is the bits a weight adds to the code stream.
+	// T4GK is the bits a weight adds to the code stream in the ordinary tier.
 	T4GK = 4
+	// T5GK is the wide tier's, a whole bit a weight more. It is here for one
+	// tensor: the logit head, which is not a hidden layer whose error gets
+	// absorbed downstream — it *is* the logits, and llama.cpp's K-quant mixes
+	// have always known it, spending 6.56 bits on the head of a model they
+	// otherwise quantize at 4.95.
+	T5GK = 5
 	// T4GL is the width of the window a weight is decoded from — the state.
+	// The same for both tiers: L is what the Viterbi's cost planes cost, and
+	// widening k narrows the backpointers rather than the planes.
 	T4GL = 12
 	// T4GSeqBytes is (T4GSeq-1)·T4GK + T4GL bits, which is 520, which is 65.
 	T4GSeqBytes = ((T4GSeq-1)*T4GK + T4GL) / 8
+	// T5GSeqBytes is the same at five bits: 647, rounded up to 648. The odd bit
+	// is not used and is not worth avoiding — no sequence length that is a
+	// power of two makes five bits come out whole, and one bit per 128 weights
+	// is 0.008 of one.
+	T5GSeqBytes = ((T4GSeq-1)*T5GK + T4GL + 7) / 8
 	// t4gStepsPerSeq is how many step codes a sequence carries.
 	t4gStepsPerSeq = T4GSeq / T4GBlock
 )
+
+// T4GSeqBytesN is what one sequence of a tier occupies.
+func T4GSeqBytesN(q Quant) int { _, sb := t4gRate(q); return sb }
+
+// t4gRate is a tier's code width and what one sequence of it occupies.
+func t4gRate(q Quant) (k, seqBytes int) {
+	if q == T5G {
+		return T5GK, T5GSeqBytes
+	}
+	return T4GK, T4GSeqBytes
+}
 
 const (
 	// The 1MAD code of compress/trellis.go, and the constants have to be these
@@ -106,21 +130,29 @@ func T4GTable() []float32 {
 	return t
 }
 
-// T4GRowBytes is what one row of n weights occupies: the steps, then the codes.
+// T4GRowBytes is what one row of n weights occupies in the ordinary tier: the
+// steps, then the codes.
 //
 // It is a multiple of four whenever n is a multiple of 512, which every matrix
 // of every language model here satisfies. A 1152-wide vision matrix is not, and
 // the format takes it anyway — a shader reads its bytes out of words either
 // way, and refusing a tensor to keep an offset even would cost more than the
 // unaligned read does.
-func T4GRowBytes(n int) int {
-	return n/T4GBlock + n/T4GSeq*T4GSeqBytes
+func T4GRowBytes(n int) int { return T4GRowBytesN(n, T4G) }
+
+// T4GRowBytesN is the same for whichever tier.
+func T4GRowBytesN(n int, q Quant) int {
+	_, sb := t4gRate(q)
+	return n/T4GBlock + n/T4GSeq*sb
 }
 
 // T4GPlanes splits a row into its steps and its codes.
-func T4GPlanes(row []byte, n int) (steps, codes []byte) {
+func T4GPlanes(row []byte, n int) (steps, codes []byte) { return T4GPlanesN(row, n, T4G) }
+
+// T4GPlanesN is the same for whichever tier.
+func T4GPlanesN(row []byte, n int, q Quant) (steps, codes []byte) {
 	ns := n / T4GBlock
-	return row[:ns], row[ns:T4GRowBytes(n)]
+	return row[:ns], row[ns:T4GRowBytesN(n, q)]
 }
 
 // PutT4GStates writes one sequence's path into 65 bytes.
@@ -136,11 +168,15 @@ func T4GPlanes(row []byte, n int) (steps, codes []byte) {
 // after it. states must be the path itself — each one its predecessor shifted
 // up by four — which is what a Viterbi traceback produces and what
 // TestT4GRoundTripIsExact holds the encoders to.
-func PutT4GStates(dst []byte, states []uint16) {
-	if len(states) != T4GSeq || len(dst) < T4GSeqBytes {
-		panic("nn: a T4G sequence is 128 states in 65 bytes")
+func PutT4GStates(dst []byte, states []uint16) { PutT4GStatesN(dst, states, T4G) }
+
+// PutT4GStatesN is the same for whichever tier.
+func PutT4GStatesN(dst []byte, states []uint16, q Quant) {
+	k, sb := t4gRate(q)
+	if len(states) != T4GSeq || len(dst) < sb {
+		panic("nn: a trellis sequence is 128 states")
 	}
-	for i := range dst[:T4GSeqBytes] {
+	for i := range dst[:sb] {
 		dst[i] = 0
 	}
 	put := func(at, width int, v uint32) {
@@ -153,7 +189,7 @@ func PutT4GStates(dst []byte, states []uint16) {
 	}
 	put(0, T4GL, uint32(states[0]))
 	for t := 1; t < T4GSeq; t++ {
-		put(T4GL+(t-1)*T4GK, T4GK, uint32(states[t])&(1<<T4GK-1))
+		put(T4GL+(t-1)*k, k, uint32(states[t])&(1<<uint(k)-1))
 	}
 }
 
@@ -163,35 +199,52 @@ func PutT4GStates(dst []byte, states []uint16) {
 // so a twelve-bit window starting at bit 4t spans two bytes whichever of the
 // two alignments it has. The last weight starts at bit 508 and ends at 519,
 // which is the sequence's last byte and not one past it.
-func T4GStateAt(codes []byte, t int) uint16 {
-	at := t * T4GK
-	v := uint32(codes[at>>3])<<8 | uint32(codes[at>>3+1])
-	return uint16(v >> uint(4-(at&7)) & 0xFFF)
+func T4GStateAt(codes []byte, t int) uint16 { return T4GStateAtN(codes, t, T4G) }
+
+// T4GStateAtN is the same for whichever tier. At five bits a window can start
+// at any bit of a byte, so it spans three rather than two; the ordinary tier
+// keeps its two-byte read, which is the one the hot kernel uses.
+func T4GStateAtN(codes []byte, t int, q Quant) uint16 {
+	if q != T5G {
+		at := t * T4GK
+		v := uint32(codes[at>>3])<<8 | uint32(codes[at>>3+1])
+		return uint16(v >> uint(4-(at&7)) & 0xFFF)
+	}
+	at := t * T5GK
+	v := uint32(codes[at>>3])<<16 | uint32(codes[at>>3+1])<<8
+	if n := at>>3 + 2; n < len(codes) {
+		v |= uint32(codes[n])
+	}
+	return uint16(v >> uint(12-(at&7)) & 0xFFF)
 }
 
 // DequantizeT4G expands one row of n weights. out must hold n floats.
-func DequantizeT4G(w []byte, n int, out []float32) {
+func DequantizeT4G(w []byte, n int, out []float32) { DequantizeT4GN(w, n, T4G, out) }
+
+// DequantizeT4GN is the same for whichever tier.
+func DequantizeT4GN(w []byte, n int, q Quant, out []float32) {
 	if n%T4GSeq != 0 {
-		panic("nn: T4G rows must be a multiple of 128")
+		panic("nn: trellis rows must be a multiple of 128")
 	}
-	steps, codes := T4GPlanes(w, n)
-	for q := 0; q*T4GSeq < n; q++ {
-		seq := codes[q*T4GSeqBytes : (q+1)*T4GSeqBytes]
-		dst := out[q*T4GSeq : (q+1)*T4GSeq]
+	_, sb := t4gRate(q)
+	steps, codes := T4GPlanesN(w, n, q)
+	for s := 0; s*T4GSeq < n; s++ {
+		seq := codes[s*sb : (s+1)*sb]
+		dst := out[s*T4GSeq : (s+1)*T4GSeq]
 		for t := 0; t < T4GSeq; t++ {
-			d := t4gSteps[steps[q*t4gStepsPerSeq+t/T4GBlock]]
-			dst[t] = T4GValue(T4GStateAt(seq, t)) * d
+			d := t4gSteps[steps[s*t4gStepsPerSeq+t/T4GBlock]]
+			dst[t] = T4GValue(T4GStateAtN(seq, t, q)) * d
 		}
 	}
 }
 
 // matVecT4GRows computes y = W x for T4G weights against float32 activations
 // that Prepare has already scaled and rotated.
-func matVecT4GRows(w []byte, b *Batch, cols int, ys [][]float32, start, end int) {
-	stride := T4GRowBytes(cols)
+func matVecT4GRows(w []byte, b *Batch, cols int, q Quant, ys [][]float32, start, end int) {
+	stride := T4GRowBytesN(cols, q)
 	row := make([]float32, cols)
 	for r := start; r < end; r++ {
-		DequantizeT4G(w[r*stride:(r+1)*stride], cols, row)
+		DequantizeT4GN(w[r*stride:(r+1)*stride], cols, q, row)
 		for c := 0; c < b.Size; c++ {
 			ys[c][r] = DotF32(row, b.F[c])
 		}

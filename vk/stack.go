@@ -66,6 +66,11 @@ var embedD4GSPIRV []byte
 //go:embed shaders/embed_t4g.spv
 var embedT4GSPIRV []byte
 
+//go:generate glslc -O -DKBITS=5 --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_t4g.comp -o shaders/embed_t5g.spv
+
+//go:embed shaders/embed_t5g.spv
+var embedT5GSPIRV []byte
+
 //go:embed shaders/embed_q40.spv
 var embedQ40SPIRV []byte
 
@@ -317,8 +322,11 @@ func (s *Stack) SetEmbedding(table *Buffer, cols int, scale float32) error {
 // head's vector, which this undoes along with the rotation.
 func (s *Stack) SetEmbeddingD4G(table, lattice *Buffer, cols int, pre []float32, q nn.Quant) error {
 	spirv := embedD4GSPIRV
-	if q == nn.T4G {
+	switch q {
+	case nn.T4G:
 		spirv = embedT4GSPIRV
+	case nn.T5G:
+		spirv = embedT5GSPIRV
 	}
 	if cols != s.dim {
 		return fmt.Errorf("vk: the embedding is %d wide and the stream is %d", cols, s.dim)

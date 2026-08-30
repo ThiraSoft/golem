@@ -20,6 +20,10 @@ import (
 )
 
 func t4gMatrix(tb testing.TB, rows, cols int) ([]byte, []float32) {
+	return t4gMatrixAs(tb, rows, cols, nn.T4G)
+}
+
+func t4gMatrixAs(tb testing.TB, rows, cols int, kind nn.Quant) ([]byte, []float32) {
 	tb.Helper()
 	r := rand.New(rand.NewSource(23))
 	w := make([]float32, rows*cols)
@@ -35,8 +39,8 @@ func t4gMatrix(tb testing.TB, rows, cols int) ([]byte, []float32) {
 			q[j] = -1
 		}
 	}
-	data := compress.EncodeT4G(w, rows, cols, q, compress.D4Params{
-		ScaleBlock: nn.T4GBlock, HadGroup: 128})
+	data := compress.EncodeT4GAs(w, rows, cols, q, compress.D4Params{
+		ScaleBlock: nn.T4GBlock, HadGroup: 128}, kind)
 	return data, q
 }
 
@@ -53,32 +57,37 @@ func TestT4GDecodeMatchesCPUExactly(t *testing.T) {
 	d := open(t)
 	defer d.Close()
 
-	data, _ := t4gMatrix(t, rows, cols)
-	m := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols}
-	want := make([]float32, cols)
+	for _, kind := range []nn.Quant{nn.T4G, nn.T5G} {
+		data, _ := t4gMatrixAs(t, rows, cols, kind)
+		m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols}
+		want := make([]float32, cols)
 
-	gpu, err := newHostGolemMatrix(d, data, rows, cols, nn.T4G)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer gpu.Close()
-
-	x := make([]float32, cols)
-	got := make([]float32, rows)
-	for j := 0; j < cols; j++ {
-		for i := range x {
-			x[i] = 0
-		}
-		x[j] = 1
-		if err := gpu.MatVec(x, got); err != nil {
+		gpu, err := newHostGolemMatrix(d, data, rows, cols, kind)
+		if err != nil {
 			t.Fatal(err)
 		}
-		for r := 0; r < rows; r++ {
-			m.Row(r, want)
-			if got[r] != want[j] {
-				t.Fatalf("weight [%d,%d]: the card reads %v, the processor %v", r, j, got[r], want[j])
+
+		x := make([]float32, cols)
+		got := make([]float32, rows)
+		for j := 0; j < cols; j++ {
+			for i := range x {
+				x[i] = 0
+			}
+			x[j] = 1
+			if err := gpu.MatVec(x, got); err != nil {
+				gpu.Close()
+				t.Fatal(err)
+			}
+			for r := 0; r < rows; r++ {
+				m.Row(r, want)
+				if got[r] != want[j] {
+					gpu.Close()
+					t.Fatalf("%s weight [%d,%d]: the card reads %v, the processor %v",
+						kind, r, j, got[r], want[j])
+				}
 			}
 		}
+		gpu.Close()
 	}
 }
 
