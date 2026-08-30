@@ -52,16 +52,65 @@ type PrepareD4G struct {
 // group is the width of the rotation that follows — the shader is built for
 // 128, which is what the converter writes.
 func NewPrepareD4G(d *Device, act *Buffer, pre []float32, group int) (*PrepareD4G, error) {
-	return newPrepareD4G(d, pre, group, prepareD4GSPIRV, []*Buffer{act, nil})
+	return newPrepareD4G(d, nil, pre, group, prepareD4GSPIRV, []*Buffer{act, nil})
 }
 
 // NewPrepareD4GFromQ8 reads a Q8_0 activation — values and scales, the form the
 // attention's mix arrives in — and writes the transformed floats into out.
 func NewPrepareD4GFromQ8(d *Device, out, values, scales *Buffer, pre []float32, group int) (*PrepareD4G, error) {
-	return newPrepareD4G(d, pre, group, prepareD4GQ8SPIRV, []*Buffer{out, nil, values, scales})
+	return newPrepareD4G(d, nil, pre, group, prepareD4GQ8SPIRV, []*Buffer{out, nil, values, scales})
 }
 
-func newPrepareD4G(d *Device, pre []float32, group int, spirv []byte, bufs []*Buffer) (*PrepareD4G, error) {
+// D4GPrepares is the transform's two pipelines, held once for a whole model.
+//
+// A site is a vector and a descriptor, not a pipeline: Qwen3.8 has four sites
+// in each of sixty-five blocks, and building a pipeline for each would be two
+// hundred and sixty compilations of two shaders. The vectors differ, and a
+// vector is a buffer in a descriptor set.
+type D4GPrepares struct {
+	d      *Device
+	plain  *Pipeline
+	fromQ8 *Pipeline
+}
+
+// NewD4GPrepares compiles the two forms once.
+func NewD4GPrepares(d *Device) (*D4GPrepares, error) {
+	k := &D4GPrepares{d: d}
+	var err error
+	if k.plain, err = d.NewPipeline(prepareD4GSPIRV, 2, uint32(unsafe.Sizeof(prepareD4GPush{}))); err != nil {
+		return nil, err
+	}
+	if k.fromQ8, err = d.NewPipeline(prepareD4GQ8SPIRV, 4, uint32(unsafe.Sizeof(prepareD4GPush{}))); err != nil {
+		k.Close()
+		return nil, err
+	}
+	return k, nil
+}
+
+// Bind is NewPrepareD4G against the shared pipeline: one site's vector over a
+// buffer transformed in place.
+func (k *D4GPrepares) Bind(act *Buffer, pre []float32, group int) (*PrepareD4G, error) {
+	return newPrepareD4G(k.d, k.plain, pre, group, nil, []*Buffer{act, nil})
+}
+
+// BindFromQ8 is NewPrepareD4GFromQ8 against the shared pipeline.
+func (k *D4GPrepares) BindFromQ8(out, values, scales *Buffer, pre []float32, group int) (*PrepareD4G, error) {
+	return newPrepareD4G(k.d, k.fromQ8, pre, group, nil, []*Buffer{out, nil, values, scales})
+}
+
+func (k *D4GPrepares) Close() {
+	for _, p := range []*Pipeline{k.plain, k.fromQ8} {
+		if p != nil {
+			p.Close()
+		}
+	}
+	k.plain, k.fromQ8 = nil, nil
+}
+
+// newPrepareD4G binds a vector, either to a pipeline of its own built from
+// spirv or to one the caller keeps. A PrepareD4G that did not build its
+// pipeline does not close it.
+func newPrepareD4G(d *Device, shared *Pipeline, pre []float32, group int, spirv []byte, bufs []*Buffer) (*PrepareD4G, error) {
 	if group != prepareD4GGroup {
 		return nil, fmt.Errorf("vk: the prepare kernel is built for a rotation of %d, asked for %d", prepareD4GGroup, group)
 	}
@@ -75,11 +124,15 @@ func newPrepareD4G(d *Device, pre []float32, group int, spirv []byte, bufs []*Bu
 	}
 	buffers := append([]*Buffer(nil), bufs...)
 	buffers[1] = p.pre // the vector is always the second binding
-	if p.pipe, err = d.NewPipeline(spirv, len(buffers), uint32(unsafe.Sizeof(prepareD4GPush{}))); err != nil {
-		p.Close()
-		return nil, err
+	pipe := shared
+	if pipe == nil {
+		if pipe, err = d.NewPipeline(spirv, len(buffers), uint32(unsafe.Sizeof(prepareD4GPush{}))); err != nil {
+			p.Close()
+			return nil, err
+		}
+		p.pipe = pipe
 	}
-	if p.set, err = p.pipe.NewSet(buffers); err != nil {
+	if p.set, err = pipe.NewSet(buffers); err != nil {
 		p.Close()
 		return nil, err
 	}

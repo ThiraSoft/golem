@@ -23,12 +23,28 @@ func (m *Model) device() (*vk.Device, error) {
 
 // UseVulkanHead uploads the logit head to the Vulkan device.
 func (m *Model) UseVulkanHead() error {
-	if m.headQ6K != nil || m.head != nil {
+	if m.headQ6K != nil || m.head != nil || m.d4gHead != nil {
 		return nil
 	}
 	d, err := m.device()
 	if err != nil {
 		return err
+	}
+	if bits := m.W.OutputHead.Quant.D4Width(); bits > 0 {
+		// A .golem head is a site like any other: the hidden state meets the
+		// reciprocal of its scale and the same rotation before the product,
+		// and vk/d4ghead.go does both.
+		k, err := vk.NewD4GKernels(d, bits)
+		if err != nil {
+			return fmt.Errorf("qwen35: cannot build the D4G kernels: %w", err)
+		}
+		h, err := vk.NewD4GHead(k, m.W.OutputHead.Data, m.W.OutputHead.Rows, m.W.OutputHead.Cols, m.W.OutputHead.Pre)
+		if err != nil {
+			k.Close()
+			return fmt.Errorf("qwen35: cannot upload the D4G head to Vulkan: %w", err)
+		}
+		m.d4gKernels, m.d4gHead = k, h
+		return nil
 	}
 	if m.W.OutputHead.Quant == nn.Q6_K {
 		h, err := vk.NewQ6KHead(d, m.W.OutputHead.Data, m.W.OutputHead.Rows, m.W.OutputHead.Cols)
@@ -47,7 +63,34 @@ func (m *Model) UseVulkanHead() error {
 }
 
 func (m *Model) VulkanHead() bool {
-	return m.headQ6K != nil || m.head != nil
+	return m.headQ6K != nil || m.head != nil || m.d4gHead != nil
+}
+
+// StartVulkanCalibration turns on the per-site accumulators of the block
+// stack, so that a conversion can measure what every matrix is fed without
+// reading a single activation back across the bus. vk/qwen_calib.go says what
+// they are and why they are there rather than on the processor.
+func (m *Model) StartVulkanCalibration() error {
+	if m.gpuPipe == nil {
+		return fmt.Errorf("qwen35: there is no device stack to calibrate on")
+	}
+	return m.gpuPipe.StartCalibration()
+}
+
+// CountVulkanCalibration tells the accumulators how many rows they have seen.
+func (m *Model) CountVulkanCalibration(rows int) {
+	if m.gpuPipe != nil {
+		m.gpuPipe.CountCalibration(rows)
+	}
+}
+
+// VulkanCalibrationSums is the per-column power of every site, and the rows it
+// was taken over, filed under the block and the site — "7/qkv".
+func (m *Model) VulkanCalibrationSums() (map[string][]float32, int, error) {
+	if m.gpuPipe == nil {
+		return nil, 0, fmt.Errorf("qwen35: there is no device stack to read")
+	}
+	return m.gpuPipe.CalibrationSums()
 }
 
 func (m *Model) VulkanStack() bool {
@@ -77,6 +120,11 @@ func (m *Model) UseVulkanStack() error {
 		return fmt.Errorf("qwen35: the model has no blocks to upload")
 	}
 
+	// A .golem checkpoint takes the other form of every projection. The width
+	// of a code is the model's and not a block's, so it is read once here and
+	// carried in the shape; zero is a checkpoint of one of llama.cpp's types.
+	bits := m.W.Blocks[0].Down.Quant.D4Width()
+
 	// Every block shares one geometry; only which mixer a block has differs.
 	// The first full-attention block names the attention side of it, and the
 	// first delta net the other.
@@ -88,6 +136,7 @@ func (m *Model) UseVulkanStack() error {
 		// vk takes the widths as a plain array: it has no reason to import nn
 		// for a type, and this is the one place the two spellings meet.
 		RoPESections: [4]int(cfg.RoPESections),
+		D4GBits:      bits,
 	}
 	for _, bc := range cfg.Blocks[:numBlocks] {
 		if bc.Type == BlockFullAttn && shape.Heads == 0 {
@@ -114,15 +163,33 @@ func (m *Model) UseVulkanStack() error {
 		bc := cfg.Blocks[i]
 		bw := &m.W.Blocks[i]
 
+		// One format for the whole model. A checkpoint half converted would
+		// load, because every matrix carries its own type, and would answer
+		// nonsense from whichever half the pipeline read the other way.
+		mixer := []nn.Matrix{bw.Q, bw.K, bw.V, bw.O}
+		if bc.Type != BlockFullAttn {
+			mixer = []nn.Matrix{bw.QKV, bw.AttnGate, bw.SSMAlpha, bw.SSMBeta, bw.SSMOut}
+		}
+		if bits > 0 {
+			for _, w := range append(mixer, bw.Gate, bw.Up, bw.Down) {
+				if w.Quant.D4Width() != bits {
+					pipe.Close()
+					return fmt.Errorf("qwen35: block %d has a %s among %d-bit codes", i, w.Quant, bits)
+				}
+			}
+		}
+
 		attnNorms = append(attnNorms, bw.AttnNorm)
 		ffnNorms = append(ffnNorms, bw.FFNNorm)
 		isSSM = append(isSSM, bc.Type != BlockFullAttn)
 
 		if err := pipe.AddFFNBlock(vk.QwenFFNData{
-			Gate:     bw.Gate.Data,
-			Up:       bw.Up.Data,
-			Down:     bw.Down.Data,
-			DownQ4_1: bw.Down.Quant == nn.Q4_1,
+			Gate:      bw.Gate.Data,
+			Up:        bw.Up.Data,
+			Down:      bw.Down.Data,
+			DownQ4_1:  bw.Down.Quant == nn.Q4_1,
+			PreGateUp: bw.Gate.Pre,
+			PreDown:   bw.Down.Pre,
 		}); err != nil {
 			pipe.Close()
 			return fmt.Errorf("qwen35: block %d feed forward: %w", i, err)
@@ -132,9 +199,12 @@ func (m *Model) UseVulkanStack() error {
 			err = pipe.AddAttnBlock(i, vk.QwenAttnData{
 				WQ: bw.Q.Data, WK: bw.K.Data, WV: bw.V.Data, WO: bw.O.Data,
 				QNorm: bw.QNorm, KNorm: bw.KNorm,
+				PreQKV: bw.Q.Pre, PreO: bw.O.Pre,
 			})
 		} else {
 			err = pipe.AddSSMBlock(i, vk.QwenSSMData{
+				PreQKV:     bw.QKV.Pre,
+				PreO:       bw.SSMOut.Pre,
 				WQKV:       bw.QKV.Data,
 				WGate:      bw.AttnGate.Data,
 				WAlpha:     bw.SSMAlpha.Data,
@@ -166,15 +236,28 @@ func (m *Model) UseVulkanStack() error {
 		if len(headNorm) == 0 {
 			headNorm = m.W.OutputNorm
 		}
+		// The prediction block is the trunk's last block read a second time,
+		// with a projection of its own in front of it. That projection is the
+		// one matrix in the model no calibration site names, so in a .golem it
+		// carries its own vector rather than a site's — see QwenMTPData.
+		if q := m.W.MTP.EHProj.Quant; q.D4Width() != bits || (bits == 0 && q != nn.Q8_0) {
+			pipe.Close()
+			return fmt.Errorf("qwen35: the prediction block's projection is %s where the model is %s",
+				q, m.W.Blocks[0].Down.Quant)
+		}
 		if err := pipe.AddMTPBlock(vk.QwenMTPData{
 			EHProj: m.W.MTP.EHProj.Data,
+			PreEH:  m.W.MTP.EHProj.Pre,
 			Attn: vk.QwenAttnData{
 				WQ: bw.Q.Data, WK: bw.K.Data, WV: bw.V.Data, WO: bw.O.Data,
 				QNorm: bw.QNorm, KNorm: bw.KNorm,
+				PreQKV: bw.Q.Pre, PreO: bw.O.Pre,
 			},
 			FFN: vk.QwenFFNData{
 				Gate: bw.Gate.Data, Up: bw.Up.Data, Down: bw.Down.Data,
-				DownQ4_1: bw.Down.Quant == nn.Q4_1,
+				DownQ4_1:  bw.Down.Quant == nn.Q4_1,
+				PreGateUp: bw.Gate.Pre,
+				PreDown:   bw.Down.Pre,
 			},
 			AttnNorm: bw.AttnNorm,
 			FFNNorm:  bw.FFNNorm,
@@ -182,10 +265,6 @@ func (m *Model) UseVulkanStack() error {
 		}); err != nil {
 			pipe.Close()
 			return fmt.Errorf("qwen35: prediction block: %w", err)
-		}
-		if m.W.MTP.EHProj.Quant != nn.Q8_0 {
-			pipe.Close()
-			return fmt.Errorf("qwen35: the prediction block's projection is %s; the card reads Q8_0", m.W.MTP.EHProj.Quant)
 		}
 	}
 
@@ -208,6 +287,14 @@ func (m *Model) UseVulkan() error {
 }
 
 func (m *Model) closeVulkan() {
+	if m.d4gHead != nil {
+		m.d4gHead.Close()
+		m.d4gHead = nil
+	}
+	if m.d4gKernels != nil {
+		m.d4gKernels.Close()
+		m.d4gKernels = nil
+	}
 	if m.headQ6K != nil {
 		m.headQ6K.Close()
 		m.headQ6K = nil

@@ -306,6 +306,11 @@ type QwenShape struct {
 	Groups    int // 16 key heads
 
 	Eps float32
+
+	// D4GBits is the code width of a .golem checkpoint, and zero for one of
+	// llama.cpp's own types. It decides which of two forms every projection in
+	// the model takes; vk/qwen_d4g.go is the other one.
+	D4GBits int
 }
 
 func (s QwenShape) qDim() int     { return s.Heads * s.HeadDim }
@@ -323,6 +328,13 @@ func (s QwenShape) qkHeads() int { return (s.ConvDim - s.Inner) / 2 / s.StateSiz
 const scanColumns = 8
 
 type QwenSSMData struct {
+	// PreQKV is the vector the four input projections read their activation
+	// through, and PreO the one the output projection reads. Both nil for a
+	// checkpoint that is not .golem; nn.D4GVectorNames says where they come
+	// from and cmd/golemquant writes them.
+	PreQKV []float32
+	PreO   []float32
+
 	WQKV     []byte
 	WGate    []byte
 	WAlpha   []byte
@@ -338,6 +350,10 @@ type QwenSSMData struct {
 }
 
 type QwenAttnData struct {
+	// PreQKV and PreO are the two sites' vectors; see QwenSSMData.
+	PreQKV []float32
+	PreO   []float32
+
 	WQ    []byte
 	WK    []byte
 	WV    []byte
@@ -347,6 +363,10 @@ type QwenAttnData struct {
 }
 
 type QwenFFNData struct {
+	// PreGateUp and PreDown are the two sites' vectors; see QwenSSMData.
+	PreGateUp []float32
+	PreDown   []float32
+
 	Gate     []byte
 	Up       []byte
 	Down     []byte
@@ -354,6 +374,11 @@ type QwenFFNData struct {
 }
 
 type qwenSSMBlock struct {
+	// index is which block of the trunk this is, and -1 for the prediction
+	// block's copies, which belong to no position in it. A calibration files
+	// its accumulators under it.
+	index int
+
 	wQKV, wGate, wAlpha, wBeta, wOut *Buffer
 
 	convWeight, convState   *Buffer
@@ -369,9 +394,16 @@ type qwenSSMBlock struct {
 	// setOutWide is that projection through the tiled Q5_K product against the
 	// output's Q8_0 form. Nil where the weights are not Q5_K.
 	setOutWide *Set
+	// d4g is the five projections in their .golem form, and nil for a
+	// checkpoint of any other type. Everything above it that is not a
+	// projection — the convolution, the recurrence, the two norms — is the
+	// same either way and is used by both.
+	d4g *qwenD4GSSM
 }
 
 type qwenAttnBlock struct {
+	index int // see qwenSSMBlock
+
 	wQ, wK, wV, wO *Buffer
 	qNorm, kNorm   *Buffer
 	kCache, vCache *Buffer
@@ -379,9 +411,13 @@ type qwenAttnBlock struct {
 	setQ, setK, setV *Set
 	setPrep, setGQA  *Set
 	setO, setOWide   *Set
+	// d4g is the four projections in their .golem form; see qwenSSMBlock.
+	d4g *qwenD4GAttn
 }
 
 type qwenFFNBlock struct {
+	index int // see qwenSSMBlock
+
 	wGate, wUp, wDown       *Buffer
 	setGate, setUp, setDown *Set
 	// setDownWide is the same projection through the tiled product against the
@@ -393,6 +429,9 @@ type qwenFFNBlock struct {
 	// dispatched differently: the Q4_1 one answers a fixed tile of columns
 	// where the Q4_0 one is a width-compiled binary.
 	q41 bool
+	// d4g is the three projections in their .golem form, and nil for a
+	// checkpoint of any other type. See qwenSSMBlock.
+	d4g *qwenD4GFFN
 }
 
 type QwenPipeline struct {
@@ -426,6 +465,17 @@ type QwenPipeline struct {
 	pipeQuant    *Pipeline // floats to their Q8_0 form
 	pipeMatT5K   *Pipeline // the tiled Q5_K product, which only a wide pass reaches
 	pipeMatT41   *Pipeline // the same tile over Q4_1 weights
+
+	// The lattice and the transform, for a .golem checkpoint. Both belong to
+	// the device rather than to a matrix — one table and two pipelines serve
+	// every site of every block — and both are nil for any other type.
+	d4g   *D4GKernels
+	preps *D4GPrepares
+
+	// calib is the per-site accumulators, when a conversion is measuring what
+	// each matrix is fed. Nil the rest of the time, and every dispatch it
+	// would have added is nil too.
+	calib *qwenCalib
 
 	// The stream, which lives in device memory. xin and stage are its host
 	// ends: one copy in at the head of a pass and one out at the foot, rather
@@ -630,6 +680,18 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		}
 	}
 
+	// A .golem checkpoint: one lattice table and two transform pipelines for
+	// the whole model, whatever any block does with them.
+	if shape.D4GBits > 0 {
+		if p.d4g, err = NewD4GKernels(d, shape.D4GBits); err != nil {
+			return nil, err
+		}
+		if p.preps, err = NewD4GPrepares(d); err != nil {
+			p.Close()
+			return nil, err
+		}
+	}
+
 	dim := shape.Dim * qwenWide
 	if p.xin, err = d.Host(dim*4, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
 		return nil, err
@@ -757,9 +819,54 @@ func (p *QwenPipeline) upload(data []byte) (*Buffer, error) {
 
 func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 	s := p.shape
-	b := &qwenSSMBlock{}
+	b := &qwenSSMBlock{index: i}
 	var err error
 
+	if !p.usesD4G() {
+		if err := p.uploadSSMProjections(b, d); err != nil {
+			return err
+		}
+	}
+	for _, u := range []struct {
+		into **Buffer
+		data []byte
+	}{
+		{&b.convWeight, asBytes(d.ConvWeight)},
+		{&b.dtBias, asBytes(d.SSMDtBias)}, {&b.ssmA, asBytes(d.SSMA)},
+		{&b.ssmNorm, asBytes(d.SSMNorm)},
+		{&b.convState, make([]byte, (s.ConvDim*4)*3)},
+		{&b.ssmState, make([]byte, s.Rank*s.StateSize*s.StateSize*4)},
+		{&b.shadowConv, make([]byte, (s.ConvDim*4)*3)},
+		{&b.shadowState, make([]byte, s.Rank*s.StateSize*s.StateSize*4)},
+	} {
+		if *u.into, err = p.upload(u.data); err != nil {
+			return err
+		}
+	}
+	if b.setConv, err = p.pipeConv.NewSet([]*Buffer{b.convWeight, p.qkvBuf, b.convState, p.convOut, b.shadowConv}); err != nil {
+		return err
+	}
+	if b.setScan, err = p.pipeScan.NewSet([]*Buffer{p.convOut, p.qkNorm, p.alphaBuf, b.dtBias, b.ssmA, p.betaBuf, b.ssmState, p.ySSM, b.shadowState}); err != nil {
+		return err
+	}
+	if b.setNormGate, err = p.pipeGate.NewSet([]*Buffer{p.ySSM, p.gateZBuf, b.ssmNorm}); err != nil {
+		return err
+	}
+	if p.usesD4G() {
+		if b.d4g, err = p.newD4GSSM(b, d); err != nil {
+			return err
+		}
+	}
+	p.ssmBlocks[i] = b
+	return nil
+}
+
+// uploadSSMProjections is a delta net's five weight matrices in one of
+// llama.cpp's types, and the descriptors that read them. A .golem checkpoint
+// takes vk/qwen_d4g.go's path instead and none of this runs.
+func (p *QwenPipeline) uploadSSMProjections(b *qwenSSMBlock, d QwenSSMData) error {
+	s := p.shape
+	var err error
 	if b.wQKV, err = p.uploadQ4_0(d.WQKV, s.ConvDim, s.Dim); err != nil {
 		return err
 	}
@@ -785,13 +892,6 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 		data []byte
 	}{
 		{&b.wAlpha, d.WAlpha}, {&b.wBeta, d.WBeta},
-		{&b.convWeight, asBytes(d.ConvWeight)},
-		{&b.dtBias, asBytes(d.SSMDtBias)}, {&b.ssmA, asBytes(d.SSMA)},
-		{&b.ssmNorm, asBytes(d.SSMNorm)},
-		{&b.convState, make([]byte, (s.ConvDim*4)*3)},
-		{&b.ssmState, make([]byte, s.Rank*s.StateSize*s.StateSize*4)},
-		{&b.shadowConv, make([]byte, (s.ConvDim*4)*3)},
-		{&b.shadowState, make([]byte, s.Rank*s.StateSize*s.StateSize*4)},
 	} {
 		if *u.into, err = p.upload(u.data); err != nil {
 			return err
@@ -807,15 +907,6 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 		return err
 	}
 	if b.setBeta, err = p.pipeMatF32.NewSet([]*Buffer{b.wBeta, p.normed, p.betaBuf}); err != nil {
-		return err
-	}
-	if b.setConv, err = p.pipeConv.NewSet([]*Buffer{b.convWeight, p.qkvBuf, b.convState, p.convOut, b.shadowConv}); err != nil {
-		return err
-	}
-	if b.setScan, err = p.pipeScan.NewSet([]*Buffer{p.convOut, p.qkNorm, p.alphaBuf, b.dtBias, b.ssmA, p.betaBuf, b.ssmState, p.ySSM, b.shadowState}); err != nil {
-		return err
-	}
-	if b.setNormGate, err = p.pipeGate.NewSet([]*Buffer{p.ySSM, p.gateZBuf, b.ssmNorm}); err != nil {
 		return err
 	}
 	outPipe := p.pipeMatQ41
@@ -836,8 +927,6 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 	if b.setOut, err = outPipe.NewSet([]*Buffer{b.wOut, p.ySSM, p.mixOut}); err != nil {
 		return err
 	}
-
-	p.ssmBlocks[i] = b
 	return nil
 }
 
@@ -846,27 +935,34 @@ func (p *QwenPipeline) AddAttnBlock(i int, d QwenAttnData) error {
 	if err != nil {
 		return err
 	}
+	b.index = i
 	p.attnBlocks[i] = b
 	return nil
 }
 
 func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 	s := p.shape
-	b := &qwenAttnBlock{}
+	b := &qwenAttnBlock{index: -1}
 	var err error
 
-	for _, u := range []struct {
-		into       **Buffer
-		data       []byte
-		rows, cols int
-	}{
-		{&b.wQ, d.WQ, s.qFullDim(), s.Dim},
-		{&b.wK, d.WK, s.kvDim(), s.Dim},
-		{&b.wV, d.WV, s.kvDim(), s.Dim},
-		{&b.wO, d.WO, s.Dim, s.qDim()},
-	} {
-		if *u.into, err = p.uploadQ4_0(u.data, u.rows, u.cols); err != nil {
+	if p.usesD4G() {
+		if b.d4g, err = p.newD4GAttn(d); err != nil {
 			return nil, err
+		}
+	} else {
+		for _, u := range []struct {
+			into       **Buffer
+			data       []byte
+			rows, cols int
+		}{
+			{&b.wQ, d.WQ, s.qFullDim(), s.Dim},
+			{&b.wK, d.WK, s.kvDim(), s.Dim},
+			{&b.wV, d.WV, s.kvDim(), s.Dim},
+			{&b.wO, d.WO, s.Dim, s.qDim()},
+		} {
+			if *u.into, err = p.uploadQ4_0(u.data, u.rows, u.cols); err != nil {
+				return nil, err
+			}
 		}
 	}
 	for _, u := range []struct {
@@ -881,14 +977,16 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 			return nil, err
 		}
 	}
-	if b.setQ, err = p.pipeMatvec.NewSet([]*Buffer{b.wQ, p.normedQ, p.normedS, p.qIn}); err != nil {
-		return nil, err
-	}
-	if b.setK, err = p.pipeMatvec.NewSet([]*Buffer{b.wK, p.normedQ, p.normedS, p.kIn}); err != nil {
-		return nil, err
-	}
-	if b.setV, err = p.pipeMatvec.NewSet([]*Buffer{b.wV, p.normedQ, p.normedS, p.vIn}); err != nil {
-		return nil, err
+	if b.d4g == nil {
+		if b.setQ, err = p.pipeMatvec.NewSet([]*Buffer{b.wQ, p.normedQ, p.normedS, p.qIn}); err != nil {
+			return nil, err
+		}
+		if b.setK, err = p.pipeMatvec.NewSet([]*Buffer{b.wK, p.normedQ, p.normedS, p.kIn}); err != nil {
+			return nil, err
+		}
+		if b.setV, err = p.pipeMatvec.NewSet([]*Buffer{b.wV, p.normedQ, p.normedS, p.vIn}); err != nil {
+			return nil, err
+		}
 	}
 	if b.setPrep, err = p.pipeAttnPrep.NewSet([]*Buffer{p.qIn, p.kIn, p.vIn, b.qNorm, b.kNorm, p.qOut, b.kCache, b.vCache, p.posBuf, p.mposBuf}); err != nil {
 		return nil, err
@@ -896,14 +994,17 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 	if b.setGQA, err = p.pipeAttnGQA.NewSet([]*Buffer{p.qOut, b.kCache, b.vCache, p.qIn, p.attnOut, p.posBuf}); err != nil {
 		return nil, err
 	}
-	if b.setO, err = p.pipeMatQ40.NewSet([]*Buffer{b.wO, p.attnOut, p.mixOut}); err != nil {
-		return nil, err
-	}
-	// And through the tiled product against that mix in eight bits, which only
-	// a wide pass reaches. The output projection is Q4_0 like the three above
-	// it; it read floats only because nothing had quantized the mix.
-	if b.setOWide, err = p.pipeMatvec.NewSet([]*Buffer{b.wO, p.attnOutQ, p.attnOutS, p.mixOut}); err != nil {
-		return nil, err
+	if b.d4g == nil {
+		if b.setO, err = p.pipeMatQ40.NewSet([]*Buffer{b.wO, p.attnOut, p.mixOut}); err != nil {
+			return nil, err
+		}
+		// And through the tiled product against that mix in eight bits, which
+		// only a wide pass reaches. The output projection is Q4_0 like the
+		// three above it; it read floats only because nothing had quantized
+		// the mix.
+		if b.setOWide, err = p.pipeMatvec.NewSet([]*Buffer{b.wO, p.attnOutQ, p.attnOutS, p.mixOut}); err != nil {
+			return nil, err
+		}
 	}
 
 	return b, nil
@@ -914,14 +1015,21 @@ func (p *QwenPipeline) AddFFNBlock(d QwenFFNData) error {
 	if err != nil {
 		return err
 	}
+	b.index = len(p.ffnBlocks)
 	p.ffnBlocks = append(p.ffnBlocks, b)
 	return nil
 }
 
 func (p *QwenPipeline) newFFNBlock(d QwenFFNData) (*qwenFFNBlock, error) {
 	s := p.shape
-	b := &qwenFFNBlock{}
+	b := &qwenFFNBlock{index: -1}
 	var err error
+	if p.usesD4G() {
+		if b.d4g, err = p.newD4GFFN(d); err != nil {
+			return nil, err
+		}
+		return b, nil
+	}
 	if b.wGate, err = p.uploadQ4_0(d.Gate, s.FFN, s.Dim); err != nil {
 		return nil, err
 	}
@@ -1192,6 +1300,7 @@ func (p *QwenPipeline) record(r *Recorder, columns, snapAt int) {
 		r.DispatchColumns(p.setAttnNorms[i], 1, cols, unsafe.Pointer(push))
 		r.Barrier()
 		tl.Stamp(r, "norm")
+		p.accumulate(r, i, "qkv", columns)
 
 		if p.isSSM[i] {
 			p.recordSSM(r, p.ssmBlocks[i], columns, snapAt)
@@ -1208,6 +1317,7 @@ func (p *QwenPipeline) record(r *Recorder, columns, snapAt int) {
 		r.DispatchColumns(p.setFFNNorms[i], 1, cols, unsafe.Pointer(&normFFN))
 		r.Barrier()
 		tl.Stamp(r, "norm")
+		p.accumulate(r, i, "gateup", columns)
 
 		p.recordFFN(r, p.ffnBlocks[i], columns)
 		r.Barrier()
@@ -1217,6 +1327,7 @@ func (p *QwenPipeline) record(r *Recorder, columns, snapAt int) {
 	r.DispatchColumns(p.setFinalNorm, 1, cols, unsafe.Pointer(&normFinal))
 	r.Barrier()
 	tl.Stamp(r, "final norm")
+	p.accumulate(r, -1, "head", columns)
 	r.Copy(p.hidden, 0, p.xs, s.Dim*columns*4)
 }
 
@@ -1299,6 +1410,15 @@ func (p *QwenPipeline) dispatchAt(r *Recorder, set *Set, rows, columns int, tile
 // so that the next pass is recorded with the stamps in it.
 func (p *QwenPipeline) Profile(t *Timeline) {
 	p.tl = t
+	p.forgetPasses()
+}
+
+// forgetPasses drops the compiled recordings, so that the next pass is laid
+// down again with whatever has just changed about what a pass does.
+func (p *QwenPipeline) forgetPasses() {
+	for _, prog := range p.pass {
+		prog.Close()
+	}
 	p.pass = nil
 }
 
@@ -1560,11 +1680,52 @@ func (p *QwenPipeline) HiddenColumn(c int) []float32 {
 }
 
 func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt int) {
+	if b.d4g != nil {
+		p.recordD4GSSM(r, b.d4g, b, columns, snapAt)
+		return
+	}
 	s := p.shape
 	qkv := moePush{dim: uint32(s.ConvDim), ffn: uint32(s.Dim), used: 1}
 	gate := moePush{dim: uint32(s.Inner), ffn: uint32(s.Dim), used: 1}
 	small := matvecKPush{Dim: uint32(s.Rank), FFN: uint32(s.Dim)}
 	out := matvecKPush{Dim: uint32(s.Dim), FFN: uint32(s.Inner)}
+
+	p.product(r, b.setQKV, s.ConvDim, columns, qkv)
+	p.product(r, b.setGate, s.Inner, columns, gate)
+	p.productK(r, b.setAlpha, s.Rank, columns, small)
+	p.productK(r, b.setBeta, s.Rank, columns, small)
+	r.Barrier()
+	p.tl.Stamp(r, "ssm in")
+
+	p.recordSSMState(r, b, columns, snapAt)
+	p.accumulate(r, b.index, "o", columns)
+
+	// Wide enough and the weights Q5_K, and the output projection is the tiled
+	// product against the eight-bit form; otherwise the mat-vec against the
+	// floats. llama.cpp's own profiler puts this projection and the Q4_1 down
+	// at 24ms of a 512-token prompt where ours took 324, and it is the last of
+	// the model's matrices to be read sixteen columns at a time.
+	// q5kCols and not tiledColumns: the tile answers that many columns and a
+	// pass narrower than one would dispatch no workgroups at all and leave the
+	// projection undone. Every width qwenWidths names from sixty-four up is a
+	// multiple of it.
+	if b.setOutWide != nil && columns >= q5kCols && columns%q5kCols == 0 {
+		quant := swigluPush{N: uint32(s.Inner), Columns: uint32(columns)}
+		r.Dispatch(p.setQuantY, uint32((s.Inner/quantBlock*columns+255)/256), unsafe.Pointer(&quant))
+		r.Barrier()
+		p.product(r, b.setOutWide, s.Dim, columns,
+			moePush{dim: uint32(s.Dim), ffn: uint32(s.Inner), used: 1})
+	} else {
+		p.productK(r, b.setOut, s.Dim, columns, out)
+	}
+}
+
+// recordSSMState is everything between a delta net's input projections and its
+// output one: the convolution, the two norms and the recurrence. None of them
+// reads a quantized weight — a delta net's convolution, its decay and its norms
+// are floats in every checkpoint — so all of it is shared with the D4G path.
+func (p *QwenPipeline) recordSSMState(r *Recorder, b *qwenSSMBlock, columns, snapAt int) {
+	s := p.shape
 	conv := ssmConvPush{Channels: uint32(s.ConvDim), Kernel: 4, Columns: uint32(columns), SnapAt: uint32(snapAt)}
 	scan := ssmScanPush{
 		NumHeads:  uint32(s.Rank),
@@ -1577,13 +1738,6 @@ func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt i
 		Rank:      uint32(s.Rank),
 		SnapAt:    uint32(snapAt),
 	}
-
-	p.product(r, b.setQKV, s.ConvDim, columns, qkv)
-	p.product(r, b.setGate, s.Inner, columns, gate)
-	p.productK(r, b.setAlpha, s.Rank, columns, small)
-	p.productK(r, b.setBeta, s.Rank, columns, small)
-	r.Barrier()
-	p.tl.Stamp(r, "ssm in")
 
 	// The convolution and the scan carry the columns inside themselves: both
 	// hold state that runs from one token to the next, so a column cannot
@@ -1609,32 +1763,45 @@ func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt i
 	r.DispatchColumns(b.setNormGate, uint32(s.Rank), uint32(columns), unsafe.Pointer(&gateNorm))
 	r.Barrier()
 	p.tl.Stamp(r, "ssm gate")
-
-	// Wide enough and the weights Q5_K, and the output projection is the tiled
-	// product against the eight-bit form; otherwise the mat-vec against the
-	// floats. llama.cpp's own profiler puts this projection and the Q4_1 down
-	// at 24ms of a 512-token prompt where ours took 324, and it is the last of
-	// the model's matrices to be read sixteen columns at a time.
-	// q5kCols and not tiledColumns: the tile answers that many columns and a
-	// pass narrower than one would dispatch no workgroups at all and leave the
-	// projection undone. Every width qwenWidths names from sixty-four up is a
-	// multiple of it.
-	if b.setOutWide != nil && columns >= q5kCols && columns%q5kCols == 0 {
-		quant := swigluPush{N: uint32(s.Inner), Columns: uint32(columns)}
-		r.Dispatch(p.setQuantY, uint32((s.Inner/quantBlock*columns+255)/256), unsafe.Pointer(&quant))
-		r.Barrier()
-		p.product(r, b.setOutWide, s.Dim, columns,
-			moePush{dim: uint32(s.Dim), ffn: uint32(s.Inner), used: 1})
-	} else {
-		p.productK(r, b.setOut, s.Dim, columns, out)
-	}
 }
 
 func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
+	if b.d4g != nil {
+		p.recordD4GAttn(r, b.d4g, b, columns)
+		return
+	}
 	s := p.shape
 	q := moePush{dim: uint32(s.qFullDim()), ffn: uint32(s.Dim), used: 1}
 	kv := moePush{dim: uint32(s.kvDim()), ffn: uint32(s.Dim), used: 1}
 	out := matvecKPush{Dim: uint32(s.Dim), FFN: uint32(s.qDim())}
+
+	p.product(r, b.setQ, s.qFullDim(), columns, q)
+	p.product(r, b.setK, s.kvDim(), columns, kv)
+	p.product(r, b.setV, s.kvDim(), columns, kv)
+	r.Barrier()
+	p.tl.Stamp(r, "attn qkv")
+
+	p.recordAttnMix(r, b, columns)
+	p.accumulate(r, b.index, "o", columns)
+
+	if columns >= tiledColumns {
+		quant := swigluPush{N: uint32(s.qDim()), Columns: uint32(columns)}
+		r.Dispatch(p.setQuantAttn, uint32((s.qDim()/quantBlock*columns+255)/256), unsafe.Pointer(&quant))
+		r.Barrier()
+		p.product(r, b.setOWide, s.Dim, columns,
+			moePush{dim: uint32(s.Dim), ffn: uint32(s.qDim()), used: 1})
+	} else {
+		p.productK(r, b.setO, s.Dim, columns, out)
+	}
+}
+
+// recordAttnMix is everything between a full attention's input projections and
+// its output one: the rotation and the caches, then the softmax. Neither reads
+// a weight matrix, so both are the same kernels over the same buffers whatever
+// the projections around them are stored as — which is what lets the D4G path
+// in vk/qwen_d4g.go be four matrices and two transforms rather than a block.
+func (p *QwenPipeline) recordAttnMix(r *Recorder, b *qwenAttnBlock, columns int) {
+	s := p.shape
 	prep := attnPrepPush{
 		MaxContext: uint32(s.MaxContext),
 		Heads:      uint32(s.Heads),
@@ -1654,13 +1821,6 @@ func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
 		Scale:      float32(1 / sqrtOf(s.HeadDim)),
 		Columns:    uint32(columns),
 	}
-
-	p.product(r, b.setQ, s.qFullDim(), columns, q)
-	p.product(r, b.setK, s.kvDim(), columns, kv)
-	p.product(r, b.setV, s.kvDim(), columns, kv)
-	r.Barrier()
-	p.tl.Stamp(r, "attn qkv")
-
 	// Every column's keys and values go into the cache before any column reads
 	// them, which is why this is a dispatch of its own and not the head of the
 	// one below: a barrier inside a workgroup does not order two workgroups.
@@ -1671,19 +1831,13 @@ func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
 	r.DispatchColumns(b.setGQA, uint32(s.Heads), uint32((columns+qAttnTile-1)/qAttnTile), unsafe.Pointer(&gqa))
 	r.Barrier()
 	p.tl.Stamp(r, "attn gqa")
-
-	if columns >= tiledColumns {
-		quant := swigluPush{N: uint32(s.qDim()), Columns: uint32(columns)}
-		r.Dispatch(p.setQuantAttn, uint32((s.qDim()/quantBlock*columns+255)/256), unsafe.Pointer(&quant))
-		r.Barrier()
-		p.product(r, b.setOWide, s.Dim, columns,
-			moePush{dim: uint32(s.Dim), ffn: uint32(s.qDim()), used: 1})
-	} else {
-		p.productK(r, b.setO, s.Dim, columns, out)
-	}
 }
 
 func (p *QwenPipeline) recordFFN(r *Recorder, b *qwenFFNBlock, columns int) {
+	if b.d4g != nil {
+		p.recordD4GFFN(r, b.d4g, columns)
+		return
+	}
 	s := p.shape
 	up := moePush{dim: uint32(s.FFN), ffn: uint32(s.Dim), used: 1}
 	// The activation is elementwise and the columns lie end to end, so a wide
@@ -1701,6 +1855,7 @@ func (p *QwenPipeline) recordFFN(r *Recorder, b *qwenFFNBlock, columns int) {
 	r.Dispatch(p.setAct, uint32((blocks+255)/256), unsafe.Pointer(&act))
 	r.Barrier()
 	p.tl.Stamp(r, "ffn act")
+	p.accumulate(r, b.index, "down", columns)
 
 	// Wide enough and the down projection is a tiled product against the
 	// eight-bit form; narrow and it is the mat-vec against the floats, which
@@ -1749,8 +1904,46 @@ func (p *QwenPipeline) Close() {
 		if p.mtp.pass != nil {
 			p.mtp.pass.Close()
 		}
+		if p.mtp.d4gEH != nil {
+			p.mtp.d4gEH.Close()
+		}
+		if p.mtp.preEH != nil {
+			p.mtp.preEH.Close()
+		}
+		for _, b := range []*qwenD4GAttn{mtpAttnD4G(p.mtp)} {
+			if b != nil {
+				b.Close()
+			}
+		}
+		if p.mtp.ffn != nil && p.mtp.ffn.d4g != nil {
+			p.mtp.ffn.d4g.Close()
+		}
 		p.mtp.ehIn.Close()
 		p.mtp = nil
+	}
+	// The .golem form of every block, before the buffers they read.
+	for _, b := range p.ffnBlocks {
+		if b != nil && b.d4g != nil {
+			b.d4g.Close()
+		}
+	}
+	for _, b := range p.attnBlocks {
+		if b != nil && b.d4g != nil {
+			b.d4g.Close()
+		}
+	}
+	for _, b := range p.ssmBlocks {
+		if b != nil && b.d4g != nil {
+			b.d4g.Close()
+		}
+	}
+	if p.preps != nil {
+		p.preps.Close()
+		p.preps = nil
+	}
+	if p.d4g != nil {
+		p.d4g.Close()
+		p.d4g = nil
 	}
 	for _, b := range p.owned {
 		b.Close()
@@ -1800,8 +1993,14 @@ type QwenMTPData struct {
 	// go up as the file holds them: shaders/matvec_q80.comp reads the format's
 	// own interleaving of a scale and thirty-two magnitudes.
 	EHProj []byte
-	Attn   QwenAttnData
-	FFN    QwenFFNData
+	// PreEH is the vector that projection reads its input through in a .golem
+	// checkpoint. No calibration site names this matrix — the model never runs
+	// at it, the prediction block being past the trunk the corpus walks — so
+	// what the converter wrote beside it is the blind rotation's own vector,
+	// under the tensor's name rather than a site's.
+	PreEH []float32
+	Attn  QwenAttnData
+	FFN   QwenFFNData
 
 	AttnNorm []float32
 	FFNNorm  []float32
@@ -1820,7 +2019,11 @@ type qwenMTPBlock struct {
 	ffnNorm  *Buffer
 	headNorm *Buffer
 
-	setEH       *Set
+	setEH *Set
+	// The .golem form of that projection: the transform its input goes
+	// through, and the matrix. Both nil for a checkpoint of any other type.
+	preEH       *PrepareD4G
+	d4gEH       *D4GMatrix
 	setAttnNorm *Set
 	setFFNNorm  *Set
 	setFinal    *Set
@@ -1835,18 +2038,28 @@ func (p *QwenPipeline) AddMTPBlock(d QwenMTPData) error {
 	b := &qwenMTPBlock{}
 	var err error
 
-	if p.pipeMatQ80 == nil {
+	if !p.usesD4G() && p.pipeMatQ80 == nil {
 		if p.pipeMatQ80, err = p.d.NewPipeline(matvecQ80SPIRV, 3, uint32(unsafe.Sizeof(matvecKPush{}))); err != nil {
 			return err
 		}
-	}
-	if b.wEH, err = p.upload(d.EHProj); err != nil {
-		return err
 	}
 	if b.ehIn, err = p.d.Host(s.Dim*2*4, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
 		return err
 	}
 	if b.ehBuf, err = p.local(s.Dim * 2 * 4); err != nil {
+		return err
+	}
+	if p.usesD4G() {
+		if len(d.PreEH) != s.Dim*2 {
+			return fmt.Errorf("vk: the prediction block's vector is %d wide, its projection reads %d", len(d.PreEH), s.Dim*2)
+		}
+		if b.preEH, err = p.preps.Bind(b.ehBuf, d.PreEH, prepareD4GGroup); err != nil {
+			return err
+		}
+		if b.d4gEH, err = NewD4GMatrixOn(p.d4g, d.EHProj, s.Dim, s.Dim*2, b.ehBuf, p.xs); err != nil {
+			return err
+		}
+	} else if b.wEH, err = p.upload(d.EHProj); err != nil {
 		return err
 	}
 	if b.attn, err = p.newAttnBlock(d.Attn); err != nil {
@@ -1864,8 +2077,10 @@ func (p *QwenPipeline) AddMTPBlock(d QwenMTPData) error {
 		}
 	}
 
-	if b.setEH, err = p.pipeMatQ80.NewSet([]*Buffer{b.wEH, b.ehBuf, p.xs}); err != nil {
-		return err
+	if !p.usesD4G() {
+		if b.setEH, err = p.pipeMatQ80.NewSet([]*Buffer{b.wEH, b.ehBuf, p.xs}); err != nil {
+			return err
+		}
 	}
 	if b.setAttnNorm, err = p.pipeNorm.NewSet([]*Buffer{p.xs, p.none, b.attnNorm, p.none, p.none, p.normed, p.normedQ, p.normedS}); err != nil {
 		return err
@@ -1881,21 +2096,54 @@ func (p *QwenPipeline) AddMTPBlock(d QwenMTPData) error {
 	return nil
 }
 
+// mtpAttnD4G is the prediction block's attention in its .golem form, or nil.
+// Its blocks are not in the pipeline's maps — it holds its own — so Close has
+// to reach them here.
+func mtpAttnD4G(b *qwenMTPBlock) *qwenD4GAttn {
+	if b.attn == nil {
+		return nil
+	}
+	return b.attn.d4g
+}
+
 func (p *QwenPipeline) HasMTP() bool { return p.mtp != nil }
 
 // Columns is how many tokens one pass can carry.
-func (p *QwenPipeline) Columns() int { return qwenWide }
+func (p *QwenPipeline) Columns() int { return p.widestPass() }
 
 // WidthFor is the widest pass that fits n remaining tokens. A run is read in
 // passes of these rather than one width and a ragged tail of single columns:
 // the mat-vec binaries exist at four widths and the largest that fits wins.
 func (p *QwenPipeline) WidthFor(n int) int {
 	for _, w := range qwenWidths {
-		if w <= n {
+		if w <= n && w <= p.widestPass() {
 			return w
 		}
 	}
 	return 1
+}
+
+// d4gWidestPass is how wide a pass a .golem model takes.
+//
+// Not because a wider one is wrong — vk/qwen_d4g.go answers any width and
+// TestVulkanD4GWidePassMatchesTokenPath holds it to the token path bit for bit
+// — but because of what a wide one costs to record. The D4G kernels are built
+// for eight columns and no more, where the quantized products have a tiled form
+// for a wide pass, so a pass of two hundred and fifty-six columns is thirty-two
+// dispatches for every matrix: seventeen thousand of them and as many barriers,
+// in one submission, which the driver's watchdog ends by resetting the card
+// mid-pass. Sixty-four keeps a submission to something a card finishes.
+//
+// The cost is prefill throughput, and the fix is a tiled D4G product rather
+// than a smaller number here.
+const d4gWidestPass = 64
+
+// widestPass is the widest a submission of this pipeline may carry.
+func (p *QwenPipeline) widestPass() int {
+	if p.usesD4G() {
+		return d4gWidestPass
+	}
+	return qwenWide
 }
 
 // DraftMTP runs the prediction block over one already-normed and concatenated
@@ -1955,7 +2203,13 @@ func (p *QwenPipeline) recordMTP(r *Recorder) {
 	r.Copy(p.mposBuf, 0, p.mposIn, 16)
 	r.Barrier()
 
-	r.Dispatch(b.setEH, matvecGroups(s.Dim), unsafe.Pointer(&eh))
+	if b.d4gEH != nil {
+		p.prepare(r, b.preEH, 1)
+		r.Barrier()
+		p.d4gProduct(r, b.d4gEH, 1)
+	} else {
+		r.Dispatch(b.setEH, matvecGroups(s.Dim), unsafe.Pointer(&eh))
+	}
 	r.Barrier()
 
 	r.Dispatch(b.setAttnNorm, 1, unsafe.Pointer(&normAttn))

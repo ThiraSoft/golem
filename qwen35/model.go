@@ -30,6 +30,10 @@ type Model struct {
 	gpuPipe *vk.QwenPipeline
 	head    *vk.Q40Head
 	headQ6K *vk.Q6KHead
+	// The .golem head, and the lattice it reads. The head is the one matrix
+	// the pipeline does not hold, so it carries its own kernels.
+	d4gHead    *vk.D4GHead
+	d4gKernels *vk.D4GKernels
 
 	// vision is nil until a projector is opened. The tower runs once per
 	// image and shares nothing with the text path.
@@ -260,6 +264,10 @@ func (m *Model) stepEmbedded(row []float32, at Place) []float32 {
 	h := make([]float32, m.Cfg.Dim)
 	copy(h, m.x)
 	nn.RMSNormPlain(h, m.W.OutputNorm, m.Cfg.Eps)
+	// The head is a site like the four inside a block: it has activations, so
+	// it has a salience, and the largest matrix in the model is the last one
+	// that should be quantized without one. qwen/model.go taps the same place.
+	calib(-1, "head", h)
 	return h
 }
 
@@ -299,6 +307,11 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 	copy(batchH.F[0], hidden)
 	batchH.QuantizeK()
 
+	if m.d4gHead != nil {
+		if err := m.d4gHead.Logits(hidden, out); err == nil {
+			return
+		}
+	}
 	if m.headQ6K != nil {
 		if err := m.headQ6K.MatVec(batchH, 0, out); err == nil {
 			return
@@ -322,6 +335,11 @@ func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
 	batchH.QuantizeK()
 
 	for i := 0; i < batch; i++ {
+		if m.d4gHead != nil {
+			if err := m.d4gHead.Logits(hidden[i], out[i]); err == nil {
+				continue
+			}
+		}
 		if m.headQ6K != nil {
 			if err := m.headQ6K.MatVec(batchH, i, out[i]); err == nil {
 				continue
