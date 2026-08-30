@@ -182,7 +182,7 @@ func bindMatrix(g *tensors.GGUF, name string, m *nn.Matrix, rows, cols int) {
 // product does the transform itself, so nothing else in this package changes.
 func bindD4G(g *tensors.GGUF, m *nn.Matrix, name string) {
 	width, err := g.Uint32("golem.d4.hadamard_group")
-	if err != nil || width == 0 || m.Quant.D4Width() == 0 {
+	if err != nil || width == 0 || !m.Quant.Golem() {
 		return
 	}
 	for _, at := range nn.D4GVectorNames(name) {

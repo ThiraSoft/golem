@@ -40,6 +40,7 @@ func main() {
 	hadGroup := flag.Int("hadamard", 128, "rotation group; 0 leaves the weights unrotated")
 	beta := flag.Float64("beta", 2, "how far a block is scaled up before rounding")
 	codebook := flag.String("codebook", "d4", "d4 for the lattice in a table, lloyd for eight levels in registers")
+	codec := flag.String("codec", "lattice", "lattice or trellis; the trellis has no decode table at all, and reaches four bits where the lattice's shell stops fitting a workgroup")
 	codeBits := flag.Int("bits", 12, "code width: 12 for the ordinary tier, 16 for the wide one")
 	scaleBlk := flag.Int("scale", 32, "weights sharing one step code; 32 is what the format stores")
 	ntok := flag.Int("tokens", 8192, "calibration tokens")
@@ -57,6 +58,16 @@ func main() {
 	vulkan := flag.Bool("vulkan", true, "encode the matrices on a Vulkan device when there is one")
 	calibSrc := flag.String("calib-model", "", "the checkpoint to calibrate on, when it is not the one being converted")
 	flag.Parse()
+
+	trellis := *codec == "trellis"
+	if !trellis && *codec != "lattice" {
+		must(fmt.Errorf("golemquant: %q is not a codec", *codec))
+	}
+	if trellis {
+		// The step is one per sixty-four weights and the format says so; the
+		// flag is the lattice's and there is nothing here to choose.
+		*scaleBlk = nn.T4GBlock
+	}
 
 	text := calibText
 	if *calibFile != "" {
@@ -101,12 +112,43 @@ func main() {
 			fmt.Printf("no device (%v); the matrices are encoded on the processor\n", err)
 		} else {
 			defer d.Close()
-			// Nine and a quarter bytes a weight across the six buffers, so
-			// thirty-two million of them is three hundred megabytes and the
-			// widest row in any checkpoint fits a pass many times over.
-			if gpu, err = vk.NewD4GEncoder(d, *codeBits, 32<<20); err != nil {
+			if trellis {
+				// The Viterbi is 2^L operations a weight against the lattice's
+				// eight — five hundred times the work, and the only half of a
+				// conversion that cares where it runs. Sixteen million weights
+				// a pass is a quarter of a gigabyte of buffers.
+				if enc, err := vk.NewTrellisEncoder(d, 1<<24); err != nil {
+					fmt.Printf("no trellis encoder on the device (%v); the processor then\n", err)
+				} else {
+					defer enc.Close()
+					var onCard, offCard int64
+					compress.TrellisPathAccel = func(norm []float32, o compress.TrellisOpts, states []uint16) bool {
+						// The kernel is compiled for one shape. Anything else
+						// falls back rather than quietly answering a different
+						// question.
+						if o.K != vk.TrellisGPUK || o.L != vk.TrellisGPUL || o.Seq != vk.TrellisGPUSeq {
+							offCard += int64(len(norm))
+							return false
+						}
+						if err := enc.QuantizePath(norm, float32(o.Gain), states); err != nil {
+							fmt.Printf("  the card refused a matrix (%v); the processor takes it\n", err)
+							offCard += int64(len(norm))
+							return false
+						}
+						onCard += int64(len(norm))
+						return true
+					}
+					defer func() {
+						fmt.Printf("%d M weights through the card, %d M through the processor\n",
+							onCard/1e6, offCard/1e6)
+					}()
+				}
+			} else if gpu, err = vk.NewD4GEncoder(d, *codeBits, 32<<20); err != nil {
+				// Nine and a quarter bytes a weight across the six buffers, so
+				// thirty-two million of them is three hundred megabytes and the
+				// widest row in any checkpoint fits a pass many times over.
 				fmt.Printf("no encoder on the device (%v); the matrices are encoded on the processor\n", err)
-			} else {
+			} else if gpu != nil {
 				defer gpu.Close()
 			}
 		}
@@ -124,7 +166,20 @@ func main() {
 	if *codeBits == nn.D4Bits16 {
 		dtype = "D4G16"
 	}
-	lloyd := *codebook == "lloyd"
+	// A trellis settles all of this: the sequence, the rate and the state width
+	// are what a workgroup's shared memory holds, the step is one per
+	// sixty-four weights, and the codebook has no parameter at all. So the
+	// lattice's flags are simply not read.
+	if trellis {
+		dtype = "T4G"
+		params = compress.D4Params{ScaleBlock: nn.T4GBlock, HadGroup: *hadGroup}
+	}
+	lloyd := !trellis && *codebook == "lloyd"
+	// What a row has to be a multiple of.
+	unit := nn.D4Block
+	if trellis {
+		unit = nn.T4GSeq
+	}
 	if lloyd {
 		dtype = "L8G"
 		if !flagWasSet("beta") {
@@ -133,7 +188,7 @@ func main() {
 			// up into its shell; this wants it left where it is.
 			params.Beta = 1
 		}
-	} else if *codebook != "d4" {
+	} else if !trellis && *codebook != "d4" {
 		must(fmt.Errorf("golemquant: %q is not a codebook", *codebook))
 	}
 
@@ -305,6 +360,8 @@ func main() {
 				}
 				var data []byte
 				switch {
+				case trellis:
+					data = compress.EncodeT4G(rows, n, pl.cols, q, pl.params)
 				case lloyd:
 					data = compress.EncodeL8G(rows, n, pl.cols, q, pl.params)
 				case onDevice(gpu, pl.params, comp, q):
@@ -389,7 +446,7 @@ func main() {
 		// A tensor this format has nothing to say about, one a probe is
 		// leaving alone, or the table of a probe that wants it in bf16: all
 		// three travel unchanged.
-		if !encodable(t) || kept(name, *keep) || (name == "token_embd.weight" && *embd == "bf16") {
+		if !encodable(t, unit) || kept(name, *keep) || (name == "token_embd.weight" && *embd == "bf16") {
 			plans = append(plans, plan{name: name, t: t, passthru: true,
 				dtype: t.DType, size: len(t.Raw)})
 			bits += float64(len(t.Raw)) * 8
@@ -540,10 +597,19 @@ func main() {
 	meta["golem.d4.scale_block"] = uint32(*scaleBlk)
 	meta["golem.d4.code_bits"] = uint32(*codeBits)
 	meta["general.file_type"] = uint32(1000)
+	if trellis {
+		meta["general.file_type"] = uint32(1003)
+		meta["golem.trellis.seq"] = uint32(nn.T4GSeq)
+		meta["golem.trellis.bits"] = uint32(nn.T4GK)
+		meta["golem.trellis.state"] = uint32(nn.T4GL)
+	}
 
 	must(checkVectors(out, rotatedBy))
 
 	must(tensors.WriteGGUFStream(*dst, meta, out))
+	if n := nn.T4GStepClipped.Load(); n > 0 {
+		fmt.Printf("%d blocks landed on an end of the step grid: the window is wrong for this checkpoint\n", n)
+	}
 	fmt.Printf("\n%.0f M weights at %.3f bits each — %s\n",
 		count/1e6, bits/count, sizeOf(int(bits/8)))
 	fmt.Printf("written to %s in %s\n", *dst, time.Since(t0).Round(time.Second))
@@ -891,11 +957,14 @@ func saliencyScale(sal []float32, alpha, clamp float64) []float32 {
 // encodable says whether a tensor is one this format has anything to say about:
 // a matrix, or a stack of them, of a type that can be read back as floats. The
 // norms, the vectors and the scalars are none of those and travel unchanged.
-func encodable(t tensors.Tensor) bool {
+func encodable(t tensors.Tensor, block int) bool {
 	if len(t.Shape) != 2 && len(t.Shape) != 3 {
 		return false
 	}
-	if t.Shape[0]%nn.D4Block != 0 {
+	// A row has to hold a whole number of whatever the codec's unit is — 64
+	// weights for a lattice block, 128 for a trellis sequence. Refuse rather
+	// than pad: a padded row is bits nobody reads and an offset nobody expects.
+	if t.Shape[0]%block != 0 {
 		return false
 	}
 	if t.DType == "BF16" {

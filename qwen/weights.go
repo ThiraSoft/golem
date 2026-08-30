@@ -208,7 +208,7 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 				{&b.PreGateUp, "gateup", b.Gate.Cols, b.Gate},
 				{&b.PreDown, "down", b.Down.Cols, b.Down},
 			} {
-				if bind.m.Quant.D4Width() == 0 {
+				if !bind.m.Quant.Golem() {
 					continue
 				}
 				name := fmt.Sprintf("blk.%d.%s.pre", i, bind.site)
@@ -223,7 +223,7 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 			}
 			b.HadGroup = w.HadGroup
 		}
-		if v, err := floats(g, "output.pre"); err == nil && w.TokenEmbd.Quant.D4Width() > 0 {
+		if v, err := floats(g, "output.pre"); err == nil && w.TokenEmbd.Quant.Golem() {
 			if len(v) != w.TokenEmbd.Cols {
 				return nil, fmt.Errorf("output.pre is %d wide, not %d", len(v), w.TokenEmbd.Cols)
 			}

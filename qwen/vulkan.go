@@ -33,7 +33,7 @@ func (m *Model) UseVulkanHead() error {
 	if m.head != nil || m.d4gHead != nil {
 		return nil
 	}
-	if bits := m.W.TokenEmbd.Quant.D4Width(); bits > 0 {
+	if gq := m.W.TokenEmbd.Quant; gq.Golem() {
 		if m.W.PreHead == nil {
 			return fmt.Errorf("qwen: a %s head without output.pre — the checkpoint was written with the table left plain", m.W.TokenEmbd.Quant)
 		}
@@ -41,7 +41,7 @@ func (m *Model) UseVulkanHead() error {
 		if err != nil {
 			return err
 		}
-		k, err := vk.NewD4GKernels(d, bits)
+		k, err := vk.NewGolemKernels(d, gq)
 		if err != nil {
 			return err
 		}
@@ -86,7 +86,7 @@ func (m *Model) useVulkanEmbedding() error {
 	}
 	if m.d4gHead != nil {
 		table, lattice, cols := m.d4gHead.Table()
-		return m.stack.SetEmbeddingD4G(table, lattice, cols, m.W.PreHead)
+		return m.stack.SetEmbeddingD4G(table, lattice, cols, m.W.PreHead, m.d4gHead.Quant())
 	}
 	if m.head == nil {
 		return nil
@@ -174,8 +174,8 @@ func (m *Model) UseVulkanStack() error {
 	// Q8_0. The lattice table belongs to the device and is uploaded once for
 	// the model, whatever a block does with it.
 	var d4g *vk.D4GKernels
-	if bits := m.W.Blocks[0].Q.Quant.D4Width(); bits > 0 {
-		if d4g, err = vk.NewD4GKernels(d, bits); err != nil {
+	if gq := m.W.Blocks[0].Q.Quant; gq.Golem() {
+		if d4g, err = vk.NewGolemKernels(d, gq); err != nil {
 			stack.Close()
 			return err
 		}

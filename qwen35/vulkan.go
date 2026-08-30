@@ -30,13 +30,13 @@ func (m *Model) UseVulkanHead() error {
 	if err != nil {
 		return err
 	}
-	if bits := m.W.OutputHead.Quant.D4Width(); bits > 0 {
+	if gq := m.W.OutputHead.Quant; gq.Golem() {
 		// A .golem head is a site like any other: the hidden state meets the
 		// reciprocal of its scale and the same rotation before the product,
 		// and vk/d4ghead.go does both.
-		k, err := vk.NewD4GKernels(d, bits)
+		k, err := vk.NewGolemKernels(d, gq)
 		if err != nil {
-			return fmt.Errorf("qwen35: cannot build the D4G kernels: %w", err)
+			return fmt.Errorf("qwen35: cannot build the %s kernels: %w", gq, err)
 		}
 		h, err := vk.NewD4GHead(k, m.W.OutputHead.Data, m.W.OutputHead.Rows, m.W.OutputHead.Cols, m.W.OutputHead.Pre)
 		if err != nil {
@@ -120,10 +120,13 @@ func (m *Model) UseVulkanStack() error {
 		return fmt.Errorf("qwen35: the model has no blocks to upload")
 	}
 
-	// A .golem checkpoint takes the other form of every projection. The width
-	// of a code is the model's and not a block's, so it is read once here and
-	// carried in the shape; zero is a checkpoint of one of llama.cpp's types.
-	bits := m.W.Blocks[0].Down.Quant.D4Width()
+	// A .golem checkpoint takes the other form of every projection. The format
+	// is the model's and not a block's, so it is read once here and carried in
+	// the shape; anything of llama.cpp's own is not one of these.
+	gq := m.W.Blocks[0].Down.Quant
+	if !gq.Golem() {
+		gq = 0
+	}
 
 	// Every block shares one geometry; only which mixer a block has differs.
 	// The first full-attention block names the attention side of it, and the
@@ -136,7 +139,7 @@ func (m *Model) UseVulkanStack() error {
 		// vk takes the widths as a plain array: it has no reason to import nn
 		// for a type, and this is the one place the two spellings meet.
 		RoPESections: [4]int(cfg.RoPESections),
-		D4GBits:      bits,
+		Golem:        gq,
 	}
 	for _, bc := range cfg.Blocks[:numBlocks] {
 		if bc.Type == BlockFullAttn && shape.Heads == 0 {
@@ -170,11 +173,11 @@ func (m *Model) UseVulkanStack() error {
 		if bc.Type != BlockFullAttn {
 			mixer = []nn.Matrix{bw.QKV, bw.AttnGate, bw.SSMAlpha, bw.SSMBeta, bw.SSMOut}
 		}
-		if bits > 0 {
+		if gq.Golem() {
 			for _, w := range append(mixer, bw.Gate, bw.Up, bw.Down) {
-				if w.Quant.D4Width() != bits {
+				if w.Quant != gq {
 					pipe.Close()
-					return fmt.Errorf("qwen35: block %d has a %s among %d-bit codes", i, w.Quant, bits)
+					return fmt.Errorf("qwen35: block %d has a %s among %s", i, w.Quant, gq)
 				}
 			}
 		}
@@ -240,7 +243,7 @@ func (m *Model) UseVulkanStack() error {
 		// with a projection of its own in front of it. That projection is the
 		// one matrix in the model no calibration site names, so in a .golem it
 		// carries its own vector rather than a site's — see QwenMTPData.
-		if q := m.W.MTP.EHProj.Quant; q.D4Width() != bits || (bits == 0 && q != nn.Q8_0) {
+		if q := m.W.MTP.EHProj.Quant; q != gq && !(!gq.Golem() && q == nn.Q8_0) {
 			pipe.Close()
 			return fmt.Errorf("qwen35: the prediction block's projection is %s where the model is %s",
 				q, m.W.Blocks[0].Down.Quant)
