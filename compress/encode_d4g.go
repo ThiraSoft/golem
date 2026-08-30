@@ -158,6 +158,19 @@ func chooseStep(blk []float32, lo, hi float32, beta float32, buf, pt []float32, 
 	return bestStep
 }
 
+// D4SearchSpan is how far either side of rms/beta the step search looks, as a
+// fraction of it. A block of outliers wants a coarse step and a flat one wants
+// a fine step, and neither is within a few percent of the other, so the span is
+// wide. It is here rather than inside the sweep because a second encoder — the
+// one in vk — has to look over exactly the same candidates in exactly the same
+// order, or the two write different files.
+func D4SearchSpan(p D4Params) (lo, hi float32) {
+	if p.SearchScale {
+		return 0.45, 2.4
+	}
+	return 1, 1
+}
+
 // EncodeD4G writes one matrix. q is the per-column vector the weights are
 // scaled by — the reciprocal of what the activations will meet — or nil for a
 // matrix that is neither scaled nor rotated. comp, when given, is the site's
@@ -175,12 +188,7 @@ func EncodeD4G(w []float32, rows, cols int, q []float32, p D4Params, comp *Comp)
 	rowBytes := cols / nn.D4Block * nn.D4BlockBytes(bits)
 	out := make([]byte, rows*rowBytes)
 
-	// A block of outliers wants a coarse step and a flat one wants a fine step,
-	// and neither is within a few percent of the other, so the span is wide.
-	spanLo, spanHi := float32(1), float32(1)
-	if p.SearchScale {
-		spanLo, spanHi = 0.45, 2.4
-	}
+	spanLo, spanHi := D4SearchSpan(p)
 	beta := float32(p.Beta)
 
 	Parallel(rows, func(lo, hi int) {

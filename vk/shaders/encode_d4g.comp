@@ -1,0 +1,163 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// The encoder of the D4G format, which is the half of a conversion that takes
+// the hour. compress/encode_d4g.go says what it does and why; this says it
+// again in the one place it can be said to two thousand blocks at once.
+//
+// A thread a scale block — thirty-two weights, one step code and eight lattice
+// codes. The step is searched over the codes themselves, and each candidate
+// costs eight roundings onto D4 with a shell test, so a block is a few thousand
+// operations that depend on nothing outside itself. That is the whole reason
+// this belongs on a card.
+//
+// The activations side of the scheme is shaders/prepare_d4g.comp, and the rows
+// this reads have already been through it.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer X     { float x[];     };
+layout(std430, binding = 1) readonly  buffer INV   { uint  inv[];   };
+layout(std430, binding = 2) readonly  buffer STEPT { float stept[]; };
+// Two codes a word. A thread owns eight of them and so owns four whole words,
+// which is what lets it write them without a single lane talking to another —
+// and it halves what the processor has to read back across the bus, which was
+// three times the kernel's own time before it did.
+layout(std430, binding = 3) writeonly buffer CODES { uint  codes[]; };
+layout(std430, binding = 4) writeonly buffer STEPS { uint  steps[]; };
+
+layout(push_constant) uniform Push {
+    uint blocks;  // scale blocks in this pass
+    int  lim;     // largest coordinate the inverse table holds
+    int  side;    // 2*lim+1
+    int  full;    // every point at or below this squared norm is coded
+    int  edge;    // above this squared norm none is
+    float beta;   // how far a block is scaled up before rounding
+    float spanLo; // the step search's span, as a fraction of rms/beta
+    float spanHi;
+} p;
+
+const uint noCode = 0xFFFFFFFFu;
+
+// Go rounds halves away from zero and GLSL's round() may not, so the rule is
+// written out: every point of this kernel has to be the point the processor
+// would have picked, or the two encoders disagree about a file.
+float roundAway(float v) {
+    return v < 0.0 ? -floor(-v + 0.5) : floor(v + 0.5);
+}
+
+// nearestDn is compress/lattice.go: round each coordinate, and if the sum came
+// out odd move the one that was rounded furthest.
+ivec4 nearestDn(vec4 v) {
+    vec4 r = vec4(roundAway(v.x), roundAway(v.y), roundAway(v.z), roundAway(v.w));
+    int sum = int(r.x) + int(r.y) + int(r.z) + int(r.w);
+    if ((sum & 1) != 0) {
+        vec4 d = abs(v - r);
+        int worst = 0;
+        float wd = d.x;
+        if (d.y > wd) { worst = 1; wd = d.y; }
+        if (d.z > wd) { worst = 2; wd = d.z; }
+        if (d.w > wd) { worst = 3; wd = d.w; }
+        r[worst] += (v[worst] > r[worst]) ? 1.0 : -1.0;
+    }
+    return ivec4(r);
+}
+
+uint lookup(ivec4 o) {
+    if (any(greaterThan(abs(o), ivec4(p.lim)))) return noCode;
+    int at = (((o.x + p.lim) * p.side + (o.y + p.lim)) * p.side + (o.z + p.lim)) * p.side + (o.w + p.lim);
+    return inv[at];
+}
+
+bool coded(ivec4 o) {
+    int n = o.x * o.x + o.y * o.y + o.z * o.z + o.w * o.w;
+    if (n <= p.full) return true;
+    if (n > p.edge) return false;
+    return lookup(o) != noCode;
+}
+
+// nearestInShell rounds onto D4 and, past the shell, pulls the vector towards
+// the origin until it lands on a point that has a code — trying a handful of
+// pulls because the first that fits is not the nearest that fits.
+ivec4 nearestInShell(vec4 v) {
+    ivec4 o = nearestDn(v);
+    if (coded(o)) return o;
+
+    float s0 = sqrt(float(p.full) / dot(v, v));
+    if (s0 > 1.0) s0 = 1.0;
+    ivec4 best = ivec4(0);
+    float bestD = 3.402823466e+38;
+    [[loop]] for (int k = 0; k < 10; k++) {
+        ivec4 t = nearestDn(v * (s0 * (1.0 - 0.04 * float(k))));
+        if (!coded(t)) continue;
+        vec4 e = v - vec4(t);
+        float d = dot(e, e);
+        if (d < bestD) { bestD = d; best = t; }
+    }
+    return best;
+}
+
+// stepCode is nn.D4StepCode: the codes are powers of two a sixteenth apart,
+// and 272 is where the exponent is centred.
+int stepCode(float v) {
+    if (!(v > 0.0)) return 0;
+    return clamp(int(roundAway(log2(v) * 16.0 + 272.0)), 0, 255);
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= p.blocks) return;
+    uint base = id * 32u;
+
+    vec4 w[8];
+    float ss = 0.0;
+    [[unroll]] for (uint g = 0u; g < 8u; g++) {
+        w[g] = vec4(x[base + g * 4u], x[base + g * 4u + 1u], x[base + g * 4u + 2u], x[base + g * 4u + 3u]);
+        ss += dot(w[g], w[g]);
+    }
+    float bs = sqrt(ss / 32.0) / p.beta;
+
+    int first = stepCode(bs * p.spanLo);
+    int last  = stepCode(bs * p.spanHi);
+    int mid   = stepCode(bs);
+
+    float best = 3.402823466e+38;
+    int bestCode = -1;
+
+    // The order the processor tries them in, because a tie goes to whichever
+    // was tried first: the rms itself, then the span from the bottom.
+    [[loop]] for (int t = -1; t <= last - first; t++) {
+        int c = (t < 0) ? mid : first + t;
+        if (t < 0 && (mid < first || mid > last)) continue;
+        float step = stept[c];
+        if (!(step > 0.0)) continue;
+        // The processor abandons a candidate as soon as it is worse than the
+        // best so far, which saves it most of the eight subvectors. Here it
+        // saves nothing — sixty-four lanes abandon at sixty-four different
+        // points and the wave runs to the last of them — while the branch
+        // stops the loop being unrolled, which puts the block's weights in
+        // scratch memory instead of registers. That was the difference between
+        // three times the processor and thirty. The answer is the same either
+        // way: a candidate that would have been abandoned ends above best and
+        // loses on the comparison below.
+        float err = 0.0;
+        [[unroll]] for (uint g = 0u; g < 8u; g++) {
+            vec4 pt = vec4(nearestInShell(w[g] / step));
+            vec4 e = w[g] - pt * step;
+            err += dot(e, e);
+        }
+        if (err < best) { best = err; bestCode = c; }
+    }
+    if (bestCode < 0) bestCode = 0;
+
+    float step = stept[bestCode];
+    uint zero = lookup(ivec4(0));
+    uint low = 0u;
+    [[unroll]] for (uint g = 0u; g < 8u; g++) {
+        uint c = lookup(nearestInShell(w[g] / step));
+        if (c == noCode) c = zero;
+        if ((g & 1u) == 0u) low = c;
+        else codes[base / 8u + g / 2u] = low | (c << 16);
+    }
+    steps[id] = uint(bestCode);
+}
