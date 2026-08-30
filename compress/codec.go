@@ -15,6 +15,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+
+	"github.com/ThiraSoft/golem/nn"
 )
 
 // ---------- helpers ----------
@@ -36,6 +39,41 @@ func Fp16round(x float32) float32 {
 	step := math.Pow(2, e-10)
 	return sign * float32(math.Round(f/step)*step)
 }
+
+// StepCodeRound rounds a block's scale onto the eight-bit grid a file stores it
+// on — powers of two a sixteenth apart — so that the bench pays for a scale
+// what the format pays. Which grid depends on the codec: nn/t4g.go's window
+// sits two octaves above nn/d4g.go's, because a lattice step is a fraction of
+// its block's RMS and a trellis step is the RMS itself.
+//
+// The grid is 4.4 % wide, against fp16's 0.05 %, and half a bit a block cheaper
+// at ScaleBlock 64. Whether that trade is free is not a question squared error
+// can answer: compress/README.md records a step grid an eighth apart costing a
+// whole point of perplexity for 0.03 dB. It is settled by perplexity and
+// divergence, and the answer is written down beside the format — on Qwen3-0.6B
+// at k=4, an fp16 scale reads 29.78 and KL 0.0658 where the step code reads
+// 29.87 and 0.0702, which is a twentieth of a point for three percent of a file.
+func StepCodeRound(x float32, trellis bool) float32 {
+	if !(x > 0) {
+		return 0
+	}
+	if trellis {
+		return nn.T4GStep(nn.T4GStepCode(x))
+	}
+	c := nn.D4StepCode(x)
+	if c == 0 || c == 255 {
+		atomic.AddInt64(&stepClipped, 1)
+	}
+	return nn.D4Step(c)
+}
+
+// stepClipped counts the blocks whose scale landed on an end of the lattice's
+// grid. The trellis keeps its own count, in nn, because the file's encoder
+// needs it too and a converter says it out loud.
+var stepClipped int64
+
+// StepClipped is that count, and resets it.
+func StepClipped() int64 { return atomic.SwapInt64(&stepClipped, 0) + nn.T4GStepClipped.Swap(0) }
 
 func Parallel(n int, fn func(lo, hi int)) {
 	// GOMAXPROCS and not NumCPU: they are the same until somebody sets the
@@ -196,6 +234,11 @@ type Opts struct {
 	UseTrellis bool
 	Tr         TrellisOpts
 
+	// Step8 stores each block's scale as an eight-bit step code rather than an
+	// fp16. It is what the file does; the bench does not have to, so the two
+	// can be measured against each other.
+	Step8 bool
+
 	// SearchScale trades encoding time for accuracy: instead of taking the
 	// block's RMS as its scale, it tries a few multiples of it and keeps the
 	// one the lattice actually reconstructs best. The RMS is the scale that
@@ -203,12 +246,29 @@ type Opts struct {
 	SearchScale bool
 }
 
+// scaleBits is what one stored scale costs.
+func (o Opts) scaleBits() float64 {
+	if o.Step8 {
+		return 8
+	}
+	return 16
+}
+
+// roundScale is how a stored scale is rounded: onto the eight-bit grid when the
+// file will store it there, through fp16 otherwise.
+func (o Opts) roundScale(x float32) float32 {
+	if o.Step8 {
+		return StepCodeRound(x, o.UseTrellis)
+	}
+	return Fp16round(x)
+}
+
 func (o Opts) BPW() float64 {
 	b := 0.0
 	if o.UseTrellis {
 		b = o.Tr.BPW()
 		if o.ScaleBlock > 0 {
-			b += 16.0 / float64(o.ScaleBlock)
+			b += o.scaleBits() / float64(o.ScaleBlock)
 		}
 		return b
 	}
@@ -219,7 +279,7 @@ func (o Opts) BPW() float64 {
 		}
 		b = math.Log2(float64(n)) / float64(o.Lat.Dim())
 		if o.ScaleBlock > 0 {
-			b += 16.0 / float64(o.ScaleBlock)
+			b += o.scaleBits() / float64(o.ScaleBlock)
 		}
 		return b
 	}
@@ -227,7 +287,7 @@ func (o Opts) BPW() float64 {
 		b += math.Log2(float64(k)) / float64(o.Dim)
 	}
 	if o.ScaleBlock > 0 {
-		b += 16.0 / float64(o.ScaleBlock)
+		b += o.scaleBits() / float64(o.ScaleBlock)
 	}
 	return b
 }
@@ -241,6 +301,9 @@ func (o Opts) Name() string {
 		fmt.Fprintf(&sb, "TCQ(k%d,L%d,T%d,g%.2f)", o.Tr.K, o.Tr.L, o.Tr.Seq, o.Tr.gain())
 		if o.ScaleBlock > 0 {
 			fmt.Fprintf(&sb, "/s%d", o.ScaleBlock)
+			if o.Step8 {
+				sb.WriteString("e8")
+			}
 		} else {
 			sb.WriteString("/srow")
 		}
@@ -415,7 +478,17 @@ func VQ(w []float32, rows, cols int, o Opts, seed int64) []float32 {
 				for i := r*cols + b; i < r*cols+b+sb; i++ {
 					s += float64(src[i]) * float64(src[i])
 				}
-				sc := Fp16round(float32(math.Sqrt(s / float64(sb))))
+				sc := float32(math.Sqrt(s / float64(sb)))
+				// The lattice stores this number, so it is rounded to what
+				// the file can hold. A trellis does not: its step is fitted
+				// to the path by least squares below and rounded there, and
+				// this one only normalises the block on the way in. Rounding
+				// it here would move the path — by four percent on the
+				// eight-bit grid, which is a gain error the codebook was
+				// measured not to want — and buy nothing at all.
+				if !o.UseTrellis {
+					sc = o.roundScale(sc)
+				}
 				scales[(r*cols+b)/sb] = sc
 				inv := float32(0)
 				if sc != 0 {
@@ -469,7 +542,7 @@ func VQ(w []float32, rows, cols int, o Opts, seed int64) []float32 {
 		// spans many blocks. Least squares gets it exactly and for nothing: the
 		// step code the format already stores per 32 weights absorbs it.
 		src := append([]float32(nil), norm...)
-		quantizeTrellis(norm, o.Tr, TrellisTable(o.Tr.Code, o.Tr.L))
+		quantizeTrellis(norm, o.Tr, TrellisTable(o.Tr.Code, o.Tr.L), nil)
 		for b := 0; b < len(norm)/sb; b++ {
 			var num, den float64
 			for i := b * sb; i < (b+1)*sb; i++ {
@@ -477,7 +550,7 @@ func VQ(w []float32, rows, cols int, o Opts, seed int64) []float32 {
 				den += float64(norm[i]) * float64(norm[i])
 			}
 			if den > 0 {
-				scales[b] = Fp16round(scales[b] * float32(num/den))
+				scales[b] = o.roundScale(scales[b] * float32(num/den))
 			}
 		}
 		return rebuild()

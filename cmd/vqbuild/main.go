@@ -47,6 +47,7 @@ func main() {
 	trGain := flag.Float64("gain", 0.94, "trellis: how far the codebook is narrowed against the source")
 	onCard := flag.Bool("vulkan", false, "run the trellis Viterbi on a Vulkan device; it is five hundred times the lattice's work and the only half that cares where it runs")
 	scaleBlk := flag.Int("scale", 64, "weights per fp16 scale")
+	step8 := flag.Bool("step8", false, "store each block's scale as the format's eight-bit step code rather than an fp16, which is half a bit a block cheaper at -scale 64")
 	alpha := flag.Float64("alpha", 0.5, "salience exponent")
 	outliers := flag.Int("outliers", 32, "columns held at 8 bits")
 	search := flag.Bool("search", false, "search each block's scale instead of taking its RMS")
@@ -240,7 +241,7 @@ func main() {
 
 		var opts compress.Opts
 		if *codec == "trellis" {
-			opts = compress.Opts{UseTrellis: true,
+			opts = compress.Opts{UseTrellis: true, Step8: *step8,
 				ScaleBlock: *scaleBlk, HadGroup: *hadGroup,
 				Tr: compress.TrellisOpts{K: *trK, L: *trL, Seq: *trSeq,
 					Gain: *trGain, Code: compress.Code1MAD}}
@@ -250,7 +251,7 @@ func main() {
 				lat, table = compress.LatD4, d4Levels
 			}
 			lv := table[levelOf(role)]
-			opts = compress.Opts{UseLattice: true, Lat: lat,
+			opts = compress.Opts{UseLattice: true, Lat: lat, Step8: *step8,
 				MaxNorm2: float32(lv.r), Beta: lv.beta, ScaleBlock: *scaleBlk, HadGroup: *hadGroup,
 				SearchScale: *search}
 		}
@@ -286,6 +287,9 @@ func main() {
 	m.Close()
 	fmt.Printf("\n%.0f M weights at %.3f bits per weight — %.2f GiB against %.2f GiB in BF16, %.2f in Q4_0\n",
 		weights/1e6, bits/weights, bits/8/(1<<30), weights*2/(1<<30), weights*4.5/8/(1<<30))
+	if n := compress.StepClipped(); n > 0 {
+		fmt.Printf("%d blocks landed on an end of the step grid; the grid is too narrow for this model\n", n)
+	}
 	fmt.Printf("rewritten in %s\n", time.Since(t0).Round(time.Second))
 }
 
