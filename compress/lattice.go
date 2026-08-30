@@ -98,29 +98,66 @@ func norm2(a []float32) float32 {
 	return s
 }
 
-// quantizeLattice puts x on the nearest lattice point inside the shell,
-// shrinking x towards the origin when the nearest point falls outside it. The
-// result is written back over x.
+// quantizeLattice puts x on the nearest lattice point inside the shell, and
+// writes that point — not the point divided by anything — back over x.
+//
+// The distinction is the whole correctness of this bench. A subvector past the
+// shell has to be pulled towards the origin until it lands somewhere codeable,
+// but the pull is a search, not a scale: the file stores one step per block and
+// a code per subvector, and there is nowhere to put a per-subvector factor.
+// Reconstructing as point/pull would hand the decoder information no decoder
+// has, and it flatters the lattice precisely in the β ≥ 8 regime the shipped
+// converter runs in — by nearly two decibels, which is enough to read above
+// Shannon's bound and not notice. `nearestInShell` in encode_d4g.go is what a
+// file actually does; this mirrors it.
 func quantizeLattice(l Lattice, x, out, tmp []float32, maxNorm2 float32) {
-	scale := float32(1)
-	for try := 0; try < 24; try++ {
-		for i := range x {
-			tmp[i] = x[i] * scale
-		}
+	var t2 []float32
+	if l != LatD4 {
+		t2 = make([]float32, len(x))
+	}
+	round := func(src, dst []float32) {
 		if l == LatD4 {
-			nearestDn(tmp, out)
+			nearestDn(src, dst)
 		} else {
-			t2 := make([]float32, len(x))
-			nearestE8(tmp, out, t2)
+			nearestE8(src, dst, t2)
 		}
-		if norm2(out) <= maxNorm2 {
-			break
+	}
+	round(x, out)
+	if norm2(out) <= maxNorm2 {
+		copy(x, out)
+		return
+	}
+	// Past the shell. The ray to the origin does not pass through the best
+	// codeable point, so a handful of pulls are tried and the one nearest the
+	// *original* x wins — the same handful, and the same starting point, as
+	// the converter's.
+	best := make([]float32, len(x))
+	bestD := float32(math.MaxFloat32)
+	s0 := float32(math.Sqrt(float64(maxNorm2) / float64(norm2(x))))
+	if s0 > 1 {
+		s0 = 1
+	}
+	for k := 0; k < 10; k++ {
+		s := s0 * (1 - 0.04*float32(k))
+		for i := range x {
+			tmp[i] = x[i] * s
 		}
-		scale *= 0.9
+		round(tmp, out)
+		if norm2(out) > maxNorm2 {
+			continue
+		}
+		if d := sqdist(x, out); d < bestD {
+			bestD = d
+			copy(best, out)
+		}
 	}
-	for i := range out {
-		x[i] = out[i] / scale
+	if bestD == float32(math.MaxFloat32) {
+		for i := range x {
+			x[i] = 0
+		}
+		return
 	}
+	copy(x, best)
 }
 
 // shellSize counts the lattice points within a squared radius, which is what

@@ -184,21 +184,23 @@ func main() {
 // and the shell is about 1.6 times that.
 type level struct{ r, beta float64 }
 
-// The resolution is deliberately past the point where it still matters. With
-// the block scale searched rather than taken, β and that scale do the same job,
-// and the error stops moving once β is large enough to use the whole shell —
-// what sets the rate is the shell, and nothing else.
+// β is not free to be large. It used to be set so a subvector filled the whole
+// shell, on the reasoning that overflow costs nothing — which held only because
+// the bench reconstructed an overflowing subvector by the factor it had been
+// pulled by, and no decoder has that factor. Under a reconstruction a file can
+// perform, overflow is clipping, and the measured optimum is four times lower:
+// β ≈ 0.63·√(r²/d), which reads 2.0 at D4's r²=40 and 4.0 at its r²=160.
 var e8Levels = []level{
-	{10, 2.4}, {16, 3.1}, {26, 3.9}, {42, 5.0}, {62, 6.1},
-	{100, 7.7}, {156, 9.6}, {260, 12.4}, {460, 16.5}, {820, 22.1},
+	{10, 0.70}, {16, 0.89}, {26, 1.14}, {42, 1.44}, {62, 1.75},
+	{100, 2.23}, {156, 2.78}, {260, 3.59}, {460, 4.78}, {820, 6.38},
 }
 
 // D4 at the same budget: half the dimension, so the same rate needs a quarter
 // of the squared radius, and the shell stays small enough to enumerate into a
 // table a shader can hold — 3961 points at r²=40, thirty-one kibibytes.
 var d4Levels = []level{
-	{6, 3.1}, {10, 4.0}, {20, 5.7}, {40, 8.0}, {60, 9.8},
-	{100, 12.6}, {160, 16.0}, {260, 20.4}, {460, 27.1}, {820, 36.2},
+	{6, 0.77}, {10, 1.00}, {20, 1.41}, {40, 1.99}, {60, 2.44},
+	{100, 3.15}, {160, 3.98}, {260, 5.08}, {460, 6.76}, {820, 9.02},
 }
 
 var levels = e8Levels
