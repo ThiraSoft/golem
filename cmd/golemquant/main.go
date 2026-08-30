@@ -9,6 +9,7 @@ package main
 // sign flips folded into it.
 
 import (
+	"bufio"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -57,6 +58,7 @@ func main() {
 	damp := flag.Float64("damp", 0.01, "ridge on the Hessian diagonal, as a fraction of its mean")
 	vulkan := flag.Bool("vulkan", true, "encode the matrices on a Vulkan device when there is one")
 	calibSrc := flag.String("calib-model", "", "the checkpoint to calibrate on, when it is not the one being converted")
+	salFile := flag.String("salience", "", "read the sites from this file, or write them to it after measuring; the salience does not depend on -alpha, -clamp or the codec, and measuring it again for each of them is most of a sweep's wall clock")
 	flag.Parse()
 
 	trellis := *codec == "trellis"
@@ -88,7 +90,30 @@ func main() {
 	if *calibSrc != "" {
 		calibFrom = *calibSrc
 	}
-	salience, accs := calibrate(calibFrom, text, *ntok, *ctx, win, *scaleBlk, *vulkan)
+	// The salience is a property of the model and the corpus alone: what the
+	// activations put through each column. Everything that turns it into a
+	// scale — the exponent, the bound — happens below, and a sweep over those
+	// re-measures nothing. On Qwen3-4B the measurement is twelve minutes and
+	// the conversion is ten, so a sweep of four settings goes from ninety
+	// minutes to fifty.
+	var salience map[string][]float32
+	var accs map[string]*compress.Acc
+	if *salFile != "" && win == 0 {
+		if s, err := readSalience(*salFile); err == nil {
+			fmt.Printf("%d sites read from %s\n", len(s), *salFile)
+			salience = s
+		}
+	}
+	if salience == nil {
+		salience, accs = calibrate(calibFrom, text, *ntok, *ctx, win, *scaleBlk, *vulkan)
+		if *salFile != "" && win == 0 && len(salience) > 0 {
+			if err := writeSalience(*salFile, salience); err != nil {
+				fmt.Printf("the sites were not kept (%v)\n", err)
+			} else {
+				fmt.Printf("%d sites written to %s\n", len(salience), *salFile)
+			}
+		}
+	}
 	if len(salience) == 0 && !*blind {
 		must(fmt.Errorf("golemquant: nothing calibrated and -blind is off, so nothing would be rotated"))
 	}
@@ -918,6 +943,101 @@ func hadamardOf(key string, group int, embd string) int {
 		return 0
 	}
 	return group
+}
+
+// The sites, kept between runs. Not a GGUF: it is one map of one shape, it is
+// read by nothing but this command, and a format nobody else parses is a format
+// nobody else can misread. A magic word so that a stale or foreign file is an
+// error rather than a model quantized against noise.
+const salienceMagic = "golemsal1"
+
+func writeSalience(path string, sal map[string][]float32) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	w := bufio.NewWriter(f)
+	if _, err := w.WriteString(salienceMagic); err != nil {
+		f.Close()
+		return err
+	}
+	keys := make([]string, 0, len(sal))
+	for k := range sal {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	put := func(n uint32) error { return binary.Write(w, binary.LittleEndian, n) }
+	if err := put(uint32(len(keys))); err != nil {
+		f.Close()
+		return err
+	}
+	for _, k := range keys {
+		v := sal[k]
+		if err := put(uint32(len(k))); err != nil {
+			f.Close()
+			return err
+		}
+		if _, err := w.WriteString(k); err != nil {
+			f.Close()
+			return err
+		}
+		if err := put(uint32(len(v))); err != nil {
+			f.Close()
+			return err
+		}
+		if err := binary.Write(w, binary.LittleEndian, v); err != nil {
+			f.Close()
+			return err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func readSalience(path string) (map[string][]float32, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	r := bufio.NewReader(f)
+	magic := make([]byte, len(salienceMagic))
+	if _, err := io.ReadFull(r, magic); err != nil || string(magic) != salienceMagic {
+		return nil, fmt.Errorf("golemquant: %s is not a salience file", path)
+	}
+	get := func() (uint32, error) {
+		var n uint32
+		err := binary.Read(r, binary.LittleEndian, &n)
+		return n, err
+	}
+	n, err := get()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string][]float32, n)
+	for i := uint32(0); i < n; i++ {
+		kn, err := get()
+		if err != nil || kn > 1<<10 {
+			return nil, fmt.Errorf("golemquant: %s is truncated", path)
+		}
+		key := make([]byte, kn)
+		if _, err := io.ReadFull(r, key); err != nil {
+			return nil, err
+		}
+		vn, err := get()
+		if err != nil || vn > 1<<22 {
+			return nil, fmt.Errorf("golemquant: %s is truncated", path)
+		}
+		v := make([]float32, vn)
+		if err := binary.Read(r, binary.LittleEndian, v); err != nil {
+			return nil, err
+		}
+		out[string(key)] = v
+	}
+	return out, nil
 }
 
 // saliencyScale turns per-column activation power into the factor the weights
