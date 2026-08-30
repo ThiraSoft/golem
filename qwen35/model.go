@@ -79,11 +79,14 @@ func New(g *tensors.GGUF, maxContext int) (*Model, error) {
 }
 
 func (m *Model) Close() error {
-	m.closeVulkan()
+	// The tower first: what it holds was allocated on the device closeVulkan
+	// is about to destroy, and a buffer freed after its device is a call into
+	// a handle that no longer names anything.
 	if m.vision != nil {
 		m.vision.Close()
 		m.vision = nil
 	}
+	m.closeVulkan()
 	if m.file != nil {
 		return m.file.Close()
 	}

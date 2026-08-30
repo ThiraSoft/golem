@@ -8,6 +8,7 @@ import (
 	"github.com/ThiraSoft/golem/imageio"
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/tensors"
+	"github.com/ThiraSoft/golem/vk"
 )
 
 // VisionTower is a projector bound and ready to run.
@@ -16,6 +17,9 @@ type VisionTower struct {
 	W   *VisionWeights
 
 	file *tensors.GGUF
+
+	// gpu is the tower on a device, or nil for the processor's path.
+	gpu *vk.VisionPipeline
 
 	// trace keeps the intermediates a reference test stands on, under the
 	// names models/qwen3vl.cpp gives its nodes. It is nil unless Trace was
@@ -41,8 +45,12 @@ func NewVisionTower(cfg *VisionConfig, w *VisionWeights) *VisionTower {
 	return &VisionTower{Cfg: cfg, W: w}
 }
 
-// Close releases the projector's file.
+// Close releases the projector's file and whatever it put on a device.
 func (v *VisionTower) Close() error {
+	if v.gpu != nil {
+		v.gpu.Close()
+		v.gpu = nil
+	}
 	if v.file == nil {
 		return nil
 	}
@@ -64,6 +72,31 @@ func (v *VisionTower) Encode(im *imageio.Image) [][]float32 {
 
 	at := cfg.PatchPositions(cols, rows)
 	xs := cfg.PatchesTraced(w, im, v)
+
+	// The card, when the tower is on one. The patch grid and the positions
+	// above are the same either way — what the device path replaces is
+	// everything from the first block on.
+	if v.gpu != nil {
+		if v.trace != nil {
+			v.gpu.Trace()
+		}
+		rows, err := v.encodeVulkan(xs, at)
+		if err != nil {
+			panic(fmt.Sprintf("qwen35: the tower failed on the card: %v", err))
+		}
+		if v.trace != nil {
+			for i := 0; i < cfg.Blocks; i++ {
+				for _, name := range vk.VisionWaypoints() {
+					key := fmt.Sprintf("%s-%d", name, i)
+					if grid := v.gpu.Waypoint(key); grid != nil {
+						v.trace[key] = grid
+					}
+				}
+			}
+		}
+		return rows
+	}
+
 	s := newVisionScratch(cfg, len(at))
 	for i := 0; i < cfg.Blocks; i++ {
 		cfg.VisionBlockForward(w, i, xs, at, s)

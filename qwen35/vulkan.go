@@ -197,7 +197,14 @@ func (m *Model) UseVulkan() error {
 	if err := m.UseVulkanStack(); err != nil {
 		return err
 	}
-	return m.UseVulkanHead()
+	if err := m.UseVulkanHead(); err != nil {
+		return err
+	}
+	// The image tower too, when a projector has been opened. It is last
+	// because it is the part that may not fit: the blocks take the card's
+	// memory first, and what the tower does with what is left is its own
+	// business — see VisionPipeline.Prepare.
+	return m.UseVisionVulkan()
 }
 
 func (m *Model) closeVulkan() {
