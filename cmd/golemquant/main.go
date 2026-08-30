@@ -41,7 +41,7 @@ func main() {
 	hadGroup := flag.Int("hadamard", 128, "rotation group; 0 leaves the weights unrotated")
 	beta := flag.Float64("beta", 2, "how far a block is scaled up before rounding")
 	codebook := flag.String("codebook", "d4", "d4 for the lattice in a table, lloyd for eight levels in registers")
-	headBits := flag.Int("head", 5, "trellis: bits a weight for the logit head, 4 or 5. It is a tenth of the weights and it is what makes the logits, and llama.cpp's K-quant mixes spend 6.56 bits on it where they spend 4.95 on the rest")
+	headBits := flag.Int("head", 4, "trellis: bits a weight for the logit head, 4 or 5. Five is what llama.cpp's K-quant mixes do in spirit — Qwen3-4B's Q4_K_M spends 6.56 bits there and 4.95 on the rest — and on Qwen3-0.6B it takes about three fifths of what an unquantized head is worth, for six percent of the file rather than seventy-three. Four is the default because the smallest file is the point")
 	codec := flag.String("codec", "lattice", "lattice or trellis; the trellis has no decode table at all, and reaches four bits where the lattice's shell stops fitting a workgroup")
 	codeBits := flag.Int("bits", 12, "code width: 12 for the ordinary tier, 16 for the wide one")
 	scaleBlk := flag.Int("scale", 32, "weights sharing one step code; 32 is what the format stores")
@@ -490,9 +490,13 @@ func main() {
 		// The logit head, which is the table when the two are tied. It is not
 		// a hidden layer whose error the layers after it absorb; it is the
 		// thing that makes the logits, and a bit a weight over a tenth of the
-		// model is a tenth of a bit over the file. On Qwen3-0.6B, leaving it
-		// in bf16 is worth half a point of perplexity and a fifth of the
-		// divergence, which is most of what this format still owes Q4_K_M.
+		// model is a tenth of a bit over the file.
+		//
+		// On Qwen3-0.6B, where the head is a quarter of the weights: four bits
+		// reads 30.82 and KL 0.0812, five reads 30.52 and 0.0718, and bf16 —
+		// the ceiling, at seventy-three percent more file — reads 30.30 and
+		// 0.0662. Five bits takes three fifths of the way there for six
+		// percent of the file.
 		if trellis && *headBits == nn.T5GK &&
 			(name == "output.weight" || (name == "token_embd.weight" && *embd != "bf16")) {
 			pl.dtype = "T5G"
