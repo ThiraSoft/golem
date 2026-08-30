@@ -141,6 +141,30 @@ bf16's 28.8521, KL 0.0812, top-1 83.4 %, top-5 99.0 %.
 The bits a weight are 4.194 and 4.201 rather than 4.1875 because a file also
 carries one F32 vector per calibration site and leaves the norms in bf16.
 
+### The offline bench is not a file, and the difference is one mechanism
+
+`cmd/vqbuild` holds 32 columns per matrix out of the quantizer at 8 bits. **No
+`.golem` can**: the format has nowhere to put them, and neither codec has ever
+stored one. So every number the bench reports is of a scheme with an extra part,
+and the bits it prints do not count it — `Opts.BPW` leaves the held-out columns
+out of its own total.
+
+What that part is worth, on Qwen3-0.6B at the same rate and codec:
+
+| | PPL | KL | top-1 |
+|---|---|---|---|
+| bench, salience unbounded, 32 columns held out | 29.87 | 0.0702 | 84.0 % |
+| bench, salience unbounded, none held out | **39.67** | **0.3105** | 69.4 % |
+| the file: salience bounded to 24×, none held out | 30.82 | 0.0812 | 83.4 % |
+
+Ten points, and the whole of it is the handful of columns whose salience scale
+would otherwise dominate the group it is rotated with. The bench solves that by
+paying 8 bits for them; the converter solves it by bounding the scale, which
+costs no bits at all and recovers all but a point of the difference. They are
+two answers to one problem and the file's is nearly as good — but it is not
+quite, and a point of perplexity is what stands between this format and the
+perplexity column of the table above.
+
 ### The step is chosen after the path
 
 A block's RMS is the scale that makes it unit-variance, which is not the scale
