@@ -29,7 +29,25 @@ const (
 	// Lloyd's eight levels, in the same twenty-six bytes and with no table at
 	// all. nn/l8g.go says what that costs.
 	L8G
+	// T4G is the trellis: 128 weights in 67 bytes, 4.1875 bits each, and a
+	// codebook that is computed rather than looked up. nn/t4g.go describes it.
+	T4G
 )
+
+// Golem says the format is one of golem's own — a matrix stored as A·(q ⊙ W),
+// whose activation therefore has to meet the site's vector and the rotation
+// before the product, and whose row has to be brought back through both when it
+// is read on its own.
+//
+// It is asked rather than inferred from the code width, which is how a fourth
+// format that has no lattice code at all came to need a name for the question.
+func (q Quant) Golem() bool {
+	switch q {
+	case D4G, D4G16, L8G, T4G:
+		return true
+	}
+	return false
+}
 
 // D4Width is the code width of a D4G format, and zero for anything else.
 func (q Quant) D4Width() int {
@@ -70,6 +88,8 @@ func (q Quant) String() string {
 		return "D4G16"
 	case L8G:
 		return "L8G"
+	case T4G:
+		return "T4G"
 	}
 	return "unknown"
 }
@@ -101,6 +121,8 @@ func QuantOf(dtype string) (Quant, bool) {
 		return D4G16, true
 	case "L8G":
 		return L8G, true
+	case "T4G":
+		return T4G, true
 	}
 	return 0, false
 }

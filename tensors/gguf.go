@@ -216,6 +216,11 @@ var ggmlTypes = map[uint32]string{
 	1000: "D4G",
 	1001: "L8G",
 	1002: "D4G16",
+	// 1001 was taken by L8G before the trellis existed, so this is 1003 and not
+	// the 1001 the plan for it named. A number that means two formats is a file
+	// that loads and answers nonsense, which is the mistake this format has
+	// already made twice by other routes.
+	1003: "T4G",
 }
 
 // blockGeometry gives, per type, how many weights sit in one block and how many
@@ -233,6 +238,7 @@ var blockGeometry = map[string][2]int{
 	"D4G":   {64, 26},   // two step codes, then sixteen twelve-bit lattice codes
 	"D4G16": {64, 34},   // the same with sixteen-bit codes
 	"L8G":   {64, 26},   // two step codes, then sixty-four three-bit levels
+	"T4G":   {128, 67},  // two step codes, then a 520-bit trellis path
 }
 
 // rowBytes is the size on disk of one row of `n` weights of the given type.
