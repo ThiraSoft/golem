@@ -60,3 +60,9 @@ __pycache__/
 /vqdiff
 /vqeval
 /kldiff
+/golemquant
+
+# Corpora cut from wikitext for a measurement, and whatever else a run leaves
+# behind. They belong to whoever published the text; the two commands that
+# make them are in compress/README.md.
+/scratchpad/
