@@ -129,17 +129,56 @@ on 4088 tokens of `wiki.test.raw` — disjoint, and neither is this README:
 | `.golem` T4G | **1.96 GiB** | 20.3757 | **0.0526** | **90.6 %** | 99.6 % |
 
 Sixteen percent smaller than Q4_K_M, twenty-six percent closer to the original's
-opinion, half a point better at naming the same word — **and 1.7 % worse at
-perplexity**. That split is the result, and reporting either half alone would
-misrepresent it. A format judged on perplexity alone loses this comparison; one
-judged on divergence alone wins it comfortably; both are worth having and they
-are not the same number.
+opinion, half a point better at naming the same word, and 1.7 % behind on
+perplexity.
+
+**That last figure is not a difference.** The evaluation is 4088 tokens in eight
+windows and the two models see the same ones, so the comparison is paired and
+can be tested: the mean gap is 0.017 nats against a standard error of 0.012 —
+t = 1.4 — and T4G is ahead in two windows of eight. Repeating it on four times
+the text settles it rather than deepening it:
+
+| 16352 tokens, 32 windows | perplexity |
+|---|---|
+| Q4_K_M | 16.0023 |
+| `.golem` T4G | 16.1185 |
+
+0.7 % apart, mean gap 0.0072 nats against a standard error of 0.0062, t = 1.2,
+and T4G ahead in **13 windows of 32**. Four times the data halves the gap and
+leaves it inside the noise. There is no measured perplexity loss; what there is
+is a measured divergence win.
+
+The lesson is the one this file already carries about reporting both numbers,
+with a second half: a perplexity difference of one or two percent on four
+thousand tokens is not a result, and the windows a run already prints are enough
+to say so.
 
 Qwen3-0.6B, same corpora, at 298.5 MiB and 4.201 bits a weight: 30.8201 against
 bf16's 28.8521, KL 0.0812, top-1 83.4 %, top-5 99.0 %.
 
 The bits a weight are 4.194 and 4.201 rather than 4.1875 because a file also
 carries one F32 vector per calibration site and leaves the norms in bf16.
+
+### The head, which is the one tensor worth more bits
+
+`-head 5` writes `token_embd` — the tied logit head — in the wide tier and
+everything else in the ordinary one. It is not a hidden layer whose error the
+layers after it absorb; it makes the logits, and llama.cpp's K-quant mixes have
+always spent more there: Qwen3-4B's Q4_K_M gives it 6.56 bits and the rest 4.95.
+
+On Qwen3-0.6B, where the head is a quarter of the weights:
+
+| head | file | PPL | KL | top-1 |
+|---|---|---|---|---|
+| four bits | 298.5 MiB | 30.8201 | 0.0812 | 83.4 % |
+| **five bits** | 317.1 MiB | 30.5240 | 0.0718 | 84.8 % |
+| bf16 — the ceiling | 517.6 MiB | 30.3016 | 0.0662 | 85.2 % |
+
+Five bits takes about three fifths of the way to an unquantized head for six
+percent of the file rather than seventy-three. It is off by default because the
+smallest file is the point, and because four bits already reads a quarter closer
+to bf16 than Q4_K_M does at sixteen percent less. On Qwen3-4B the head is a
+tenth of the weights rather than a quarter, so five costs 0.10 GiB.
 
 ### The offline bench is not a file, and the difference is one mechanism
 
@@ -285,6 +324,10 @@ a K-quant is at hand.
 - **A global gain on the trellis codebook**: g = 1 is optimal and any departure
   costs. The adaptation that pays is per block, and least squares takes it
   exactly.
+- **The salience bound, and its exponent**, for the trellis. Six settings on
+  Qwen3-0.6B — bounds of 8, 12, 24, 48 and none at α = 0.5, and α = 0.4 and 0.6
+  at 24 — read 30.68 to 30.82 and KL 0.0800 to 0.0850. The default is as good as
+  any of them, which is the same answer `-search` gets by a different route.
 - **More calibration**, for the trellis. On Qwen3-4B in one pass, 2048 tokens
   read 19.7285 and KL 0.0510; 8192 read 19.7004 and **0.0550**. More calibration
   buys average likelihood and sells per-token agreement. Windowing it to match
