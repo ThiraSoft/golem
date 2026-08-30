@@ -108,9 +108,14 @@ func (p *Prompt) Places(slot, startPos int) []Place {
 		q := startPos + i
 		at[i] = Place{Slot: slot, Pos: q, T: q, H: q, W: q}
 	}
+	// A span may reach past either end of this prompt: Slice keeps a cut
+	// picture's start where the whole picture put it, negative when the
+	// picture began in an earlier pass, so that a row's axes are the ones the
+	// whole picture gave it. Only the rows this prompt actually holds are
+	// written, and r stays the row's index in the picture throughout.
 	for _, im := range p.Images {
 		base := startPos + im.Start
-		for r := 0; r < im.Count; r++ {
+		for r := max(0, -im.Start); r < im.Count && im.Start+r < len(at); r++ {
 			at[im.Start+r] = Place{
 				Slot: slot,
 				Pos:  base + r,
