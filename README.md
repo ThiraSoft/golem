@@ -21,7 +21,7 @@ A golem is inert matter given a voice. That is what these engines do to a file o
 - **Zero Friction**: Compiles to a single static binary. No Python environment, no `cgo`, no runtime to install.
 - **Pure Go, four dependencies**: `purego` for the Vulkan loader, and three file formats the standard library does not read — WebP, MP3, FLAC. `CGO_ENABLED=0 go build ./...` passes.
 - **OpenAI Compatible**: Drop-in replacement for OpenAI API clients, tool calls included.
-- **Multimodal**: Text, Vision (images) and Audio (WAV/MP3/FLAC) via Gemma 4.
+- **Multimodal**: Text, Vision (images) and Audio (WAV/MP3/FLAC) via Gemma 4; Qwen3.8 sees too, its tower checked against llama.cpp waypoint by waypoint.
 - **Verified, not asserted**: no layer is deemed correct until its intermediate activations match llama.cpp or PyTorch, waypoint by waypoint.
 - **Fast on CPU**: keeps pace with `llama.cpp` on tuned AVX2 kernels — ahead reading prompts, level generating, except on the smallest model, where the weights stop being the cost and it says so.
 - **Vulkan GPU**: bound through `purego` rather than cgo. Measured on AMD against `llama.cpp`'s own Vulkan build: ahead of it reading prompts on all five models, and generating on both Gemma ones. The table below says where it is behind, and by how much.
@@ -148,7 +148,7 @@ Attention is the one line where the gap is a shape rather than a margin: golem d
 | --- | --- | --- |
 | **Gemma 4** | E2B, 12B, 26B A4B (mixture of 128 experts). Text, Vision, Audio. | Reading a prompt ×1.24 (E2B), ×1.33 (12B), ×1.06 (26B A4B). Generating, a tie: ×1.01, ×1.04, ×1.06 — vs llama.cpp |
 | **Qwen3** | Dense models, from a GGUF. | 4B: ×1.13 reading, ×1.00 generating. 0.6B: ×0.99 reading, ×0.85 generating — vs llama.cpp |
-| **Qwen3.8** | 27B: Dense model featuring forty-eight gated delta nets and sixteen attentions (three to one ratio) — plus the checkpoint's own multi-token-prediction head, which drafts the second token of every pass. | 0.72 t/s on an i7-9700K: a delta net rewrites a 128×128 state a head every token, and that is arithmetic no kernel makes cheaper. On a card, 30.1 a token at a time, **46.0 drafting** and **1236** reading a prompt, against llama.cpp's Vulkan build at 32.8 and 1234.7 |
+| **Qwen3.8** | 27B: Dense model featuring forty-eight gated delta nets and sixteen attentions (three to one ratio) — plus the checkpoint's own multi-token-prediction head, which drafts the second token of every pass. Text and Vision. | 0.72 t/s on an i7-9700K: a delta net rewrites a 128×128 state a head every token, and that is arithmetic no kernel makes cheaper. On a card, 30.1 a token at a time, **46.0 drafting** and **1236** reading a prompt, against llama.cpp's Vulkan build at 32.8 and 1234.7 |
 | **Pocket TTS** | 12 shipped models across 6 languages, voice cloning included. | ×2.31 and ×1.69 the speed of the PyTorch reference, on the 24- and 6-layer models |
 
 In absolute terms, on an i7-9700K with eight threads and Q4_0 weights: Gemma E2B draws 22.6 tokens a second and reads 204; the 12B, 5.0 and 42; the 26B A4B, 13.1 and 51; Qwen3 4B, 14.6 and 110. Pocket TTS speaks at ×2.94 real time in French, ×6.81 in English.
@@ -157,7 +157,7 @@ In absolute terms, on an i7-9700K with eight threads and Q4_0 weights: Gemma E2B
 
 ## 👁️ Multimodal (Vision & Audio)
 
-Provide the projector weights, and Gemma can see and hear:
+Provide the projector weights, and Gemma can see and hear — and Qwen3.8 can see:
 
 **Analyze images:**
 
@@ -174,6 +174,17 @@ Provide the projector weights, and Gemma can see and hear:
     -mmproj mmproj-gemma-4-E2B-it-QAT-BF16.gguf \
     -audio question.wav -p "Answer what is asked."
 ```
+
+**Qwen3.8 looks the same way**, with its own projector:
+
+```bash
+./golem-cli -model Qwen3.8-27B-Q4_0.gguf -mmproj mmproj-F16.gguf \
+    -image photo.png -p "Describe this image in one sentence."
+```
+
+Its tower has no fixed input size: the picture keeps its aspect ratio, is scaled to a grid the token budget allows, and the learned position table is interpolated onto that grid — which is why an image of any shape gives a different number of rows. Every waypoint of it is held to llama.cpp's, worst gap 1.1e-4 at the patches and 6.4e-3 after all twenty-seven blocks. It sees and does not hear: the projector carries no audio encoder.
+
+The tower runs on the processor even when the model is on a card, and costs about thirty seconds for a 640×426 picture. Reading the prompt and drawing the answer then run wherever the model does.
 
 WAV, MP3 and FLAC, at any rate and any number of channels; the front end downmixes and resamples before the encoder sees anything. The 26B's projector carries no audio weights, so that checkpoint sees and does not hear.
 

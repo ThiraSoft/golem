@@ -21,6 +21,7 @@ The same rule holds for speed. Every number in these READMEs is a benchmark in t
 | `token/` | tokenizers, one package per family |
 | `audio/` | sound: reading and writing WAV, decoding MP3 and FLAC, resampling to mono at the model's rate, and the log-mel front end a speech tower reads |
 | `imageio/` | decoding an image and putting it in the shape a vision encoder reads: planar RGB, one float a channel a pixel |
+| `nn/interpolate.go` | ggml's antialiased bilinear, which a tower with no fixed input size resizes its learned position table with |
 | `sample/` | top-k, top-p, temperature, and a seeded draw over a row of logits |
 | `chat/` | a conversation's shape — messages, tools, calls — and the interface an engine implements to write one out |
 | `vk/` | Vulkan compute, bound through `purego` rather than cgo: devices, buffers, pipelines, and the three dozen kernels the blocks of three architectures are made of. |
