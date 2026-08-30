@@ -184,7 +184,9 @@ Provide the projector weights, and Gemma can see and hear — and Qwen3.8 can se
 
 Its tower has no fixed input size: the picture keeps its aspect ratio, is scaled to a grid the token budget allows, and the learned position table is interpolated onto that grid — which is why an image of any shape gives a different number of rows. Every waypoint of it is held to llama.cpp's, worst gap 1.1e-4 at the patches and 6.4e-3 after all twenty-seven blocks. It sees and does not hear: the projector carries no audio encoder.
 
-The tower runs on the processor even when the model is on a card, and costs about thirty seconds for a 640×426 picture. Reading the prompt and drawing the answer then run wherever the model does.
+The tower goes to the card with the model. A 640×426 picture takes 33.6 seconds on an i7-9700K and **1.03 on an RX 9070 XT**, and every waypoint of the card's tower is held to llama.cpp's too — worst gap 9.9e-3 over the twenty-seven blocks, against the same 0.02 the processor's is held to. Reading the prompt and drawing the answer then run wherever the model does.
+
+The projector is 884 MiB in fp16 and shares the card with the model, so it is resident when there is room and streamed one block at a time when there is not: 1.03 seconds an image against 1.41, rather than a fall back to the processor's thirty-three. `GOLEM_VISION_STREAM=1` forces the second path, which is how it is tested on a machine with room for the first.
 
 WAV, MP3 and FLAC, at any rate and any number of channels; the front end downmixes and resamples before the encoder sees anything. The 26B's projector carries no audio weights, so that checkpoint sees and does not hear.
 

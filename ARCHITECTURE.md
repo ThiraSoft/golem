@@ -23,7 +23,7 @@ The same rule holds for speed. Every number in these READMEs is a benchmark in t
 | `imageio/` | decoding an image and putting it in the shape a vision encoder reads: planar RGB, one float a channel a pixel |
 | `sample/` | top-k, top-p, temperature, and a seeded draw over a row of logits |
 | `chat/` | a conversation's shape — messages, tools, calls — and the interface an engine implements to write one out |
-| `vk/` | Vulkan compute, bound through `purego` rather than cgo: devices, buffers, pipelines, and the three dozen kernels the blocks of three architectures are made of. |
+| `vk/` | Vulkan compute, bound through `purego` rather than cgo: devices, buffers, pipelines, and the three dozen kernels the blocks of three architectures are made of — with a vision tower of its own, whose fp16 weights and mean-subtracting norms share nothing with the text kernels. |
 
 Nothing is promoted into this layer on the strength of a guess. Code moves here once two engines are shown to want it, in the same commit that makes them both use it. `chat/` is the newest of them: the conversation types lived in `gemma/` until a second engine needed them.
 
