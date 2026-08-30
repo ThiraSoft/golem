@@ -101,6 +101,18 @@ func main() {
 	fmt.Fprintf(os.Stderr, "%s: %s, %d blocks, %d positions in %d slot(s) of %d, %s, loaded in %s on %d cores\n",
 		name, m.Name, m.Blocks, *context, m.Slots(), m.SlotContext(), head,
 		time.Since(start).Round(time.Millisecond), runtime.NumCPU())
+
+	// The image tower, when there is one. It is worth a line of its own: a
+	// tower that did not fit beside the model still runs on the card, and the
+	// difference is a tenth of a second an image rather than a wrong answer.
+	if on, resident := m.VisionVulkan(); on {
+		how := "one group of weights at a time across the bus"
+		if resident {
+			how = "resident"
+		}
+		fmt.Fprintf(os.Stderr, "image tower on vulkan, %s\n", how)
+	}
+
 	// The port is taken before it is announced: an address already in use must
 	// not be reported as a server that is listening.
 	listener, err := net.Listen("tcp", *addr)

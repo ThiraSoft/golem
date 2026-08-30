@@ -98,6 +98,15 @@ type vulkanHead interface {
 	VulkanStack() bool
 }
 
+// vulkanVision is implemented by the engines whose image tower can move to a
+// device as well. It is apart from vulkanHead because the two are opened at
+// different moments — a projector is a second file, and the commands do not
+// agree on whether it is read before the device is chosen or after.
+type vulkanVision interface {
+	UseVisionVulkan() error
+	VisionVulkan() (on, resident bool)
+}
+
 // UseVulkan moves to a Vulkan device everything of this engine that can go:
 // the logit head, and the expert stacks of a mixture. Both are read in full or
 // nearly so for every token drawn, and both are bandwidth on a CPU.
@@ -113,7 +122,33 @@ func (m *Model) UseVulkan() error {
 	if err := h.UseVulkanStack(); err != nil {
 		return err
 	}
-	return h.UseVulkanHead()
+	if err := h.UseVulkanHead(); err != nil {
+		return err
+	}
+	return m.useVisionVulkan()
+}
+
+// useVisionVulkan puts an already-opened image tower on the device. It is a
+// no-op for an engine that has no such tower and for one whose projector has
+// not been opened yet — the second case is why OpenProjector calls it too.
+func (m *Model) useVisionVulkan() error {
+	v, ok := m.Forward.(vulkanVision)
+	if !ok {
+		return nil
+	}
+	return v.UseVisionVulkan()
+}
+
+// VisionVulkan says whether the image tower is on a device and whether the
+// whole of it is resident there, for the line printed at startup. A tower that
+// is not resident still runs on the card; its weights cross the bus once an
+// image instead of once.
+func (m *Model) VisionVulkan() (on, resident bool) {
+	v, ok := m.Forward.(vulkanVision)
+	if !ok {
+		return false, false
+	}
+	return v.VisionVulkan()
 }
 
 // Vulkan says what is on a device, for the line printed at startup.

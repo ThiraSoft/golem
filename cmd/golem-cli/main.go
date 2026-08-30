@@ -123,6 +123,17 @@ func main() {
 			loading.Round(time.Millisecond), runtime.NumCPU())
 		fmt.Fprintf(os.Stderr, "sampling: temperature %g, top-k %d, top-p %g, seed %d\n",
 			params.Temperature, params.TopK, params.TopP, params.Seed)
+
+		// The image tower, when there is one. It is worth a line of its own: a
+		// tower that did not fit beside the model still runs on the card, and the
+		// difference is a tenth of a second an image rather than a wrong answer.
+		if on, resident := m.VisionVulkan(); on {
+			how := "one group of weights at a time across the bus"
+			if resident {
+				how = "resident"
+			}
+			fmt.Fprintf(os.Stderr, "image tower on vulkan, %s\n", how)
+		}
 	}
 
 	newSession := func() *Session {

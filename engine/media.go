@@ -196,7 +196,16 @@ func (m *Model) OpenProjector(path string) error {
 	case *gemma.Model:
 		return inner.OpenProjector(path)
 	case *qwen35.Model:
-		return inner.OpenProjector(path)
+		if err := inner.OpenProjector(path); err != nil {
+			return err
+		}
+		// The blocks may already be on a device: the server chooses the device
+		// before it reads the projector and the command-line client after it.
+		// Whichever came first, the tower follows the blocks.
+		if _, blocks := m.Vulkan(); blocks {
+			return m.useVisionVulkan()
+		}
+		return nil
 	}
 	return fmt.Errorf("engine: %s cannot be given a projector; gemma4 and qwen35 can", m.Name)
 }
