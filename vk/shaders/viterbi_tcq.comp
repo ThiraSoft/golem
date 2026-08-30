@@ -1,0 +1,167 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// The trellis encoder on the card.
+//
+// compress/trellis.go says what this does; this says it again to thousands of
+// sequences at once. A workgroup owns one sequence and finds the cheapest path
+// through the bitshift trellis, which is the half of a conversion that takes
+// the afternoon: 2^L operations a weight, four thousand at L=12, against the
+// eight the lattice needs. It is also the half that depends on nothing outside
+// its own sequence, which is the whole reason it belongs here.
+//
+// Three decisions make it fit the sixty-four kibibytes a workgroup is given,
+// and each of them is forced:
+//
+//   - the backpointers live in shared memory. In device memory they would be a
+//     hundred and twenty-eight bytes a weight written and read back, against
+//     half a byte of output — a terabyte of traffic for a four-billion-weight
+//     model, and the arithmetic would never get to be the thing that is slow.
+//   - a sequence is 128 weights, not the 1024 the processor may use. The
+//     backpointers are T·2^(L−k) nibbles, and 128 is what leaves room for the
+//     two cost planes beside them. It costs (L−k)/T = 0.06 bits a weight,
+//     counted honestly in the rate.
+//   - the state's value is recomputed rather than tabulated. A table of 2^L
+//     floats is sixteen kibibytes there is nowhere to put. That the code is
+//     cheap to compute is not a detail of this format, it is the reason the
+//     format has no table at all.
+//
+// k = 4 only. At k = 3 the prefix count doubles and the backpointers no longer
+// fit beside the costs; that shape wants its own sizing and does not have it
+// yet. The processor side refuses anything else rather than compute nonsense.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer Z   { float z[];   };
+layout(std430, binding = 1) writeonly buffer OUT { float rec[]; };
+
+layout(push_constant) uniform Push {
+    uint seqs;  // sequences in this pass
+    float gain; // the source is scaled by this before rounding, and back after
+} p;
+
+const uint K = 4u;
+const uint L = 12u;
+const uint T = 128u;
+const uint NSTATES = 1u << L;       // 4096
+const uint NPREFIX = 1u << (L - K); // 256
+const uint FAN = 1u << K;           // 16
+const uint SHIFT = L - K;
+
+// 32 KiB of costs, 16 KiB of backpointers at a nibble each, and the small
+// change: 50 KiB against the 64 the card allows.
+shared float cost[2u * NSTATES];
+shared uint bp[T * NPREFIX / 8u];
+shared float zs[T];
+shared float redVal[256];
+shared uint redAt[256];
+
+// Code1MAD of compress/trellis.go: a linear congruential step, then the sum of
+// the four bytes of the result, centred and scaled to unit variance. It must
+// agree with the processor's exactly, or the two encoders disagree about a
+// file — TestViterbiMatchesCPU is what holds it to that.
+precise float trellisValue(uint s) {
+    uint x = 34038481u * s + 76625530u;
+    uint sum = (x & 0xffu) + ((x >> 8) & 0xffu) + ((x >> 16) & 0xffu) + ((x >> 24) & 0xffu);
+    // Not a division: see mad1Scale in compress/trellis.go for why the two
+    // forms are not the same number, and what it cost.
+    precise float v = (float(sum) - 510.0) * 0.00676589971;
+    return v;
+}
+
+void main() {
+    uint seq = gl_WorkGroupID.x;
+    if (seq >= p.seqs) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = seq * T;
+
+    for (uint i = tid; i < T; i += 256u) zs[i] = z[base + i] * p.gain;
+    for (uint i = tid; i < T * NPREFIX / 8u; i += 256u) bp[i] = 0u;
+    barrier();
+
+    // t = 0: every window is a legal start, so the cost is the distortion.
+    for (uint s = tid; s < NSTATES; s += 256u) {
+        precise float d = zs[0] - trellisValue(s);
+        precise float c = d * d;
+        cost[s] = c;
+    }
+    barrier();
+
+    uint cur = 1u, prev = 0u;
+    [[loop]] for (uint t = 1u; t < T; t++) {
+        // All 2^k predecessors of a state share the prefix s>>k, so one
+        // minimum per prefix serves every state that shares it. That is what
+        // makes a step 2^L work and not 2^(L+k), and it is the difference
+        // between this being an afternoon and being hopeless.
+        for (uint pre = tid; pre < NPREFIX; pre += 256u) {
+            float best = 3.402823466e+38;
+            uint bj = 0u;
+            [[unroll]] for (uint j = 0u; j < FAN; j++) {
+                float c = cost[prev * NSTATES + ((j << SHIFT) | pre)];
+                if (c < best) { best = c; bj = j; }
+            }
+            // One nibble a prefix, so eight prefixes to a word and no field
+            // ever straddles one. Different threads share a word, hence the
+            // atomic; the same field is never written twice.
+            uint at = t * NPREFIX + pre;
+            atomicOr(bp[at >> 3u], bj << ((at & 7u) * 4u));
+
+            uint sb = pre << K;
+            // `precise` and the temporary are not decoration. Without them the
+            // driver contracts `best + d*d` into a fused multiply-add, whose
+            // rounding differs from the processor's two operations — and a
+            // Viterbi is a chain of comparisons, so a rounding that moves a
+            // near-tie moves the whole path. It cost seven percent of the
+            // weights, at identical error, before this was written out.
+            [[unroll]] for (uint b = 0u; b < FAN; b++) {
+                precise float d = zs[t] - trellisValue(sb | b);
+                precise float sq = d * d;
+                precise float c = best + sq;
+                cost[cur * NSTATES + (sb | b)] = c;
+            }
+        }
+        barrier();
+        uint sw = cur; cur = prev; prev = sw;
+        barrier();
+    }
+
+    // The cheapest final state, by a reduction rather than a scan.
+    float best = 3.402823466e+38;
+    uint at = 0u;
+    for (uint s = tid; s < NSTATES; s += 256u) {
+        float c = cost[prev * NSTATES + s];
+        if (c < best) { best = c; at = s; }
+    }
+    redVal[tid] = best;
+    redAt[tid] = at;
+    barrier();
+    // A tie must go to the lowest state, because the processor scans upwards
+    // and keeps the first strict improvement. Anything else and the two
+    // encoders can pick different paths of identical cost.
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            bool take = redVal[tid + stride] < redVal[tid] ||
+                        (redVal[tid + stride] == redVal[tid] && redAt[tid + stride] < redAt[tid]);
+            if (take) {
+                redVal[tid] = redVal[tid + stride];
+                redAt[tid] = redAt[tid + stride];
+            }
+        }
+        barrier();
+    }
+
+    // The traceback is one thread walking T steps. It is a short tail on a
+    // long kernel, and splitting it would cost more in barriers than it saves.
+    if (tid == 0u) {
+        uint s = redAt[0];
+        for (uint i = T; i > 0u; i--) {
+            uint t = i - 1u;
+            rec[base + t] = trellisValue(s) / p.gain;
+            if (t > 0u) {
+                uint a = t * NPREFIX + (s >> K);
+                uint j = (bp[a >> 3u] >> ((a & 7u) * 4u)) & 0xfu;
+                s = (j << SHIFT) | (s >> K);
+            }
+        }
+    }
+}

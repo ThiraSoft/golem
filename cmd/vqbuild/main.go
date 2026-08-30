@@ -22,7 +22,9 @@ import (
 
 	"github.com/ThiraSoft/golem/compress"
 	"github.com/ThiraSoft/golem/qwen"
+	"github.com/ThiraSoft/golem/qwen35"
 	"github.com/ThiraSoft/golem/token/bytebpe"
+	"github.com/ThiraSoft/golem/vk"
 )
 
 // which site's activations feed each matrix.
@@ -38,27 +40,91 @@ func main() {
 	dst := flag.String("out", "", "where to write the reconstructed copy")
 	plan := flag.String("plan", "default:3", "bit levels per role, e.g. default:3,token_embd:6,ffn_down:4")
 	lattice := flag.String("lattice", "E8", "E8 or D4; D4 is the one whose decode table fits a workgroup")
+	codec := flag.String("codec", "lattice", "lattice or trellis; the trellis needs no decode table at all")
+	trK := flag.Int("k", 3, "trellis: bits emitted per weight")
+	trL := flag.Int("L", 12, "trellis: state bits; the Viterbi costs 2^L per weight")
+	trSeq := flag.Int("seq", 1024, "trellis: weights coded as one sequence")
+	trGain := flag.Float64("gain", 0.94, "trellis: how far the codebook is narrowed against the source")
+	onCard := flag.Bool("vulkan", false, "run the trellis Viterbi on a Vulkan device; it is five hundred times the lattice's work and the only half that cares where it runs")
 	scaleBlk := flag.Int("scale", 64, "weights per fp16 scale")
 	alpha := flag.Float64("alpha", 0.5, "salience exponent")
 	outliers := flag.Int("outliers", 32, "columns held at 8 bits")
 	search := flag.Bool("search", false, "search each block's scale instead of taking its RMS")
 	hadGroup := flag.Int("hadamard", 128, "rotation group; 0 leaves the weights unrotated")
 	ntok := flag.Int("tokens", 256, "calibration tokens")
+	calibCard := flag.Bool("calib-vulkan", false, "measure the sites by running the model on a Vulkan device; on the processor this is most of a conversion's wall clock")
+	calibFile := flag.String("calib", "", "text to calibrate on; the built-in paragraph is 173 tokens, which is few enough to overfit")
 	roles := flag.String("roles", "all", "which matrices to compress; the rest stay BF16")
 	flag.Parse()
+
+	if *onCard && *codec == "trellis" {
+		dev, err := vk.Open()
+		must(err)
+		defer dev.Close()
+		enc, err := vk.NewTrellisEncoder(dev, 1<<24)
+		must(err)
+		defer enc.Close()
+		var onCardWeights, offCardWeights int64
+		compress.TrellisAccel = func(norm []float32, o compress.TrellisOpts) bool {
+			// The kernel is compiled for one shape. Anything else falls back
+			// rather than quietly answering a different question.
+			if o.K != vk.TrellisGPUK || o.L != vk.TrellisGPUL || o.Seq != vk.TrellisGPUSeq {
+				offCardWeights += int64(len(norm))
+				return false
+			}
+			if err := enc.Quantize(norm, float32(o.Gain)); err != nil {
+				fmt.Printf("  the card refused a matrix (%v); the processor takes it\n", err)
+				offCardWeights += int64(len(norm))
+				return false
+			}
+			onCardWeights += int64(len(norm))
+			return true
+		}
+		defer func() {
+			fmt.Printf("%d M weights through the card, %d M through the processor\n",
+				onCardWeights/1e6, offCardWeights/1e6)
+		}()
+	}
 
 	// One pass over a calibration text, keeping only the per-column power of
 	// the activations that meet each matrix.
 	sal := map[string][]float64{}
 	cnt := map[string]int{}
-	m, err := qwen.Open(*src, 4096)
+	// The context has to hold the calibration, or the forward pass walks off
+	// the end of the cache — a panic in the attention, a long way from the flag
+	// that caused it.
+	ctx := 4096
+	for ctx < *ntok {
+		ctx *= 2
+	}
+	m, err := qwen.Open(*src, ctx)
 	must(err)
 	v, err := bytebpe.Load(m.File())
 	must(err)
-	ids := v.Encode(calibText, true, false)
+	text := calibText
+	if *calibFile != "" {
+		b, err := os.ReadFile(*calibFile)
+		must(err)
+		text = string(b)
+	}
+	ids := v.Encode(text, true, false)
 	if len(ids) > *ntok {
 		ids = ids[:*ntok]
 	}
+	// The corpus a file is judged on must not be the corpus it was fitted to,
+	// and this is the place that mistake gets made.
+	fmt.Printf("calibrating on %d tokens\n", len(ids))
+
+	// The card first, when asked. It measures the same thing and it is the
+	// difference between seven minutes and seconds; the processor's tap below
+	// stays as the fallback and as what the card is checked against.
+	var salience map[string][]float32
+	if *calibCard {
+		if s, ok := calibrateOnCard(*src, text, *ntok, ctx); ok {
+			salience = s
+		}
+	}
+
 	qwen.Calib = func(block int, site string, rows [][]float32) {
 		key := fmt.Sprintf("%d/%s", block, site)
 		s := sal[key]
@@ -74,18 +140,21 @@ func main() {
 		cnt[key] += len(rows)
 	}
 	t0 := time.Now()
-	m.ForwardBatch(ids, 0)
-	qwen.Calib = nil
-	fmt.Printf("calibrated on %d tokens in %s, %d sites\n",
-		len(ids), time.Since(t0).Round(time.Millisecond), len(sal))
-	salience := map[string][]float32{}
-	for k, s := range sal {
-		out := make([]float32, len(s))
-		for j := range s {
-			out[j] = float32(math.Sqrt(s[j] / float64(cnt[k])))
+	if salience == nil {
+		m.ForwardBatch(ids, 0)
+		qwen.Calib = nil
+		fmt.Printf("calibrated on %d tokens in %s, %d sites\n",
+			len(ids), time.Since(t0).Round(time.Millisecond), len(sal))
+		salience = make(map[string][]float32, len(sal))
+		for k, s := range sal {
+			out := make([]float32, len(s))
+			for j := range s {
+				out[j] = float32(math.Sqrt(s[j] / float64(cnt[k])))
+			}
+			salience[k] = out
 		}
-		salience[k] = out
 	}
+	qwen.Calib = nil
 	file := m.File()
 
 	// The copy, patched tensor by tensor.
@@ -135,14 +204,22 @@ func main() {
 		w, err := t.F32()
 		must(err)
 
-		lat, table := compress.LatE8, e8Levels
-		if *lattice == "D4" {
-			lat, table = compress.LatD4, d4Levels
+		var opts compress.Opts
+		if *codec == "trellis" {
+			opts = compress.Opts{UseTrellis: true,
+				ScaleBlock: *scaleBlk, HadGroup: *hadGroup,
+				Tr: compress.TrellisOpts{K: *trK, L: *trL, Seq: *trSeq,
+					Gain: *trGain, Code: compress.Code1MAD}}
+		} else {
+			lat, table := compress.LatE8, e8Levels
+			if *lattice == "D4" {
+				lat, table = compress.LatD4, d4Levels
+			}
+			lv := table[levelOf(role)]
+			opts = compress.Opts{UseLattice: true, Lat: lat,
+				MaxNorm2: float32(lv.r), Beta: lv.beta, ScaleBlock: *scaleBlk, HadGroup: *hadGroup,
+				SearchScale: *search}
 		}
-		lv := table[levelOf(role)]
-		opts := compress.Opts{UseLattice: true, Lat: lat,
-			MaxNorm2: float32(lv.r), Beta: lv.beta, ScaleBlock: *scaleBlk, HadGroup: *hadGroup,
-			SearchScale: *search}
 		sc := compress.Scheme{Alpha: *alpha, Outliers: *outliers, VQ: opts}
 		var s []float32
 		if isBlk {
@@ -289,3 +366,66 @@ const calibText = `The quick brown fox jumps over the lazy dog. ` +
 	`The capital of France is Paris, and the capital of Japan is Tokyo. ` +
 	`Water boils at 100 degrees Celsius at sea level, and freezes at zero. ` +
 	`Un modèle de langage prédit le prochain jeton à partir de ceux qui précèdent.`
+
+// calibrateOnCard is the salience measured with the model on a card, which is
+// the same measurement cmd/golemquant makes and for the same reason: on the
+// processor it is most of a conversion's wall clock. Once the Viterbi moved to
+// the card, the eight minutes a six-hundred-million-weight model took were
+// seven of calibration and one of quantizing — the wrong half was on the card.
+//
+// The site keys are "block/site" with the same four names the processor's tap
+// uses — vk/qwen_calib.go names them qkv, o, gateup and down — so what comes
+// back drops straight into the map the rest of this command already reads.
+func calibrateOnCard(path, text string, ntok, ctx int) (map[string][]float32, bool) {
+	give := func(err error) (map[string][]float32, bool) {
+		fmt.Printf("no calibration on the card (%v); the processor then\n", err)
+		return nil, false
+	}
+	m, err := qwen35.Open(path, ctx)
+	if err != nil {
+		return give(err)
+	}
+	defer m.Close()
+	if err := m.UseVulkanStack(); err != nil {
+		return give(err)
+	}
+	if err := m.StartVulkanCalibration(); err != nil {
+		return give(err)
+	}
+	v, err := bytebpe.Load(m.File())
+	if err != nil {
+		return give(err)
+	}
+	ids := v.Encode(text, true, false)
+	if len(ids) > ntok {
+		ids = ids[:ntok]
+	}
+	t0 := time.Now()
+	for at := 0; at < len(ids); at += ctx {
+		end := at + ctx
+		if end > len(ids) {
+			end = len(ids)
+		}
+		m.Reset()
+		m.ForwardBatch(ids[at:end], 0)
+		m.CountVulkanCalibration(end - at)
+	}
+	sums, rows, err := m.VulkanCalibrationSums()
+	if err != nil {
+		return give(err)
+	}
+	if rows == 0 {
+		return give(fmt.Errorf("the card measured no rows"))
+	}
+	out := make(map[string][]float32, len(sums))
+	for k, sv := range sums {
+		u := make([]float32, len(sv))
+		for j, x := range sv {
+			u[j] = float32(math.Sqrt(float64(x) / float64(rows)))
+		}
+		out[k] = u
+	}
+	fmt.Printf("calibrated on %d tokens in %s on the card, %d sites\n",
+		len(ids), time.Since(t0).Round(time.Millisecond), len(out))
+	return out, true
+}

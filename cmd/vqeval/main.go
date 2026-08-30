@@ -121,22 +121,36 @@ func main() {
 	}
 }
 
+var gains = []float64{0.88, 0.94, 1.0, 1.06}
+
 func buildSchemes() []compress.Scheme {
-	lat := func(l compress.Lattice, r float32, beta float64) compress.Scheme {
-		return compress.Scheme{Alpha: 0.5, Outliers: 32, VQ: compress.Opts{
-			UseLattice: true, Lat: l, MaxNorm2: r, Beta: beta,
-			ScaleBlock: 64, HadGroup: 128, SearchScale: true}}
+	// The shipped format's settings, so a comparison here means something
+	// about a file: no held-out columns, one step per 32 weights.
+	lat := func(r float32, beta float64) compress.Scheme {
+		return compress.Scheme{Alpha: 0.5, VQ: compress.Opts{
+			UseLattice: true, Lat: compress.LatD4, MaxNorm2: r, Beta: beta,
+			ScaleBlock: 32, HadGroup: 128, SearchScale: true}}
 	}
-	box := func(beta float64) compress.Scheme {
-		return compress.Scheme{Alpha: 0.5, Outliers: 32, VQ: compress.Opts{
-			UseLattice: true, Lat: compress.LatD4, UseBox: true, Beta: beta,
-			ScaleBlock: 64, HadGroup: 128, SearchScale: true}}
+	tcq := func(k, l int, g float64, sb int) compress.Scheme {
+		return compress.Scheme{Alpha: 0.5, VQ: compress.Opts{
+			UseTrellis: true, ScaleBlock: sb, HadGroup: 128,
+			Tr: compress.TrellisOpts{K: k, L: l, Seq: 1024, Gain: g, Code: compress.Code1MAD}}}
 	}
+	// Beta has to be re-tuned for each radius: it was fitted against a bench
+	// that reconstructed a subvector by the factor it had been pulled by, and
+	// no file can do that. Under a reconstruction a decoder could actually
+	// perform, the old beta puts nearly every subvector outside the shell.
 	var out []compress.Scheme
-	out = append(out, lat(compress.LatD4, 40, 8))   // the shell, 12 bits, 31 KiB table
-	out = append(out, lat(compress.LatD4, 20, 5.7)) // a shell of 11 bits, to match the box
-	for _, b := range []float64{1.5, 2.2, 3.0, 4.0, 5.5} {
-		out = append(out, box(b))
+	for _, b := range []float64{1.5, 2.0, 2.5, 3.0, 4.0} {
+		out = append(out, lat(40, b))
+	}
+	for _, b := range []float64{2.5, 3.5, 4.5, 6.0, 8.0} {
+		out = append(out, lat(160, b))
+	}
+	for _, k := range []int{3, 4} {
+		for _, sb := range []int{32, 64} {
+			out = append(out, tcq(k, 12, 0.94, sb))
+		}
 	}
 	return out
 }
