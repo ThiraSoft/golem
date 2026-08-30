@@ -16,7 +16,9 @@ package vk
 
 import (
 	_ "embed"
+	"encoding/binary"
 	"fmt"
+	"math"
 	"unsafe"
 
 	"github.com/ThiraSoft/golem/nn"
@@ -31,6 +33,23 @@ import (
 //go:generate glslc -O -DBITS16 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_d4g.comp -o shaders/matvec_d4g16_4.spv
 //go:generate glslc -O -DBITS16 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_d4g.comp -o shaders/matvec_d4g16_8.spv
 //go:generate glslc -O -DNOTABLE --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_d4g.comp -o shaders/matvec_d4g_notable.spv
+
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t4g.spv
+//go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t4g_2.spv
+//go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t4g_4.spv
+//go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t4g_8.spv
+
+//go:embed shaders/matvec_t4g.spv
+var matvecT4GSPIRV []byte
+
+//go:embed shaders/matvec_t4g_2.spv
+var matvecT4G2SPIRV []byte
+
+//go:embed shaders/matvec_t4g_4.spv
+var matvecT4G4SPIRV []byte
+
+//go:embed shaders/matvec_t4g_8.spv
+var matvecT4G8SPIRV []byte
 
 //go:embed shaders/matvec_d4g.spv
 var matvecD4GSPIRV []byte
@@ -82,6 +101,7 @@ var D4GWidths = []int{1, 2, 4, 8}
 // rather than to a matrix: the lattice table, and one pipeline a pass width.
 type D4GKernels struct {
 	d     *Device
+	q     nn.Quant
 	bits  int
 	table *Buffer
 	pipes map[int]*Pipeline
@@ -89,13 +109,34 @@ type D4GKernels struct {
 
 // NewD4GKernels uploads the lattice of a code width and builds its pipelines.
 func NewD4GKernels(d *Device, bits int) (*D4GKernels, error) {
-	spirv, ok := d4gSPIRV(bits)
-	if !ok {
-		return nil, fmt.Errorf("vk: there is no D4G kernel for %d-bit codes", bits)
+	switch bits {
+	case nn.D4Bits:
+		return NewGolemKernels(d, nn.D4G)
+	case nn.D4Bits16:
+		return NewGolemKernels(d, nn.D4G16)
 	}
-	k := &D4GKernels{d: d, bits: bits, pipes: map[int]*Pipeline{}}
+	return nil, fmt.Errorf("vk: there is no D4G kernel for %d-bit codes", bits)
+}
+
+// NewGolemKernels builds the pipelines of one of golem's own formats, and
+// whatever else belongs to the device rather than to a matrix.
+//
+// For the lattice that is a table — sixteen kibibytes at twelve bits a code, a
+// quarter of a mebibyte at sixteen — uploaded once for every matrix of every
+// model, because the table is the lattice and not a codebook fitted to a
+// tensor. For the trellis it is nothing at all: the codebook is computed from
+// the state, which is the whole reason that format reaches four bits where the
+// lattice's shell stops fitting a workgroup. The binding stays, holding four
+// bytes nobody reads, so that one set layout serves both and every component
+// built on this needs to know which format it has only where the bytes differ.
+func NewGolemKernels(d *Device, q nn.Quant) (*D4GKernels, error) {
+	spirv, ok := golemSPIRV(q)
+	if !ok {
+		return nil, fmt.Errorf("vk: there is no kernel for %s", q)
+	}
+	k := &D4GKernels{d: d, q: q, bits: q.D4Width(), pipes: map[int]*Pipeline{}}
 	var err error
-	if k.table, err = d.Upload(packD4Table(bits)); err != nil {
+	if k.table, err = d.Upload(golemTable(q)); err != nil {
 		return nil, err
 	}
 	for _, columns := range D4GWidths {
@@ -109,15 +150,34 @@ func NewD4GKernels(d *Device, bits int) (*D4GKernels, error) {
 	return k, nil
 }
 
-func d4gSPIRV(bits int) (map[int][]byte, bool) {
-	switch bits {
-	case nn.D4Bits:
+func golemSPIRV(q nn.Quant) (map[int][]byte, bool) {
+	switch q {
+	case nn.D4G:
 		return map[int][]byte{1: matvecD4GSPIRV, 2: matvecD4G2SPIRV, 4: matvecD4G4SPIRV, 8: matvecD4G8SPIRV}, true
-	case nn.D4Bits16:
+	case nn.D4G16:
 		return map[int][]byte{1: matvecD4G16SPIRV, 2: matvecD4G16_2SPIRV, 4: matvecD4G16_4SPIRV, 8: matvecD4G16_8SPIRV}, true
+	case nn.T4G:
+		return map[int][]byte{1: matvecT4GSPIRV, 2: matvecT4G2SPIRV, 4: matvecT4G4SPIRV, 8: matvecT4G8SPIRV}, true
 	}
 	return nil, false
 }
+
+// golemTable is what the second binding holds: the lattice for D4G, and for a
+// trellis the step grid, which is the only table that format has. Both are
+// uploaded once for the device and serve every matrix of every model.
+func golemTable(q nn.Quant) []byte {
+	if q == nn.T4G {
+		out := make([]byte, 256*4)
+		for c := 0; c < 256; c++ {
+			binary.LittleEndian.PutUint32(out[c*4:], math.Float32bits(nn.T4GStep(byte(c))))
+		}
+		return out
+	}
+	return packD4Table(q.D4Width())
+}
+
+// Quant is the format these kernels read.
+func (k *D4GKernels) Quant() nn.Quant { return k.q }
 
 // Table is the lattice buffer, for a caller binding its own sets.
 func (k *D4GKernels) Table() *Buffer { return k.table }
@@ -171,14 +231,19 @@ type D4GMatrix struct {
 // form a pipeline uses, where both are stages of a recording and neither is
 // visible to the host.
 func NewD4GMatrixOn(k *D4GKernels, data []byte, rows, cols int, act, out *Buffer) (*D4GMatrix, error) {
-	if cols%nn.D4Block != 0 {
-		return nil, fmt.Errorf("vk: a D4G row needs a multiple of %d columns, given %d", nn.D4Block, cols)
+	unit := nn.D4Block
+	if k.q == nn.T4G {
+		// A path is the unit, not a block: a row that held half of one would
+		// have a step with no codes under it.
+		unit = nn.T4GSeq
 	}
-	nb := cols / nn.D4Block
-	if nb%2 != 0 {
-		return nil, fmt.Errorf("vk: %d columns give %d blocks a row, and the shader reads words", cols, nb)
+	if cols%unit != 0 {
+		return nil, fmt.Errorf("vk: a %s row needs a multiple of %d columns, given %d", k.q, unit, cols)
 	}
-	if want := rows * nb * nn.D4BlockBytes(k.bits); len(data) != want {
+	if k.q != nn.T4G && (cols/nn.D4Block)%2 != 0 {
+		return nil, fmt.Errorf("vk: %d columns give %d blocks a row, and the shader reads words", cols, cols/nn.D4Block)
+	}
+	if want := rows * (nn.Matrix{Quant: k.q, Cols: cols}).RowBytes(); len(data) != want {
 		return nil, fmt.Errorf("vk: %d rows of %d columns need %d bytes, given %d", rows, cols, want, len(data))
 	}
 	m := &D4GMatrix{d: k.d, k: k, rows: rows, cols: cols, sets: map[int]*Set{}}
@@ -237,17 +302,23 @@ type hostD4GMatrix struct {
 }
 
 func newHostD4GMatrix(d *Device, data []byte, rows, cols int) (*hostD4GMatrix, error) {
-	return newHostD4G(d, data, rows, cols, nil)
+	return newHostD4G(d, data, rows, cols, nn.D4G, nil)
+}
+
+// newHostGolemMatrix is the same for whichever of golem's formats wrote the
+// bytes.
+func newHostGolemMatrix(d *Device, data []byte, rows, cols int, q nn.Quant) (*hostD4GMatrix, error) {
+	return newHostD4G(d, data, rows, cols, q, nil)
 }
 
 // newHostD4GMatrixNoTable builds the same from the kernel that skips the
 // lookup. It computes nothing anybody wants; it prices the table.
 func newHostD4GMatrixNoTable(d *Device, data []byte, rows, cols int) (*hostD4GMatrix, error) {
-	return newHostD4G(d, data, rows, cols, matvecD4GNoTableSPIRV)
+	return newHostD4G(d, data, rows, cols, nn.D4G, matvecD4GNoTableSPIRV)
 }
 
-func newHostD4G(d *Device, data []byte, rows, cols int, spirv []byte) (*hostD4GMatrix, error) {
-	k, err := NewD4GKernels(d, nn.D4Bits)
+func newHostD4G(d *Device, data []byte, rows, cols int, q nn.Quant, spirv []byte) (*hostD4GMatrix, error) {
+	k, err := NewGolemKernels(d, q)
 	if err != nil {
 		return nil, err
 	}

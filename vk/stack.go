@@ -26,6 +26,8 @@ import (
 	"fmt"
 	"strconv"
 	"unsafe"
+
+	"github.com/ThiraSoft/golem/nn"
 )
 
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/norm.comp -o shaders/norm.spv
@@ -58,6 +60,11 @@ var embedQ6KSPIRV []byte
 
 //go:embed shaders/embed_d4g.spv
 var embedD4GSPIRV []byte
+
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_t4g.comp -o shaders/embed_t4g.spv
+
+//go:embed shaders/embed_t4g.spv
+var embedT4GSPIRV []byte
 
 //go:embed shaders/embed_q40.spv
 var embedQ40SPIRV []byte
@@ -308,7 +315,11 @@ func (s *Stack) SetEmbedding(table *Buffer, cols int, scale float32) error {
 // SetEmbeddingD4G points the stack at a .golem embedding table, so that a token
 // crosses the bus as an identifier rather than as a row of floats. pre is the
 // head's vector, which this undoes along with the rotation.
-func (s *Stack) SetEmbeddingD4G(table, lattice *Buffer, cols int, pre []float32) error {
+func (s *Stack) SetEmbeddingD4G(table, lattice *Buffer, cols int, pre []float32, q nn.Quant) error {
+	spirv := embedD4GSPIRV
+	if q == nn.T4G {
+		spirv = embedT4GSPIRV
+	}
 	if cols != s.dim {
 		return fmt.Errorf("vk: the embedding is %d wide and the stream is %d", cols, s.dim)
 	}
@@ -322,7 +333,7 @@ func (s *Stack) SetEmbeddingD4G(table, lattice *Buffer, cols int, pre []float32)
 		return fmt.Errorf("vk: the embedding is already set")
 	}
 	var err error
-	if s.embedD4G, err = s.d.NewPipeline(embedD4GSPIRV, 5, uint32(unsafe.Sizeof(embedPush{}))); err != nil {
+	if s.embedD4G, err = s.d.NewPipeline(spirv, 5, uint32(unsafe.Sizeof(embedPush{}))); err != nil {
 		return err
 	}
 	if s.ids, err = s.d.Host(maxColumns*4, bufferUsageStorage); err != nil {

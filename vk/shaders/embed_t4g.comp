@@ -1,0 +1,73 @@
+#version 450
+
+// The token embedding of a trellis .golem, read on the card.
+//
+// embed_d4g.comp says what this does and why a row is not the row anybody
+// wants: the table is the logit head, stored the way the logit product wants
+// it, so a row of it has to come back through the site's vector and the
+// rotation before it is a token's embedding. Undoing them is not applying them
+// again in the same order — the transform is its own inverse, the scaling is
+// not, and the scaling went on first so it comes off last.
+//
+// The one thing that is neater here than there: a rotation group is 128 and so
+// is a trellis sequence, so a workgroup is exactly one path and a thread is
+// exactly one weight of it.
+
+#ifndef GROUP
+#define GROUP 128
+#endif
+
+layout(local_size_x = GROUP) in;
+
+layout(std430, binding = 0) readonly  buffer W  { uint  w[];     }; // the table
+layout(std430, binding = 1) readonly  buffer T  { float steps[]; }; // the step grid, not a codebook
+layout(std430, binding = 2) readonly  buffer ID { int   ids[];   };
+layout(std430, binding = 3) readonly  buffer P  { float pre[];   };
+layout(std430, binding = 4) writeonly buffer Y  { float y[];     };
+
+layout(push_constant) uniform Push {
+    uint cols;
+} p;
+
+shared float s[GROUP];
+
+uint byteAt(uint at) { return (w[at >> 2u] >> ((at & 3u) * 8u)) & 0xFFu; }
+
+float t4gValue(uint st) {
+    uint v = 34038481u * st + 76625530u;
+    uint sum = (v & 0xffu) + ((v >> 8) & 0xffu) + ((v >> 16) & 0xffu) + ((v >> 24) & 0xffu);
+    return (float(sum) - 510.0) * 0.00676589971;
+}
+
+void main() {
+    uint perColumn = p.cols / GROUP;
+    uint gid = gl_WorkGroupID.x;
+    uint col = gid / perColumn;
+    uint seq = gid - col * perColumn;
+    int id = ids[col];
+    uint t = gl_LocalInvocationID.x;
+    if (id < 0) return;
+
+    uint nb = p.cols / 64u;
+    uint ns = p.cols / 128u;
+    uint rowBase = uint(id) * (nb + ns * 65u);
+
+    float step = steps[byteAt(rowBase + seq * 2u + (t >> 6u))];
+
+    uint at = rowBase + nb + seq * 65u + (t * 4u >> 3u);
+    uint pair = (byteAt(at) << 8u) | byteAt(at + 1u);
+    uint state = (pair >> (4u - ((t * 4u) & 7u))) & 0xFFFu;
+
+    s[t] = t4gValue(state) * step;
+    barrier();
+
+    for (uint l = 1u; l < GROUP; l <<= 1u) {
+        float mine = s[t];
+        float other = s[t ^ l];
+        barrier();
+        s[t] = ((t & l) == 0u) ? (mine + other) : (other - mine);
+        barrier();
+    }
+
+    y[col * p.cols + seq * GROUP + t] = s[t] * inversesqrt(float(GROUP)) * pre[seq * GROUP + t];
+}

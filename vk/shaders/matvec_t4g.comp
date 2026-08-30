@@ -1,0 +1,110 @@
+#version 450
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// y = W * x for a T4G matrix against float activations.
+//
+// A sequence is 128 weights: two eight-bit step codes, one per sixty-four, and
+// 520 bits of trellis path. Expanding a weight is a twelve-bit window at bit
+// offset 4t, a multiply, an add and a byte sum — and no table at all, which is
+// the whole reason this format exists. matvec_d4g.comp uploads sixteen
+// kibibytes of lattice for every dispatch on the card; the four-bit tier of
+// that lattice would need 493, which is more than a workgroup has. This needs
+// nothing.
+//
+// The row is two planes, steps then codes, for matvec_d4g.comp's reason: a
+// 67-byte block would start on an odd boundary and this reads words.
+//
+// The window is always two bytes and never three. Every offset is a multiple of
+// four bits, so a twelve-bit field starting at 4t has one of two alignments
+// inside a byte pair, and the last weight of a sequence starts at bit 508 and
+// ends at 519 — the sequence's last byte, not one past it.
+//
+// Workgroup: 128 threads -> 16 output rows, 8 lanes per row, which is
+// matvec_d4g.comp's shape. COLUMNS is how many activations one reading of the
+// weights answers.
+
+#ifndef COLUMNS
+#define COLUMNS 1
+#endif
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly  buffer W { uint  w[]; };
+// Binding 1 is the lattice a D4G matrix reads. A trellis has no codebook to
+// look up — that is the whole point of it — so what sits there instead is the
+// step grid: 256 floats, one per code, a kibibyte for the life of the device.
+//
+// A kibibyte rather than an exp2, and not for speed. Go builds the grid with
+// math.Exp2 in double and rounds; this card's exp2 lands one unit in the last
+// place away from that for some codes, and a decoder that is one ULP from the
+// processor's is a decoder that disagrees about what the file says. It is
+// invisible in a product — the gap was 3e-7 of the output — and it is exactly
+// the kind of invisible this format cannot afford, so the two sides read the
+// same 256 numbers instead of each computing them.
+layout(std430, binding = 1) readonly  buffer T { float steps[]; };
+layout(std430, binding = 2) readonly  buffer X { float x[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint dim; // outputs
+    uint ffn; // inputs
+    uint col; // the first column of the pass this dispatch answers
+} p;
+
+const uint LANES = 8u;
+const uint OUTS  = 16u;
+const uint SEQ   = 128u; // weights in one path
+const uint BLOCK = 64u;  // weights sharing one step
+const uint SEQB  = 65u;  // bytes one path occupies
+
+uint byteAt(uint at) { return (w[at >> 2u] >> ((at & 3u) * 8u)) & 0xFFu; }
+
+// The 1MAD code of nn/t4g.go. It has to be these constants and this arithmetic:
+// a decoder is a pure function of the bits it reads, so a shader that hashes a
+// state differently is a second format sharing a name. Written as a multiply
+// and not a division for the reason compress/trellis.go gives.
+float t4gValue(uint s) {
+    uint v = 34038481u * s + 76625530u;
+    uint sum = (v & 0xffu) + ((v >> 8) & 0xffu) + ((v >> 16) & 0xffu) + ((v >> 24) & 0xffu);
+    return (float(sum) - 510.0) * 0.00676589971;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x * OUTS + (gl_LocalInvocationID.x / LANES);
+    uint lane = gl_LocalInvocationID.x % LANES;
+    bool live = row < p.dim;
+    if (!live) row = 0u;
+
+    uint nb  = p.ffn / BLOCK;         // step codes a row
+    uint ns  = p.ffn / SEQ;           // paths a row
+    uint rowBase  = row * (nb + ns * SEQB);
+    uint codeBase = rowBase + nb;
+
+    float sum[COLUMNS];
+    [[unroll]] for (uint c = 0u; c < COLUMNS; c++) sum[c] = 0.0;
+
+    for (uint b = lane; live && b < nb; b += LANES) {
+        float step = steps[byteAt(rowBase + b)];
+        // Which path this block is the first or second half of.
+        uint seqAt = codeBase + (b >> 1u) * SEQB + (b & 1u) * 32u;
+        uint xOffset = b * BLOCK;
+
+        // Two weights a byte pair: the even one is the pair's top twelve bits,
+        // the odd one its bottom twelve.
+        [[unroll]] for (uint m = 0u; m < BLOCK / 2u; m++) {
+            uint pair = (byteAt(seqAt + m) << 8u) | byteAt(seqAt + m + 1u);
+            float a = t4gValue(pair >> 4u) * step;
+            float e = t4gValue(pair & 0xFFFu) * step;
+            [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+                uint xc = (p.col + c) * p.ffn + xOffset + m * 2u;
+                sum[c] += a * x[xc] + e * x[xc + 1u];
+            }
+        }
+    }
+
+    [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+        float total = subgroupClusteredAdd(sum[c], LANES);
+        if (lane == 0u && live) y[(p.col + c) * p.dim + row] = total;
+    }
+}

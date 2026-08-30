@@ -15,6 +15,8 @@ package vk
 import (
 	"fmt"
 	"unsafe"
+
+	"github.com/ThiraSoft/golem/nn"
 )
 
 // A D4GHead is the head matrix resident in device memory, with the transform
@@ -93,6 +95,10 @@ func (h *D4GHead) Logits(hidden, out []float32) error {
 func (h *D4GHead) Table() (weights, lattice *Buffer, cols int) {
 	return h.m.weights, h.k.table, h.cols
 }
+
+// Quant is the format the head is stored in, which the stack needs to pick the
+// kernel that reads a row of it.
+func (h *D4GHead) Quant() nn.Quant { return h.k.q }
 
 func (h *D4GHead) Close() {
 	if h.m != nil {

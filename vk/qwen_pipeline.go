@@ -18,6 +18,8 @@ import (
 	_ "embed"
 	"fmt"
 	"unsafe"
+
+	"github.com/ThiraSoft/golem/nn"
 )
 
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q40.comp -o shaders/matvec_q40.spv
@@ -307,10 +309,13 @@ type QwenShape struct {
 
 	Eps float32
 
-	// D4GBits is the code width of a .golem checkpoint, and zero for one of
+	// Golem is the format of a .golem checkpoint, and the zero value for one of
 	// llama.cpp's own types. It decides which of two forms every projection in
 	// the model takes; vk/qwen_d4g.go is the other one.
-	D4GBits int
+	//
+	// A code width would not answer it any more: the trellis has no lattice
+	// code, so the question is which format and not how wide.
+	Golem nn.Quant
 }
 
 func (s QwenShape) qDim() int     { return s.Heads * s.HeadDim }
@@ -682,8 +687,8 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 
 	// A .golem checkpoint: one lattice table and two transform pipelines for
 	// the whole model, whatever any block does with them.
-	if shape.D4GBits > 0 {
-		if p.d4g, err = NewD4GKernels(d, shape.D4GBits); err != nil {
+	if shape.Golem.Golem() {
+		if p.d4g, err = NewGolemKernels(d, shape.Golem); err != nil {
 			return nil, err
 		}
 		if p.preps, err = NewD4GPrepares(d); err != nil {
