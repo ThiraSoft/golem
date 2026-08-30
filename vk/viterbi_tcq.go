@@ -9,10 +9,19 @@ package vk
 // six-hundred-million-weight model on twelve cores, which makes three hours
 // for a four-billion one. That is the number this file exists to remove.
 //
-// What crosses the bus is what a sequence reconstructs, not its codes. The
-// research path measures a reconstruction, so this returns one; packing a path
-// into a file's bit stream is a shift and a mask per weight and belongs with
-// the format, not here.
+// What crosses the bus is both what a sequence reconstructs and the path it
+// walked. The research bench measures a reconstruction and wants only the
+// first; a file stores the path, and stores it rather than the reconstruction
+// because the decoder recomputes one from the other. It cannot be the
+// processor's path either: TestViterbiMatchesCPU holds the two encoders to the
+// same cost and not to the same path, so the bytes written have to be the ones
+// the card actually walked.
+//
+// The path comes back wide, one state a weight, and is packed into the file's
+// 520-bit sequences by nn.PutT4GStates — the same division of labour
+// vk/encode_d4g.go makes, and for the same reason: a shader that packed
+// twelve-bit fields straddling words would cost more to write than the packing
+// costs to do on the processor.
 
 import (
 	_ "embed"
@@ -45,10 +54,12 @@ type TrellisEncoder struct {
 	d   *Device
 	cap int
 
-	stage   *Buffer // host, what a pass is written into
-	z       *Buffer // device, what the kernel reads
-	rec     *Buffer // device, what it writes
-	recBack *Buffer // host, what comes back
+	stage    *Buffer // host, what a pass is written into
+	z        *Buffer // device, what the kernel reads
+	rec      *Buffer // device, the reconstruction it writes
+	recBack  *Buffer // host, what comes back
+	path     *Buffer // device, the state of each weight
+	pathBack *Buffer // host, the same
 
 	pipe *Pipeline
 	set  *Set
@@ -72,6 +83,8 @@ func NewTrellisEncoder(d *Device, capacity int) (*TrellisEncoder, error) {
 		{&e.z, false, bufferUsageStorage | bufferUsageTransferDst},
 		{&e.rec, false, bufferUsageStorage | bufferUsageTransferSrc},
 		{&e.recBack, true, bufferUsageTransferDst},
+		{&e.path, false, bufferUsageStorage | bufferUsageTransferSrc},
+		{&e.pathBack, true, bufferUsageTransferDst},
 	} {
 		var err error
 		if b.host {
@@ -84,7 +97,7 @@ func NewTrellisEncoder(d *Device, capacity int) (*TrellisEncoder, error) {
 			return nil, err
 		}
 	}
-	bufs := []*Buffer{e.z, e.rec}
+	bufs := []*Buffer{e.z, e.rec, e.path}
 	var err error
 	if e.pipe, err = d.NewPipeline(viterbiTCQSPIRV, len(bufs), uint32(unsafe.Sizeof(viterbiPush{}))); err != nil {
 		e.Close()
@@ -105,6 +118,21 @@ func (e *TrellisEncoder) Capacity() int { return e.cap }
 // norm is expected already normalised — unit RMS per scale block — which is
 // what compress.VQ hands its quantizer.
 func (e *TrellisEncoder) Quantize(norm []float32, gain float32) error {
+	return e.quantize(norm, gain, nil)
+}
+
+// QuantizePath is Quantize with the path kept: states holds one state a weight,
+// which is what nn.PutT4GStates writes into a file. The reconstruction is still
+// written back over norm, because the converter needs it to fit each block's
+// step by least squares before it packs anything.
+func (e *TrellisEncoder) QuantizePath(norm []float32, gain float32, states []uint16) error {
+	if len(states) != len(norm) {
+		return fmt.Errorf("vk: %d weights and room for %d states", len(norm), len(states))
+	}
+	return e.quantize(norm, gain, states)
+}
+
+func (e *TrellisEncoder) quantize(norm []float32, gain float32, states []uint16) error {
 	if len(norm)%TrellisGPUSeq != 0 {
 		return fmt.Errorf("vk: %d weights is not a whole number of %d-weight sequences",
 			len(norm), TrellisGPUSeq)
@@ -137,11 +165,17 @@ func (e *TrellisEncoder) Quantize(norm []float32, gain float32) error {
 			r.Dispatch(e.set, uint32(seqs), unsafe.Pointer(&push))
 			r.Barrier()
 			r.CopyFrom(e.recBack, 0, e.rec, 0, n*4)
+			r.CopyFrom(e.pathBack, 0, e.path, 0, n*4)
 		})
 		if err != nil {
 			return err
 		}
 		copy(norm[at:at+n], e.recBack.Floats()[:n])
+		if states != nil {
+			for i, v := range e.pathBack.Uints()[:n] {
+				states[at+i] = uint16(v)
+			}
+		}
 	}
 	return nil
 }
@@ -150,7 +184,7 @@ func (e *TrellisEncoder) Close() {
 	if e == nil {
 		return
 	}
-	for _, b := range []*Buffer{e.stage, e.z, e.rec, e.recBack} {
+	for _, b := range []*Buffer{e.stage, e.z, e.rec, e.recBack, e.path, e.pathBack} {
 		if b != nil {
 			b.Close()
 		}

@@ -380,6 +380,14 @@ func (b *Buffer) Floats() []float32 {
 	return unsafe.Slice((*float32)(b.mapped), b.size/4)
 }
 
+// Uints is the mapped buffer read as uint32.
+func (b *Buffer) Uints() []uint32 {
+	if b.mapped == nil {
+		panic("vk: buffer is not host visible")
+	}
+	return unsafe.Slice((*uint32)(b.mapped), b.size/4)
+}
+
 // Close releases the buffer and its memory.
 func (b *Buffer) Close() {
 	if b.mapped != nil {
@@ -400,7 +408,14 @@ func (b *Buffer) Close() {
 // is the load-time path for a weight tensor: it runs once, and afterwards the
 // weights are read at the speed of the card's own memory rather than the bus.
 func (d *Device) Upload(data []byte) (*Buffer, error) {
-	dst, err := d.newBuffer(uint64(len(data)), bufferUsageStorage|bufferUsageTransferDst, memoryDeviceLocal)
+	// Rounded up to a word. Every kernel here reads a storage buffer as uint[],
+	// so a tensor whose byte count is not a multiple of four would put its last
+	// bytes in a word past the end of the buffer — which most drivers answer
+	// with zeros and one answers with a fault. A T4G row is 67·n/128 bytes and
+	// is odd whenever the row is not a multiple of 512 wide, which a vision
+	// tower's 1152 is not.
+	size := (len(data) + 3) &^ 3
+	dst, err := d.newBuffer(uint64(size), bufferUsageStorage|bufferUsageTransferDst, memoryDeviceLocal)
 	if err != nil {
 		return nil, err
 	}

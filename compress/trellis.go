@@ -18,6 +18,8 @@ package compress
 
 import (
 	"math"
+
+	"github.com/ThiraSoft/golem/nn"
 )
 
 // TrellisCode names how a state becomes a number.
@@ -62,6 +64,13 @@ func trellisValue(c TrellisCode, s uint32) float32 {
 		m2 := math.Float32frombits((x^0x3c00)&0xffff<<16) * float32(i3M)
 		return m1 + m2
 	default:
+		// nn owns this, because the decoder does: a file is read by nn and a
+		// second copy of the hash here would be a second format sharing a
+		// name. At L past sixteen the state no longer fits what nn takes, and
+		// nothing in the format goes there.
+		if l := s >> 16; l == 0 {
+			return nn.T4GValue(uint16(s))
+		}
 		x := uint32(mad1A)*s + uint32(mad1B)
 		sum := (x & 0xff) + ((x >> 8) & 0xff) + ((x >> 16) & 0xff) + ((x >> 24) & 0xff)
 		return (float32(sum) - 510) * mad1Scale
@@ -141,7 +150,10 @@ func newViterbiWork(o TrellisOpts) *viterbiWork {
 	}
 }
 
-func viterbi(z []float32, val []float32, o TrellisOpts, w *viterbiWork) {
+// viterbi finds the path and writes the reconstruction over z. states, when it
+// is not nil, is filled with the state each weight was coded as — which is what
+// a file stores, the reconstruction being what the decoder recomputes from it.
+func viterbi(z []float32, val []float32, o TrellisOpts, w *viterbiWork, states []uint16) {
 	ns, np := w.nstates, w.nprefix
 	kb := uint(o.K)
 	shift := uint(o.L - o.K)
@@ -186,6 +198,9 @@ func viterbi(z []float32, val []float32, o TrellisOpts, w *viterbiWork) {
 	s := end
 	for t := T - 1; t >= 0; t-- {
 		z[t] = val[s]
+		if states != nil {
+			states[t] = uint16(s)
+		}
 		if t > 0 {
 			j := int(w.bp[t*np+(s>>kb)])
 			s = (j << shift) | (s >> kb)
@@ -200,10 +215,21 @@ func viterbi(z []float32, val []float32, o TrellisOpts, w *viterbiWork) {
 // it from there.
 var TrellisAccel func(norm []float32, o TrellisOpts) bool
 
+// TrellisPathAccel is TrellisAccel for a caller that wants the path as well as
+// the reconstruction — the converter, which has a file to write. It is a second
+// hook rather than a wider first one because the research bench asks for a
+// reconstruction and has nowhere to put a path, and a pass that carried one
+// anyway would be four bytes a weight across the bus for nothing.
+var TrellisPathAccel func(norm []float32, o TrellisOpts, states []uint16) bool
+
 // quantizeTrellis runs the whole normalised matrix through the trellis, one
 // sequence at a time, writing the reconstruction back over norm.
-func quantizeTrellis(norm []float32, o TrellisOpts, val []float32) {
-	if TrellisAccel != nil && TrellisAccel(norm, o) {
+func quantizeTrellis(norm []float32, o TrellisOpts, val []float32, states []uint16) {
+	if states == nil {
+		if TrellisAccel != nil && TrellisAccel(norm, o) {
+			return
+		}
+	} else if TrellisPathAccel != nil && TrellisPathAccel(norm, o, states) {
 		return
 	}
 	nseq := len(norm) / o.Seq
@@ -216,7 +242,11 @@ func quantizeTrellis(norm []float32, o TrellisOpts, val []float32) {
 			for j, v := range seq {
 				z[j] = v * g
 			}
-			viterbi(z, val, o, w)
+			var st []uint16
+			if states != nil {
+				st = states[i*o.Seq : (i+1)*o.Seq]
+			}
+			viterbi(z, val, o, w, st)
 			for j, v := range z {
 				seq[j] = v / g
 			}
@@ -227,5 +257,16 @@ func quantizeTrellis(norm []float32, o TrellisOpts, val []float32) {
 // QuantizeTrellis is quantizeTrellis for callers outside this package — the
 // card's encoder, which has to be held to exactly what the processor does.
 func QuantizeTrellis(norm []float32, o TrellisOpts) {
-	quantizeTrellis(norm, o, TrellisTable(o.Code, o.L))
+	quantizeTrellis(norm, o, TrellisTable(o.Code, o.L), nil)
+}
+
+// QuantizeTrellisPath is QuantizeTrellis with the path kept: states holds the
+// state of every weight, one per weight, which is what a file is written from.
+//
+// The reconstruction is still written back over norm, and the converter needs
+// it: each block's step is fitted to it by least squares before anything is
+// packed, and the step is chosen after the path for the reason
+// compress/codec.go gives.
+func QuantizeTrellisPath(norm []float32, o TrellisOpts, states []uint16) {
+	quantizeTrellis(norm, o, TrellisTable(o.Code, o.L), states)
 }

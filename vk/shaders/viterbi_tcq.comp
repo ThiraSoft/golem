@@ -32,8 +32,14 @@
 
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly  buffer Z   { float z[];   };
-layout(std430, binding = 1) writeonly buffer OUT { float rec[]; };
+layout(std430, binding = 0) readonly  buffer Z    { float z[];    };
+layout(std430, binding = 1) writeonly buffer OUT  { float rec[];  };
+// The path, one state a weight. A file stores the path and not the
+// reconstruction — the decoder recomputes the second from the first — and the
+// two encoders do not agree about which minimum-cost path they found, so the
+// bytes written have to be the ones this workgroup actually walked. The
+// research bench reads rec and ignores this; the converter reads both.
+layout(std430, binding = 2) writeonly buffer PATH { uint  path[]; };
 
 layout(push_constant) uniform Push {
     uint seqs;  // sequences in this pass
@@ -157,6 +163,7 @@ void main() {
         for (uint i = T; i > 0u; i--) {
             uint t = i - 1u;
             rec[base + t] = trellisValue(s) / p.gain;
+            path[base + t] = s;
             if (t > 0u) {
                 uint a = t * NPREFIX + (s >> K);
                 uint j = (bp[a >> 3u] >> ((a & 7u) * 4u)) & 0xfu;

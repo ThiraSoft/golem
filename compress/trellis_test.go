@@ -89,7 +89,7 @@ func TestTrellisBeatsD4OnGaussian(t *testing.T) {
 		for _, l := range []int{12, 14, 16} {
 			o := TrellisOpts{K: 3, L: l, Seq: seq, Code: Code1MAD}
 			rec := append([]float32(nil), x...)
-			quantizeTrellis(rec, o, TrellisTable(o.Code, o.L))
+			quantizeTrellis(rec, o, TrellisTable(o.Code, o.L), nil)
 			t.Logf("TCQ k=3 L=%-2d T=%-4d  %.3f bits/weight   %6.2f dB", l, seq, o.BPW(), sqnrDB(x, rec))
 		}
 	}
@@ -126,7 +126,7 @@ func TestTrellisAtFourBits(t *testing.T) {
 	for _, l := range []int{12, 14, 16} {
 		o := TrellisOpts{K: 4, L: l, Seq: 4096, Code: Code1MAD}
 		rec := append([]float32(nil), x...)
-		quantizeTrellis(rec, o, TrellisTable(o.Code, o.L))
+		quantizeTrellis(rec, o, TrellisTable(o.Code, o.L), nil)
 		t.Logf("TCQ k=4 L=%-2d T=4096  %.3f bits/weight  %6.2f dB   (no table at all)", l, o.BPW(), sqnrDB(x, rec))
 	}
 }
@@ -142,9 +142,39 @@ func TestTrellisRateLadder(t *testing.T) {
 	for _, k := range []int{2, 3, 4, 5} {
 		o := TrellisOpts{K: k, L: 12, Seq: 256, Code: Code1MAD}
 		rec := append([]float32(nil), x...)
-		quantizeTrellis(rec, o, TrellisTable(o.Code, o.L))
+		quantizeTrellis(rec, o, TrellisTable(o.Code, o.L), nil)
 		db := sqnrDB(x, rec)
 		t.Logf("TCQ k=%d L=12  %.2f bits/weight  %6.2f dB   (Shannon %5.2f, gap %4.2f)",
 			k, o.BPW(), db, 6.02*float64(k), 6.02*float64(k)-db)
+	}
+}
+
+// The path the processor returns must expand to the reconstruction it returns
+// beside it, and must be a legal walk of the trellis — its predecessor shifted
+// up by k. Both are what makes 520 bits a sequence enough to hold it, and the
+// card is held to the same pair in vk.
+func TestTrellisPathDecodesToItsReconstruction(t *testing.T) {
+	o := TrellisOpts{K: 4, L: 12, Seq: 128, Code: Code1MAD}
+	const n = 128 * 64
+	x := gaussian(n, 3)
+	rec := append([]float32(nil), x...)
+	states := make([]uint16, n)
+	QuantizeTrellisPath(rec, o, states)
+
+	val := TrellisTable(o.Code, o.L)
+	for i := range rec {
+		if val[states[i]] != rec[i] {
+			t.Fatalf("weight %d: state %d expands to %v, the encoder reconstructed %v",
+				i, states[i], val[states[i]], rec[i])
+		}
+	}
+	for q := 0; q+o.Seq <= n; q += o.Seq {
+		for i := 1; i < o.Seq; i++ {
+			prev, cur := uint32(states[q+i-1]), uint32(states[q+i])
+			mask := uint32(1)<<uint(o.L) - 1
+			if (prev<<uint(o.K))&mask != cur&^(1<<uint(o.K)-1) {
+				t.Fatalf("sequence at %d, step %d: %012b does not follow %012b", q, i, cur, prev)
+			}
+		}
 	}
 }

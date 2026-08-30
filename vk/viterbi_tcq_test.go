@@ -106,3 +106,56 @@ func TestViterbiMatchesCPU(t *testing.T) {
 		t.Errorf("the card reconstructs at %.3f dB against the processor's %.3f", dbGPU, dbCPU)
 	}
 }
+
+// The path has to be the path: decoding the states the card returns must give
+// back, exactly, the reconstruction it returned beside them. This is the one
+// contract of the pair that is exact — a decoder is a pure function of the bits
+// it reads, so a state that expands to anything else is a file that reads
+// differently from what the encoder measured.
+func TestViterbiPathDecodesToItsReconstruction(t *testing.T) {
+	d, err := Open()
+	if err != nil {
+		t.Skip(err)
+	}
+	defer d.Close()
+
+	const n = TrellisGPUSeq * 64
+	rg := rand.New(rand.NewSource(4))
+	src := make([]float32, n)
+	for i := range src {
+		src[i] = float32(rg.NormFloat64())
+	}
+
+	e, err := NewTrellisEncoder(d, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	rec := append([]float32(nil), src...)
+	states := make([]uint16, n)
+	if err := e.QuantizePath(rec, 1, states); err != nil {
+		t.Fatal(err)
+	}
+
+	val := compress.TrellisTable(compress.Code1MAD, TrellisGPUL)
+	for i := range rec {
+		if got := val[states[i]]; got != rec[i] {
+			t.Fatalf("weight %d: state %d expands to %v, the card reconstructed %v",
+				i, states[i], got, rec[i])
+		}
+	}
+
+	// And the states must be a walk of the trellis: each one is the last L bits
+	// of the code stream, so it is its predecessor shifted up by k. A path that
+	// does not satisfy this cannot be written as 520 bits at all.
+	for q := 0; q+TrellisGPUSeq <= n; q += TrellisGPUSeq {
+		for t2 := 1; t2 < TrellisGPUSeq; t2++ {
+			prev := uint32(states[q+t2-1])
+			cur := uint32(states[q+t2])
+			if want := (prev << TrellisGPUK) & (1<<TrellisGPUL - 1); cur>>TrellisGPUK<<TrellisGPUK&(1<<TrellisGPUL-1) != want {
+				t.Fatalf("sequence at %d, step %d: %012b does not follow %012b", q, t2, cur, prev)
+			}
+		}
+	}
+}
