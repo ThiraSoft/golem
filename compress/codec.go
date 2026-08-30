@@ -190,6 +190,12 @@ type Opts struct {
 	MaxNorm2   float32
 	Beta       float64 // how far the normalised subvector is scaled up before rounding
 
+	// A trellis replaces the lattice: the sequence, not the subvector, is the
+	// unit that gets coded, and the state's value is computed rather than
+	// stored. UseTrellis wins over UseLattice when both are set.
+	UseTrellis bool
+	Tr         TrellisOpts
+
 	// SearchScale trades encoding time for accuracy: instead of taking the
 	// block's RMS as its scale, it tries a few multiples of it and keeps the
 	// one the lattice actually reconstructs best. The RMS is the scale that
@@ -199,6 +205,13 @@ type Opts struct {
 
 func (o Opts) BPW() float64 {
 	b := 0.0
+	if o.UseTrellis {
+		b = o.Tr.BPW()
+		if o.ScaleBlock > 0 {
+			b += 16.0 / float64(o.ScaleBlock)
+		}
+		return b
+	}
 	if o.UseLattice {
 		n := shellSize(o.Lat, o.MaxNorm2)
 		if o.UseBox {
@@ -223,6 +236,15 @@ func (o Opts) Name() string {
 	var sb strings.Builder
 	if o.HadGroup > 0 {
 		fmt.Fprintf(&sb, "HAD%d+", o.HadGroup)
+	}
+	if o.UseTrellis {
+		fmt.Fprintf(&sb, "TCQ(k%d,L%d,T%d,g%.2f)", o.Tr.K, o.Tr.L, o.Tr.Seq, o.Tr.gain())
+		if o.ScaleBlock > 0 {
+			fmt.Fprintf(&sb, "/s%d", o.ScaleBlock)
+		} else {
+			sb.WriteString("/srow")
+		}
+		return sb.String()
 	}
 	if o.UseLattice {
 		if o.UseBox {
@@ -406,6 +428,61 @@ func VQ(w []float32, rows, cols int, o Opts, seed int64) []float32 {
 		}
 	})
 
+	// The reconstruction both vector quantizers share: put the scales back,
+	// then undo the rotation the way the activation side would.
+	rebuild := func() []float32 {
+		out := make([]float32, len(w))
+		Parallel(rows, func(lo, hi int) {
+			for r := lo; r < hi; r++ {
+				for b := 0; b < cols; b += sb {
+					sc := scales[(r*cols+b)/sb]
+					for i := r*cols + b; i < r*cols+b+sb; i++ {
+						out[i] = norm[i] * sc
+					}
+				}
+			}
+		})
+		if o.HadGroup > 0 {
+			signs := RandomSigns(cols, seed+7)
+			Hadamard(out, rows, cols, o.HadGroup, Make1(cols))
+			Parallel(rows, func(lo, hi int) {
+				for r := lo; r < hi; r++ {
+					for i := 0; i < cols; i++ {
+						out[r*cols+i] *= signs[i]
+					}
+				}
+			})
+		}
+		return out
+	}
+
+	// A trellis codes whole sequences, so it wants the row length to hold a
+	// whole number of them; every matrix in these models does.
+	if o.UseTrellis {
+		if o.Tr.Seq <= 0 || len(norm)%o.Tr.Seq != 0 || o.Tr.L <= o.Tr.K || o.Tr.K > 8 {
+			return nil
+		}
+		// The step is chosen *after* the path, not before it. The block's RMS
+		// is the scale that makes it unit-variance, which is not the scale that
+		// reconstructs it best; the lattice buys that difference with a grid of
+		// seven multipliers per block, and a trellis cannot, because one path
+		// spans many blocks. Least squares gets it exactly and for nothing: the
+		// step code the format already stores per 32 weights absorbs it.
+		src := append([]float32(nil), norm...)
+		quantizeTrellis(norm, o.Tr, TrellisTable(o.Tr.Code, o.Tr.L))
+		for b := 0; b < len(norm)/sb; b++ {
+			var num, den float64
+			for i := b * sb; i < (b+1)*sb; i++ {
+				num += float64(src[i]) * float64(norm[i])
+				den += float64(norm[i]) * float64(norm[i])
+			}
+			if den > 0 {
+				scales[b] = Fp16round(scales[b] * float32(num/den))
+			}
+		}
+		return rebuild()
+	}
+
 	if o.UseLattice {
 		d := o.Lat.Dim()
 		beta := float32(o.Beta)
@@ -451,29 +528,7 @@ func VQ(w []float32, rows, cols int, o Opts, seed int64) []float32 {
 				copy(blk, best)
 			}
 		})
-		out := make([]float32, len(w))
-		Parallel(rows, func(lo, hi int) {
-			for r := lo; r < hi; r++ {
-				for b := 0; b < cols; b += sb {
-					sc := scales[(r*cols+b)/sb]
-					for i := r*cols + b; i < r*cols+b+sb; i++ {
-						out[i] = norm[i] * sc
-					}
-				}
-			}
-		})
-		if o.HadGroup > 0 {
-			signs := RandomSigns(cols, seed+7)
-			Hadamard(out, rows, cols, o.HadGroup, Make1(cols))
-			Parallel(rows, func(lo, hi int) {
-				for r := lo; r < hi; r++ {
-					for i := 0; i < cols; i++ {
-						out[r*cols+i] *= signs[i]
-					}
-				}
-			})
-		}
-		return out
+		return rebuild()
 	}
 
 	d := o.Dim
