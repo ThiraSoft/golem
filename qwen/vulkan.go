@@ -99,6 +99,22 @@ func (m *Model) useVulkanEmbedding() error {
 // which it does when both the stack and the head are on it.
 func (m *Model) VulkanEmbedding() bool { return m.stack != nil && m.stack.Embedding() }
 
+// UseVulkan puts the whole model on a Vulkan device: the blocks and the logit
+// head. It is the name qwen35 gives the same thing, and it exists here for the
+// same reason vqdiff gives for measuring on a card at all — a quality number
+// nobody runs is a quality number nobody has. A perplexity over four thousand
+// positions of this model is minutes of eight cores and seconds of a card, and
+// the two agree: the card and the processor differ by 9e-4 of the hidden state
+// and 3e-7 of a logit, which is float32 addition order and nothing else.
+//
+// The head goes on first, because the stack asks it for the embedding table.
+func (m *Model) UseVulkan() error {
+	if err := m.UseVulkanHead(); err != nil {
+		return err
+	}
+	return m.UseVulkanStack()
+}
+
 // UseVulkanStack puts every block of the model on a Vulkan device: the
 // attention with its cache, the feed forward, and the two norms between them.
 // A token then crosses the bus twice — the embedding in and the last hidden
