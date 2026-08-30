@@ -40,9 +40,19 @@ func main() {
 	ctx := flag.Int("ctx", 512, "window size for the corpus")
 	limit := flag.Int("limit", 4096, "how many corpus tokens to read")
 	steps := flag.Int("steps", 40, "greedy steps")
+	vulkan := flag.Bool("vulkan", false, "run the model on a Vulkan device")
 	flag.Parse()
 
-	m, err := open(*model, 4096)
+	// The window, not a fixed four thousand. A context is the cache a model
+	// keeps and the width of every attention dispatch that reads it: on a
+	// twenty-seven billion parameter model four thousand positions is a kernel
+	// long enough for the driver's watchdog to call the ring hung, and it
+	// resets the card mid-measurement. Nothing here ever reads past one window.
+	ctxSize := *ctx
+	if *steps > 0 {
+		ctxSize += *steps + len(heldOut)/2
+	}
+	m, err := open(*model, ctxSize, *vulkan)
 	must(err)
 	defer m.Close()
 	v, err := bytebpe.Load(m.File())
@@ -189,16 +199,39 @@ type qwen35Model struct{ *qwen35.Model }
 
 func (m qwen35Model) Vocab() int { return m.Cfg.Vocab }
 
+// vulkanModel is a model that can put itself on a device. Both engines can;
+// naming it here keeps open's return type the narrow one above.
+type vulkanModel interface{ UseVulkan() error }
+
 // open reads a checkpoint with whichever engine claims it. qwen refuses an
 // architecture it does not know, which is how the second gets its turn.
-func open(path string, ctx int) (model, error) {
-	if m, err := qwen.Open(path, ctx); err == nil {
-		return qwenModel{m}, nil
-	} else if m2, err2 := qwen35.Open(path, ctx); err2 == nil {
-		return qwen35Model{m2}, nil
+//
+// onDevice is not an optimisation here, it is what makes the measurement
+// possible. A perplexity over four thousand positions of a twenty-seven
+// billion parameter model is an hour of eight cores and a few seconds of a
+// card, and a quality number nobody runs is a quality number nobody has — which
+// is how a format came to be judged by how well each of its matrices agreed
+// with its own codes.
+func open(path string, ctx int, onDevice bool) (model, error) {
+	var m model
+	if a, err := qwen.Open(path, ctx); err == nil {
+		m = qwenModel{a}
+	} else if b, err2 := qwen35.Open(path, ctx); err2 == nil {
+		m = qwen35Model{b}
 	} else {
 		return nil, fmt.Errorf("neither engine reads it: %v; %v", err, err2)
 	}
+	if onDevice {
+		v, ok := m.(vulkanModel)
+		if !ok {
+			return nil, fmt.Errorf("this engine has nothing that moves to a device")
+		}
+		if err := v.UseVulkan(); err != nil {
+			m.Close()
+			return nil, fmt.Errorf("on the device: %w", err)
+		}
+	}
+	return m, nil
 }
 
 func must(err error) {
