@@ -288,7 +288,7 @@ func main() {
 	fmt.Printf("\n%.0f M weights at %.3f bits per weight — %.2f GiB against %.2f GiB in BF16, %.2f in Q4_0\n",
 		weights/1e6, bits/weights, bits/8/(1<<30), weights*2/(1<<30), weights*4.5/8/(1<<30))
 	if n := compress.StepClipped(); n > 0 {
-		fmt.Printf("%d blocks landed on an end of the step grid; the grid is too narrow for this model\n", n)
+		fmt.Printf("%d blocks of the %.0f M weights landed on an end of the step grid\n", n, weights/1e6)
 	}
 	fmt.Printf("rewritten in %s\n", time.Since(t0).Round(time.Second))
 }

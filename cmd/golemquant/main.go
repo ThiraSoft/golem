@@ -608,7 +608,7 @@ func main() {
 
 	must(tensors.WriteGGUFStream(*dst, meta, out))
 	if n := nn.T4GStepClipped.Load(); n > 0 {
-		fmt.Printf("%d blocks landed on an end of the step grid: the window is wrong for this checkpoint\n", n)
+		fmt.Printf("%d blocks of the %.0f M weights landed on an end of the step grid\n", n, count/1e6)
 	}
 	fmt.Printf("\n%.0f M weights at %.3f bits each — %s\n",
 		count/1e6, bits/count, sizeOf(int(bits/8)))
