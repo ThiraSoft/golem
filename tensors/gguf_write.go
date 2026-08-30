@@ -25,10 +25,41 @@ type OutTensor struct {
 	Data  []byte
 }
 
+// OutStream is one tensor described before its bytes exist: enough to lay out
+// the file's table, and a function that writes the tensor when its turn comes.
+//
+// It is what lets a converter hold one tensor at a time. The alternative — an
+// OutTensor a tensor, all of them live at once — is the whole output file in
+// memory, which for a twenty-seven billion parameter model is ten gigabytes
+// beside the checkpoint it is reading. That was measured the way these things
+// usually are.
+type OutStream struct {
+	Name  string
+	Shape []int // row length first, as GGUF orders them
+	DType string
+	// Size is how many bytes Write will produce. The table carries offsets, so
+	// the layout is decided before any of the data exists and a Write that
+	// produces a different number is a corrupt file — WriteGGUFStream checks.
+	Size  int
+	Write func(io.Writer) error
+}
+
 // WriteGGUF writes the metadata and tensors to path, aligned as GGUF v3 wants.
 // meta is written in the order its keys sort, so the same input gives the same
 // file.
-func WriteGGUF(path string, meta map[string]any, tensors []OutTensor) (err error) {
+func WriteGGUF(path string, meta map[string]any, tensors []OutTensor) error {
+	out := make([]OutStream, len(tensors))
+	for i, t := range tensors {
+		data := t.Data
+		out[i] = OutStream{Name: t.Name, Shape: t.Shape, DType: t.DType, Size: len(data),
+			Write: func(w io.Writer) error { _, err := w.Write(data); return err }}
+	}
+	return WriteGGUFStream(path, meta, out)
+}
+
+// WriteGGUFStream is the same file, with each tensor's bytes produced as it is
+// written rather than held until every one of them exists.
+func WriteGGUFStream(path string, meta map[string]any, tensors []OutStream) (err error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -64,7 +95,7 @@ func WriteGGUF(path string, meta map[string]any, tensors []OutTensor) (err error
 	var at uint64
 	for i, t := range tensors {
 		offsets[i] = at
-		at += uint64(len(t.Data))
+		at += uint64(t.Size)
 		at = (at + alignment - 1) &^ (alignment - 1)
 	}
 	for i, t := range tensors {
@@ -89,20 +120,35 @@ func WriteGGUF(path string, meta map[string]any, tensors []OutTensor) (err error
 	if _, err := f.Write(w.buf); err != nil {
 		return err
 	}
-	for i, t := range tensors {
-		if _, err := f.Write(t.Data); err != nil {
-			return err
+	for _, t := range tensors {
+		c := &counter{w: f}
+		if err := t.Write(c); err != nil {
+			return fmt.Errorf("tensor %q: %w", t.Name, err)
 		}
-		next := uint64(len(t.Data))
-		next = (next + alignment - 1) &^ (alignment - 1)
-		if gap := int(next) - len(t.Data); gap > 0 {
+		if c.n != t.Size {
+			return fmt.Errorf("tensor %q said %d bytes and wrote %d", t.Name, t.Size, c.n)
+		}
+		next := (t.Size + alignment - 1) &^ (alignment - 1)
+		if gap := next - t.Size; gap > 0 {
 			if _, err := f.Write(make([]byte, gap)); err != nil {
 				return err
 			}
 		}
-		_ = i
 	}
 	return nil
+}
+
+// counter is how the writer holds a tensor to the size it declared, which is
+// the one thing a streamed table cannot recover from getting wrong.
+type counter struct {
+	w io.Writer
+	n int
+}
+
+func (c *counter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += n
+	return n, err
 }
 
 // typeNumbers is ggmlTypes read the other way round.

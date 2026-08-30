@@ -1,7 +1,11 @@
 package tensors
 
 import (
+	"bytes"
+	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -142,4 +146,69 @@ func equalInts(a, b []int) bool {
 		}
 	}
 	return true
+}
+
+// A streamed file and a held one are the same bytes. The table carries offsets
+// decided before any tensor's data exists, so the two ways of producing that
+// data have to agree about every size — and a stream that says one number and
+// writes another must be refused rather than written.
+func TestWriteGGUFStreamMatchesTheHeldForm(t *testing.T) {
+	dir := t.TempDir()
+	meta := map[string]any{"general.architecture": "test", "test.count": uint32(3)}
+	held := []OutTensor{
+		{Name: "a.weight", Shape: []int{4, 2}, DType: "F32", Data: make([]byte, 32)},
+		{Name: "b.weight", Shape: []int{3}, DType: "F32", Data: []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}},
+	}
+	for i := range held[0].Data {
+		held[0].Data[i] = byte(i)
+	}
+	want := filepath.Join(dir, "held.gguf")
+	if err := WriteGGUF(want, meta, held); err != nil {
+		t.Fatal(err)
+	}
+
+	streamed := make([]OutStream, len(held))
+	for i, h := range held {
+		data := h.Data
+		streamed[i] = OutStream{Name: h.Name, Shape: h.Shape, DType: h.DType, Size: len(data),
+			Write: func(w io.Writer) error {
+				// A byte at a time, so that nothing about the file depends on
+				// a tensor arriving in one write.
+				for _, b := range data {
+					if _, err := w.Write([]byte{b}); err != nil {
+						return err
+					}
+				}
+				return nil
+			}}
+	}
+	got := filepath.Join(dir, "streamed.gguf")
+	if err := WriteGGUFStream(got, meta, streamed); err != nil {
+		t.Fatal(err)
+	}
+	a, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a, b) {
+		t.Fatalf("the two files differ: %d bytes against %d", len(a), len(b))
+	}
+}
+
+func TestWriteGGUFStreamRefusesAWrongSize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "short.gguf")
+	err := WriteGGUFStream(path, map[string]any{"general.architecture": "test"}, []OutStream{
+		{Name: "a.weight", Shape: []int{8}, DType: "F32", Size: 32,
+			Write: func(w io.Writer) error { _, err := w.Write(make([]byte, 16)); return err }},
+	})
+	if err == nil {
+		t.Fatal("a tensor that wrote half of what it declared was accepted")
+	}
+	if !strings.Contains(err.Error(), "wrote 16") {
+		t.Errorf("the error does not say what was written: %v", err)
+	}
 }
