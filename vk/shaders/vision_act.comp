@@ -1,0 +1,68 @@
+#version 450
+
+// The two elementwise passes of the tower: ggml's tabulated GELU, and a
+// residual added in.
+//
+// They share a kernel because they share a shape — one value a lane over a
+// buffer of patches by width — and because keeping them apart would put two
+// dispatches where the recording already has three hundred.
+//
+// GELU is not evaluated. ggml rounds its argument to fp16 and looks the answer
+// up in a table of sixty-five thousand, and a shader that evaluated the
+// polynomial would sit a few units in the last place away from the reference
+// at every one of five million values. shaders/moe_act.comp reads the same
+// table for the same reason; floatToHalf below is nn/half.go bit for bit.
+
+#define THREADS 256
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) buffer          DST  { float dst[];  };
+layout(std430, binding = 1) readonly buffer SRC  { float src[];  };
+layout(std430, binding = 2) readonly buffer GELU { float gelu[]; };
+
+layout(push_constant) uniform Push {
+    uint count;
+    uint op;      // 0: GELU in place; 1: dst += src
+} p;
+
+uint floatToHalf(float f) {
+    uint bits     = floatBitsToUint(f);
+    uint sign     = (bits >> 16) & 0x8000u;
+    int  exponent = int((bits >> 23) & 0xFFu) - 127 + 15;
+    uint mantissa = bits & 0x7FFFFFu;
+
+    if ((bits & 0x7FFFFFFFu) == 0u) return sign;
+    if (exponent >= 0x1F) {
+        if ((bits & 0x7F800000u) == 0x7F800000u && mantissa != 0u) return sign | 0x7E00u;
+        return sign | 0x7C00u;
+    }
+    if (exponent <= 0) {
+        if (exponent < -10) return sign;
+        mantissa |= 0x800000u;
+        uint shift = uint(14 - exponent);
+        uint value = mantissa >> shift;
+        uint rest  = mantissa & ((1u << shift) - 1u);
+        uint mid   = 1u << (shift - 1u);
+        if (rest > mid || (rest == mid && (value & 1u) == 1u)) value++;
+        return sign | value;
+    }
+    uint value = (uint(exponent) << 10) | (mantissa >> 13);
+    uint rest  = mantissa & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (value & 1u) == 1u)) value++;
+    return sign | value;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.count) return;
+    if (p.op == 1u) {
+        dst[i] += src[i];
+        return;
+    }
+    float v = dst[i];
+    // The two ends are left alone, as nn/gelu_table.go leaves them: GELU(x) is
+    // zero below and x above, to well beyond what fp16 can tell apart.
+    if (v <= -10.0)      dst[i] = 0.0;
+    else if (v >= 10.0)  dst[i] = v;
+    else                 dst[i] = gelu[floatToHalf(v)];
+}

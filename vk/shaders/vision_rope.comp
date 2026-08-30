@@ -1,0 +1,68 @@
+#version 450
+
+// The tower's rotation, which is GGML_ROPE_TYPE_VISION.
+//
+// The frequency ladder restarts at every section, which is the exact inverse
+// of the property the trunk's M-RoPE depends on: eighteen pairs turn by the
+// patch's row and eighteen by its column, and each counts its own exponent
+// from zero. nn.PrepareVision is the same rule on the processor and says why
+// the denominator is half the head rather than the head.
+//
+// The pairing is the half split — element i turns against element i + half —
+// and the two rotated projections are written out apart from the fused buffer
+// they were read from, because the values are what the attention reads and the
+// fused buffer is what it reads them from.
+
+#define THREADS 256
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer QKV { float qkv[]; };
+layout(std430, binding = 1) readonly  buffer POS { uint  pos[]; };
+layout(std430, binding = 2) writeonly buffer Q   { float q[];   };
+layout(std430, binding = 3) writeonly buffer K   { float k[];   };
+
+layout(push_constant) uniform Push {
+    uint dim;
+    uint heads;
+    uint head;    // the head's width
+    uint sect;    // one section, which is a quarter of the head
+    float base;
+} p;
+
+void main() {
+    uint pt = gl_WorkGroupID.x;
+    uint half_ = p.head / 2u;
+    uint pairs = p.heads * half_;
+
+    uint y = pos[pt * 2u];
+    uint x = pos[pt * 2u + 1u];
+
+    uint src = pt * 3u * p.dim;
+    uint dst = pt * p.dim;
+
+    for (uint e = gl_LocalInvocationID.x; e < pairs; e += THREADS) {
+        uint h = e / half_;
+        uint i = e % half_;
+
+        // Which axis this pair turns by, and how far into its own section it
+        // sits. VISION reads the first two sections and nothing past them.
+        uint sector = i % p.head;
+        uint axis   = sector < p.sect ? 0u : 1u;
+        uint within = sector < p.sect ? sector : sector - p.sect;
+
+        float at    = float(axis == 0u ? y : x);
+        float theta = at * pow(p.base, -2.0 * float(within) / float(half_));
+        float c = cos(theta), s = sin(theta);
+
+        uint lo = h * p.head + i;
+        uint hi = lo + half_;
+
+        float qre = qkv[src + lo],             qim = qkv[src + hi];
+        float kre = qkv[src + p.dim + lo],     kim = qkv[src + p.dim + hi];
+
+        q[dst + lo] = qre * c - qim * s;
+        q[dst + hi] = qre * s + qim * c;
+        k[dst + lo] = kre * c - kim * s;
+        k[dst + hi] = kre * s + kim * c;
+    }
+}

@@ -1,0 +1,104 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// The tower's product: Y = X * W' + bias, with W in fp16 and everything else
+// in float32.
+//
+// Nothing here is quantized. The projector ships as fp16 and llama.cpp runs it
+// that way, so the weight is read as two halves a word and widened, and the
+// accumulator is a float32 as ggml's is. That is why this is not
+// shaders/matmul.comp with another weight case bolted on: that kernel's whole
+// shape is the Q8_0 activation and the integer dot product, and neither exists
+// here.
+//
+// One tile is BM outputs by BN patches. A thread carries TM by TN of them and
+// the shared dimension is walked BK at a time, which is the ordinary shape;
+// what is worth naming is the stride. BK floats a row puts every row of the
+// tile on the same bank, and the reads of the inner loop — one row, every
+// thread — would then serialise. One float of padding walks them round.
+
+#define THREADS 256
+#define BM 64
+#define BN 64
+#define BK 32
+#define TM 4
+#define TN 4
+#define STRIDE (BK + 1)
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer W   { uint  w[];   };
+layout(std430, binding = 1) readonly  buffer X   { float x[];   };
+layout(std430, binding = 2) readonly  buffer PAR { float par[]; };
+layout(std430, binding = 3) writeonly buffer Y   { float y[];   };
+
+layout(push_constant) uniform Push {
+    uint outputs;   // rows of the weight, and the width of one row of Y
+    uint inputs;    // the shared dimension
+    uint patches;   // columns of X and of Y
+    uint base;      // where this matrix starts in w, counted in halves
+    uint bias;      // where its bias starts in par, or ~0 for none
+} p;
+
+shared float sw[BM * STRIDE];
+shared float sx[BN * STRIDE];
+
+void main() {
+    uint t  = gl_LocalInvocationID.x;
+    uint tr = t / (BN / TN);
+    uint tc = t % (BN / TN);
+
+    uint tiles = (p.outputs + uint(BM) - 1u) / uint(BM);
+    uint row0  = (gl_WorkGroupID.x % tiles) * uint(BM);
+    uint col0  = (gl_WorkGroupID.x / tiles) * uint(BN);
+
+    float acc[TM][TN];
+    [[unroll]] for (uint r = 0u; r < TM; r++) {
+        [[unroll]] for (uint c = 0u; c < TN; c++) acc[r][c] = 0.0;
+    }
+
+    for (uint k0 = 0u; k0 < p.inputs; k0 += uint(BK)) {
+        // The weights, two halves a word. A row of the matrix begins at an
+        // even element because p.inputs is even for every matrix this tower
+        // holds, so a pair never straddles two rows.
+        for (uint e = t; e < uint(BM) * uint(BK) / 2u; e += uint(THREADS)) {
+            uint r  = e / (uint(BK) / 2u);
+            uint kk = (e % (uint(BK) / 2u)) * 2u;
+            uint srow = row0 + r;
+            vec2 v = vec2(0.0);
+            if (srow < p.outputs && k0 + kk < p.inputs) {
+                v = unpackHalf2x16(w[(p.base + srow * p.inputs + k0 + kk) >> 1u]);
+            }
+            sw[r * uint(STRIDE) + kk]      = v.x;
+            sw[r * uint(STRIDE) + kk + 1u] = v.y;
+        }
+        for (uint e = t; e < uint(BN) * uint(BK); e += uint(THREADS)) {
+            uint c  = e / uint(BK);
+            uint kk = e % uint(BK);
+            uint scol = col0 + c;
+            sx[c * uint(STRIDE) + kk] =
+                (scol < p.patches && k0 + kk < p.inputs) ? x[scol * p.inputs + k0 + kk] : 0.0;
+        }
+        barrier();
+
+        [[unroll]] for (uint kk = 0u; kk < uint(BK); kk++) {
+            float a[TM], b[TN];
+            [[unroll]] for (uint r = 0u; r < TM; r++) a[r] = sw[(tr * uint(TM) + r) * uint(STRIDE) + kk];
+            [[unroll]] for (uint c = 0u; c < TN; c++) b[c] = sx[(tc * uint(TN) + c) * uint(STRIDE) + kk];
+            [[unroll]] for (uint r = 0u; r < TM; r++) {
+                [[unroll]] for (uint c = 0u; c < TN; c++) acc[r][c] += a[r] * b[c];
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint r = 0u; r < TM; r++) {
+        uint row = row0 + tr * uint(TM) + r;
+        if (row >= p.outputs) continue;
+        float add = (p.bias == ~0u) ? 0.0 : par[p.bias + row];
+        [[unroll]] for (uint c = 0u; c < TN; c++) {
+            uint col = col0 + tc * uint(TN) + c;
+            if (col < p.patches) y[col * p.outputs + row] = acc[r][c] + add;
+        }
+    }
+}

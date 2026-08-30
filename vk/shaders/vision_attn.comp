@@ -1,0 +1,111 @@
+#version 450
+
+// The tower's attention: every patch sees every patch, and there is no cache.
+//
+// An image is encoded whole and once, so there is nothing here of the text
+// side's ring, its slots or its mask — which is why this is its own kernel and
+// not a case of shaders/qwen_attn_gqa.comp. What it does have that the text
+// side does not is a key set as long as the query set, four thousand of them
+// for a large picture, and a workgroup that held every score would hold sixteen
+// kilobytes of them.
+//
+// So the scores are never all in memory at once. A workgroup takes one query
+// and one head and walks the keys a wave at a time, carrying the running
+// maximum and the running sum and rescaling what it has accumulated whenever
+// the maximum moves. It is the online softmax, and it lands on the same answer
+// as nn.SoftmaxGGML over the whole row for the same reason the two orders of a
+// sum land on the same total: exp(a-m) / sum, with m subtracted from every
+// term, does not depend on when m was known.
+
+#define THREADS 128
+#define MAXHEAD 128
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer Q     { float q[];     };
+layout(std430, binding = 1) readonly  buffer K     { float k[];     };
+layout(std430, binding = 2) readonly  buffer QKV   { float qkv[];   };
+layout(std430, binding = 3) writeonly buffer MIXED { float mixed[]; };
+
+layout(push_constant) uniform Push {
+    uint patches;
+    uint dim;
+    uint head;    // the head's width
+    float scale;
+} p;
+
+shared float sq[MAXHEAD];
+shared float sacc[MAXHEAD];
+shared float ss[THREADS];
+shared float red[THREADS];
+
+float reduceMax(uint t, float v) {
+    red[t] = v;
+    barrier();
+    for (uint s = THREADS / 2u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] = max(red[t], red[t + s]);
+        barrier();
+    }
+    float all = red[0];
+    barrier();
+    return all;
+}
+
+float reduceAdd(uint t, float v) {
+    red[t] = v;
+    barrier();
+    for (uint s = THREADS / 2u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    float all = red[0];
+    barrier();
+    return all;
+}
+
+void main() {
+    uint t  = gl_LocalInvocationID.x;
+    uint pt = gl_WorkGroupID.x;
+    uint h  = gl_WorkGroupID.y;
+    uint hd = p.head;
+
+    if (t < hd) {
+        sq[t]   = q[pt * p.dim + h * hd + t];
+        sacc[t] = 0.0;
+    }
+    barrier();
+
+    float m = -1.0e30;
+    float total = 0.0;
+
+    for (uint c0 = 0u; c0 < p.patches; c0 += uint(THREADS)) {
+        uint j = c0 + t;
+        float score = -1.0e30;
+        if (j < p.patches) {
+            float d = 0.0;
+            for (uint i = 0u; i < hd; i++) d += sq[i] * k[j * p.dim + h * hd + i];
+            score = d * p.scale;
+        }
+
+        float mine = max(m, reduceMax(t, score));
+        float e    = (j < p.patches) ? exp(score - mine) : 0.0;
+        ss[t] = e;
+        float chunk = reduceAdd(t, e);
+
+        // What was accumulated under the old maximum, brought to the new one.
+        float bring = exp(m - mine);
+        total = total * bring + chunk;
+
+        uint n = min(uint(THREADS), p.patches - c0);
+        if (t < hd) {
+            float a = sacc[t] * bring;
+            for (uint jj = 0u; jj < n; jj++) {
+                a += ss[jj] * qkv[(c0 + jj) * 3u * p.dim + 2u * p.dim + h * hd + t];
+            }
+            sacc[t] = a;
+        }
+        m = mine;
+        barrier();
+    }
+
+    if (t < hd) mixed[pt * p.dim + h * hd + t] = sacc[t] / total;
+}

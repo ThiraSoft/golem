@@ -1,0 +1,63 @@
+#version 450
+
+// ggml_norm over one patch: the mean subtracted, then a gain and a bias.
+//
+// Every norm of the text model is an RMS with a gain alone; this tower's are
+// NORM_TYPE_NORMAL, which is nn.LayerNormGGML and the same thing Gemma's
+// unified embedder reads. The mean is what makes it a second kernel rather
+// than a flag on shaders/norm.comp: that one never sums the values, only their
+// squares, and adding a first pass to it would cost the text model a sweep it
+// has no use for.
+//
+// The processor accumulates both sums in float64 and this accumulates them in
+// float32 across two hundred and fifty-six lanes. Over 1152 values the
+// difference is a part in ten million, which is four orders below the
+// tolerance the reference test holds the tower to.
+
+#define THREADS 256
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer SRC { float src[]; };
+layout(std430, binding = 1) readonly  buffer PAR { float par[]; };
+layout(std430, binding = 2) writeonly buffer DST { float dst[]; };
+
+layout(push_constant) uniform Push {
+    uint dim;
+    uint gain;   // where the gain starts in par
+    uint bias;   // where the bias starts
+    float eps;
+} p;
+
+shared float red[THREADS];
+
+float total(uint t, float mine) {
+    red[t] = mine;
+    barrier();
+    for (uint s = THREADS / 2u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    float all = red[0];
+    barrier();
+    return all;
+}
+
+void main() {
+    uint t    = gl_LocalInvocationID.x;
+    uint base = gl_WorkGroupID.x * p.dim;
+
+    float sum = 0.0;
+    for (uint i = t; i < p.dim; i += THREADS) sum += src[base + i];
+    float mean = total(t, sum) / float(p.dim);
+
+    float sum2 = 0.0;
+    for (uint i = t; i < p.dim; i += THREADS) {
+        float d = src[base + i] - mean;
+        sum2 += d * d;
+    }
+    float scale = inversesqrt(total(t, sum2) / float(p.dim) + p.eps);
+
+    for (uint i = t; i < p.dim; i += THREADS) {
+        dst[base + i] = (src[base + i] - mean) * scale * par[p.gain + i] + par[p.bias + i];
+    }
+}
