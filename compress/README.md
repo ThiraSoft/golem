@@ -456,6 +456,82 @@ a half of eight cores — and refuses to write a file it could not calibrate.
   mean of 39.73 against 39.80 for one bound chosen for the whole model. The
   spread is the choosing, not the choice.
 
+## What this is built on
+
+None of this is a new idea; the value is in what got kept, what got measured
+away, and how the pieces fit a workgroup's shared memory. One line each for
+what golem took:
+
+- **QTIP** — Tseng, Sun, Hou, De Sa, *QTIP: Quantization with Trellises and
+  Incoherence Processing*, NeurIPS 2024, arXiv:2406.11235. The bitshift trellis
+  itself: state as the last *L* bits of the code stream, the 1MAD hash that
+  turns a state into a Gaussian sample, and the fact that a computed codebook
+  needs no table. `nn/t4g.go`, `compress/trellis.go`.
+- **Trellis-coded quantization** — Marcellin and Fischer, *Trellis Coded
+  Quantization of Memoryless and Gauss-Markov Sources*, IEEE Transactions on
+  Communications, vol. 38, no. 1, 1990. The older idea QTIP builds on: code a
+  sequence as a path through a state machine so the effective dimension is the
+  sequence, not the block. This file calls it "TCQ" throughout without saying
+  whose.
+- **Viterbi** — A. J. Viterbi, *Error Bounds for Convolutional Codes and an
+  Asymptotically Optimum Decoding Algorithm*, IEEE Transactions on Information
+  Theory, vol. 13, no. 2, 1967. The minimum-cost path search the encoder runs,
+  named in `compress/trellis.go` and `vk/shaders/viterbi_tcq.comp` with no
+  source given.
+- **Tail-biting convolutional codes** — H. H. Ma and J. K. Wolf, *On Tail
+  Biting Convolutional Codes*, IEEE Transactions on Communications, vol.
+  COM-34, no. 2, 1986. The construction behind the section above: close a
+  path on itself instead of priming it, which is where the 0.24 dB of
+  "constraint is cheap" and the padded layout's twelve priming bits both
+  come from.
+- **QuIP#** — Tseng, Chee, Sun, Kuleshov, De Sa, *QuIP#: Even Better LLM
+  Quantization with Hadamard Incoherence and Lattice Codebooks*, ICML 2024.
+  The E8 lattice codebook and the Hadamard incoherence processing this format
+  used before the trellis replaced the codebook; D4 was chosen over E8 because
+  E8's shell does not fit a workgroup's shared memory, a comparison only worth
+  making with QuIP# named.
+- **Conway and Sloane**, *Sphere Packings, Lattices and Groups*, Springer,
+  1988. The D4 lattice and its canonical enumeration by squared norm then
+  lexicographically — what `nn/d4g_tables.go` implemented before it was
+  deleted.
+- **Lloyd** — S. P. Lloyd, *Least Squares Quantization in PCM*, IEEE
+  Transactions on Information Theory, vol. 28, no. 2, 1982, circulated as a
+  Bell Labs memorandum in 1957. The scalar codebook the `L8G` tier used, and
+  the baseline the table-free comparison measured against; the 25-year gap
+  between writing and publication is not a typo.
+- **AWQ** — Lin, Tang, Tang, Yang, Chen, Wang, Xiao, Dang, Gan, Han,
+  *AWQ: Activation-aware Weight Quantization for LLM Compression and
+  Acceleration*, MLSys 2024. The per-column salience scale, raised to α = 0.5
+  and normalised by its geometric mean — "the salience, which is most of what
+  the format is" above is a description of AWQ with a bound added, worth
+  twenty points of perplexity on Qwen3-0.6B by golem's own measurement.
+- **QuIP** — Chee, Cai, Kuleshov, De Sa, *QuIP: 2-Bit Quantization of Large
+  Language Models With Guarantees*, NeurIPS 2023, arXiv:2307.13304. The
+  original argument for incoherence processing: a random-sign Hadamard
+  rotation makes every tensor statistically identical, which is what lets one
+  codebook serve every matrix of every model. QuIP# above is the practical
+  form this repository actually runs.
+- **GPTQ** — Frantar, Ashkboos, Hoefler, Alistarh, *GPTQ: Accurate
+  Post-Training Quantization for Generative Pre-trained Transformers*, ICLR
+  2023, arXiv:2210.17323. The error-compensation pass in `compress/gptq.go`,
+  measured at 0.15 points and mostly deleted for it — a negative result is
+  only useful if the reader knows what was tried.
+- **AQLM** — Egiazarian, Panferov, Kuznedelev, Frantar, Babenko, Alistarh,
+  *Extreme Compression of Large Language Models via Additive Quantization*,
+  ICML 2024, arXiv:2401.06118. Named above in framing what a codebook-plus-scheme
+  format is compared against; additive quantization is the other route to the
+  same sub-4-bit territory this format does not take.
+- **Shannon**, *Coding Theorems for a Discrete Source With a Fidelity
+  Criterion*, IRE International Convention Record, vol. 7, part 4, 1959. The
+  rate-distortion bound everything above is measured against — 18.06 dB at
+  three bits, 24.08 at four, for a memoryless Gaussian.
+
+Not included: a 2026 preprint proposing a differentiable relaxation of TCQ via
+the BCJR forward-backward algorithm exists (arXiv:2605.10655) and is relevant
+to where this codec could go next, but it reports results on a 1B model at
+2 bits and nothing here has tried it — it is a pointer for future work, not a
+source this format is built on.
+
 ## Traps
 
 - The calibration corpus must be long **and** disjoint from the evaluation. An
