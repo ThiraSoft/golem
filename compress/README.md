@@ -166,6 +166,62 @@ when a K-quant is already at hand. This is a property of the scheme, not the
 codebook: a converter reads whatever floats it is given back out of whichever
 format they arrived in, and neither the salience nor the rotation cares.
 
+### What three bits buys, and what is not three bits
+
+`T3G` cuts the trellis's window in half: four bits a weight down to three,
+520 bits of path down to 391 — twelve for the first weight in a window plus
+three for each of the 127 after it — with the same two eight-bit steps per
+128-weight row. The seven padding bits are what keep the row on a byte
+boundary anyway: 2 (steps) + 391 (path) = 393 bits, and 52 bytes is 416, so
+seven bits ride along unused rather than the block spilling into a 53rd byte
+a shader would have to read and mask around. They cost nothing measured —
+the row is 3.25 bits a weight, not 3.0555, and that eighth of a bit is the
+price already visible in the table at the top of this file.
+
+A `.golem` T3G file is not three bits throughout. `golemquant` still refuses
+to write a head that narrow — the logit head is still worth more bits than
+the body, for the reason above — so it defaults to four-bit `T4G` there.
+State the body's rate, the head's rate, and the weighted rate together, or a
+file's size will get compared against a Q3_K figure that assumes a codec
+this uneven never happens:
+
+| model | body | head | weighted | file |
+|---|---|---|---|---|
+| Qwen3-0.6B | 3.25 (T3G) | 4.1875 (T4G) | 3.509 | 255.0 MiB |
+| Qwen3-4B | 3.25 (T3G) | 4.1875 (T4G) | 3.347 | 1.573 GiB |
+
+The 4B sits closer to the nominal 3.25 than the 0.6B because the head is a
+smaller fraction of a bigger model's weights — about a tenth here, versus
+about a quarter on the 0.6B — so the four-bit tax on it moves the weighted
+rate less.
+
+Measured on Qwen3-4B, same corpus and eight windows as the T4G table above,
+against llama.cpp's own floor at three bits — Q3_K_M at 1.93 GiB, Q3_K_S at
+1.76 GiB:
+
+| | size | PPL | KL | top-1 | top-5 |
+|---|---|---|---|---|---|
+| Q3_K_M | 1.93 GiB | 24.0253 | 0.2453 | 79.8 % | 97.7 % |
+| Q3_K_S | 1.76 GiB | 24.9781 | 0.3336 | 77.9 % | 96.7 % |
+| `.golem` T3G | **1.573 GiB** | **21.1078** | **0.1771** | **83.1 %** | **98.3 %** |
+
+Smaller than either K-quant tier and ahead on every axis — and unlike the
+T4G-vs-Q4_K_M gap above, this one clears the paired test rather than falling
+inside it. The same eight windows, tested the same way: T3G's mean per-window
+gap against Q3_K_M is −0.1295 nats/token, standard error 0.0441, t = 2.94 on
+seven degrees of freedom, above the two-tailed 5 % bound, and T3G wins six
+windows of eight (seven of eight against Q3_K_S, t = 5.20). Three bits is a
+cliff for the K-quants — 0.17 GiB between Q3_K_S and Q3_K_M buys them less
+than a point of perplexity, a quarter of what the next 0.4 GiB up to Q4_K_M
+buys — and the trellis clears that cliff instead of sliding down it with them.
+
+Qwen3-0.6B, same corpora, calibrated on 2048 tokens: 34.8552 against bf16's
+28.8521, KL 0.2498, top-1 73.6 %, top-5 96.4 %, at 3.509 bpw weighted and
+255.0 MiB. `golemquant`'s conversion log reports how much of that ran where —
+4022 M weights through the card and 0 M through the processor's k=3
+fallback on the 4B — which is what a shader landing the new codebook should
+show; a large processor figure would mean the kernel was never reached.
+
 ### The head, which is the one tensor worth more bits
 
 `-head 5` writes `token_embd` — the tied logit head — in the wide tier and
