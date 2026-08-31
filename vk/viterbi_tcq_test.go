@@ -123,6 +123,12 @@ func viterbiAgainstCPU(t *testing.T, kbits int) {
 // it reads, so a state that expands to anything else is a file that reads
 // differently from what the encoder measured.
 func TestViterbiPathDecodesToItsReconstruction(t *testing.T) {
+	for _, k := range []int{TrellisGPUK, TrellisGPUK5, TrellisGPUK3} {
+		t.Run(fmt.Sprintf("k%d", k), func(t *testing.T) { viterbiPathDecodesToItsReconstruction(t, k) })
+	}
+}
+
+func viterbiPathDecodesToItsReconstruction(t *testing.T, kbits int) {
 	d, err := Open()
 	if err != nil {
 		t.Skip(err)
@@ -141,6 +147,9 @@ func TestViterbiPathDecodesToItsReconstruction(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer e.Close()
+	if err := e.UseK(kbits); err != nil {
+		t.Fatal(err)
+	}
 
 	rec := append([]float32(nil), src...)
 	states := make([]uint16, n)
@@ -163,7 +172,7 @@ func TestViterbiPathDecodesToItsReconstruction(t *testing.T) {
 		for t2 := 1; t2 < TrellisGPUSeq; t2++ {
 			prev := uint32(states[q+t2-1])
 			cur := uint32(states[q+t2])
-			if want := (prev << TrellisGPUK) & (1<<TrellisGPUL - 1); cur>>TrellisGPUK<<TrellisGPUK&(1<<TrellisGPUL-1) != want {
+			if want := (prev << uint(kbits)) & (1<<TrellisGPUL - 1); cur>>uint(kbits)<<uint(kbits)&(1<<TrellisGPUL-1) != want {
 				t.Fatalf("sequence at %d, step %d: %012b does not follow %012b", q, t2, cur, prev)
 			}
 		}

@@ -136,7 +136,7 @@ func main() {
 				defer enc.Close()
 				var onCard, offCard int64
 				compress.TrellisPathAccel = func(norm []float32, o compress.TrellisOpts, states []uint16) bool {
-					// The kernels are compiled for two rates and one
+					// The kernels are compiled for three rates and one
 					// shape. Anything else falls back rather than quietly
 					// answering a different question.
 					if !vk.TrellisGPUHasK(o.K) || o.L != vk.TrellisGPUL || o.Seq != vk.TrellisGPUSeq {

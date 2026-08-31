@@ -28,13 +28,15 @@
 //
 // k = 3, 4 and 5. Widening k narrows the trellis rather than the planes: the
 // prefix count is 2^(L−k), so five bits halves the backpointers where three
-// doubles them. What changes is how a backpointer is stored: five bits spend
-// a byte each over 128 prefixes (8 KiB), four bits a nibble each over 256
-// (16 KiB), and three bits — the narrow tier, going the other way — pack ten
-// to a word instead of eight, wasting two of the word's 32 bits rather than
-// widening every field, over 512 prefixes (25.6 KiB). All three fit beside
-// the 32 KiB of costs and the 2.5 KiB of small change; k = 3 is the tightest,
-// with under 4 KiB of the 64 to spare.
+// doubles them. At k = 4 and k = 5 that halving and the doubled field width
+// (a nibble against a byte) cancel exactly, so both wide tiers spend the same
+// 16 KiB and the packing question never comes up: 8 fields and 4 fields to a
+// word both divide 32 evenly. k = 3 is the first rate where it doesn't — 3 is
+// the first field width that does not divide 32 — so its fields pack ten to a
+// word instead of a clean eight or four, wasting two of the word's 32 bits,
+// over 512 prefixes (25.6 KiB). All three fit beside the 32 KiB of costs and
+// the 2.5 KiB of small change; k = 3 is the tightest, with under 4 KiB of the
+// 64 to spare.
 #ifndef KBITS
 #define KBITS 4
 #endif
@@ -59,15 +61,17 @@ const uint K = uint(KBITS);
 const uint L = 12u;
 const uint T = 128u;
 const uint NSTATES = 1u << L;       // 4096
-const uint NPREFIX = 1u << (L - K); // 256
-const uint FAN = 1u << K;           // 16
+const uint NPREFIX = 1u << (L - K); // 256 at k=4; 128 at k=5; 512 at k=3
+const uint FAN = 1u << K;           // 16 at k=4; 32 at k=5; 8 at k=3
 const uint SHIFT = L - K;
 
 // 32 KiB of costs, plus backpointers sized to the tier: a byte each over 128
-// prefixes at five bits (8 KiB), a nibble each over 256 at four (16 KiB), or
-// ten 3-bit fields to a word over 512 at three (25.6 KiB, ceiling-divided —
-// 512 does not split evenly by tens). Plus 2.5 KiB of small change: costliest
-// at k = 3, at 60.1 KiB against the 64 the card allows.
+// prefixes at five bits, a nibble each over 256 at four — both 16 KiB, the
+// halved prefix count and the doubled field width cancelling exactly — or ten
+// 3-bit fields to a word over 512 at three (25.6 KiB, ceiling-divided — the
+// dividend is T*NPREFIX = 65536, and 65536 does not split evenly by tens).
+// Plus 2.5 KiB of small change: costliest at k = 3, at 60.1 KiB against the
+// 64 the card allows.
 #if KBITS == 5
 #define BPPERWORD 4u
 #define BPWIDTH   8u
