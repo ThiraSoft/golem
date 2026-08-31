@@ -4,8 +4,13 @@ A checkpoint in, a `.golem` out. One codebook, and a scheme around it:
 
 | | block | bits/weight | tensor type |
 |---|---|---|---|
-| `T4G` | 128 weights in 67 bytes | 4.19 | 1003 |
-| `T5G` | 128 weights in 83 bytes | 5.19 | 1004 |
+| `T3G` | 128 weights in 52 bytes | 3.25 | 1000 |
+| `T4G` | 128 weights in 67 bytes | 4.19 | 1001 |
+| `T5G` | 128 weights in 83 bytes | 5.19 | 1002 |
+
+`T3G` is the narrow body of a small model or a tight budget, never the head —
+a logit head this narrow spends bits where they are worth least, and
+`golemquant` refuses to write one.
 
 The file is a GGUF. Same container, so the vocabulary, the rope base and the
 chat template travel unchanged; what is new is a tensor type llama.cpp does not
@@ -30,7 +35,9 @@ either format reached — so the lattice was retired rather than kept beside it.
 
 `golem.hadamard_group` and `golem.scale_block` in the metadata say what the
 file was written with — both name the scheme, and are unchanged by which
-codebook a block holds. `general.file_type` is 1003 for `T4G`, 1004 for `T5G`.
+codebook a block holds. `general.file_type` is 1000 for `T3G`, 1001 for
+`T4G`, 1002 for `T5G` — the body's tier, since the body is what the file is
+named for even when the head is written wider.
 
 The state is the last twelve bits of the code stream, so
 weight *t* reads the twelve bits at offset 4·*t* and hashes them:

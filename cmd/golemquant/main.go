@@ -39,8 +39,8 @@ func main() {
 	alpha := flag.Float64("alpha", 0.5, "salience exponent; 0 leaves the columns alone")
 	clamp := flag.Float64("clamp", 24, "largest factor the salience may scale a column by, either way; 0 lets it run")
 	hadGroup := flag.Int("hadamard", 128, "rotation group; 0 leaves the weights unrotated")
-	headBits := flag.Int("head", 4, "bits a weight for the logit head, 4 or 5. Five is what llama.cpp's K-quant mixes do in spirit — Qwen3-4B's Q4_K_M spends 6.56 bits there and 4.95 on the rest — and on Qwen3-0.6B it takes about three fifths of what an unquantized head is worth, for six percent of the file rather than seventy-three. Four is the default because the smallest file is the point")
-	bodyBits := flag.Int("bits", 4, "trellis body rate in bits a weight: 4 or 5")
+	headBits := flag.Int("head", 4, "bits a weight for the logit head, 3, 4 or 5, and never narrower than -bits. Four or five is what llama.cpp's K-quant mixes do in spirit — Qwen3-4B's Q4_K_M spends 6.56 bits there and 4.95 on the rest — and on Qwen3-0.6B it takes about three fifths of what an unquantized head is worth, for six percent of the file rather than seventy-three. Four is the default whatever the body is: on a three-bit body that is a bit more, which is the same mix in spirit")
+	bodyBits := flag.Int("bits", 4, "trellis body rate in bits a weight: 3, 4 or 5")
 	scaleBlk := flag.Int("scale", 32, "weights sharing one step code; 32 is what the format stores")
 	ntok := flag.Int("tokens", 8192, "calibration tokens")
 	ctx := flag.Int("ctx", 512, "calibration window")
@@ -57,11 +57,18 @@ func main() {
 	salFile := flag.String("salience", "", "read the sites from this file, or write them to it after measuring; the salience does not depend on -alpha, -clamp or the codec, and measuring it again for each of them is most of a sweep's wall clock")
 	flag.Parse()
 
-	if *headBits != nn.T4GK && *headBits != nn.T5GK {
-		must(fmt.Errorf("golemquant: the head is %d or %d bits, not %d", nn.T4GK, nn.T5GK, *headBits))
+	if *headBits != nn.T3GK && *headBits != nn.T4GK && *headBits != nn.T5GK {
+		must(fmt.Errorf("golemquant: the head is %d, %d or %d bits, not %d", nn.T3GK, nn.T4GK, nn.T5GK, *headBits))
 	}
-	if *bodyBits != nn.T4GK && *bodyBits != nn.T5GK {
-		must(fmt.Errorf("golemquant: the body is %d or %d bits, not %d", nn.T4GK, nn.T5GK, *bodyBits))
+	if *bodyBits != nn.T3GK && *bodyBits != nn.T4GK && *bodyBits != nn.T5GK {
+		must(fmt.Errorf("golemquant: the body is %d, %d or %d bits, not %d", nn.T3GK, nn.T4GK, nn.T5GK, *bodyBits))
+	}
+	// The head makes the logits rather than absorbing the layers-after error a
+	// hidden site does, and llama.cpp's K-quant mixes have always spent more
+	// there than on the rest — a head narrower than the body would spend bits
+	// where they are worth least.
+	if *headBits < *bodyBits {
+		must(fmt.Errorf("golemquant: a %d-bit head under a %d-bit body spends the bits where they are worth least", *headBits, *bodyBits))
 	}
 	// The step is one per sixty-four weights and the format says so; the flag
 	// is a scale block's and there is nothing here to choose.
@@ -173,10 +180,7 @@ func main() {
 	// width are what a workgroup's shared memory holds, the step is one per
 	// sixty-four weights, and the codebook has no parameter at all.
 	params := compress.D4Params{ScaleBlock: nn.T4GBlock, HadGroup: *hadGroup}
-	dtype := "T4G"
-	if *bodyBits == nn.T5GK {
-		dtype = "T5G"
-	}
+	dtype := dtypeFor(*bodyBits)
 	// What a row has to be a multiple of: a trellis sequence.
 	unit := nn.T4GSeq
 
@@ -430,9 +434,9 @@ func main() {
 		// the ceiling, at seventy-three percent more file — reads 30.30 and
 		// 0.0662. Five bits takes three fifths of the way there for six
 		// percent of the file.
-		if *headBits == nn.T5GK &&
+		if *headBits != *bodyBits &&
 			(name == "output.weight" || (name == "token_embd.weight" && *embd != "bf16")) {
-			pl.dtype = "T5G"
+			pl.dtype = dtypeFor(*headBits)
 		}
 		if len(t.Shape) == 3 {
 			// A stack of experts: ne2 of them, each ne1 rows of ne0. They are
@@ -573,9 +577,11 @@ func main() {
 	}
 	meta["golem.hadamard_group"] = uint32(*hadGroup)
 	meta["golem.scale_block"] = uint32(*scaleBlk)
-	meta["general.file_type"] = uint32(1003)
+	// The body's tier is what the file is called: a three-bit body under a
+	// four-bit head is a T3G file, whatever the head turns out to be.
+	meta["general.file_type"] = uint32(fileTypeOf(*bodyBits))
 	meta["golem.trellis.seq"] = uint32(nn.T4GSeq)
-	meta["golem.trellis.bits"] = uint32(nn.T4GK)
+	meta["golem.trellis.bits"] = uint32(*bodyBits)
 	meta["golem.trellis.state"] = uint32(nn.T4GL)
 
 	must(checkVectors(out, rotatedBy))
@@ -587,6 +593,34 @@ func main() {
 	fmt.Printf("\n%.0f M weights at %.3f bits each — %s\n",
 		count/1e6, bits/count, sizeOf(int(bits/8)))
 	fmt.Printf("written to %s in %s\n", *dst, time.Since(t0).Round(time.Second))
+}
+
+// dtypeFor is the tensor type a rate writes: the same string nn.QuantOf reads
+// back.
+func dtypeFor(bits int) string {
+	switch bits {
+	case nn.T3GK:
+		return "T3G"
+	case nn.T5GK:
+		return "T5G"
+	default:
+		return "T4G"
+	}
+}
+
+// fileTypeOf is general.file_type's value for the body's rate: 1000, 1001 or
+// 1002 for T3G, T4G or T5G. This is a separate table from tensors' tensor-type
+// switch on purpose — that one already owns the fact of which id a dtype
+// string is, and a second mapping here would be the same fact written twice.
+func fileTypeOf(bodyBits int) int {
+	switch bodyBits {
+	case nn.T3GK:
+		return 1000
+	case nn.T5GK:
+		return 1002
+	default:
+		return 1001
+	}
 }
 
 // relErrCeiling is what a matrix may differ from its original by and still be
