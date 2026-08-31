@@ -159,9 +159,9 @@ type Stack struct {
 	embedGolem *Pipeline
 	// embedPre is the head's vector, uploaded when that table is bound.
 	embedPre *Buffer
-	embedSet        *Set
-	ids             *Buffer // one identifier a column, negative where the caller wrote its own
-	embedOf         embedPush
+	embedSet *Set
+	ids      *Buffer // one identifier a column, negative where the caller wrote its own
+	embedOf  embedPush
 
 	routerIn  *Buffer // the residual under the router's own norm and scale
 	routerOut *Buffer // one logit per expert
@@ -317,7 +317,6 @@ func (s *Stack) SetEmbedding(table *Buffer, cols int, scale float32) error {
 	return nil
 }
 
-// SetEmbeddingQ40 gives the stack a Q4_0 token embedding table to read on-card.
 // SetEmbeddingGolem points the stack at a .golem embedding table, so that a
 // token crosses the bus as an identifier rather than as a row of floats. pre is
 // the head's vector, which this undoes along with the rotation.
@@ -370,6 +369,7 @@ func (s *Stack) SetEmbeddingGolem(table, steps *Buffer, cols int, pre []float32,
 	return nil
 }
 
+// SetEmbeddingQ40 gives the stack a Q4_0 token embedding table to read on-card.
 func (s *Stack) SetEmbeddingQ40(table *Buffer, cols int, scale float32) error {
 	if cols != s.dim {
 		return fmt.Errorf("vk: the embedding is %d wide and the stream is %d", cols, s.dim)

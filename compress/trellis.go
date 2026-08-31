@@ -3,9 +3,9 @@ package compress
 // Trellis-coded quantization: the codebook with no dimension.
 //
 // A lattice quantizes d weights at a time and pays for its shell with a table,
-// which is why this repository settled on D4 — E8 at the same rate wants two
-// hundred mebibytes of decode table and a workgroup has thirty-two kibibytes.
-// The trellis escapes that trade entirely. It codes a whole sequence, T weights
+// which is why this repository settled on D4 before the trellis replaced it —
+// E8 at the same rate wants two hundred mebibytes of decode table and a
+// workgroup has thirty-two kibibytes. The trellis escapes that trade entirely. It codes a whole sequence, T weights
 // long, as one path through a state machine, so the effective dimension is T
 // rather than four; and the value of a state is *computed* from the state
 // rather than looked up, so there is no table at all.

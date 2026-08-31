@@ -7,7 +7,7 @@
 // sequences at once. A workgroup owns one sequence and finds the cheapest path
 // through the bitshift trellis, which is the half of a conversion that takes
 // the afternoon: 2^L operations a weight, four thousand at L=12, against the
-// eight the lattice needs. It is also the half that depends on nothing outside
+// eight the lattice this format replaced needed. It is also the half that depends on nothing outside
 // its own sequence, which is the whole reason it belongs here.
 //
 // Three decisions make it fit the sixty-four kibibytes a workgroup is given,

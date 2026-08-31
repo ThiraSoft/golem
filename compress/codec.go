@@ -441,8 +441,8 @@ func VQ(w []float32, rows, cols int, o Opts, seed int64) []float32 {
 					s += float64(src[i]) * float64(src[i])
 				}
 				sc := float32(math.Sqrt(s / float64(sb)))
-				// The lattice stores this number, so it is rounded to what
-				// the file can hold. A trellis does not: its step is fitted
+				// The lattice used to store this number, so it was rounded to
+				// what the file could hold. A trellis does not: its step is fitted
 				// to the path by least squares below and rounded there, and
 				// this one only normalises the block on the way in. Rounding
 				// it here would move the path — by four percent on the

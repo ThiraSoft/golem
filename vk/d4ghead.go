@@ -90,9 +90,9 @@ func (h *D4GHead) Logits(hidden, out []float32) error {
 	return nil
 }
 
-// Table is the head matrix and its lattice, so that a caller holding both this
-// and a Stack can have the card look a token up for itself.
-func (h *D4GHead) Table() (weights, lattice *Buffer, cols int) {
+// Table is the head matrix and its step grid, so that a caller holding both
+// this and a Stack can have the card look a token up for itself.
+func (h *D4GHead) Table() (weights, steps *Buffer, cols int) {
 	return h.m.weights, h.k.table, h.cols
 }
 

@@ -19,9 +19,9 @@
 // and five bits an offset lands on any bit of a byte, so the window can need
 // three bytes; see the KBITS==3 and KBITS==5 branches below.
 //
-// Workgroup: 128 threads -> 16 output rows, 8 lanes per row, which is
-// matvec_d4g.comp's shape. COLUMNS is how many activations one reading of the
-// weights answers.
+// Workgroup: 128 threads -> 16 output rows, 8 lanes per row, the shape every
+// tier's matvec shader shares. COLUMNS is how many activations one reading of
+// the weights answers.
 
 #ifndef COLUMNS
 #define COLUMNS 1

@@ -46,7 +46,7 @@ const (
 // format that has no lattice code at all came to need a name for the question.
 func (q Quant) Golem() bool {
 	switch q {
-	case T4G, T5G, T3G:
+	case T3G, T4G, T5G:
 		return true
 	}
 	return false

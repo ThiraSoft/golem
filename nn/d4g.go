@@ -26,13 +26,6 @@ import (
 	"strings"
 )
 
-const (
-	// D4Block is how many weights share one scale and one run of codes.
-	D4Block = 64
-	// D4SubBlock is how many weights share one step.
-	D4SubBlock = 32
-)
-
 // d4Steps is what the eight bits of a step code name.
 var d4Steps [256]float32
 
