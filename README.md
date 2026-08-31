@@ -25,6 +25,7 @@ A golem is inert matter given a voice. That is what these engines do to a file o
 - **Verified, not asserted**: no layer is deemed correct until its intermediate activations match llama.cpp or PyTorch, waypoint by waypoint.
 - **Fast on CPU**: keeps pace with `llama.cpp` on tuned AVX2 kernels — ahead reading prompts, level generating, except on the smallest model, where the weights stop being the cost and it says so.
 - **Vulkan GPU**: bound through `purego` rather than cgo. Measured on AMD against `llama.cpp`'s own Vulkan build: ahead of it reading prompts on all five models, and generating on both Gemma ones. The table below says where it is behind, and by how much.
+- **Its own weight format**: `.golem` is 18 % smaller than llama.cpp's Q3_K_M on Qwen3-4B and ahead of it on every measure — a trellis codebook with no lookup table, converted on the card. [What it costs](#-golem--the-engines-own-weight-format).
 - **Serves several clients at once**: `-parallel N` holds N conversations and carries a token for each of them through one read of the weights, on the card as well as on the processor — Qwen3.8 on the card excepted, for a reason [written below](#-several-conversations-one-pass).
 
 ## 🚀 Quickstart
@@ -154,6 +155,57 @@ Attention is the one line where the gap is a shape rather than a margin: golem d
 In absolute terms, on an i7-9700K with eight threads and Q4_0 weights: Gemma E2B draws 22.6 tokens a second and reads 204; the 12B, 5.0 and 42; the 26B A4B, 13.1 and 51; Qwen3 4B, 14.6 and 110. Pocket TTS speaks at ×2.94 real time in French, ×6.81 in English.
 
 **The 0.6B is the one this engine loses**, and [`qwen/README.md`](qwen/README.md) says why: at 320 MB the weights fit close enough that the memory bus stops being the limit, and what is left is arithmetic, where llama.cpp's kernels win. This engine is built for the regime where reading the weights is the cost, and it says so where it is not.
+
+## 🗜️ `.golem` — the engine's own weight format
+
+golem reads GGUF like everyone else. It also writes a format of its own, and on the
+model below it is **smaller than llama.cpp's three-bit quantization while reading
+closer to the original than its four-bit one**.
+
+Qwen3-4B, 4088 tokens of wikitext, every row measured against the same bf16
+reference:
+
+| | size | perplexity | KL divergence | top-1 agreement |
+| --- | --- | --- | --- | --- |
+| bf16 | 7.5 GiB | 19.29 | — | — |
+| Q4_K_M | 2.33 GiB | 20.04 | 0.0715 | 90.1 % |
+| **`.golem` T4G** | **1.96 GiB** | 20.38 | **0.0526** | **90.6 %** |
+| Q3_K_M | 1.93 GiB | 24.03 | 0.2453 | 79.8 % |
+| **`.golem` T3G** | **1.57 GiB** | **21.11** | **0.1771** | **83.1 %** |
+
+Read the last two rows together: **T3G is 18 % smaller than Q3_K_M and ahead of it
+on every column**, by nearly three points of perplexity and a third of the
+divergence. The evaluation is paired — both models see the same tokens in the same
+eight windows — so the gap is testable, and it is not noise: t = −2.94, T3G ahead
+in six windows of eight.
+
+Two things do the work, and neither is new:
+
+- **A trellis instead of a table.** The codebook is a state machine, not a list of
+  points: a weight is twelve bits of the code stream hashed by four instructions,
+  so there is nothing to look up and nothing to keep in shared memory. That is
+  what opens the four-bit tier, where a lattice's table would need 493 KiB against
+  the 32 a GPU workgroup has. The structure is QTIP's bitshift trellis.
+- **A rotation and a salience scale**, applied per calibration site rather than
+  per matrix. This is most of the format's value: without the scale, the same
+  codebook costs twenty points of perplexity instead of one and a half.
+
+Three widths — T3G at 3.25 bits a weight, T4G at 4.19, T5G at 5.19 for the logit
+head, which is worth more bits than the layers before it. A three-bit file carries
+a four-bit head by default, so the 1.57 GiB above is 3.35 bits a weight overall,
+not 3.25.
+
+```bash
+go build ./cmd/golemquant
+./golemquant -model Qwen3-4B-BF16.gguf -out Qwen3-4B.golem -bits 3 -calib wiki.txt
+./golem-cli -model Qwen3-4B.golem -vulkan -p "..."
+```
+
+The file is a GGUF — same container, same vocabulary, same chat template — with a
+tensor type llama.cpp does not know, which is why it is named `.golem` rather than
+`.gguf`: the extension is the warning that only this engine reads it. The
+conversion runs on the card, and [`compress/README.md`](compress/README.md) has
+the method, the measurements, and a list of what was tried and did not work.
 
 ## 👁️ Multimodal (Vision & Audio)
 
