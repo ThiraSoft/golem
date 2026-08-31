@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"strings"
 )
 
 const ggufMagic = 0x46554747 // "GGUF", little-endian
@@ -222,8 +223,41 @@ var ggmlTypes = map[uint32]string{
 	1001: "T4G",
 	1002: "T5G",
 	// 1003 and 1004 were T4G and T5G, and 1000-1002 were the lattice, Lloyd and
-	// the wide lattice. None is reused: a file that still names one should fail
-	// to load rather than be read as a tier it is not.
+	// the wide lattice: 1001 and 1002 changed geometry, so an old file fails on
+	// row size before it fails on meaning. 1000 did not — D4G was 26 bytes per
+	// 64 weights and T3G is 52 per 128, the same 3.25 bits a weight — so a
+	// pre-trellis D4G file passes the type lookup and the row-size check and
+	// decodes as a trellis tier, silently reading `golem.d4.hadamard_group`'s
+	// group as absent and every row's salience as nonsense. checkTrellisMeta
+	// below is what actually catches this one.
+}
+
+// checkTrellisMeta refuses two things a type number and a row size cannot
+// catch on their own: a file still carrying a `golem.d4.*` key from the
+// lattice era, and a trellis-tier tensor (1000-1002) with no
+// `golem.trellis.bits` to say which tier wrote it. Type 1000 is numerically
+// identical between D4G and T3G — same block size, same bytes — so this is
+// the only place a pre-trellis file is told apart from the one that replaced
+// it.
+func (g *GGUF) checkTrellisMeta() error {
+	for key := range g.Meta {
+		if strings.HasPrefix(key, "golem.d4.") {
+			return fmt.Errorf("gguf: carries %q, which the lattice-era converter wrote; this file predates the trellis format and has to be rebuilt with golemquant", key)
+		}
+	}
+	hasTrellis := false
+	for _, t := range g.Tensors {
+		switch t.DType {
+		case "T3G", "T4G", "T5G":
+			hasTrellis = true
+		}
+	}
+	if hasTrellis {
+		if _, err := g.Uint32("golem.trellis.bits"); err != nil {
+			return fmt.Errorf("gguf: trellis tensors with no golem.trellis.bits; rebuild the file with golemquant")
+		}
+	}
+	return nil
 }
 
 // blockGeometry gives, per type, how many weights sit in one block and how many
@@ -321,7 +355,7 @@ func (g *GGUF) readTensorTable(r *reader, count uint64) error {
 			Offset: start,
 		}
 	}
-	return nil
+	return g.checkTrellisMeta()
 }
 
 // Get returns a tensor by name.

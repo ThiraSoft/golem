@@ -24,6 +24,7 @@ func TestGGUFRoundTrip(t *testing.T) {
 		"tokenizer.ggml.scores":    []any{float32(1), float32(-2)},
 		"golem.hadamard_group":     uint32(128),
 		"golem.scale_block":        uint32(64),
+		"golem.trellis.bits":       uint32(4),
 		"general.quantization_ver": uint64(2),
 	}
 	tensors := []OutTensor{
@@ -75,5 +76,74 @@ func TestGGUFRoundTrip(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestGGUFRefusesLatticeEra checks the guard that catches the one tensor type
+// a D4G file and a T3G file cannot be told apart by size or type number alone:
+// both are 26 bytes per 64 weights. A file still carrying a golem.d4.* key
+// must fail to open rather than decode through the trellis as nonsense.
+func TestGGUFRefusesLatticeEra(t *testing.T) {
+	meta := map[string]any{
+		"general.architecture":    "qwen3",
+		"general.alignment":       uint32(32),
+		"golem.d4.hadamard_group": uint32(128),
+	}
+	tensors := []OutTensor{
+		{Name: "blk.0.attn_q.weight", Shape: []int{128, 2}, DType: "T3G",
+			Data: make([]byte, 2*52)},
+	}
+	path := filepath.Join(t.TempDir(), "lattice-era.golem")
+	if err := WriteGGUF(path, meta, tensors); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenGGUF(path); err == nil {
+		t.Fatal("a golem.d4.* key opened without complaint")
+	}
+}
+
+// TestGGUFRefusesLatticeEraEvenWithTrellisBits covers the transitional files
+// on disk that carry both a golem.d4.* key and golem.trellis.bits — written
+// after the trellis existed but before this branch renamed the metadata keys.
+// The d4 key alone has to refuse the file: trellis.bits being present too must
+// not be read as permission.
+func TestGGUFRefusesLatticeEraEvenWithTrellisBits(t *testing.T) {
+	meta := map[string]any{
+		"general.architecture":    "qwen3",
+		"general.alignment":       uint32(32),
+		"golem.d4.hadamard_group": uint32(128),
+		"golem.trellis.bits":      uint32(4),
+	}
+	tensors := []OutTensor{
+		{Name: "blk.0.attn_q.weight", Shape: []int{128, 2}, DType: "T3G",
+			Data: make([]byte, 2*52)},
+	}
+	path := filepath.Join(t.TempDir(), "transitional.golem")
+	if err := WriteGGUF(path, meta, tensors); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenGGUF(path); err == nil {
+		t.Fatal("a golem.d4.* key opened without complaint even with golem.trellis.bits present")
+	}
+}
+
+// TestGGUFRefusesTrellisWithoutBits checks the other half of the same guard:
+// trellis-tier tensors (1000-1002) with no golem.trellis.bits to say which
+// tier wrote them.
+func TestGGUFRefusesTrellisWithoutBits(t *testing.T) {
+	meta := map[string]any{
+		"general.architecture": "qwen3",
+		"general.alignment":    uint32(32),
+	}
+	tensors := []OutTensor{
+		{Name: "blk.0.attn_q.weight", Shape: []int{128, 2}, DType: "T3G",
+			Data: make([]byte, 2*52)},
+	}
+	path := filepath.Join(t.TempDir(), "no-bits.golem")
+	if err := WriteGGUF(path, meta, tensors); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenGGUF(path); err == nil {
+		t.Fatal("a trellis tensor with no golem.trellis.bits opened without complaint")
 	}
 }
