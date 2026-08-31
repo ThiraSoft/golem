@@ -145,8 +145,9 @@ with a second half: a perplexity difference of one or two percent on four
 thousand tokens is not a result, and the windows a run already prints are enough
 to say so.
 
-Qwen3-0.6B, same corpora, at 298.5 MiB and 4.201 bits a weight: 30.8201 against
-bf16's 28.8521, KL 0.0812, top-1 83.4 %, top-5 99.0 %.
+Qwen3-0.6B, same corpora, at 298.5 MiB and 4.201 bits a weight, calibrated on
+2048 tokens (this format's default): 30.3744 against bf16's 28.8521, KL 0.0800,
+top-1 84.2 %, top-5 99.0 %.
 
 The bits a weight are 4.194 and 4.201 rather than 4.1875 because a file also
 carries one F32 vector per calibration site and leaves the norms in bf16.
@@ -169,7 +170,7 @@ On Qwen3-0.6B, where the head is a quarter of the weights:
 
 | head | file | PPL | KL | top-1 |
 |---|---|---|---|---|
-| four bits | 298.5 MiB | 30.8201 | 0.0812 | 83.4 % |
+| four bits (2048-token calibration) | 298.5 MiB | 30.3744 | 0.0800 | 84.2 % |
 | **five bits** | 317.1 MiB | 30.5240 | 0.0718 | 84.8 % |
 | bf16 — the ceiling | 517.6 MiB | 30.3016 | 0.0662 | 85.2 % |
 
@@ -193,7 +194,7 @@ What that part is worth, on Qwen3-0.6B at the same rate and codec:
 |---|---|---|---|
 | bench, salience unbounded, 32 columns held out | 29.87 | 0.0702 | 84.0 % |
 | bench, salience unbounded, none held out | **39.67** | **0.3105** | 69.4 % |
-| the file: salience bounded to 24×, none held out | 30.82 | 0.0812 | 83.4 % |
+| the file: salience bounded to 24×, none held out | 30.37 | 0.0800 | 84.2 % |
 
 Ten points, and the whole of it is the handful of columns whose salience scale
 would otherwise dominate the group it is rotated with. The bench solves that by
@@ -310,7 +311,14 @@ a half of eight cores — and refuses to write a file it could not calibrate.
 - **More calibration**, for the trellis. On Qwen3-4B in one pass, 2048 tokens
   read 19.7285 and KL 0.0510; 8192 read 19.7004 and **0.0550**. More calibration
   buys average likelihood and sells per-token agreement. Windowing it to match
-  the evaluation's regime is worse on both: 19.7808 / 0.0566.
+  the evaluation's regime is worse on both: 19.7808 / 0.0566. **This does not
+  generalise.** On Qwen3-0.6B, 2048 tokens read 30.3744 and 8192 read 30.8680 —
+  a gap of 0.49 nats the *other* way round: more calibration makes perplexity
+  worse on the smaller model. Whatever the 4B's pair of numbers said about
+  calibration buying average likelihood at the cost of per-token agreement, it
+  is a fact about that model's size, not about calibration in general — the two
+  models disagree on which direction more calibration even moves perplexity, so
+  a reader should not assume either row predicts a third model's.
 - **Choosing the salience per site** (`-search`, left off): six settings give a
   mean of 39.73 against 39.80 for one bound chosen for the whole model. The
   spread is the choosing, not the choice.
