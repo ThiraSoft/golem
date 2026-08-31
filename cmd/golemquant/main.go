@@ -41,8 +41,7 @@ func main() {
 	hadGroup := flag.Int("hadamard", 128, "rotation group; 0 leaves the weights unrotated")
 	headBits := flag.Int("head", 4, "bits a weight for the logit head, 3, 4 or 5, and never narrower than -bits. Four or five is what llama.cpp's K-quant mixes do in spirit — Qwen3-4B's Q4_K_M spends 6.56 bits there and 4.95 on the rest — and on Qwen3-0.6B it takes about three fifths of what an unquantized head is worth, for six percent of the file rather than seventy-three. Four is the default whatever the body is: on a three-bit body that is a bit more, which is the same mix in spirit")
 	bodyBits := flag.Int("bits", 4, "trellis body rate in bits a weight: 3, 4 or 5")
-	scaleBlk := flag.Int("scale", 32, "weights sharing one step code; 32 is what the format stores")
-	ntok := flag.Int("tokens", 8192, "calibration tokens")
+	ntok := flag.Int("tokens", 2048, "calibration tokens; every measurement in compress/README.md used 2048, and more buys nothing at these file sizes")
 	ctx := flag.Int("ctx", 512, "calibration window")
 	calibFile := flag.String("calib", "", "text to calibrate on; a built-in paragraph when empty")
 	embd := flag.String("embd", "rot", "how to store token_embd: rot, plain or bf16")
@@ -70,10 +69,6 @@ func main() {
 	if *headBits < *bodyBits {
 		must(fmt.Errorf("golemquant: a %d-bit head under a %d-bit body spends the bits where they are worth least", *headBits, *bodyBits))
 	}
-	// The step is one per sixty-four weights and the format says so; the flag
-	// is a scale block's and there is nothing here to choose.
-	*scaleBlk = nn.T4GBlock
-
 	text := calibText
 	if *calibFile != "" {
 		b, err := os.ReadFile(*calibFile)
@@ -108,7 +103,7 @@ func main() {
 		}
 	}
 	if salience == nil {
-		salience, accs = calibrate(calibFrom, text, *ntok, *ctx, win, *scaleBlk, *vulkan)
+		salience, accs = calibrate(calibFrom, text, *ntok, *ctx, win, nn.T4GBlock, *vulkan)
 		if *salFile != "" && win == 0 && len(salience) > 0 {
 			if err := writeSalience(*salFile, salience); err != nil {
 				fmt.Printf("the sites were not kept (%v)\n", err)
@@ -430,7 +425,7 @@ func main() {
 		// model is a tenth of a bit over the file.
 		//
 		// On Qwen3-0.6B, where the head is a quarter of the weights: four bits
-		// reads 30.82 and KL 0.0812, five reads 30.52 and 0.0718, and bf16 —
+		// reads 30.37 and KL 0.0800, five reads 30.52 and 0.0718, and bf16 —
 		// the ceiling, at seventy-three percent more file — reads 30.30 and
 		// 0.0662. Five bits takes three fifths of the way there for six
 		// percent of the file.
@@ -576,7 +571,7 @@ func main() {
 		meta[k] = v
 	}
 	meta["golem.hadamard_group"] = uint32(*hadGroup)
-	meta["golem.scale_block"] = uint32(*scaleBlk)
+	meta["golem.scale_block"] = uint32(nn.T4GBlock)
 	// The body's tier is what the file is called: a three-bit body under a
 	// four-bit head is a T3G file, whatever the head turns out to be.
 	meta["general.file_type"] = uint32(fileTypeOf(*bodyBits))
