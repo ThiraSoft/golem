@@ -27,6 +27,20 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 )
 
+// D4Params is what the converter chose, and what the file then no longer needs
+// to say. The name is the scheme's, not the lattice's: ScaleBlock and HadGroup
+// describe the per-column vector and the rotation, which the trellis shares
+// with everything golem's own format has ever written. There is no scale-search
+// parameter here — a lattice's step was a fraction of its block's RMS, tried at
+// a few candidate multiples because the block was scaled up into a shell; a
+// trellis step is the block's RMS itself, fitted by least squares after the
+// path is chosen, which is a question the codebook answers and not one this
+// struct has anything to say about.
+type D4Params struct {
+	ScaleBlock int // weights sharing one step code; must be a multiple of 32
+	HadGroup   int // 0 leaves the matrix unrotated
+}
+
 // T4GOpts is the trellis the file is written with. There is nothing to choose:
 // the sequence length, the rate and the state width are all fixed by the format
 // and by what a workgroup's sixty-four kibibytes hold, and the codebook's gain
@@ -136,4 +150,71 @@ func EncodeT4GAs(w []float32, rows, cols int, q []float32, p D4Params, kind nn.Q
 		}
 	})
 	return out
+}
+
+// RelErr is what the codes cost the matrix they stand for, in the basis they
+// were written in: ‖W-Ŵ‖/‖W‖ over the rotated, scaled weights. It is the
+// quantizer's own error and nothing else's, which is what says whether there is
+// room left in the quantizer or only in what surrounds it. kind says which of
+// golem's own formats wrote the bytes.
+func RelErr(w []float32, rows, cols int, q []float32, p D4Params, data []byte, kind nn.Quant) float64 {
+	m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols}
+	var num, den float64
+	row := make([]float32, cols)
+	rec := make([]float32, cols)
+	for r := 0; r < rows; r++ {
+		copy(row, w[r*cols:(r+1)*cols])
+		if q != nil {
+			nn.PrepareD4G(row, q, p.HadGroup)
+		}
+		m.Row(r, rec)
+		for j := range row {
+			d := float64(row[j] - rec[j])
+			num += d * d
+			den += float64(row[j]) * float64(row[j])
+		}
+	}
+	return math.Sqrt(num / den)
+}
+
+// EnergyD4G is what a matrix's quantization costs the product it sits in,
+// relative to what the product is: ‖(W-Ŵ)X‖² over ‖WX‖², estimated from the
+// activations the accumulator saw. kind says which of golem's own formats wrote
+// the bytes.
+//
+// The difference is measured in the basis the weights were written in and then
+// carried back to the one the activations were measured in, because that is
+// where the Hessian lives. Which is also why pre is needed and not just q: the
+// two are reciprocal, and undoing a rotation is not the same as applying it.
+func EnergyD4G(w []float32, rows, cols int, q, pre []float32, p D4Params, data []byte, kind nn.Quant, a *Acc) (float64, float64) {
+	m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols}
+	nums := make([]float64, rows)
+	dens := make([]float64, rows)
+	Parallel(rows, func(lo, hi int) {
+		row := make([]float32, cols)
+		rec := make([]float32, cols)
+		d := make([]float32, cols)
+		for r := lo; r < hi; r++ {
+			copy(row, w[r*cols:(r+1)*cols])
+			if q != nil {
+				nn.PrepareD4G(row, q, p.HadGroup)
+			}
+			m.Row(r, rec)
+			for j := range d {
+				d[j] = row[j] - rec[j]
+			}
+			if pre != nil {
+				nn.UnprepareD4G(d, pre, p.HadGroup)
+			}
+			nums[r] = a.Energy(d)
+			copy(d, w[r*cols:(r+1)*cols])
+			dens[r] = a.Energy(d)
+		}
+	})
+	var num, den float64
+	for r := range nums {
+		num += nums[r]
+		den += dens[r]
+	}
+	return num, den
 }

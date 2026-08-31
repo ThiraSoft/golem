@@ -6,14 +6,11 @@
 //
 // A sequence is 128 weights: two eight-bit step codes, one per sixty-four, and
 // 520 bits of trellis path. Expanding a weight is a twelve-bit window at bit
-// offset 4t, a multiply, an add and a byte sum — and no table at all, which is
-// the whole reason this format exists. matvec_d4g.comp uploads sixteen
-// kibibytes of lattice for every dispatch on the card; the four-bit tier of
-// that lattice would need 493, which is more than a workgroup has. This needs
-// nothing.
+// offset 4t, a multiply, an add and a byte sum — and no codebook to look up at
+// all, which is the whole reason this format exists.
 //
-// The row is two planes, steps then codes, for matvec_d4g.comp's reason: a
-// 67-byte block would start on an odd boundary and this reads words.
+// The row is two planes, steps then codes: a 67-byte block would start on an
+// odd boundary and this reads words.
 //
 // The window is always two bytes and never three. Every offset is a multiple of
 // four bits, so a twelve-bit field starting at 4t has one of two alignments
@@ -40,9 +37,8 @@
 layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly  buffer W { uint  w[]; };
-// Binding 1 is the lattice a D4G matrix reads. A trellis has no codebook to
-// look up — that is the whole point of it — so what sits there instead is the
-// step grid: 256 floats, one per code, a kibibyte for the life of the device.
+// Binding 1 is the step grid: 256 floats, one per code, a kibibyte uploaded
+// once and shared by every matrix of every model on the card.
 //
 // A kibibyte rather than an exp2, and not for speed. Go builds the grid with
 // math.Exp2 in double and rounds; this card's exp2 lands one unit in the last

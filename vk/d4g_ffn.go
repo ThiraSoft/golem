@@ -21,8 +21,6 @@ import (
 	_ "embed"
 	"fmt"
 	"unsafe"
-
-	"github.com/ThiraSoft/golem/nn"
 )
 
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/swiglu_d4g.comp -o shaders/swiglu_d4g.spv
@@ -181,10 +179,4 @@ func (f *D4GFFN) Close() {
 		}
 	}
 	*f = D4GFFN{}
-}
-
-// blockBytesD4G is what one row of a matrix costs at this device's code width,
-// for a caller checking a checkpoint before it uploads it.
-func (k *D4GKernels) RowBytes(cols int) int {
-	return cols / nn.D4Block * nn.D4BlockBytes(k.bits)
 }

@@ -145,7 +145,7 @@ func bindD4G(g *tensors.GGUF, pre *[]float32, group *int, name string, cols int)
 	if pre == nil {
 		return
 	}
-	width, err := g.Uint32("golem.d4.hadamard_group")
+	width, err := g.Uint32("golem.hadamard_group")
 	if err != nil || width == 0 {
 		return
 	}

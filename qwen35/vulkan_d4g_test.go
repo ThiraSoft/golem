@@ -44,7 +44,7 @@ func TestVulkanD4GMatchesCPU(t *testing.T) {
 		t.Skipf("open: %v", err)
 	}
 	defer m.Close()
-	if m.W.Blocks[0].Down.Quant.D4Width() == 0 {
+	if !m.W.Blocks[0].Down.Quant.Golem() {
 		t.Fatalf("%s is not a .golem checkpoint: its blocks are %s", path, m.W.Blocks[0].Down.Quant)
 	}
 

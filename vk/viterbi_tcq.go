@@ -58,6 +58,11 @@ const (
 // TrellisGPUHasK says whether a kernel was built for that rate.
 func TrellisGPUHasK(k int) bool { return k == TrellisGPUK || k == TrellisGPUK5 }
 
+// maxWorkgroups is what every Vulkan implementation promises on the first axis
+// of a dispatch. Cards allow more and this one allows a great deal more, but a
+// pass that stays inside the promise costs nothing to arrange.
+const maxWorkgroups = 65535
+
 type viterbiPush struct {
 	seqs uint32
 	gain float32

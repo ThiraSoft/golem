@@ -181,7 +181,7 @@ func bindMatrix(g *tensors.GGUF, name string, m *nn.Matrix, rows, cols int) {
 // knows. A matrix in any other format has neither and this leaves it alone; the
 // product does the transform itself, so nothing else in this package changes.
 func bindD4G(g *tensors.GGUF, m *nn.Matrix, name string) {
-	width, err := g.Uint32("golem.d4.hadamard_group")
+	width, err := g.Uint32("golem.hadamard_group")
 	if err != nil || width == 0 || !m.Quant.Golem() {
 		return
 	}

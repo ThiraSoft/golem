@@ -220,17 +220,9 @@ type Opts struct {
 	TrainMax   int   // subvectors sampled to fit the codebooks
 	Iters      int
 
-	// A lattice replaces the trained codebooks entirely: no search, no
-	// dictionary, and a rate set by the shell radius rather than by k.
-	UseLattice bool
-	Lat        Lattice
-	UseBox     bool // D4 confined to a box, so a decoder needs no table
-	MaxNorm2   float32
-	Beta       float64 // how far the normalised subvector is scaled up before rounding
-
-	// A trellis replaces the lattice: the sequence, not the subvector, is the
-	// unit that gets coded, and the state's value is computed rather than
-	// stored. UseTrellis wins over UseLattice when both are set.
+	// A trellis replaces the trained codebooks entirely: the sequence, not the
+	// subvector, is the unit that gets coded, and the state's value is computed
+	// rather than stored.
 	UseTrellis bool
 	Tr         TrellisOpts
 
@@ -238,12 +230,6 @@ type Opts struct {
 	// fp16. It is what the file does; the bench does not have to, so the two
 	// can be measured against each other.
 	Step8 bool
-
-	// SearchScale trades encoding time for accuracy: instead of taking the
-	// block's RMS as its scale, it tries a few multiples of it and keeps the
-	// one the lattice actually reconstructs best. The RMS is the scale that
-	// makes the block unit-variance, not the scale that minimises the error.
-	SearchScale bool
 }
 
 // scaleBits is what one stored scale costs.
@@ -272,17 +258,6 @@ func (o Opts) BPW() float64 {
 		}
 		return b
 	}
-	if o.UseLattice {
-		n := shellSize(o.Lat, o.MaxNorm2)
-		if o.UseBox {
-			n = boxSize()
-		}
-		b = math.Log2(float64(n)) / float64(o.Lat.Dim())
-		if o.ScaleBlock > 0 {
-			b += o.scaleBits() / float64(o.ScaleBlock)
-		}
-		return b
-	}
 	for _, k := range o.Stages {
 		b += math.Log2(float64(k)) / float64(o.Dim)
 	}
@@ -304,19 +279,6 @@ func (o Opts) Name() string {
 			if o.Step8 {
 				sb.WriteString("e8")
 			}
-		} else {
-			sb.WriteString("/srow")
-		}
-		return sb.String()
-	}
-	if o.UseLattice {
-		if o.UseBox {
-			fmt.Fprintf(&sb, "BOX(b%.2f)", o.Beta)
-		} else {
-			fmt.Fprintf(&sb, "%s(r%g,b%.2f)", o.Lat, o.MaxNorm2, o.Beta)
-		}
-		if o.ScaleBlock > 0 {
-			fmt.Fprintf(&sb, "/s%d", o.ScaleBlock)
 		} else {
 			sb.WriteString("/srow")
 		}
@@ -553,54 +515,6 @@ func VQ(w []float32, rows, cols int, o Opts, seed int64) []float32 {
 				scales[b] = o.roundScale(scales[b] * float32(num/den))
 			}
 		}
-		return rebuild()
-	}
-
-	if o.UseLattice {
-		d := o.Lat.Dim()
-		beta := float32(o.Beta)
-		mults := []float32{1}
-		if o.SearchScale {
-			mults = []float32{0.82, 0.88, 0.94, 1, 1.06, 1.13, 1.22}
-		}
-		nblk := rows * cols / sb
-		Parallel(nblk, func(lo, hi int) {
-			pt := make([]float32, d)
-			tmp := make([]float32, d)
-			buf := make([]float32, d)
-			best := make([]float32, sb)
-			cand := make([]float32, sb)
-			for b := lo; b < hi; b++ {
-				blk := norm[b*sb : (b+1)*sb]
-				bestErr := float32(math.MaxFloat32)
-				for _, mu := range mults {
-					copy(cand, blk)
-					var err float32
-					for p := 0; p*d < sb; p++ {
-						x := cand[p*d : (p+1)*d]
-						for i := range x {
-							buf[i] = x[i] * beta / mu
-						}
-						if o.UseBox {
-							quantizeBox(buf, pt)
-						} else {
-							quantizeLattice(o.Lat, buf, pt, tmp, o.MaxNorm2)
-						}
-						for i := range x {
-							q := buf[i] * mu / beta
-							e := x[i] - q
-							err += e * e
-							x[i] = q
-						}
-					}
-					if err < bestErr {
-						bestErr = err
-						copy(best, cand)
-					}
-				}
-				copy(blk, best)
-			}
-		})
 		return rebuild()
 	}
 

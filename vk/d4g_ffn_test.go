@@ -35,12 +35,12 @@ func TestD4GFFNMatchesCPU(t *testing.T) {
 	qDown := compress.RandomSigns(ffn, 43)
 	preGateUp, preDown := reciprocal(qGateUp), reciprocal(qDown)
 
-	p := compress.D4Params{Beta: 2, ScaleBlock: 32, HadGroup: 128, SearchScale: true}
-	gateD := compress.EncodeD4G(gateW, ffn, dim, qGateUp, p, nil)
-	upD := compress.EncodeD4G(upW, ffn, dim, qGateUp, p, nil)
-	downD := compress.EncodeD4G(downW, dim, ffn, qDown, p, nil)
+	p := compress.D4Params{ScaleBlock: nn.T4GBlock, HadGroup: 128}
+	gateD := compress.EncodeT4GAs(gateW, ffn, dim, qGateUp, p, nn.T4G)
+	upD := compress.EncodeT4GAs(upW, ffn, dim, qGateUp, p, nn.T4G)
+	downD := compress.EncodeT4GAs(downW, dim, ffn, qDown, p, nn.T4G)
 
-	k, err := NewD4GKernels(d, nn.D4Bits)
+	k, err := NewGolemKernels(d, nn.T4G)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,9 +80,9 @@ func TestD4GFFNMatchesCPU(t *testing.T) {
 	}
 
 	// The same arithmetic on the processor, from the same bytes.
-	gateM := nn.Matrix{Data: gateD, Quant: nn.D4G, Rows: ffn, Cols: dim}
-	upM := nn.Matrix{Data: upD, Quant: nn.D4G, Rows: ffn, Cols: dim}
-	downM := nn.Matrix{Data: downD, Quant: nn.D4G, Rows: dim, Cols: ffn}
+	gateM := nn.Matrix{Data: gateD, Quant: nn.T4G, Rows: ffn, Cols: dim}
+	upM := nn.Matrix{Data: upD, Quant: nn.T4G, Rows: ffn, Cols: dim}
+	downM := nn.Matrix{Data: downD, Quant: nn.T4G, Rows: dim, Cols: ffn}
 	worst, scale := 0.0, 0.0
 	got := out.Floats()
 	for c := 0; c < columns; c++ {

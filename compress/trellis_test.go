@@ -57,33 +57,14 @@ func TestTrellisValuesAreStandardGaussian(t *testing.T) {
 	}
 }
 
-// What the trellis buys over the lattice, at the rate the format spends today.
+// What the trellis buys over the lattice it replaced, at the rate the format
+// spent before this task retired the lattice entirely. The lattice's own
+// number is no longer measurable here — its codebook is gone — so it is
+// recorded rather than recomputed: a D4 lattice with a spherical boundary read
+// 16.05 dB at 2.99 bits/weight, against Shannon's 18.06 dB bound.
 func TestTrellisBeatsD4OnGaussian(t *testing.T) {
 	const n = 1 << 18
 	x := gaussian(n, 7)
-
-	// D4 at r²=40 is the shipped codebook: 12 bits for four weights.
-	pt := make([]float32, 4)
-	tmp := make([]float32, 4)
-	buf := make([]float32, 4)
-	best, bestBeta := 0.0, 0.0
-	for _, beta := range []float64{1.6, 2.0, 2.5, 3.0, 4.0, 6.0, 8.0, 12.0} {
-		cand := append([]float32(nil), x...)
-		for p := 0; p*4 < n; p++ {
-			v := cand[p*4 : (p+1)*4]
-			for i := range v {
-				buf[i] = v[i] * float32(beta)
-			}
-			quantizeLattice(LatD4, buf, pt, tmp, 40)
-			for i := range v {
-				v[i] = buf[i] / float32(beta)
-			}
-		}
-		if db := sqnrDB(x, cand); db > best {
-			best, bestBeta = db, beta
-		}
-	}
-	t.Logf("D4  r²=40   2.99 bits/weight   %6.2f dB  (best beta %.1f)", best, bestBeta)
 
 	for _, seq := range []int{256, 1024, 4096} {
 		for _, l := range []int{12, 14, 16} {
@@ -96,32 +77,13 @@ func TestTrellisBeatsD4OnGaussian(t *testing.T) {
 }
 
 // The step up: four bits of code against the wide D4 tier, which is where a
-// file that means to reach Q4_K_M's quality is going to have to live.
+// file that means to reach Q4_K_M's quality is going to have to live. The wide
+// tier's own number is recorded rather than recomputed, for the same reason as
+// above: it read 14.97 dB at 3.986 bits/weight, from a table of 493 KiB — too
+// big for a workgroup, which is the whole reason the trellis exists.
 func TestTrellisAtFourBits(t *testing.T) {
 	const n = 1 << 18
 	x := gaussian(n, 7)
-
-	pt := make([]float32, 4)
-	tmp := make([]float32, 4)
-	buf := make([]float32, 4)
-	best, bestBeta := 0.0, 0.0
-	for _, beta := range []float64{2.5, 3.5, 4.6, 6.0, 8.0, 12.0, 16.0} {
-		cand := append([]float32(nil), x...)
-		for p := 0; p*4 < n; p++ {
-			v := cand[p*4 : (p+1)*4]
-			for i := range v {
-				buf[i] = v[i] * float32(beta)
-			}
-			quantizeLattice(LatD4, buf, pt, tmp, 160)
-			for i := range v {
-				v[i] = buf[i] / float32(beta)
-			}
-		}
-		if db := sqnrDB(x, cand); db > best {
-			best, bestBeta = db, beta
-		}
-	}
-	t.Logf("D4  r²=160  3.986 bits/weight  %6.2f dB  (best beta %.1f; table 493 KiB, too big for a workgroup)", best, bestBeta)
 
 	for _, l := range []int{12, 14, 16} {
 		o := TrellisOpts{K: 4, L: l, Seq: 4096, Code: Code1MAD}

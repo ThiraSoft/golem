@@ -78,12 +78,8 @@ func (m Matrix) RowBytes() int {
 		return m.Cols / SuperBlock * q6_kBlockBytes
 	case Q8_0:
 		return m.Cols / QuantBlock * q8_0BlockBytes
-	case L8G:
-		return m.Cols / L8Block * l8BlockBytes
 	case T4G, T5G:
 		return T4GRowBytesN(m.Cols, m.Quant)
-	case D4G, D4G16:
-		return m.Cols / D4Block * D4BlockBytes(m.Quant.D4Width())
 	}
 	panic(fmt.Sprintf("nn: no row size for %s", m.Quant))
 }
@@ -186,12 +182,8 @@ func (m Matrix) rows(b *Batch, ys [][]float32, start, end int) {
 		matVecQ6_KRows(m.Data, b, m.Cols, ys, start, end)
 	case Q8_0:
 		matVecQ8_0Rows(m.Data, b, m.Cols, ys, start, end)
-	case L8G:
-		matVecL8GRows(m.Data, b, m.Cols, ys, start, end)
 	case T4G, T5G:
 		matVecT4GRows(m.Data, b, m.Cols, m.Quant, ys, start, end)
-	case D4G, D4G16:
-		matVecD4GRows(m.Data, b, m.Cols, m.Quant.D4Width(), ys, start, end)
 	default:
 		panic(fmt.Sprintf("nn: %s is not a matrix format", m.Quant))
 	}
@@ -263,14 +255,8 @@ func (m Matrix) Row(index int, out []float32) {
 		DequantizeQ3_K(row, m.Cols, out)
 	case Q4_K:
 		DequantizeQ4_K(row, m.Cols, out)
-	case L8G:
-		DequantizeL8G(row, m.Cols, out)
-		m.unrotate(out)
 	case T4G, T5G:
 		DequantizeT4GN(row, m.Cols, m.Quant, out)
-		m.unrotate(out)
-	case D4G, D4G16:
-		DequantizeD4GN(row, m.Cols, m.Quant.D4Width(), out)
 		m.unrotate(out)
 	case F32:
 		for i := 0; i < m.Cols; i++ {

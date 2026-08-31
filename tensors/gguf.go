@@ -214,13 +214,9 @@ var ggmlTypes = map[uint32]string{
 	14: "Q6_K",
 	30: "BF16",
 	// golem's own, which llama.cpp will not recognise and is not meant to.
-	1000: "D4G",
-	1001: "L8G",
-	1002: "D4G16",
-	// 1001 was taken by L8G before the trellis existed, so this is 1003 and not
-	// the 1001 the plan for it named. A number that means two formats is a file
-	// that loads and answers nonsense, which is the mistake this format has
-	// already made twice by other routes.
+	// 1000-1002 were the lattice's — D4G, L8G, D4G16 — retired along with it;
+	// a number that means two formats is a file that loads and answers
+	// nonsense, so they stay empty rather than being reused here.
 	1003: "T4G",
 	1004: "T5G",
 }
@@ -228,21 +224,18 @@ var ggmlTypes = map[uint32]string{
 // blockGeometry gives, per type, how many weights sit in one block and how many
 // bytes that block occupies.
 var blockGeometry = map[string][2]int{
-	"F32":   {1, 4},
-	"F16":   {1, 2},
-	"BF16":  {1, 2},
-	"Q4_0":  {32, 18},   // one fp16 scale, then 32 nibbles
-	"Q4_1":  {32, 20},   // an fp16 scale and an fp16 minimum, then 32 nibbles
-	"Q8_0":  {32, 34},   // one fp16 scale, then 32 signed bytes
-	"Q3_K":  {256, 110}, // hmask, two-bit quants, twelve packed scales, one fp16
-	"Q4_K":  {256, 144}, // 2 fp16 (d, dmin) + 12 scales + 128 nibbles
-	"Q5_K":  {256, 176}, // 2 fp16 (d, dmin) + 12 scales + 32 high bits + 128 nibbles
-	"Q6_K":  {256, 210}, // 128 low nibbles, 64 high pairs, 16 scales, one fp16
-	"D4G":   {64, 26},   // two step codes, then sixteen twelve-bit lattice codes
-	"D4G16": {64, 34},   // the same with sixteen-bit codes
-	"L8G":   {64, 26},   // two step codes, then sixty-four three-bit levels
-	"T4G":   {128, 67},  // two step codes, then a 520-bit trellis path
-	"T5G":   {128, 83},  // the same at five bits a weight, 648 of them
+	"F32":  {1, 4},
+	"F16":  {1, 2},
+	"BF16": {1, 2},
+	"Q4_0": {32, 18},   // one fp16 scale, then 32 nibbles
+	"Q4_1": {32, 20},   // an fp16 scale and an fp16 minimum, then 32 nibbles
+	"Q8_0": {32, 34},   // one fp16 scale, then 32 signed bytes
+	"Q3_K": {256, 110}, // hmask, two-bit quants, twelve packed scales, one fp16
+	"Q4_K": {256, 144}, // 2 fp16 (d, dmin) + 12 scales + 128 nibbles
+	"Q5_K": {256, 176}, // 2 fp16 (d, dmin) + 12 scales + 32 high bits + 128 nibbles
+	"Q6_K": {256, 210}, // 128 low nibbles, 64 high pairs, 16 scales, one fp16
+	"T4G":  {128, 67},  // two step codes, then a 520-bit trellis path
+	"T5G":  {128, 83},  // the same at five bits a weight, 648 of them
 }
 
 // rowBytes is the size on disk of one row of `n` weights of the given type.

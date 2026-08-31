@@ -1,11 +1,11 @@
 # compress
 
-A checkpoint in, a `.golem` out. Two codebooks, one scheme around them:
+A checkpoint in, a `.golem` out. One codebook, and a scheme around it:
 
 | | block | bits/weight | tensor type |
 |---|---|---|---|
-| `D4G` | 64 weights in 26 bytes | 3.26 | 1000 |
 | `T4G` | 128 weights in 67 bytes | 4.19 | 1003 |
+| `T5G` | 128 weights in 83 bytes | 5.19 | 1004 |
 
 The file is a GGUF. Same container, so the vocabulary, the rope base and the
 chat template travel unchanged; what is new is a tensor type llama.cpp does not
@@ -13,41 +13,26 @@ know and one vector per calibration site beside the matrices.
 
 Everything below about the scheme — the salience, the bound of 24×, the rotation
 by 128, `nn.D4GVectorNames` and the `A·(q ⊙ W)` convention with its two rules —
-is shared by both, unchanged, and is where most of the format's value is. Only
-the codebook differs.
+is where most of the format's value is, and it is independent of the codebook:
+a lattice carried it before the trellis did, and lost only the codebook question
+when it was retired.
 
-## What a block holds
+## What a block holds: a trellis, with nothing to look up
 
-A row is two planes, the steps then the codes, because a 26-byte block would
-otherwise start on a two-byte boundary and a shader reads words.
+A sequence of 128 weights costs 67 bytes, 4.1875 bits each, and there is no
+decode table at all — the whole reason this codebook exists. An earlier
+codebook, a D4 lattice, decoded by table lookup: 3961 points at r²=40 fit a
+workgroup's thirty-one kibibytes of shared memory at twelve bits a code, but
+the four-bit tier its successor needed would have taken a table of 493 KiB,
+which does not fit. The trellis was written to close that gap, and once it did,
+carrying two codebooks bought nothing a measurement could find at any rate
+either format reached — so the lattice was retired rather than kept beside it.
 
-Per block of 64 weights:
+`golem.hadamard_group` and `golem.scale_block` in the metadata say what the
+file was written with — both name the scheme, and are unchanged by which
+codebook a block holds. `general.file_type` is 1003 for `T4G`, 1004 for `T5G`.
 
-- **two step codes**, one for each 32 weights. Eight bits each, naming powers of
-  two spaced a sixteenth apart.
-- **sixteen 12-bit codes**, each naming a point of the D4 lattice — the integer
-  points of even coordinate sum — in canonical order by squared norm then
-  lexicographically. Everything of norm ≤ 40 fits, which is 3961 points, and
-  the first 135 of norm 42 fill the code out to exactly 4096.
-
-There is a wide tier, `D4G16`, at sixteen bits a code. Its shell reaches norm
-162 and its table is a quarter of a mebibyte rather than sixteen kibibytes,
-which no longer fits a workgroup's shared memory.
-
-`golem.d4.hadamard_group`, `golem.d4.code_bits` and `golem.d4.scale_block` in
-the metadata say what the file was written with. `general.file_type` is 1000.
-
-## The other codebook: a trellis, with nothing to look up
-
-`-codec trellis` writes `T4G` instead. 128 weights in 67 bytes, 4.1875 bits
-each, and no decode table at all.
-
-D4 was chosen because its table fits a workgroup: 3961 points at r²=40 is
-thirty-one kibibytes of shared memory. That choice bought a lookup and paid for
-it with dimension four, and it closed the four-bit tier, whose table is 493 KiB
-— which is where a file meaning to reach Q4_K_M's quality has to live.
-
-A trellis has no table. The state is the last twelve bits of the code stream, so
+The state is the last twelve bits of the code stream, so
 weight *t* reads the twelve bits at offset 4·*t* and hashes them:
 
     weight t  =  step[t/64] · 1MAD(the twelve bits at 4t within the sequence)
@@ -74,7 +59,8 @@ Per sequence of 128 weights:
                                        ------
                                        4.1875
 
-A row is two planes, steps then codes, for D4G's reason. 128 is not free choice:
+A row is two planes, steps then codes: a 67-byte block would otherwise start on
+an odd boundary, and a shader reads words. 128 is not free choice:
 the Viterbi's backpointers have to sit in a workgroup's shared memory beside the
 two cost planes, and 32 KiB + 16 KiB is what fits in the 64 KiB this card gives.
 In device memory they would be 128 bytes a weight written and read back against
@@ -88,13 +74,17 @@ It was 7 % of the weights.
 
 ### The step, and where its window sits
 
-Eight bits naming powers of two a sixteenth apart, which is D4G's spacing and
-for D4G's reason. The window is not D4G's: it runs from 6.1e-5 to 3.83 rather
-than from 7.6e-6 to 0.48, because a lattice step is a *fraction* of its block's
-RMS — the block is scaled up into a shell several units across — and a trellis
-step is the block's RMS itself. Getting that wrong is not subtle in hindsight
-and is invisible in advance: a unit-variance source clipped at D4G's ceiling and
-reconstructed at **5.5 dB instead of 23**, with every shape agreeing.
+Eight bits naming powers of two a sixteenth apart. A grid an eighth apart costs
+a whole point of perplexity against an fp16 step at the same granularity, which
+is more than the finer granularity wins back — the step sits at the bottom of a
+curve, and nine percent is far enough up its sides to matter.
+
+The window is 6.1e-5 to 3.83, not the wider range an earlier, lattice-based
+codebook used. A lattice's step is a *fraction* of its block's RMS — the block
+is scaled up into a shell several units across — while a trellis step is the
+block's RMS itself, and the two windows are not interchangeable: a unit-variance
+source clipped at the wider window's ceiling reconstructs at **5.5 dB instead of
+23**, with every shape still agreeing.
 
 An eight-bit step against an fp16 scale is 0.125 bits a weight, three percent of
 the file, and whether it is free is not a question squared error can answer —
@@ -111,11 +101,13 @@ three percent of the file. The format takes the step.
 
 ### What it costs the weights
 
-The quantizer reads **23.1 dB on every tensor to ±0.4 dB**, head included,
-against D4G's 16.05 — the rotation makes them statistically identical, so one
-number describes the model. Shannon's bound at four bits is 24.08 and this codec
-reads 23.04 on a Gaussian, so what the file loses to the codec is a tenth of a
-decibel and what the codec loses to theory is one.
+The quantizer reads **23.1 dB on every tensor to ±0.4 dB**, head included — the
+rotation makes them statistically identical, so one number describes the model.
+Shannon's bound at four bits is 24.08 and this codec reads 23.04 on a Gaussian,
+so what the file loses to the codec is a tenth of a decibel and what the codec
+loses to theory is one. The retired lattice read 16.05 dB at the rate it spent,
+14.97 at four bits — the numbers that closed the question of which codebook to
+keep.
 
 ### What the file reads
 
@@ -158,6 +150,13 @@ bf16's 28.8521, KL 0.0812, top-1 83.4 %, top-5 99.0 %.
 
 The bits a weight are 4.194 and 4.201 rather than 4.1875 because a file also
 carries one F32 vector per calibration site and leaves the norms in bf16.
+
+Converting from an already-quantized checkpoint costs little — 23.97 from
+Q4_K_M against 23.80 from bf16, in the older, D4G-era regime this was first
+measured under — so there is no need to fetch a multi-gigabyte bf16 checkpoint
+when a K-quant is already at hand. This is a property of the scheme, not the
+codebook: a converter reads whatever floats it is given back out of whichever
+format they arrived in, and neither the salience nor the rotation cares.
 
 ### The head, which is the one tensor worth more bits
 
@@ -212,14 +211,15 @@ candidate steps per block; a trellis cannot, because one path spans two blocks
 and the search would have to be joint. Least squares takes it exactly and for
 nothing once the path exists, and it is worth about 4 % of the error.
 
-### The two encoders are held to a weaker contract than D4G's
+### The two encoders are held to a weaker contract than byte equality
 
-`TestEncodeD4GMatchesCPU` demands byte equality because a D4 code is an index
-into a shared enumeration: two encoders that disagree write different files for
-the same weights. A trellis records the path it chose, and **any minimum-cost
-path is an equally valid file**. `TestViterbiMatchesCPU` therefore holds the two
-to the same *cost*, to a part in a hundred thousand, and reports agreement
-(94.2 %) only as a collapse detector.
+A codebook that is a table has one right index for a point — an index into a
+shared enumeration — so two encoders that disagree write different files for
+the same weights, and byte equality is the contract to hold them to. A trellis
+records the path it chose instead, and **any minimum-cost path is an equally
+valid file**: `TestViterbiMatchesCPU` therefore holds the two encoders to the
+same *cost*, to a part in a hundred thousand, and reports agreement (94.2 %)
+only as a collapse detector.
 
 **This does not extend to the decoder.** A decoder is a pure function of the bits
 it reads, so Go and the shader must agree exactly, and
@@ -267,8 +267,10 @@ its vector; `MatVec` does not, because the activation already did.
 `q` is not just signs. It carries an AWQ-style scale: the per-column power of
 the activations that reach a site, raised to α = 0.5 and normalised by its
 geometric mean. Converting without it — signs and rotation alone — costs twenty
-points of perplexity on Qwen3-0.6B, 39.80 against 60.01. The lattice, which took
-the most work, is worth 1.5 of those points.
+points of perplexity on Qwen3-0.6B, 39.80 against 60.01. The codebook, which
+took the most work, was worth 1.5 of those points when it was the D4 lattice —
+a comparison against the codebook doing nothing, not against the trellis that
+replaced it.
 
 The scale is **bounded to 24×**, and that is not a detail. It is applied before
 a rotation that mixes 128 columns together: a column shrunk by two thousand is
@@ -280,38 +282,15 @@ eighteen thousand and the model reads at a perplexity of 246 rather than 40.
 which is fifteen seconds for eight thousand tokens of a 27B against an hour and
 a half of eight cores — and refuses to write a file it could not calibrate.
 
-## What the numbers are
-
-On Qwen3-4B, against the same corpus, held out from calibration:
-
-| | size | perplexity | KL | top-1 | top-5 |
-|---|---|---|---|---|---|
-| bf16 | — | 21.27 | — | — | — |
-| Q4_K_M | 2.33 GiB | 21.57 | 0.053 | 88.7 % | 99.3 % |
-| `.golem` | 1.52 GiB | 23.80 | 0.175 | 78.2 % | 97.1 % |
-
-Perplexity says twelve percent worse. The divergence says three and a third
-times further from the original's opinion, and a different word chosen one time
-in five where Q4_K_M chooses one in nine. Both are worth having and they are not
-the same number — `cmd/vqdiff` reports both, and a format judged on perplexity
-alone is a format flattered by it.
-
-The quantizer reads **16.05 dB on every tensor to ±0.03 dB**, head included: the
-rotation makes them statistically identical. Shannon's bound for a memoryless
-Gaussian at three bits of code is 18.06 dB and a D4 lattice with a spherical
-boundary tops out near 16.9, so 0.85 dB is what is left. Matching Q4_K_M's 4.95
-bits at 3.26 would want 10.9 dB, and 1.7 bits is 10 dB: no published method
-recovers that without end-to-end fine-tuning.
-
-Converting from an already-quantized checkpoint costs little — 23.97 from
-Q4_K_M against 23.80 from bf16 — so there is no need to fetch a 47 GiB bf16 when
-a K-quant is at hand.
-
 ## What is measured and does not work
 
-- **GPTQ compensation** (`gptq.go`): 0.15 points on a real model, where it halves
-  the output error on synthetic data. The rotation whitens the Hessian and
-  leaves nothing to redistribute. The code works; it just buys nothing here.
+- **GPTQ compensation**: 0.15 points on a real model, where it halves the
+  output error on synthetic data. The rotation whitens the Hessian and leaves
+  nothing to redistribute. It worked; it just bought nothing here, so the
+  factoring machinery (`Comp`, `NewComp`, the Cholesky routines) was removed
+  from `gptq.go` along with `cmd/golemquant`'s `-gptq` and `-damp` flags —
+  what is left is the windowed-Hessian accumulator, which the salience search
+  still reads.
 - **Non-uniform bit allocation**: per-weight sensitivities span 2.4× and
   `ffn_down` is indeed the most sensitive, but the arithmetic-to-geometric mean
   ratio is 0.17 dB. Three code widths and three shader variants for that: no.
@@ -335,16 +314,6 @@ a K-quant is at hand.
 - **Choosing the salience per site** (`-search`, left off): six settings give a
   mean of 39.73 against 39.80 for one bound chosen for the whole model. The
   spread is the choosing, not the choice.
-
-## The codebook is worth four times what theory gives it
-
-At identical size on Qwen3-0.6B: the D4 lattice (16.21 dB) reads 39.80, Lloyd
-with eight levels in registers (15.92 dB) reads 41.30, uniform eight levels
-(15.34 dB) reads 43.22. The error gap between lattice and Lloyd is 0.29 dB,
-which predicts half a point; the measurement is 1.50. Three explanations were
-tested and all three are false — it is not tail clipping, not error cancellation
-in the dot product, not a preference for a uniform step. `-codebook lloyd` is
-kept to ask the question again in ten minutes.
 
 ## Traps
 

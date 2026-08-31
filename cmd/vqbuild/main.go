@@ -38,9 +38,6 @@ var feeds = map[string]string{
 func main() {
 	src := flag.String("model", "", "BF16 GGUF to compress")
 	dst := flag.String("out", "", "where to write the reconstructed copy")
-	plan := flag.String("plan", "default:3", "bit levels per role, e.g. default:3,token_embd:6,ffn_down:4")
-	lattice := flag.String("lattice", "E8", "E8 or D4; D4 is the one whose decode table fits a workgroup")
-	codec := flag.String("codec", "lattice", "lattice or trellis; the trellis needs no decode table at all")
 	trK := flag.Int("k", 3, "trellis: bits emitted per weight")
 	trL := flag.Int("L", 12, "trellis: state bits; the Viterbi costs 2^L per weight")
 	trSeq := flag.Int("seq", 1024, "trellis: weights coded as one sequence")
@@ -50,7 +47,6 @@ func main() {
 	step8 := flag.Bool("step8", false, "store each block's scale as the format's eight-bit step code rather than an fp16, which is half a bit a block cheaper at -scale 64")
 	alpha := flag.Float64("alpha", 0.5, "salience exponent")
 	outliers := flag.Int("outliers", 32, "columns held at 8 bits")
-	search := flag.Bool("search", false, "search each block's scale instead of taking its RMS")
 	hadGroup := flag.Int("hadamard", 128, "rotation group; 0 leaves the weights unrotated")
 	ntok := flag.Int("tokens", 256, "calibration tokens")
 	window := flag.Int("window", 0, "measure the sites in windows of this many tokens; 0 is one pass over the lot, which measures better")
@@ -59,7 +55,7 @@ func main() {
 	roles := flag.String("roles", "all", "which matrices to compress; the rest stay BF16")
 	flag.Parse()
 
-	if *onCard && *codec == "trellis" {
+	if *onCard {
 		dev, err := vk.Open()
 		must(err)
 		defer dev.Close()
@@ -197,8 +193,6 @@ func main() {
 	out, err := os.OpenFile(*dst, os.O_WRONLY, 0)
 	must(err)
 
-	levelOf := parsePlan(*plan)
-
 	names := make([]string, 0, len(file.Tensors))
 	for n := range file.Tensors {
 		names = append(names, n)
@@ -239,22 +233,10 @@ func main() {
 		w, err := t.F32()
 		must(err)
 
-		var opts compress.Opts
-		if *codec == "trellis" {
-			opts = compress.Opts{UseTrellis: true, Step8: *step8,
-				ScaleBlock: *scaleBlk, HadGroup: *hadGroup,
-				Tr: compress.TrellisOpts{K: *trK, L: *trL, Seq: *trSeq,
-					Gain: *trGain, Code: compress.Code1MAD}}
-		} else {
-			lat, table := compress.LatE8, e8Levels
-			if *lattice == "D4" {
-				lat, table = compress.LatD4, d4Levels
-			}
-			lv := table[levelOf(role)]
-			opts = compress.Opts{UseLattice: true, Lat: lat, Step8: *step8,
-				MaxNorm2: float32(lv.r), Beta: lv.beta, ScaleBlock: *scaleBlk, HadGroup: *hadGroup,
-				SearchScale: *search}
-		}
+		opts := compress.Opts{UseTrellis: true, Step8: *step8,
+			ScaleBlock: *scaleBlk, HadGroup: *hadGroup,
+			Tr: compress.TrellisOpts{K: *trK, L: *trL, Seq: *trSeq,
+				Gain: *trGain, Code: compress.Code1MAD}}
 		sc := compress.Scheme{Alpha: *alpha, Outliers: *outliers, VQ: opts}
 		var s []float32
 		if isBlk {
@@ -291,64 +273,6 @@ func main() {
 		fmt.Printf("%d blocks of the %.0f M weights landed on an end of the step grid\n", n, weights/1e6)
 	}
 	fmt.Printf("rewritten in %s\n", time.Since(t0).Round(time.Second))
-}
-
-// The (shell, resolution) pairs that trace each lattice's rate-distortion
-// curve. A step up costs roughly a third of a bit. The shell is set so that it
-// holds what the resolution produces: a normalised subvector has ‖βx‖² ≈ dβ²,
-// and the shell is about 1.6 times that.
-type level struct{ r, beta float64 }
-
-// β is not free to be large. It used to be set so a subvector filled the whole
-// shell, on the reasoning that overflow costs nothing — which held only because
-// the bench reconstructed an overflowing subvector by the factor it had been
-// pulled by, and no decoder has that factor. Under a reconstruction a file can
-// perform, overflow is clipping, and the measured optimum is four times lower:
-// β ≈ 0.63·√(r²/d), which reads 2.0 at D4's r²=40 and 4.0 at its r²=160.
-var e8Levels = []level{
-	{10, 0.70}, {16, 0.89}, {26, 1.14}, {42, 1.44}, {62, 1.75},
-	{100, 2.23}, {156, 2.78}, {260, 3.59}, {460, 4.78}, {820, 6.38},
-}
-
-// D4 at the same budget: half the dimension, so the same rate needs a quarter
-// of the squared radius, and the shell stays small enough to enumerate into a
-// table a shader can hold — 3961 points at r²=40, thirty-one kibibytes.
-var d4Levels = []level{
-	{6, 0.77}, {10, 1.00}, {20, 1.41}, {40, 1.99}, {60, 2.44},
-	{100, 3.15}, {160, 3.98}, {260, 5.08}, {460, 6.76}, {820, 9.02},
-}
-
-var levels = e8Levels
-
-// parsePlan reads "default:3,token_embd:6" into a lookup from role to level.
-func parsePlan(spec string) func(string) int {
-	byRole := map[string]int{}
-	def := 3
-	for _, part := range strings.Split(spec, ",") {
-		kv := strings.SplitN(part, ":", 2)
-		if len(kv) != 2 {
-			continue
-		}
-		var n int
-		fmt.Sscan(kv[1], &n)
-		if n < 0 {
-			n = 0
-		}
-		if n >= len(levels) {
-			n = len(levels) - 1
-		}
-		if kv[0] == "default" {
-			def = n
-		} else {
-			byRole[kv[0]] = n
-		}
-	}
-	return func(role string) int {
-		if n, ok := byRole[role]; ok {
-			return n
-		}
-		return def
-	}
 }
 
 func parse(name string) (int, string, bool) {

@@ -190,7 +190,7 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 
 	// A .golem file carries one vector a site. Any other file has none, and
 	// the blocks are left with nil ones — which is what the products check.
-	if group, err := g.Uint32("golem.d4.hadamard_group"); err == nil {
+	if group, err := g.Uint32("golem.hadamard_group"); err == nil {
 		w.HadGroup = int(group)
 		for i := range cfg.Blocks {
 			b := &w.Blocks[i]

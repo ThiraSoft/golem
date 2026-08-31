@@ -39,11 +39,8 @@ func main() {
 	alpha := flag.Float64("alpha", 0.5, "salience exponent; 0 leaves the columns alone")
 	clamp := flag.Float64("clamp", 24, "largest factor the salience may scale a column by, either way; 0 lets it run")
 	hadGroup := flag.Int("hadamard", 128, "rotation group; 0 leaves the weights unrotated")
-	beta := flag.Float64("beta", 2, "how far a block is scaled up before rounding")
-	codebook := flag.String("codebook", "d4", "d4 for the lattice in a table, lloyd for eight levels in registers")
-	headBits := flag.Int("head", 4, "trellis: bits a weight for the logit head, 4 or 5. Five is what llama.cpp's K-quant mixes do in spirit — Qwen3-4B's Q4_K_M spends 6.56 bits there and 4.95 on the rest — and on Qwen3-0.6B it takes about three fifths of what an unquantized head is worth, for six percent of the file rather than seventy-three. Four is the default because the smallest file is the point")
-	codec := flag.String("codec", "lattice", "lattice or trellis; the trellis has no decode table at all, and reaches four bits where the lattice's shell stops fitting a workgroup")
-	codeBits := flag.Int("bits", 12, "code width: 12 for the ordinary tier, 16 for the wide one")
+	headBits := flag.Int("head", 4, "bits a weight for the logit head, 4 or 5. Five is what llama.cpp's K-quant mixes do in spirit — Qwen3-4B's Q4_K_M spends 6.56 bits there and 4.95 on the rest — and on Qwen3-0.6B it takes about three fifths of what an unquantized head is worth, for six percent of the file rather than seventy-three. Four is the default because the smallest file is the point")
+	bodyBits := flag.Int("bits", 4, "trellis body rate in bits a weight: 4 or 5")
 	scaleBlk := flag.Int("scale", 32, "weights sharing one step code; 32 is what the format stores")
 	ntok := flag.Int("tokens", 8192, "calibration tokens")
 	ctx := flag.Int("ctx", 512, "calibration window")
@@ -55,25 +52,20 @@ func main() {
 	report := flag.Bool("report", false, "print what each matrix's codes cost it")
 	blind := flag.Bool("blind", true, "rotate matrices no calibration site names, with signs alone")
 	keep := flag.String("keep", "", "comma-separated tensor name fragments left in BF16")
-	window := flag.Int("gptq", 0, "error-compensation window in columns; 0 turns it off")
-	damp := flag.Float64("damp", 0.01, "ridge on the Hessian diagonal, as a fraction of its mean")
 	vulkan := flag.Bool("vulkan", true, "encode the matrices on a Vulkan device when there is one")
 	calibSrc := flag.String("calib-model", "", "the checkpoint to calibrate on, when it is not the one being converted")
 	salFile := flag.String("salience", "", "read the sites from this file, or write them to it after measuring; the salience does not depend on -alpha, -clamp or the codec, and measuring it again for each of them is most of a sweep's wall clock")
 	flag.Parse()
 
-	trellis := *codec == "trellis"
-	if !trellis && *codec != "lattice" {
-		must(fmt.Errorf("golemquant: %q is not a codec", *codec))
-	}
-	if trellis && *headBits != nn.T4GK && *headBits != nn.T5GK {
+	if *headBits != nn.T4GK && *headBits != nn.T5GK {
 		must(fmt.Errorf("golemquant: the head is %d or %d bits, not %d", nn.T4GK, nn.T5GK, *headBits))
 	}
-	if trellis {
-		// The step is one per sixty-four weights and the format says so; the
-		// flag is the lattice's and there is nothing here to choose.
-		*scaleBlk = nn.T4GBlock
+	if *bodyBits != nn.T4GK && *bodyBits != nn.T5GK {
+		must(fmt.Errorf("golemquant: the body is %d or %d bits, not %d", nn.T4GK, nn.T5GK, *bodyBits))
 	}
+	// The step is one per sixty-four weights and the format says so; the flag
+	// is a scale block's and there is nothing here to choose.
+	*scaleBlk = nn.T4GBlock
 
 	text := calibText
 	if *calibFile != "" {
@@ -81,8 +73,8 @@ func main() {
 		must(err)
 		text = string(b)
 	}
-	win := *window
-	if *search && win < *swin {
+	win := 0
+	if *search {
 		win = *swin
 	}
 	// What a site is fed does not depend on which of llama.cpp's four-bit
@@ -128,61 +120,45 @@ func main() {
 
 	// The two halves of a conversion are not alike. The calibration runs the
 	// model, so it needs the engine and stays on the processor. The encoding
-	// needs nothing but the matrix — eight hundred million scale blocks, each
-	// searching its own step over forty candidates, none of them looking at
-	// another — and on this machine that was sixty-eight minutes of eight
-	// cores against under two of a card. The kernel writes the same bytes:
-	// vk.TestEncodeD4GMatchesCPU holds it to this encoder byte for byte,
-	// because a file quantized half one way and half the other would be two
-	// formats sharing a name.
-	var gpu *vk.D4GEncoder
+	// needs nothing but the matrix, and the Viterbi is the only half of a
+	// conversion that cares where it runs: 2^L operations a weight, five
+	// hundred times a scale-block search, so a card is worth reaching for.
 	if *vulkan {
 		if d, err := vk.Open(); err != nil {
 			fmt.Printf("no device (%v); the matrices are encoded on the processor\n", err)
 		} else {
 			defer d.Close()
-			if trellis {
-				// The Viterbi is 2^L operations a weight against the lattice's
-				// eight — five hundred times the work, and the only half of a
-				// conversion that cares where it runs. Sixteen million weights
-				// a pass is a quarter of a gigabyte of buffers.
-				if enc, err := vk.NewTrellisEncoder(d, 1<<24); err != nil {
-					fmt.Printf("no trellis encoder on the device (%v); the processor then\n", err)
-				} else {
-					defer enc.Close()
-					var onCard, offCard int64
-					compress.TrellisPathAccel = func(norm []float32, o compress.TrellisOpts, states []uint16) bool {
-						// The kernels are compiled for two rates and one
-						// shape. Anything else falls back rather than quietly
-						// answering a different question.
-						if !vk.TrellisGPUHasK(o.K) || o.L != vk.TrellisGPUL || o.Seq != vk.TrellisGPUSeq {
-							offCard += int64(len(norm))
-							return false
-						}
-						if err := enc.UseK(o.K); err != nil {
-							offCard += int64(len(norm))
-							return false
-						}
-						if err := enc.QuantizePath(norm, float32(o.Gain), states); err != nil {
-							fmt.Printf("  the card refused a matrix (%v); the processor takes it\n", err)
-							offCard += int64(len(norm))
-							return false
-						}
-						onCard += int64(len(norm))
-						return true
+			// Sixteen million weights a pass is a quarter of a gigabyte of
+			// buffers.
+			if enc, err := vk.NewTrellisEncoder(d, 1<<24); err != nil {
+				fmt.Printf("no trellis encoder on the device (%v); the processor then\n", err)
+			} else {
+				defer enc.Close()
+				var onCard, offCard int64
+				compress.TrellisPathAccel = func(norm []float32, o compress.TrellisOpts, states []uint16) bool {
+					// The kernels are compiled for two rates and one
+					// shape. Anything else falls back rather than quietly
+					// answering a different question.
+					if !vk.TrellisGPUHasK(o.K) || o.L != vk.TrellisGPUL || o.Seq != vk.TrellisGPUSeq {
+						offCard += int64(len(norm))
+						return false
 					}
-					defer func() {
-						fmt.Printf("%d M weights through the card, %d M through the processor\n",
-							onCard/1e6, offCard/1e6)
-					}()
+					if err := enc.UseK(o.K); err != nil {
+						offCard += int64(len(norm))
+						return false
+					}
+					if err := enc.QuantizePath(norm, float32(o.Gain), states); err != nil {
+						fmt.Printf("  the card refused a matrix (%v); the processor takes it\n", err)
+						offCard += int64(len(norm))
+						return false
+					}
+					onCard += int64(len(norm))
+					return true
 				}
-			} else if gpu, err = vk.NewD4GEncoder(d, *codeBits, 32<<20); err != nil {
-				// Nine and a quarter bytes a weight across the six buffers, so
-				// thirty-two million of them is three hundred megabytes and the
-				// widest row in any checkpoint fits a pass many times over.
-				fmt.Printf("no encoder on the device (%v); the matrices are encoded on the processor\n", err)
-			} else if gpu != nil {
-				defer gpu.Close()
+				defer func() {
+					fmt.Printf("%d M weights through the card, %d M through the processor\n",
+						onCard/1e6, offCard/1e6)
+				}()
 			}
 		}
 	}
@@ -193,37 +169,16 @@ func main() {
 	}
 	sort.Strings(names)
 
-	params := compress.D4Params{Beta: *beta, ScaleBlock: *scaleBlk,
-		HadGroup: *hadGroup, Bits: *codeBits, SearchScale: true}
-	dtype := "D4G"
-	if *codeBits == nn.D4Bits16 {
-		dtype = "D4G16"
+	// The trellis settles all of this: the sequence, the rate and the state
+	// width are what a workgroup's shared memory holds, the step is one per
+	// sixty-four weights, and the codebook has no parameter at all.
+	params := compress.D4Params{ScaleBlock: nn.T4GBlock, HadGroup: *hadGroup}
+	dtype := "T4G"
+	if *bodyBits == nn.T5GK {
+		dtype = "T5G"
 	}
-	// A trellis settles all of this: the sequence, the rate and the state width
-	// are what a workgroup's shared memory holds, the step is one per
-	// sixty-four weights, and the codebook has no parameter at all. So the
-	// lattice's flags are simply not read.
-	if trellis {
-		dtype = "T4G"
-		params = compress.D4Params{ScaleBlock: nn.T4GBlock, HadGroup: *hadGroup}
-	}
-	lloyd := !trellis && *codebook == "lloyd"
-	// What a row has to be a multiple of.
-	unit := nn.D4Block
-	if trellis {
-		unit = nn.T4GSeq
-	}
-	if lloyd {
-		dtype = "L8G"
-		if !flagWasSet("beta") {
-			// The levels are a unit Gaussian's, so a block's step is its RMS
-			// rather than a fraction of it. The lattice wants the block scaled
-			// up into its shell; this wants it left where it is.
-			params.Beta = 1
-		}
-	} else if !trellis && *codebook != "d4" {
-		must(fmt.Errorf("golemquant: %q is not a codebook", *codebook))
-	}
+	// What a row has to be a multiple of: a trellis sequence.
+	unit := nn.T4GSeq
 
 	// One vector a site: the sign flips of the rotation over the salience
 	// scale. The weights are multiplied by it, the activations by its
@@ -280,7 +235,7 @@ func main() {
 	// be trusted over.
 	cands := []cand{{0.5, 0}, {0.35, 24}, {0.5, 12}, {0.5, 24}, {0.5, 48}, {0.65, 12}, {0.65, 24}, {0.8, 8}}
 	searched := map[string]bool{}
-	pickSalience := func(key string, w []float32, rows, cols int) {
+	pickSalience := func(key string, w []float32, rows, cols int, kind nn.Quant) {
 		if !*search || searched[key] || accs[key] == nil {
 			return
 		}
@@ -293,8 +248,8 @@ func main() {
 		best, bestAt := math.Inf(1), cand{*alpha, *clamp}
 		for _, c := range cands {
 			pv, qv := build(key, c.alpha, c.clamp)
-			data := compress.EncodeD4G(w[:n*cols], n, cols, qv, p, nil)
-			num, den := compress.EnergyD4G(w[:n*cols], n, cols, qv, pv, p, data, accs[key])
+			data := compress.EncodeT4GAs(w[:n*cols], n, cols, qv, p, kind)
+			num, den := compress.EnergyD4G(w[:n*cols], n, cols, qv, pv, p, data, kind, accs[key])
 			if e := num / den; e < best {
 				best, bestAt = e, c
 			}
@@ -302,17 +257,6 @@ func main() {
 		pre[key], weight[key] = build(key, bestAt.alpha, bestAt.clamp)
 		fmt.Printf("  salience %-10s alpha %.2f bound %4.0f, output error %.4f\n",
 			key, bestAt.alpha, bestAt.clamp, math.Sqrt(best))
-	}
-
-	// The second pass. The Hessian of a site is what says how to spend the
-	// columns not yet quantized on the error of the ones already are, and it
-	// has to be taken in the basis the weights were rotated into — so it can
-	// only be built once the vectors above exist, which is why this is a pass
-	// of its own and not a tally kept during the first.
-	comps := map[string]*compress.Comp{}
-	if *window > 0 {
-		comps = hessians(calibFrom, text, *ntok, *ctx, pre, *hadGroup, *embd,
-			*window, *scaleBlk, *damp)
 	}
 
 	// What a matrix with no calibration site was rotated by, one vector each,
@@ -373,7 +317,6 @@ func main() {
 			av = blindPre[pl.name]
 		}
 		q := reciprocal(av)
-		comp := comps[pl.key]
 		kind, _ := nn.QuantOf(pl.dtype)
 		stride := rowBytes(pl.cols, pl.dtype)
 		perChunk := max(1, expandBudget/(pl.cols*4))
@@ -386,22 +329,12 @@ func main() {
 					return err
 				}
 				if e == 0 && at == 0 {
-					pickSalience(pl.key, rows, n, pl.cols)
+					pickSalience(pl.key, rows, n, pl.cols, kind)
 					if pl.key != "" {
 						q = reciprocal(pre[pl.key])
 					}
 				}
-				var data []byte
-				switch {
-				case trellis:
-					data = compress.EncodeT4GAs(rows, n, pl.cols, q, pl.params, kind)
-				case lloyd:
-					data = compress.EncodeL8G(rows, n, pl.cols, q, pl.params)
-				case onDevice(gpu, pl.params, comp, q):
-					data = encodeOnDevice(gpu, rows, n, pl.cols, q, pl.params)
-				default:
-					data = compress.EncodeD4G(rows, n, pl.cols, q, pl.params, comp)
-				}
+				data := compress.EncodeT4GAs(rows, n, pl.cols, q, pl.params, kind)
 				if e == 0 && at == 0 {
 					// What the codes cost in the basis they were written in.
 					// The theoretical floor for a memoryless Gaussian at this
@@ -497,15 +430,14 @@ func main() {
 		// the ceiling, at seventy-three percent more file — reads 30.30 and
 		// 0.0662. Five bits takes three fifths of the way there for six
 		// percent of the file.
-		if trellis && *headBits == nn.T5GK &&
+		if *headBits == nn.T5GK &&
 			(name == "output.weight" || (name == "token_embd.weight" && *embd != "bf16")) {
 			pl.dtype = "T5G"
 		}
 		if len(t.Shape) == 3 {
 			// A stack of experts: ne2 of them, each ne1 rows of ne0. They are
 			// one tensor in the file and one matrix each here, because a
-			// lattice code spans four weights of a row and a row belongs to
-			// one expert.
+			// trellis sequence spans a row and a row belongs to one expert.
 			pl.stack = t.Shape[2]
 		}
 		pl.rows = t.Elems() / pl.cols / pl.stack
@@ -639,17 +571,12 @@ func main() {
 	for k, v := range g.Meta {
 		meta[k] = v
 	}
-	meta["golem.d4.hadamard_group"] = uint32(*hadGroup)
-	meta["golem.d4.radius"] = uint32(nn.D4Radius)
-	meta["golem.d4.scale_block"] = uint32(*scaleBlk)
-	meta["golem.d4.code_bits"] = uint32(*codeBits)
-	meta["general.file_type"] = uint32(1000)
-	if trellis {
-		meta["general.file_type"] = uint32(1003)
-		meta["golem.trellis.seq"] = uint32(nn.T4GSeq)
-		meta["golem.trellis.bits"] = uint32(nn.T4GK)
-		meta["golem.trellis.state"] = uint32(nn.T4GL)
-	}
+	meta["golem.hadamard_group"] = uint32(*hadGroup)
+	meta["golem.scale_block"] = uint32(*scaleBlk)
+	meta["general.file_type"] = uint32(1003)
+	meta["golem.trellis.seq"] = uint32(nn.T4GSeq)
+	meta["golem.trellis.bits"] = uint32(nn.T4GK)
+	meta["golem.trellis.state"] = uint32(nn.T4GL)
 
 	must(checkVectors(out, rotatedBy))
 
@@ -660,34 +587,6 @@ func main() {
 	fmt.Printf("\n%.0f M weights at %.3f bits each — %s\n",
 		count/1e6, bits/count, sizeOf(int(bits/8)))
 	fmt.Printf("written to %s in %s\n", *dst, time.Since(t0).Round(time.Second))
-}
-
-// onDevice says whether the card's encoder answers this matrix. It writes the
-// same bytes as the sweep for the format as the converter's defaults produce
-// it, and nothing else: the compensation is a sequential pass over the columns
-// of a row and belongs on a processor, and the kernel is built for the scale
-// block and the rotation the format stores.
-func onDevice(gpu *vk.D4GEncoder, p compress.D4Params, comp *compress.Comp, q []float32) bool {
-	if gpu == nil || comp != nil {
-		return false
-	}
-	if p.ScaleBlock != nn.D4SubBlock {
-		return false
-	}
-	return q == nil || p.HadGroup == 0 || p.HadGroup == vk.PrepareD4GGroup
-}
-
-// encodeOnDevice is EncodeD4G with the search on the card: the codes and the
-// steps come back wide, and the packing into the file's twelve-bit planes is
-// compress.PackD4G, which is the same call the sweep makes at the end of a row.
-func encodeOnDevice(gpu *vk.D4GEncoder, w []float32, rows, cols int, q []float32, p compress.D4Params) []byte {
-	codes := make([]uint16, rows*cols/4)
-	steps := make([]byte, rows*cols/nn.D4SubBlock)
-	lo, hi := compress.D4SearchSpan(p)
-	must(gpu.Encode(w, rows, cols, q, vk.D4GEncodeParams{
-		HadGroup: p.HadGroup, Beta: float32(p.Beta), SpanLo: lo, SpanHi: hi,
-	}, codes, steps))
-	return compress.PackD4G(codes, steps, rows, cols, p.Width())
 }
 
 // relErrCeiling is what a matrix may differ from its original by and still be
@@ -905,43 +804,6 @@ func calibrate(path, text string, ntok, ctx, win, block int, useVulkan bool) (ma
 	return out, accs
 }
 
-// hessians is the second pass: the same text again, with each activation put
-// through the site's own vector and rotation before it is counted, so that what
-// comes out is the Hessian the quantizer will actually meet.
-func hessians(path, text string, ntok, ctx int, pre map[string][]float32,
-	group int, embd string, want, block int, damp float64) map[string]*compress.Comp {
-	accs := map[string]*compress.Acc{}
-	buf := [][]float32{}
-	t0 := time.Now()
-	runCalib(path, text, ntok, ctx, func(blk int, site string, rows [][]float32) {
-		key := fmt.Sprintf("%d/%s", blk, site)
-		cols := len(rows[0])
-		a := accs[key]
-		if a == nil {
-			a = compress.NewAcc(cols, fitWindow(cols, want, block))
-			accs[key] = a
-		}
-		for len(buf) < len(rows) {
-			buf = append(buf, make([]float32, cols))
-		}
-		use := buf[:len(rows)]
-		for i, r := range rows {
-			if len(use[i]) != cols {
-				use[i] = make([]float32, cols)
-			}
-			copy(use[i], r)
-			nn.PrepareD4G(use[i], pre[key], hadamardOf(key, group, embd))
-		}
-		a.AddRows(use)
-	})
-	out := map[string]*compress.Comp{}
-	for k, a := range accs {
-		out[k] = a.Comp(damp)
-	}
-	fmt.Printf("factored %d sites in %s\n", len(out), time.Since(t0).Round(time.Second))
-	return out
-}
-
 // fitWindow shrinks a requested window until it divides the row and holds a
 // whole number of scale blocks: a ragged window would either straddle a block
 // or leave one uncompensated, and neither is worth the special case.
@@ -956,15 +818,6 @@ func fitWindow(cols, want, block int) int {
 		}
 	}
 	return block
-}
-
-// hadamardOf says how wide the rotation is at a site, which is nothing for a
-// table stored plain.
-func hadamardOf(key string, group int, embd string) int {
-	if key == headKey && embd != "rot" {
-		return 0
-	}
-	return group
 }
 
 // The sites, kept between runs. Not a GGUF: it is one map of one shape, it is
@@ -1176,7 +1029,7 @@ func expandRows(t tensors.Tensor, from, to int) ([]float32, error) {
 
 // reciprocal is the weights' half of a vector given the activations', which is
 // what nn.PrepareD4G undoes. The two are elementwise reciprocal by definition
-// of the scheme; compress/encode_d4g.go says why.
+// of the scheme; compress/encode_t4g.go says why.
 func reciprocal(v []float32) []float32 {
 	if v == nil {
 		return nil
@@ -1223,18 +1076,6 @@ func expand(t tensors.Tensor) ([]float32, error) {
 		}
 	})
 	return out, nil
-}
-
-// flagWasSet says whether the command line named a flag, so that a default
-// chosen for one codebook is not imposed on a caller who chose another.
-func flagWasSet(name string) bool {
-	found := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == name {
-			found = true
-		}
-	})
-	return found
 }
 
 // kept says whether a tensor is one of those a probe is leaving alone, so that

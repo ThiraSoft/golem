@@ -22,15 +22,15 @@ func TestGGUFRoundTrip(t *testing.T) {
 		"tokenizer.ggml.bos_id":    int32(11),
 		"tokenizer.ggml.add_bos":   true,
 		"tokenizer.ggml.scores":    []any{float32(1), float32(-2)},
-		"golem.d4.hadamard_group":  uint32(128),
-		"golem.d4.radius":          uint32(40),
+		"golem.hadamard_group":     uint32(128),
+		"golem.scale_block":        uint32(64),
 		"general.quantization_ver": uint64(2),
 	}
 	tensors := []OutTensor{
 		{Name: "output_norm.weight", Shape: []int{4}, DType: "F32",
 			Data: []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}},
-		{Name: "blk.0.attn_q.weight", Shape: []int{64, 2}, DType: "D4G",
-			Data: make([]byte, 2*26)},
+		{Name: "blk.0.attn_q.weight", Shape: []int{128, 2}, DType: "T4G",
+			Data: make([]byte, 2*67)},
 	}
 	for i := range tensors[1].Data {
 		tensors[1].Data[i] = byte(i * 7)

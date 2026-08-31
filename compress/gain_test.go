@@ -8,12 +8,14 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 )
 
-// Rounding onto a lattice is supposed to shrink a row — the reconstruction a
-// little shorter than what it stands for — and that part of the error would be
-// systematic, so one number a row would take it away. It does not: the gain
-// comes out at 1.0000 ± 1.7% and removes half a percent of the error. This is
-// here so that nobody adds a per-row gain to the format on the strength of the
-// argument, which is sound, without the measurement, which says no.
+// Rounding onto a trellis path is supposed to shrink a row — the
+// reconstruction a little shorter than what it stands for — and that part of
+// the error would be systematic, so one number a row would take it away. It
+// does not: the gain comes out close to 1.0000 and removes a fraction of a
+// percent of the error. This is here so that nobody adds a per-row gain to the
+// format on the strength of the argument, which is sound, without the
+// measurement, which says no. TrellisOpts already carries a Gain field for the
+// codebook itself; this is the separate question of a gain per row of output.
 func TestPerRowGainIsNotWorthCarrying(t *testing.T) {
 	const rows, cols, samples = 128, 1024, 256
 	rng := rand.New(rand.NewSource(5))
@@ -36,19 +38,19 @@ func TestPerRowGainIsNotWorthCarrying(t *testing.T) {
 	for i, v := range q {
 		inv[i] = 1 / v
 	}
-	p := D4Params{Beta: 2, ScaleBlock: 32, HadGroup: 128, SearchScale: true}
-	data := EncodeD4G(w, rows, cols, q, p, nil)
+	p := D4Params{ScaleBlock: nn.T4GBlock, HadGroup: 128}
+	data := EncodeT4GAs(w, rows, cols, q, p, nn.T4G)
 
 	xr := cloneRows(x)
 	for _, r := range xr {
 		nn.PrepareD4G(r, inv, 128)
 	}
-	stride := cols / nn.D4Block * 26
+	m := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols}
 	rec := make([]float32, cols)
 	var plain, gained, den float64
 	var sumG, sumG2 float64
 	for r := 0; r < rows; r++ {
-		nn.DequantizeD4G(data[r*stride:(r+1)*stride], cols, rec)
+		m.Row(r, rec)
 		orig := w[r*cols : (r+1)*cols]
 		// The gain that best matches the product, in closed form.
 		var num, dsq float64
@@ -80,4 +82,14 @@ func TestPerRowGainIsNotWorthCarrying(t *testing.T) {
 	t.Logf("gain %.4f ± %.4f; output error %.4f plain, %.4f with a gain a row (%.1f%% of it)",
 		mean, sd, math.Sqrt(plain/den), math.Sqrt(gained/den),
 		100*math.Sqrt(gained/plain))
+}
+
+// cloneRows makes an independent copy of each row, for a caller that is about
+// to transform one copy in place and still wants the original beside it.
+func cloneRows(x [][]float32) [][]float32 {
+	out := make([][]float32, len(x))
+	for i, r := range x {
+		out[i] = append([]float32(nil), r...)
+	}
+	return out
 }

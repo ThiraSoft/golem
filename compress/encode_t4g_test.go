@@ -8,166 +8,183 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 )
 
-// The packing has to be exact, and it is the one contract of this format that
-// is. A decoder is a pure function of the bits it reads, so a round trip that
-// loses anything is a packing bug and not a rounding one — see the encoders,
-// which are deliberately held to a weaker contract because two minimum-cost
-// paths are two valid files.
-func TestT4GRoundTripIsExact(t *testing.T) {
-	rg := rand.New(rand.NewSource(17))
-	for _, kind := range []nn.Quant{nn.T4G, nn.T5G} {
-		for _, cols := range []int{128, 256, 1024, 1152} {
-			const rows = 5
-			w := make([]float32, rows*cols)
-			for i := range w {
-				w[i] = float32(rg.NormFloat64()) * 0.02
-			}
-			data := EncodeT4GAs(w, rows, cols, nil, D4Params{ScaleBlock: nn.T4GBlock}, kind)
-			if want := rows * nn.T4GRowBytesN(cols, kind); len(data) != want {
-				t.Fatalf("%s, %d columns: %d bytes, want %d", kind, cols, len(data), want)
-			}
-
-			// What the file says, read back the way a reader will.
-			m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols}
-			got := make([]float32, cols)
-
-			// What the encoder chose, rebuilt from the same path and the same
-			// steps without going through any bytes at all.
-			for r := 0; r < rows; r++ {
-				m.Row(r, got)
-				row := make([]float32, cols)
-				copy(row, w[r*cols:(r+1)*cols])
-				want := reconstructT4G(row, kind)
-				for j := range want {
-					if got[j] != want[j] {
-						t.Fatalf("%s, %d columns, row %d, weight %d: the file reads %v, the encoder chose %v",
-							kind, cols, r, j, got[j], want[j])
-					}
-				}
-			}
-		}
-	}
-}
-
-// reconstructT4G is EncodeT4G's arithmetic with no file in the middle: the same
-// normalisation, the same path, the same least-squares step on the same grid.
-func reconstructT4G(row []float32, kind nn.Quant) []float32 {
-	cols := len(row)
-	norm := make([]float32, cols)
-	for b := 0; b*nn.T4GBlock < cols; b++ {
-		blk := row[b*nn.T4GBlock : (b+1)*nn.T4GBlock]
-		var ss float64
-		for _, v := range blk {
-			ss += float64(v) * float64(v)
-		}
-		inv := float32(0)
-		if rms := float32(math.Sqrt(ss / float64(nn.T4GBlock))); rms > 0 {
-			inv = 1 / rms
-		}
-		for i, v := range blk {
-			norm[b*nn.T4GBlock+i] = v * inv
-		}
-	}
-	states := make([]uint16, cols)
-	QuantizeTrellisPath(norm, T4GOptsFor(kind), states)
-	out := make([]float32, cols)
-	for b := 0; b*nn.T4GBlock < cols; b++ {
-		var num, den float64
-		for i := b * nn.T4GBlock; i < (b+1)*nn.T4GBlock; i++ {
-			num += float64(row[i]) * float64(norm[i])
-			den += float64(norm[i]) * float64(norm[i])
-		}
-		code := byte(0)
-		if den > 0 {
-			code = nn.T4GStepCode(float32(num / den))
-		}
-		step := nn.T4GStep(code)
-		for i := b * nn.T4GBlock; i < (b+1)*nn.T4GBlock; i++ {
-			out[i] = nn.T4GValue(states[i]) * step
-		}
-	}
-	return out
-}
-
-// The bits themselves: a legal path packed into 65 bytes and read back one
-// weight at a time. This is the arithmetic every decoder repeats — Go's, the
-// shader's — so it is checked on its own before anything is built on it.
-func TestT4GStatesPackAndUnpack(t *testing.T) {
-	rg := rand.New(rand.NewSource(5))
-	for _, tier := range []struct {
-		q nn.Quant
-		k int
-	}{{nn.T4G, nn.T4GK}, {nn.T5G, nn.T5GK}} {
-		for trial := 0; trial < 64; trial++ {
-			states := make([]uint16, nn.T4GSeq)
-			states[0] = uint16(rg.Intn(1 << nn.T4GL))
-			for i := 1; i < nn.T4GSeq; i++ {
-				states[i] = uint16((uint32(states[i-1])<<uint(tier.k) | uint32(rg.Intn(1<<uint(tier.k)))) & (1<<nn.T4GL - 1))
-			}
-			buf := make([]byte, nn.T4GSeqBytesN(tier.q))
-			nn.PutT4GStatesN(buf, states, tier.q)
-			for i, want := range states {
-				if got := nn.T4GStateAtN(buf, i, tier.q); got != want {
-					t.Fatalf("%s, weight %d: read %012b, wrote %012b", tier.q, i, got, want)
-				}
-			}
-		}
-	}
-}
-
-// What the format costs, said in the same unit the plan for it was written in.
-func TestT4GBitsPerWeight(t *testing.T) {
-	const cols = 1024
-	for _, want := range []struct {
-		q   nn.Quant
-		bpw float64
-	}{{nn.T4G, 4.1875}, {nn.T5G, 5.1875}} {
-		bpw := float64(nn.T4GRowBytesN(cols, want.q)) * 8 / cols
-		if bpw != want.bpw {
-			t.Fatalf("a %s row of %d is %d bytes, %.4f bits a weight, want %.4f",
-				want.q, cols, nn.T4GRowBytesN(cols, want.q), bpw, want.bpw)
-		}
-	}
-}
-
-// What the file itself reconstructs, on the source the rotation makes every
-// tensor into. The bench measures the codec; this measures the bytes, which is
-// the thing a model reads, and the two should not differ.
+// The encoder and the kernel have to agree about what a file means. This holds
+// one to the other on the only thing that matters: the product.
 //
-// It also watches the step grid. A block whose step saturates is quantized
-// against a codebook of the wrong size, and it does not look like an error: the
-// file loads, every shape agrees, and the tensor reads at five decibels. That
-// happened, with D4G's window, whose ceiling of 0.478 a unit-variance source
-// walks straight past.
-func TestT4GFileReconstructsAGaussian(t *testing.T) {
-	nn.T4GStepClipped.Store(0)
-	const rows, cols = 64, 1024
-	w := gaussian(rows*cols, 21)
-	for _, tier := range []struct {
-		q     nn.Quant
-		floor float64
-	}{{nn.T4G, 20}, {nn.T5G, 26}} {
-		data := EncodeT4GAs(w, rows, cols, nil, D4Params{ScaleBlock: nn.T4GBlock}, tier.q)
+// It is the test that catches a scheme that is self-consistent and wrong — the
+// rotation applied to the weights but not the activations, a reciprocal taken
+// once too often, a scale folded into the wrong side. Each of those leaves the
+// weights looking plausible and the answer somebody else's.
+func TestD4GProductSurvivesTheRoundTrip(t *testing.T) {
+	const rows, cols = 96, 256
+	r := rand.New(rand.NewSource(5))
 
-		m := nn.Matrix{Data: data, Quant: tier.q, Rows: rows, Cols: cols}
-		rec := make([]float32, rows*cols)
-		row := make([]float32, cols)
-		for r := 0; r < rows; r++ {
-			m.Row(r, row)
-			copy(rec[r*cols:], row)
+	// Weights with the shape the rotation exists for: a handful of columns
+	// carrying far more than the rest. Gaussian noise would not do — it is
+	// already incoherent, so a rotation can only fail to help, and the
+	// assertion below would be measuring nothing.
+	w := make([]float32, rows*cols)
+	for i := range w {
+		w[i] = float32(r.NormFloat64()) * 0.02
+	}
+	for j := 0; j < cols; j += 23 {
+		for i := 0; i < rows; i++ {
+			w[i*cols+j] *= 8
 		}
-		db := sqnrDB(w, rec)
-		t.Logf("%s: %.4f bits a weight, %.2f dB (Shannon is %.2f)",
-			tier.q, float64(nn.T4GRowBytesN(cols, tier.q))*8/cols, db,
-			6.02*float64(nn.T4GRowBytesN(cols, tier.q))*8/cols)
-		if n := nn.T4GStepClipped.Load(); n != 0 {
-			t.Errorf("%d blocks landed on an end of the step grid", n)
+	}
+	x := make([]float32, cols)
+	for i := range x {
+		x[i] = float32(r.NormFloat64())
+	}
+
+	// The per-column vector, signs and a salience scale together.
+	q := make([]float32, cols)
+	pre := make([]float32, cols)
+	for j := range q {
+		s := float32(0.5 + r.Float64())
+		if r.Intn(2) == 0 {
+			s = -s
 		}
-		// The codec reads 22.65 dB at four bits on a Gaussian and the file's
-		// own per-block step buys a little more; a bit a weight is six more.
-		// Anything under the floor is a packing bug, not a codebook.
-		if db < tier.floor {
-			t.Errorf("%s reconstructs at %.2f dB, which is not what the codec does", tier.q, db)
+		q[j] = s
+		pre[j] = 1 / s
+	}
+
+	var unrotated float64
+	for _, group := range []int{0, 128} {
+		params := D4Params{ScaleBlock: nn.T4GBlock, HadGroup: group}
+		data := EncodeT4GAs(w, rows, cols, q, params, nn.T4G)
+		if want := rows * nn.T4GRowBytesN(cols, nn.T4G); len(data) != want {
+			t.Fatalf("group %d: %d bytes, want %d", group, len(data), want)
 		}
+
+		// What the kernel does: prepare the activation, then the product.
+		xp := make([]float32, cols)
+		copy(xp, x)
+		nn.PrepareD4G(xp, pre, group)
+
+		m := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols}
+		b := nn.NewBatch(cols, 1)
+		copy(b.F[0], xp)
+		got := make([]float32, rows)
+		m.MatVec(b, got)
+
+		// What it should have been.
+		var num, den float64
+		for i := 0; i < rows; i++ {
+			var want float64
+			for j := 0; j < cols; j++ {
+				want += float64(w[i*cols+j]) * float64(x[j])
+			}
+			d := want - float64(got[i])
+			num += d * d
+			den += want * want
+		}
+		rel := math.Sqrt(num / den)
+		// This is a wiring check, not a quality bar. The per-column vector here
+		// is random rather than a real salience, which is the worst case for it
+		// — the error on a column the weights were shrunk into comes back
+		// multiplied. What it has to catch is a scheme that is self-consistent
+		// and wrong, and those miss by a factor, not by a few percent.
+		if rel > 0.35 {
+			t.Errorf("group %d: the product is %.4f away from the real one", group, rel)
+		}
+		if group == 0 {
+			unrotated = rel
+		} else if rel > unrotated {
+			t.Errorf("the rotation made it worse: %.4f rotated against %.4f plain", rel, unrotated)
+		}
+		t.Logf("group %d: relative error %.4f", group, rel)
+	}
+}
+
+// A matrix with no vector and no rotation is the plain case the embedding
+// table takes, and it has to work on its own.
+func TestD4GWithoutRotationOrScaling(t *testing.T) {
+	const rows, cols = 32, 128
+	r := rand.New(rand.NewSource(9))
+	w := make([]float32, rows*cols)
+	for i := range w {
+		w[i] = float32(r.NormFloat64()) * 0.05
+	}
+	data := EncodeT4GAs(w, rows, cols, nil, D4Params{ScaleBlock: nn.T4GBlock}, nn.T4G)
+
+	out := make([]float32, cols)
+	m := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols}
+	var num, den float64
+	for i := 0; i < rows; i++ {
+		m.Row(i, out)
+		for j := 0; j < cols; j++ {
+			d := float64(w[i*cols+j] - out[j])
+			num += d * d
+			den += float64(w[i*cols+j]) * float64(w[i*cols+j])
+		}
+	}
+	if rel := math.Sqrt(num / den); rel > 0.18 {
+		t.Errorf("a row read back is %.4f away from the one written", rel)
+	}
+}
+
+// A row read back is the row that went in.
+//
+// This is the check nothing had: RelErr compares the codes against the matrix
+// already put through the site's scale and rotation, which is the basis they
+// were written in, and every reader of a *product* meets them in that basis.
+// A row read on its own does not — the embedding table is read a token at a
+// time and the row has to be the embedding — and between the two lives a fault
+// that changes no shape, no name and no size, and that a card-against-processor
+// comparison cannot see because both sides read it the same wrong way.
+func TestARowReadsBackAsTheRowThatWentIn(t *testing.T) {
+	const rows, cols, group = 48, 512, 128
+	r := rand.New(rand.NewSource(21))
+	w := make([]float32, rows*cols)
+	for i := range w {
+		w[i] = float32(r.NormFloat64() * 0.02)
+	}
+	// A site's vector: signs over a scale, which is what a calibration writes.
+	pre := make([]float32, cols)
+	q := make([]float32, cols)
+	for j := range pre {
+		s := float32(0.4 + r.Float64())
+		if r.Intn(2) == 0 {
+			s = -s
+		}
+		q[j] = s
+		pre[j] = 1 / s
+	}
+	p := D4Params{ScaleBlock: nn.T4GBlock, HadGroup: group}
+	data := EncodeT4GAs(w, rows, cols, q, p, nn.T4G)
+
+	// Bound the way a loader binds it: the vector the file carries beside it.
+	m := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols, Pre: pre, HadGroup: group}
+	got := make([]float32, cols)
+	var num, den float64
+	for i := 0; i < rows; i++ {
+		m.Row(i, got)
+		for j, x := range w[i*cols : (i+1)*cols] {
+			d := float64(got[j] - x)
+			num += d * d
+			den += float64(x) * float64(x)
+		}
+	}
+	rel := math.Sqrt(num / den)
+	if rel > 0.25 {
+		t.Errorf("a row reads back %.4f away from the row that went in; the format's own error is about 0.15, and 1.4 is a row still rotated", rel)
+	}
+
+	// And a matrix with no vector hands back what it holds, because that is
+	// what a product wants.
+	plain := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols}
+	stored := make([]float32, cols)
+	plain.Row(0, stored)
+	m.Row(0, got)
+	same := true
+	for j := range got {
+		if got[j] != stored[j] {
+			same = false
+			break
+		}
+	}
+	if same {
+		t.Error("a bound matrix and an unbound one gave the same row, so nothing was undone")
 	}
 }

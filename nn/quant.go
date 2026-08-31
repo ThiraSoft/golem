@@ -20,16 +20,6 @@ const (
 	Q5_K
 	Q6_K
 	Q8_0
-	// D4G is golem's own: 64 weights in 26 bytes, a twelve-bit lattice code
-	// every four. nn/d4g.go describes it.
-	D4G
-	// D4G16 is the same format with sixteen-bit codes — 34 bytes a block, a
-	// whole bit a weight more, and a table sixteen times larger.
-	D4G16
-	// L8G is D4G's container with a scalar codebook: three bits a weight over
-	// Lloyd's eight levels, in the same twenty-six bytes and with no table at
-	// all. nn/l8g.go says what that costs.
-	L8G
 	// T4G is the trellis: 128 weights in 67 bytes, 4.1875 bits each, and a
 	// codebook that is computed rather than looked up. nn/t4g.go describes it.
 	T4G
@@ -50,23 +40,10 @@ const (
 // format that has no lattice code at all came to need a name for the question.
 func (q Quant) Golem() bool {
 	switch q {
-	case D4G, D4G16, L8G, T4G, T5G:
+	case T4G, T5G:
 		return true
 	}
 	return false
-}
-
-// D4Width is the code width of a D4G format, and zero for anything else.
-func (q Quant) D4Width() int {
-	switch q {
-	case D4G:
-		return D4Bits
-	case D4G16:
-		return D4Bits16
-	case L8G:
-		return L8Bits
-	}
-	return 0
 }
 
 func (q Quant) String() string {
@@ -91,12 +68,6 @@ func (q Quant) String() string {
 		return "Q6_K"
 	case Q8_0:
 		return "Q8_0"
-	case D4G:
-		return "D4G"
-	case D4G16:
-		return "D4G16"
-	case L8G:
-		return "L8G"
 	case T4G:
 		return "T4G"
 	case T5G:
@@ -128,12 +99,6 @@ func QuantOf(dtype string) (Quant, bool) {
 		return Q6_K, true
 	case "Q8_0":
 		return Q8_0, true
-	case "D4G":
-		return D4G, true
-	case "D4G16":
-		return D4G16, true
-	case "L8G":
-		return L8G, true
 	case "T4G":
 		return T4G, true
 	case "T5G":
