@@ -485,7 +485,8 @@ what golem took:
   "constraint is cheap" and the padded layout's twelve priming bits both
   come from.
 - **QuIP#** — Tseng, Chee, Sun, Kuleshov, De Sa, *QuIP#: Even Better LLM
-  Quantization with Hadamard Incoherence and Lattice Codebooks*, ICML 2024.
+  Quantization with Hadamard Incoherence and Lattice Codebooks*, ICML 2024,
+  arXiv:2402.04396.
   The E8 lattice codebook and the Hadamard incoherence processing this format
   used before the trellis replaced the codebook; D4 was chosen over E8 because
   E8's shell does not fit a workgroup's shared memory, a comparison only worth
@@ -501,7 +502,7 @@ what golem took:
   between writing and publication is not a typo.
 - **AWQ** — Lin, Tang, Tang, Yang, Chen, Wang, Xiao, Dang, Gan, Han,
   *AWQ: Activation-aware Weight Quantization for LLM Compression and
-  Acceleration*, MLSys 2024. The per-column salience scale, raised to α = 0.5
+  Acceleration*, MLSys 2024, arXiv:2306.00978. The per-column salience scale, raised to α = 0.5
   and normalised by its geometric mean — "the salience, which is most of what
   the format is" above is a description of AWQ with a bound added, worth
   twenty points of perplexity on Qwen3-0.6B by golem's own measurement.
