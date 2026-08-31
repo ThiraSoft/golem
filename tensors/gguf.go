@@ -239,7 +239,7 @@ var blockGeometry = map[string][2]int{
 	"Q4_K": {256, 144}, // 2 fp16 (d, dmin) + 12 scales + 128 nibbles
 	"Q5_K": {256, 176}, // 2 fp16 (d, dmin) + 12 scales + 32 high bits + 128 nibbles
 	"Q6_K": {256, 210}, // 128 low nibbles, 64 high pairs, 16 scales, one fp16
-	"T3G":  {128, 52},  // two step codes, then a 393-bit path in 400
+	"T3G":  {128, 50},  // two step codes, then a tail-biting 384-bit path
 	"T4G":  {128, 67},  // two step codes, then a 520-bit trellis path
 	"T5G":  {128, 83},  // the same at five bits a weight, 648 of them
 }

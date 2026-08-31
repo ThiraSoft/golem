@@ -18,6 +18,7 @@ package compress
 
 import (
 	"math"
+	"sync/atomic"
 
 	"github.com/ThiraSoft/golem/nn"
 )
@@ -95,6 +96,15 @@ type TrellisOpts struct {
 	Seq  int // weights coded as one sequence — the effective dimension
 	Code TrellisCode
 
+	// TailBiting closes the path on itself: state[0] is a successor of
+	// state[Seq-1], so the code stream is a ring and no bits are spent priming
+	// a window. It costs L−k bits a sequence — 0.09 bits a weight at k=3,
+	// which is the whole of what the padded layout wasted — and it costs a
+	// second Viterbi pass, because the constraint couples the two ends of the
+	// search. It is only legal where L is a whole multiple of k, which of the
+	// three tiers is k=3 alone.
+	TailBiting bool
+
 	// Gain narrows the codebook against the source. The block arrives at unit
 	// RMS and the code's values are N(0,1), so a gain of one lines the two up
 	// — which is not what minimises the error. The reconstruction that does is
@@ -116,8 +126,14 @@ func (t TrellisOpts) gain() float32 {
 // BitsPerSeq is what one sequence actually occupies. The first weight needs a
 // whole L-bit window before there is any history to shift, so a sequence is not
 // T·k bits but T·k + (L−k) — under two percent at T=256, and the honest number
-// to put in a rate.
-func (t TrellisOpts) BitsPerSeq() int { return (t.Seq-1)*t.K + t.L }
+// to put in a rate. A tail-biting sequence is T·k exactly: the priming window
+// is the wrapped tail, and it is already paid for.
+func (t TrellisOpts) BitsPerSeq() int {
+	if t.TailBiting {
+		return t.Seq * t.K
+	}
+	return (t.Seq-1)*t.K + t.L
+}
 
 func (t TrellisOpts) BPW() float64 {
 	return float64(t.BitsPerSeq()) / float64(t.Seq)
@@ -136,24 +152,47 @@ type viterbiWork struct {
 	bp        []uint8 // per step, the winning j for each prefix
 	nstates   int
 	nprefix   int
+
+	// Tail-biting runs the search twice and the first pass destroys what the
+	// second one needs, so the source and the path get a scratch of their own.
+	src []float32
+	st  []uint16
 }
 
 func newViterbiWork(o TrellisOpts) *viterbiWork {
 	ns := 1 << uint(o.L)
 	np := 1 << uint(o.L-o.K)
-	return &viterbiWork{
+	w := &viterbiWork{
 		prev:    make([]float32, ns),
 		cur:     make([]float32, ns),
 		bp:      make([]uint8, o.Seq*np),
 		nstates: ns,
 		nprefix: np,
 	}
+	if o.TailBiting {
+		w.src = make([]float32, o.Seq)
+		w.st = make([]uint16, o.Seq)
+	}
+	return w
 }
 
 // viterbi finds the path and writes the reconstruction over z. states, when it
 // is not nil, is filled with the state each weight was coded as — which is what
 // a file stores, the reconstruction being what the decoder recomputes from it.
 func viterbi(z []float32, val []float32, o TrellisOpts, w *viterbiWork, states []uint16) {
+	viterbiFrom(z, val, o, w, states, -1)
+}
+
+// viterbiFrom is viterbi with the start constrained. startPrefix, when it is
+// not negative, is the low L−k bits some state must have been left with for the
+// path to continue into state[0] — so the legal starts are the 2^k states s
+// with s>>k == startPrefix, and nothing else. It is what tail-biting's second
+// pass needs and what nothing else uses.
+//
+// An illegal start is priced at MaxFloat32 rather than removed. Adding a
+// distortion to it rounds back to MaxFloat32 in float32, so a dead path stays
+// dead and can never beat a live one, and the step loop keeps the one shape.
+func viterbiFrom(z []float32, val []float32, o TrellisOpts, w *viterbiWork, states []uint16, startPrefix int) {
 	ns, np := w.nstates, w.nprefix
 	kb := uint(o.K)
 	shift := uint(o.L - o.K)
@@ -161,6 +200,10 @@ func viterbi(z []float32, val []float32, o TrellisOpts, w *viterbiWork, states [
 
 	// t = 0: any window is a legal start, so the cost is the distortion alone.
 	for s := 0; s < ns; s++ {
+		if startPrefix >= 0 && s>>kb != startPrefix {
+			w.prev[s] = math.MaxFloat32
+			continue
+		}
 		d := z[0] - val[s]
 		w.prev[s] = d * d
 	}
@@ -208,6 +251,93 @@ func viterbi(z []float32, val []float32, o TrellisOpts, w *viterbiWork, states [
 	}
 }
 
+// TrellisTailSeqs and TrellisTailOpen count what the approximation costs.
+// A tail-biting path has to be a cycle, and the two-pass search does not
+// guarantee one: TrellisTailOpen is how many sequences came out of the second
+// pass ending somewhere its own start does not follow from. Those are not
+// broken files — closeTail below rewrites the path to what the decoder will
+// actually read — but they are sequences whose last three weights were chosen
+// against a tail that is not the one they got, and the fraction is the honest
+// measure of whether this approximation is the right one.
+var (
+	TrellisTailSeqs atomic.Int64
+	TrellisTailOpen atomic.Int64
+)
+
+// closeTail makes a path agree with the bits it will be written as.
+//
+// A tail-biting sequence stores one k-bit symbol a weight — the top k bits of
+// its own state — and a state is L/k consecutive symbols read as a ring. So the
+// decoder's state for weight t is fixed by the symbols alone, and for the last
+// L/k − 1 weights those symbols come partly from the start of the sequence. If
+// the search closed the ring the rewrite changes nothing; if it did not, this
+// is what makes the reconstruction the encoder measures the same one the file
+// yields, which is what every step fit and every error figure downstream
+// assumes.
+func closeTail(z []float32, val []float32, o TrellisOpts, states []uint16) {
+	T := o.Seq
+	k := uint(o.K)
+	nsym := o.L / o.K
+	mask := uint16(1<<k - 1)
+	open := false
+	for t := 0; t < T; t++ {
+		var s uint16
+		for j := 0; j < nsym; j++ {
+			sym := states[(t+j)%T] >> uint(o.L-o.K) & mask
+			s |= sym << uint(o.L-(j+1)*o.K)
+		}
+		if t >= T-nsym+1 && s != states[t] {
+			open = true
+		}
+		z[t] = val[s]
+		states[t] = s
+	}
+	TrellisTailSeqs.Add(1)
+	if open {
+		TrellisTailOpen.Add(1)
+	}
+}
+
+// viterbiTail is the tail-biting search: two passes and a close.
+//
+// The exact answer would run the search from every one of the 2^L start states
+// and keep the cheapest cycle — 4096 times the work, which is not a thing that
+// can be done to four billion weights. This is the standard approximation
+// instead. Pass one runs unconstrained and its terminal state names the tail
+// the path wants to end on; pass two runs again with the start restricted to
+// the 2^k states that tail can be followed by, and that is the file. It is an
+// approximation and it does not always converge — TrellisTailOpen counts the
+// sequences where it did not.
+func viterbiTail(z []float32, val []float32, o TrellisOpts, w *viterbiWork, states []uint16) {
+	copy(w.src, z)
+	st := states
+	if st == nil {
+		st = w.st
+	}
+	viterbiFrom(z, val, o, w, st, -1)
+	end := int(st[o.Seq-1])
+	copy(z, w.src)
+	viterbiFrom(z, val, o, w, st, end&(1<<uint(o.L-o.K)-1))
+	closeTail(z, val, o, st)
+}
+
+// CloseTailPaths is closeTail over a whole array, for a caller outside this
+// package. The card's Viterbi walks the ring but does not close it — that is
+// the processor's half, the same division of labour that leaves the bit
+// packing to nn — so anything holding the two encoders to each other has to
+// close both sides the same way.
+func CloseTailPaths(z []float32, o TrellisOpts, states []uint16) {
+	val := TrellisTable(o.Code, o.L)
+	g := o.gain()
+	for i := 0; i+o.Seq <= len(z); i += o.Seq {
+		seq := z[i : i+o.Seq]
+		closeTail(seq, val, o, states[i:i+o.Seq])
+		for j, v := range seq {
+			seq[j] = v / g
+		}
+	}
+}
+
 // TrellisAccel, when set, is given first refusal on a matrix. It is how the
 // card gets to do the Viterbi without this package importing the one that
 // drives it — vk imports compress, so the arrow cannot point both ways. It
@@ -226,10 +356,27 @@ var TrellisPathAccel func(norm []float32, o TrellisOpts, states []uint16) bool
 // sequence at a time, writing the reconstruction back over norm.
 func quantizeTrellis(norm []float32, o TrellisOpts, val []float32, states []uint16) {
 	if states == nil {
-		if TrellisAccel != nil && TrellisAccel(norm, o) {
+		// A tail-biting pass has to come back with its path, because closing
+		// the ring is what makes the reconstruction the file's. The hook that
+		// returns only a reconstruction is therefore never offered one.
+		if TrellisAccel != nil && !o.TailBiting && TrellisAccel(norm, o) {
 			return
 		}
 	} else if TrellisPathAccel != nil && TrellisPathAccel(norm, o, states) {
+		if o.TailBiting {
+			// The card walked the ring; this is what the bytes will read as.
+			g := o.gain()
+			Parallel(len(norm)/o.Seq, func(lo, hi int) {
+				z := make([]float32, o.Seq)
+				for i := lo; i < hi; i++ {
+					seq := norm[i*o.Seq : (i+1)*o.Seq]
+					closeTail(z, val, o, states[i*o.Seq:(i+1)*o.Seq])
+					for j, v := range z {
+						seq[j] = v / g
+					}
+				}
+			})
+		}
 		return
 	}
 	nseq := len(norm) / o.Seq
@@ -246,7 +393,11 @@ func quantizeTrellis(norm []float32, o TrellisOpts, val []float32, states []uint
 			if states != nil {
 				st = states[i*o.Seq : (i+1)*o.Seq]
 			}
-			viterbi(z, val, o, w, st)
+			if o.TailBiting {
+				viterbiTail(z, val, o, w, st)
+			} else {
+				viterbi(z, val, o, w, st)
+			}
 			for j, v := range z {
 				seq[j] = v / g
 			}

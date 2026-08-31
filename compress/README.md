@@ -4,7 +4,7 @@ A checkpoint in, a `.golem` out. One codebook, and a scheme around it:
 
 | | block | bits/weight | tensor type |
 |---|---|---|---|
-| `T3G` | 128 weights in 52 bytes | 3.25 | 1000 |
+| `T3G` | 128 weights in 50 bytes | 3.125 | 1000 |
 | `T4G` | 128 weights in 67 bytes | 4.19 | 1001 |
 | `T5G` | 128 weights in 83 bytes | 5.19 | 1002 |
 
@@ -169,14 +169,38 @@ format they arrived in, and neither the salience nor the rotation cares.
 ### What three bits buys, and what is not three bits
 
 `T3G` cuts the trellis's window in half: four bits a weight down to three,
-520 bits of path down to 391 — twelve for the first weight in a window plus
-three for each of the 127 after it — with the same two eight-bit steps per
-128-weight row. The seven padding bits are what keep the row on a byte
-boundary anyway: 2 (steps) + 391 (path) = 393 bits, and 52 bytes is 416, so
-seven bits ride along unused rather than the block spilling into a 53rd byte
-a shader would have to read and mask around. They cost nothing measured —
-the row is 3.25 bits a weight, not 3.0555, and that eighth of a bit is the
-price already visible in the table at the top of this file.
+520 bits of path down to 384 — 128 three-bit symbols and nothing else — with
+the same two eight-bit steps per 128-weight row. It is the one **tail-biting**
+tier: the path closes on itself, so weight *t*'s window is bits
+`[3t, 3t+12)` **modulo 384** and the last three weights of a sequence read a
+window that runs off the end and returns to bit zero. No twelve bits of
+priming and no padding: 48 bytes of path, 50 of block, **3.125 bits a weight
+exactly.**
+
+That is legal here and nowhere else in the format, because L = 4k only at
+k = 3. A window is four whole symbols wide, so a state is four consecutive
+symbols read as a ring and the file stores the top three bits of each state at
+bit offset 3t. At four and five bits a window is not a whole number of symbols
+and the priming stays.
+
+The encoder pays for it. A tail-biting path has to be a *cycle* — `state[0]`
+must be a successor of `state[127]` — and the exact search runs from all 2^12
+starts, which is 4096 times the work. What runs instead is the standard
+two-pass approximation: one unconstrained pass whose terminal state names the
+tail, then a second restricted to the 2^3 states that tail can be followed by.
+`closeTail` rewrites whatever ring the second pass leaves open to the ring the
+decoder will actually read, so the file is self-consistent either way; on real
+weights it has to about 1.35 % of the time. Iterating past two passes buys
+0.05 dB and stops, so the search is converged and the gap below is the loop.
+
+**Measured, this is a bad trade, and the padded layout it replaced is the one
+to keep.** See §7.1 of the design note for the full comparison. In short: the
+loop costs 1.01 dB of quantizer SNR (17.28 → 16.27 on a Gaussian) where the
+0.125 bits a weight it gives back is worth 0.73 dB on this codec's own
+rate–distortion slope of about 5.9 dB a bit; and it does not even buy the
+bandwidth it was for, because the kernel reads five bytes per eight weights in
+both layouts and never touches the padding — generation measured **48.94 t/s
+padded against 47.20 tail-biting** on Qwen3-4B.
 
 A `.golem` T3G file is not three bits throughout. `golemquant` still refuses
 to write a head that narrow — the logit head is still worth more bits than
@@ -187,10 +211,10 @@ this uneven never happens:
 
 | model | body | head | weighted | file |
 |---|---|---|---|---|
-| Qwen3-0.6B | 3.25 (T3G) | 4.1875 (T4G) | 3.509 | 255.0 MiB |
-| Qwen3-4B | 3.25 (T3G) | 4.1875 (T4G) | 3.347 | 1.573 GiB |
+| Qwen3-0.6B | 3.125 (T3G) | 4.1875 (T4G) | 3.416 | 248.4 MiB |
+| Qwen3-4B | 3.125 (T3G) | 4.1875 (T4G) | 3.235 | 1.520 GiB |
 
-The 4B sits closer to the nominal 3.25 than the 0.6B because the head is a
+The 4B sits closer to the nominal 3.125 than the 0.6B because the head is a
 smaller fraction of a bigger model's weights — about a tenth here, versus
 about a quarter on the 0.6B — so the four-bit tax on it moves the weighted
 rate less.
@@ -203,9 +227,13 @@ against llama.cpp's own floor at three bits — Q3_K_M at 1.93 GiB, Q3_K_S at
 |---|---|---|---|---|---|
 | Q3_K_M | 1.93 GiB | 24.0253 | 0.2453 | 79.8 % | 97.7 % |
 | Q3_K_S | 1.76 GiB | 24.9781 | 0.3336 | 77.9 % | 96.7 % |
-| `.golem` T3G | **1.573 GiB** | **21.1078** | **0.1771** | **83.1 %** | **98.3 %** |
+| `.golem` T3G, tail-biting | 1.520 GiB | 22.0596 | 0.2129 | 80.9 % | 97.8 % |
+| `.golem` T3G, padded | **1.573 GiB** | **21.1078** | **0.1771** | **83.1 %** | **98.3 %** |
 
-Smaller than either K-quant tier and ahead on every axis — and unlike the
+The statistics below are the padded row's, which is the one that should be
+shipped; the tail-biting row is what the same conversion reads a decibel of
+quantizer SNR poorer, and it is here so the trade can be seen rather than
+argued about. Smaller than either K-quant tier and ahead on every axis — and unlike the
 T4G-vs-Q4_K_M gap above, this one clears the paired test rather than falling
 inside it. The same eight windows, tested the same way: T3G's mean per-window
 gap against Q3_K_M is −0.1295 nats/token, standard error 0.0441, t = 2.94 on
@@ -215,9 +243,12 @@ cliff for the K-quants — 0.17 GiB between Q3_K_S and Q3_K_M buys them less
 than a point of perplexity, a quarter of what the next 0.4 GiB up to Q4_K_M
 buys — and the trellis clears that cliff instead of sliding down it with them.
 
-Qwen3-0.6B, same corpora, calibrated on 2048 tokens: 34.8552 against bf16's
-28.8521, KL 0.2498, top-1 73.6 %, top-5 96.4 %, at 3.509 bpw weighted and
-255.0 MiB. `golemquant`'s conversion log reports how much of that ran where —
+Qwen3-0.6B, same corpora, calibrated on 2048 tokens, padded: 34.8552 against
+bf16's 28.8521, KL 0.2498, top-1 73.6 %, top-5 96.4 %, at 3.509 bpw weighted
+and 255.0 MiB. Tail-biting on the same model: 36.7061, KL 0.3215, top-1
+70.0 %, at 3.416 bpw and 248.4 MiB — the same trade the 4B shows, half again
+as steep, because a smaller model has less slack.
+`golemquant`'s conversion log reports how much of that ran where —
 4022 M weights through the card and 0 M through the processor's k=3
 fallback on the 4B — which is what a shader landing the new codebook should
 show; a large processor figure would mean the kernel was never reached.

@@ -85,11 +85,27 @@ const uint SHIFT = L - K;
 // Ceiling division: only k = 3's ten-per-word packing doesn't split T*NPREFIX
 // evenly, and a floor here would undersize the array by one word.
 #define BPWORDS ((T * NPREFIX + BPPERWORD - 1u) / BPPERWORD)
+
+// The three-bit tier is tail-biting: its path has to close on itself, because
+// weight t's window is bits [3t, 3t+12) modulo 384 and the last three weights
+// read the start of their own sequence. Solving that exactly means searching
+// from all 2^L starts, which is 4096 times the work. This is the standard
+// approximation: one unconstrained pass, whose terminal state names the tail
+// the path wants, then a second with the start restricted to the 2^k states
+// that tail can be followed by. compress/trellis.go closes whatever ring the
+// second pass leaves open and counts how often it had to.
+#if KBITS == 3
+#define NPASS 2u
+#else
+#define NPASS 1u
+#endif
 shared float cost[2u * NSTATES];
 shared uint bp[BPWORDS];
 shared float zs[T];
 shared float redVal[256];
 shared uint redAt[256];
+// The low L−k bits the previous pass ended on, or all ones for a free start.
+shared uint tailPrefix;
 
 // Code1MAD of compress/trellis.go: a linear congruential step, then the sum of
 // the four bytes of the result, centred and scaled to unit variance. It must
@@ -111,93 +127,112 @@ void main() {
     uint base = seq * T;
 
     for (uint i = tid; i < T; i += 256u) zs[i] = z[base + i] * p.gain;
-    for (uint i = tid; i < BPWORDS; i += 256u) bp[i] = 0u;
+    if (tid == 0u) tailPrefix = 0xffffffffu;
     barrier();
 
-    // t = 0: every window is a legal start, so the cost is the distortion.
-    for (uint s = tid; s < NSTATES; s += 256u) {
-        precise float d = zs[0] - trellisValue(s);
-        precise float c = d * d;
-        cost[s] = c;
-    }
-    barrier();
+    [[loop]] for (uint pass = 0u; pass < NPASS; pass++) {
+        // atomicOr only ever sets bits, so a second pass has to start from zero.
+        for (uint i = tid; i < BPWORDS; i += 256u) bp[i] = 0u;
+        barrier();
 
-    uint cur = 1u, prev = 0u;
-    [[loop]] for (uint t = 1u; t < T; t++) {
-        // All 2^k predecessors of a state share the prefix s>>k, so one
-        // minimum per prefix serves every state that shares it. That is what
-        // makes a step 2^L work and not 2^(L+k), and it is the difference
-        // between this being an afternoon and being hopeless.
-        for (uint pre = tid; pre < NPREFIX; pre += 256u) {
-            float best = 3.402823466e+38;
-            uint bj = 0u;
-            [[unroll]] for (uint j = 0u; j < FAN; j++) {
-                float c = cost[prev * NSTATES + ((j << SHIFT) | pre)];
-                if (c < best) { best = c; bj = j; }
+        // t = 0: every window is a legal start, so the cost is the distortion —
+        // unless a previous pass named a tail, in which case only the states that
+        // tail can be followed by are legal. An illegal one is priced at
+        // MaxFloat32 rather than removed: adding a distortion to it rounds back to
+        // MaxFloat32, so a dead path stays dead and the step loop keeps its shape.
+        // compress/trellis.go's viterbiFrom does exactly this.
+        for (uint s = tid; s < NSTATES; s += 256u) {
+            precise float d = zs[0] - trellisValue(s);
+            precise float c = d * d;
+            cost[s] = (tailPrefix == 0xffffffffu || (s >> K) == tailPrefix)
+                          ? c : 3.402823466e+38;
+        }
+        barrier();
+
+        uint cur = 1u, prev = 0u;
+        [[loop]] for (uint t = 1u; t < T; t++) {
+            // All 2^k predecessors of a state share the prefix s>>k, so one
+            // minimum per prefix serves every state that shares it. That is what
+            // makes a step 2^L work and not 2^(L+k), and it is the difference
+            // between this being an afternoon and being hopeless.
+            for (uint pre = tid; pre < NPREFIX; pre += 256u) {
+                float best = 3.402823466e+38;
+                uint bj = 0u;
+                [[unroll]] for (uint j = 0u; j < FAN; j++) {
+                    float c = cost[prev * NSTATES + ((j << SHIFT) | pre)];
+                    if (c < best) { best = c; bj = j; }
+                }
+                // One field a prefix, a whole number of them to a word and no
+                // field ever straddles one. Different threads share a word, hence
+                // the atomic; the same field is never written twice.
+                uint at = t * NPREFIX + pre;
+                atomicOr(bp[at / BPPERWORD], bj << ((at % BPPERWORD) * BPWIDTH));
+
+                uint sb = pre << K;
+                // `precise` and the temporary are not decoration. Without them the
+                // driver contracts `best + d*d` into a fused multiply-add, whose
+                // rounding differs from the processor's two operations — and a
+                // Viterbi is a chain of comparisons, so a rounding that moves a
+                // near-tie moves the whole path. It cost seven percent of the
+                // weights, at identical error, before this was written out.
+                [[unroll]] for (uint b = 0u; b < FAN; b++) {
+                    precise float d = zs[t] - trellisValue(sb | b);
+                    precise float sq = d * d;
+                    precise float c = best + sq;
+                    cost[cur * NSTATES + (sb | b)] = c;
+                }
             }
-            // One field a prefix, a whole number of them to a word and no
-            // field ever straddles one. Different threads share a word, hence
-            // the atomic; the same field is never written twice.
-            uint at = t * NPREFIX + pre;
-            atomicOr(bp[at / BPPERWORD], bj << ((at % BPPERWORD) * BPWIDTH));
+            barrier();
+            uint sw = cur; cur = prev; prev = sw;
+            barrier();
+        }
 
-            uint sb = pre << K;
-            // `precise` and the temporary are not decoration. Without them the
-            // driver contracts `best + d*d` into a fused multiply-add, whose
-            // rounding differs from the processor's two operations — and a
-            // Viterbi is a chain of comparisons, so a rounding that moves a
-            // near-tie moves the whole path. It cost seven percent of the
-            // weights, at identical error, before this was written out.
-            [[unroll]] for (uint b = 0u; b < FAN; b++) {
-                precise float d = zs[t] - trellisValue(sb | b);
-                precise float sq = d * d;
-                precise float c = best + sq;
-                cost[cur * NSTATES + (sb | b)] = c;
+        // The cheapest final state, by a reduction rather than a scan.
+        float best = 3.402823466e+38;
+        uint at = 0u;
+        for (uint s = tid; s < NSTATES; s += 256u) {
+            float c = cost[prev * NSTATES + s];
+            if (c < best) { best = c; at = s; }
+        }
+        redVal[tid] = best;
+        redAt[tid] = at;
+        barrier();
+        // A tie must go to the lowest state, because the processor scans upwards
+        // and keeps the first strict improvement. Anything else and the two
+        // encoders can pick different paths of identical cost.
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                bool take = redVal[tid + stride] < redVal[tid] ||
+                            (redVal[tid + stride] == redVal[tid] && redAt[tid + stride] < redAt[tid]);
+                if (take) {
+                    redVal[tid] = redVal[tid + stride];
+                    redAt[tid] = redAt[tid + stride];
+                }
+            }
+            barrier();
+        }
+
+        // What the next pass has to start from, if there is one.
+        if (tid == 0u) tailPrefix = redAt[0] & (NPREFIX - 1u);
+        barrier();
+
+        // The traceback is one thread walking T steps. It is a short tail on a
+        // long kernel, and splitting it would cost more in barriers than it saves.
+        // Only the last pass needs it: an earlier one is run for its terminal state
+        // alone.
+        if (pass + 1u == NPASS && tid == 0u) {
+            uint s = redAt[0];
+            for (uint i = T; i > 0u; i--) {
+                uint t = i - 1u;
+                rec[base + t] = trellisValue(s) / p.gain;
+                path[base + t] = s;
+                if (t > 0u) {
+                    uint a = t * NPREFIX + (s >> K);
+                    uint j = (bp[a / BPPERWORD] >> ((a % BPPERWORD) * BPWIDTH)) & ((1u << BPWIDTH) - 1u);
+                    s = (j << SHIFT) | (s >> K);
+                }
             }
         }
         barrier();
-        uint sw = cur; cur = prev; prev = sw;
-        barrier();
-    }
-
-    // The cheapest final state, by a reduction rather than a scan.
-    float best = 3.402823466e+38;
-    uint at = 0u;
-    for (uint s = tid; s < NSTATES; s += 256u) {
-        float c = cost[prev * NSTATES + s];
-        if (c < best) { best = c; at = s; }
-    }
-    redVal[tid] = best;
-    redAt[tid] = at;
-    barrier();
-    // A tie must go to the lowest state, because the processor scans upwards
-    // and keeps the first strict improvement. Anything else and the two
-    // encoders can pick different paths of identical cost.
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            bool take = redVal[tid + stride] < redVal[tid] ||
-                        (redVal[tid + stride] == redVal[tid] && redAt[tid + stride] < redAt[tid]);
-            if (take) {
-                redVal[tid] = redVal[tid + stride];
-                redAt[tid] = redAt[tid + stride];
-            }
-        }
-        barrier();
-    }
-
-    // The traceback is one thread walking T steps. It is a short tail on a
-    // long kernel, and splitting it would cost more in barriers than it saves.
-    if (tid == 0u) {
-        uint s = redAt[0];
-        for (uint i = T; i > 0u; i--) {
-            uint t = i - 1u;
-            rec[base + t] = trellisValue(s) / p.gain;
-            path[base + t] = s;
-            if (t > 0u) {
-                uint a = t * NPREFIX + (s >> K);
-                uint j = (bp[a / BPPERWORD] >> ((a % BPPERWORD) * BPWIDTH)) & ((1u << BPWIDTH) - 1u);
-                s = (j << SHIFT) | (s >> K);
-            }
-        }
     }
 }

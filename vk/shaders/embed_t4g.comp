@@ -57,7 +57,7 @@ void main() {
 #if KBITS == 5
     const uint SEQB = 81u;
 #elif KBITS == 3
-    const uint SEQB = 50u;
+    const uint SEQB = 48u;
 #else
     const uint SEQB = 65u;
 #endif
@@ -68,15 +68,24 @@ void main() {
     float step = steps[byteAt(rowBase + seq * 2u + (t >> 6u))];
 
     uint bit = t * KBITS;
-    uint at = rowBase + nb + seq * SEQB + (bit >> 3u);
-#if KBITS == 5 || KBITS == 3
-    // Three bytes, because at three and five bits a window starts at any bit
-    // of a byte. The guard is a real bounds check at k=5: the last weight
-    // starts at bit 635 and ends at 646, one short of the third byte, so an
-    // unconditional read there would be one byte past the last row. At k=3 the
-    // guard is a no-op: the last weight starts at bit 381 (bit & 7 == 5, so
-    // the condition is always true) and its third byte is 49 — SEQB-1, the
-    // sequence's last byte, not one past it.
+    uint seqAt = rowBase + nb + seq * SEQB;
+    uint at = seqAt + (bit >> 3u);
+#if KBITS == 3
+    // Three bytes, because at three bits a window starts at any bit of a byte,
+    // and the three-bit tier is tail-biting: weight t's window is bits
+    // [3t, 3t+12) modulo 384, so the last three weights read off the end of
+    // the 48-byte path and back to its start. Byte offsets are taken inside
+    // the sequence for exactly that.
+    uint o0 = bit >> 3u;
+    uint o1 = o0 + 1u; if (o1 >= SEQB) o1 -= SEQB;
+    uint o2 = o0 + 2u; if (o2 >= SEQB) o2 -= SEQB;
+    uint word = (byteAt(seqAt + o0) << 16u) | (byteAt(seqAt + o1) << 8u) | byteAt(seqAt + o2);
+    uint state = (word >> (12u - (bit & 7u))) & 0xFFFu;
+#elif KBITS == 5
+    // Three bytes, because at five bits a window starts at any bit of a byte.
+    // The guard is a real bounds check: the last weight starts at bit 635 and
+    // ends at 646, one short of the third byte, so an unconditional read there
+    // would be one byte past the last row.
     uint third = ((bit & 7u) > 4u) ? byteAt(at + 2u) : 0u;
     uint word = (byteAt(at) << 16u) | (byteAt(at + 1u) << 8u) | third;
     uint state = (word >> (12u - (bit & 7u))) & 0xFFFu;

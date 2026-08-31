@@ -29,11 +29,12 @@ const (
 	// logits, and which llama.cpp's K-quant mixes have always given more bits
 	// than the rest of the model.
 	T5G
-	// T3G is the trellis at three bits a weight: 128 weights in 52 bytes, 3.25
-	// each, which is D4G's rate to the bit. Same 1MAD, same window, seven bits
-	// of padding at the end of a sequence because 12 + 127·3 is 393 and not a
-	// whole number of bytes. It is what retires the lattice: the same size, two
-	// decibels better on a Gaussian, and no table at all.
+	// T3G is the trellis at three bits a weight: 128 weights in 50 bytes, 3.125
+	// each, an eighth of a bit under D4G's rate. Same 1MAD, same window, and no
+	// padding at all — the path is tail-biting, so it closes on itself and the
+	// twelve bits that primed a window in the other tiers are the last three
+	// weights' windows wrapping to bit zero. It is what retires the lattice:
+	// smaller, better on a Gaussian, and no table at all.
 	T3G
 )
 

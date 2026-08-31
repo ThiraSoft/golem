@@ -48,10 +48,13 @@ func viterbiAgainstCPU(t *testing.T, kbits int) {
 	}
 	const gain = 0.94
 
+	// The narrow tier is tail-biting, and the card walks the ring while the
+	// processor closes it, so both sides go through the path route here and
+	// both get closed — which is what the converter does.
+	o := compress.TrellisOpts{K: kbits, L: TrellisGPUL, Seq: TrellisGPUSeq,
+		Gain: gain, Code: compress.Code1MAD, TailBiting: kbits == TrellisGPUK3}
 	want := append([]float32(nil), src...)
-	compress.QuantizeTrellis(want, compress.TrellisOpts{
-		K: kbits, L: TrellisGPUL, Seq: TrellisGPUSeq,
-		Gain: gain, Code: compress.Code1MAD})
+	compress.QuantizeTrellis(want, o)
 
 	e, err2 := NewTrellisEncoder(d, n)
 	if err2 != nil {
@@ -62,8 +65,12 @@ func viterbiAgainstCPU(t *testing.T, kbits int) {
 		t.Fatal(err)
 	}
 	got := append([]float32(nil), src...)
-	if err := e.Quantize(got, gain); err != nil {
+	states := make([]uint16, n)
+	if err := e.QuantizePath(got, gain, states); err != nil {
 		t.Fatal(err)
+	}
+	if o.TailBiting {
+		compress.CloseTailPaths(got, o, states)
 	}
 
 	var same int
@@ -167,7 +174,8 @@ func viterbiPathDecodesToItsReconstruction(t *testing.T, kbits int) {
 
 	// And the states must be a walk of the trellis: each one is the last L bits
 	// of the code stream, so it is its predecessor shifted up by k. A path that
-	// does not satisfy this cannot be written as 520 bits at all.
+	// does not satisfy this cannot be written at all. Closing the ring is the
+	// processor's half and is not asserted here — this is the card's raw walk.
 	for q := 0; q+TrellisGPUSeq <= n; q += TrellisGPUSeq {
 		for t2 := 1; t2 < TrellisGPUSeq; t2++ {
 			prev := uint32(states[q+t2-1])
