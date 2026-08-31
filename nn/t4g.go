@@ -81,23 +81,15 @@ const (
 	T5GSeqBytes = ((T4GSeq-1)*T5GK + T4GL + 7) / 8
 	// T3GK is the narrow tier's, one bit a weight less than the ordinary one.
 	T3GK = 3
-	// T3GSeqBytes is 128·3 = 384 bits, which is 48. There is no priming window
-	// and no padding, because the narrow tier is tail-biting: the path closes
-	// on itself, so weight t's window is bits [3t, 3t+12) *modulo 384* and the
-	// twelve bits that primed the other tiers are the last three weights'
-	// windows wrapping to the start. Three bits a weight exactly, and the 12
-	// the priming cost is what T3GTailBiting buys back.
-	T3GSeqBytes = T4GSeq * T3GK / 8
+	// T3GSeqBytes is 12 + 127·3 = 393 bits rounded up to 400, which is 50. The
+	// seven bits are written as zero and never read; nn/t3g_test.go holds a
+	// reader to that. They are also most of what tail-biting would give back,
+	// which was built and measured and is not here: compress/README.md says
+	// what it cost, and why the bytes it saved bought nothing on this card.
+	T3GSeqBytes = ((T4GSeq-1)*T3GK + T4GL + 7) / 8
 	// t4gStepsPerSeq is how many step codes a sequence carries.
 	t4gStepsPerSeq = T4GSeq / T4GBlock
 )
-
-// T4GTailBiting says whether a tier's path closes on itself. Only the narrow
-// one does, and only because L = 4k there exactly: a window is four whole
-// symbols wide, so weight t's three bits are the top three of its own state and
-// the sequence is 128 symbols with nothing else in it. At four and five bits a
-// window is not a whole number of symbols and the priming stays.
-func T4GTailBiting(q Quant) bool { return q == T3G }
 
 // T4GSeqBytesN is what one sequence of a tier occupies.
 func T4GSeqBytesN(q Quant) int { _, sb := t4gRate(q); return sb }
@@ -187,14 +179,6 @@ func T4GPlanesN(row []byte, n int, q Quant) (steps, codes []byte) {
 // after it. states must be the path itself — each one its predecessor shifted
 // up by four — which is what a Viterbi traceback produces and what
 // TestT4GRoundTripIsExact holds the encoders to.
-//
-// The narrow tier writes nothing but symbols: 128 states, three bits each, the
-// top three of the state itself. That is the same stream said differently — a
-// state is four consecutive symbols — and it is what makes the sequence close
-// on itself, because the symbol a wrapped window reads at bit 0 is the symbol
-// weight 0 wrote there. The path must therefore be a *cycle*: state[0] has to
-// be a successor of state[127], or the last three windows read back as
-// something the encoder never chose.
 func PutT4GStates(dst []byte, states []uint16) { PutT4GStatesN(dst, states, T4G) }
 
 // PutT4GStatesN is the same for whichever tier.
@@ -213,12 +197,6 @@ func PutT4GStatesN(dst []byte, states []uint16, q Quant) {
 			}
 			at++
 		}
-	}
-	if T4GTailBiting(q) {
-		for t := 0; t < T4GSeq; t++ {
-			put(t*k, k, uint32(states[t])>>uint(T4GL-k))
-		}
-		return
 	}
 	put(0, T4GL, uint32(states[0]))
 	for t := 1; t < T4GSeq; t++ {
@@ -244,18 +222,8 @@ func T4GStateAtN(codes []byte, t int, q Quant) uint16 {
 		v := uint32(codes[at>>3])<<8 | uint32(codes[at>>3+1])
 		return uint16(v >> uint(4-(at&7)) & 0xFFF)
 	}
-	k, sb := t4gRate(q)
+	k, _ := t4gRate(q)
 	at := t * k
-	if T4GTailBiting(q) {
-		// The window runs off the end of the sequence and returns to its
-		// start. Only the last three weights of the 128 do — a window ends at
-		// bit 3t+12, which is inside 384 up to t = 124 — and the modulo is on
-		// the sequence's own length, not on the slice, because callers hand
-		// this the rest of the plane and not just one path.
-		b := at >> 3
-		v := uint32(codes[b])<<16 | uint32(codes[(b+1)%sb])<<8 | uint32(codes[(b+2)%sb])
-		return uint16(v >> uint(12-(at&7)) & 0xFFF)
-	}
 	v := uint32(codes[at>>3])<<16 | uint32(codes[at>>3+1])<<8
 	if n := at>>3 + 2; n < len(codes) {
 		v |= uint32(codes[n])

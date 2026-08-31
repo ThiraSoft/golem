@@ -42,10 +42,11 @@ func TestEncodeT3GDecodesToWhatItReconstructed(t *testing.T) {
 		}
 	}
 	snr := 10 * math.Log10(den/num)
-	// The bench reads 17.05 dB at three bits on a Gaussian. Tail-biting takes
-	// the Viterbi's free choice of start away, so hold this well below that and
-	// let the end-to-end measurement be the real check: what is being detected
-	// here is a codec wired to the wrong rate, which reads far worse than 14.
+	// The bench reads 17.05 dB at three bits on a Gaussian with the window
+	// primed. A short row pays the priming on fewer weights, so hold this well
+	// below that and let the end-to-end measurement be the real check: what is
+	// being detected here is a codec wired to the wrong rate, which reads far
+	// worse than 14.
 	if snr < 14 {
 		t.Fatalf("three-bit trellis reads %.2f dB, which is not a three-bit codec", snr)
 	}
@@ -53,53 +54,20 @@ func TestEncodeT3GDecodesToWhatItReconstructed(t *testing.T) {
 
 // TestT3GOptsAreTheThreeBitRate guards the one field a copy-paste gets wrong.
 //
-// BPW() is BitsPerSeq()/Seq, the path alone, with no step codes: three bits a
-// weight exactly, because the tail-biting sequence is 128 symbols and nothing
-// else. The other two tiers still pay L−k to prime a window, and this is the
-// difference that pays for the second Viterbi pass.
+// The expected BPW is not 1/8 over three: BPW() is BitsPerSeq()/Seq, and
+// BitsPerSeq() is the path only — (Seq-1)*K + L, with no byte padding and no
+// step codes — because that is what the trellis itself costs, before the
+// format rounds a sequence up to a whole number of bytes. For T3G that is
+// (128-1)*3 + 12 = 393 bits over 128 weights, or 3.0703125 bpw; the padded
+// 400 bits (50 bytes) that T3GSeqBytes actually writes is a format decision
+// BPW does not see.
 func TestT3GOptsAreTheThreeBitRate(t *testing.T) {
 	o := T4GOptsFor(nn.T3G)
-	if o.K != nn.T3GK || o.Seq != nn.T4GSeq || o.L != nn.T4GL || !o.TailBiting {
+	if o.K != nn.T3GK || o.Seq != nn.T4GSeq || o.L != nn.T4GL {
 		t.Fatalf("T3G opts are %+v", o)
 	}
-	if bpw := o.BPW(); math.Abs(bpw-3) > 1e-9 {
-		t.Fatalf("the path is %v bits a weight, not 3", bpw)
-	}
-	if o := T4GOptsFor(nn.T4G); o.TailBiting {
-		t.Fatal("the four-bit tier does not tail-bite: L is not a multiple of k")
-	}
-}
-
-// TestT3GPathsClose is the encoder's half of the format's one new invariant.
-// The decoder reads the last three weights of a sequence through a window that
-// wraps, so the path the file records has to be a cycle whatever the search
-// found — closeTail is what guarantees it, and this is what says the
-// guarantee holds on real weights and not only in the arithmetic.
-func TestT3GPathsClose(t *testing.T) {
-	const seqs = 64
-	rng := rand.New(rand.NewSource(11))
-	z := make([]float32, seqs*nn.T4GSeq)
-	for i := range z {
-		z[i] = float32(rng.NormFloat64())
-	}
-	o := T4GOptsFor(nn.T3G)
-	states := make([]uint16, len(z))
-	before := TrellisTailOpen.Load()
-	QuantizeTrellisPath(z, o, states)
-	t.Logf("%d of %d sequences did not close on the first two passes",
-		TrellisTailOpen.Load()-before, seqs)
-
-	dst := make([]byte, nn.T3GSeqBytes)
-	for s := 0; s < seqs; s++ {
-		path := states[s*nn.T4GSeq : (s+1)*nn.T4GSeq]
-		if path[0]>>nn.T3GK != path[nn.T4GSeq-1]&(1<<uint(nn.T4GL-nn.T3GK)-1) {
-			t.Fatalf("sequence %d: the ring does not close", s)
-		}
-		nn.PutT4GStatesN(dst, path, nn.T3G)
-		for i, want := range path {
-			if got := nn.T4GStateAtN(dst, i, nn.T3G); got != want {
-				t.Fatalf("sequence %d weight %d: read back %#x, want %#x", s, i, got, want)
-			}
-		}
+	const want = 393.0 / 128.0
+	if bpw := o.BPW(); math.Abs(bpw-want) > 1e-9 {
+		t.Fatalf("the path is %v bits a weight, not %v", bpw, want)
 	}
 }

@@ -146,11 +146,7 @@ func main() {
 					// The kernels are compiled for three rates and one
 					// shape. Anything else falls back rather than quietly
 					// answering a different question.
-					// The narrow kernel is compiled tail-biting and the others
-					// are not, because that is what the tiers are. An opts
-					// that disagrees is a question this card cannot answer.
-					if !vk.TrellisGPUHasK(o.K) || o.L != vk.TrellisGPUL || o.Seq != vk.TrellisGPUSeq ||
-						o.TailBiting != (o.K == vk.TrellisGPUK3) {
+					if !vk.TrellisGPUHasK(o.K) || o.L != vk.TrellisGPUL || o.Seq != vk.TrellisGPUSeq {
 						offCard += int64(len(norm))
 						return false
 					}
@@ -593,15 +589,6 @@ func main() {
 	must(tensors.WriteGGUFStream(*dst, meta, out))
 	if n := nn.T4GStepClipped.Load(); n > 0 {
 		fmt.Printf("%d blocks of the %.0f M weights landed on an end of the step grid\n", n, count/1e6)
-	}
-	// The narrow tier's path has to close on itself, and the two-pass search
-	// that closes it is an approximation. This is how often it did not
-	// converge: those sequences were written as the ring the decoder will
-	// read, but their last three weights were chosen against a different tail.
-	if n := compress.TrellisTailSeqs.Load(); n > 0 {
-		open := compress.TrellisTailOpen.Load()
-		fmt.Printf("%d of %d tail-biting sequences did not close (%.3f%%)\n",
-			open, n, float64(open)/float64(n)*100)
 	}
 	fmt.Printf("\n%.0f M weights at %.3f bits each — %s\n",
 		count/1e6, bits/count, sizeOf(int(bits/8)))

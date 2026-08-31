@@ -19,12 +19,6 @@
 // and five bits an offset lands on any bit of a byte, so the window can need
 // three bytes; see the KBITS==3 and KBITS==5 branches below.
 //
-// The three-bit tier is also tail-biting: its path closes on itself, so weight
-// t's window is bits [3t, 3t+12) modulo 384 and the last three weights of a
-// sequence read a window that runs off the end and returns to bit zero. That is
-// what buys the priming window back — 48 bytes against 50 — and the wrap costs
-// two subtractions on the last of a half-block's eight groups.
-//
 // Workgroup: 128 threads -> 16 output rows, 8 lanes per row, which is
 // matvec_d4g.comp's shape. COLUMNS is how many activations one reading of the
 // weights answers.
@@ -74,7 +68,7 @@ const uint BLOCK = 64u;  // weights sharing one step
 const uint SEQB  = 81u;  // 127·5 + 12 = 647 bits, rounded up
 const uint HALFB = 40u;  // bytes the first sixty-four weights of a path occupy
 #elif KBITS == 3
-const uint SEQB  = 48u;  // 128·3 = 384 bits, tail-biting, no priming window
+const uint SEQB  = 50u;  // 127·3 + 12 = 393 bits, rounded up to 400
 const uint HALFB = 24u;  // 3·64 = 192 bits, which is byte 24 exactly
 #else
 const uint SEQB  = 65u;  // 127·4 + 12 = 520 bits exactly
@@ -112,15 +106,7 @@ void main() {
         // Which path this block is the first or second half of. A half is a
         // whole number of bytes in both tiers, which is why the block is 64
         // and not something the step would have to straddle.
-#if KBITS == 3
-        // The start of the whole path, not of its half: a wrapped window
-        // returns to bit zero of the sequence, so the half-block offset is
-        // folded into the group's own offset below.
-        uint seqAt = codeBase + (b >> 1u) * SEQB;
-        uint halfAt = (b & 1u) * HALFB;
-#else
         uint seqAt = codeBase + (b >> 1u) * SEQB + (b & 1u) * HALFB;
-#endif
         uint xOffset = b * BLOCK;
 
 #if KBITS == 5
@@ -156,18 +142,9 @@ void main() {
         // count, so the shifts fold away and nothing branches — the wide tier's
         // trick at a narrower rate.
         [[unroll]] for (uint g = 0u; g < BLOCK / 8u; g++) {
-            // Byte offsets inside the 48-byte path, so the last group's fourth
-            // and fifth bytes can wrap to the start of the same sequence
-            // instead of reading the next one's. Only the last group of the
-            // second half-block ever does — a group covers bits [8o, 8o+40),
-            // and 40 past byte 45 is 400 — and `g` is a compile-time constant
-            // in an unrolled loop, so seven groups of eight compile with no
-            // test at all and the eighth with one.
-            uint o = halfAt + g * 3u;
-            uint o3 = o + 3u, o4 = o + 4u;
-            if (g == BLOCK / 8u - 1u && o3 >= SEQB) { o3 -= SEQB; o4 -= SEQB; }
-            uint w0 = byteAt(seqAt + o), w1 = byteAt(seqAt + o + 1u), w2 = byteAt(seqAt + o + 2u);
-            uint w3 = byteAt(seqAt + o3), w4 = byteAt(seqAt + o4);
+            uint o = seqAt + g * 3u;
+            uint w0 = byteAt(o), w1 = byteAt(o + 1u), w2 = byteAt(o + 2u);
+            uint w3 = byteAt(o + 3u), w4 = byteAt(o + 4u);
             uint lo = (w0 << 24u) | (w1 << 16u) | (w2 << 8u) | w3;
             uint hi = w4;
             [[unroll]] for (uint i = 0u; i < 8u; i++) {

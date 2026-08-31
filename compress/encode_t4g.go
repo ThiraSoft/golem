@@ -57,8 +57,7 @@ func T4GOptsFor(q nn.Quant) TrellisOpts {
 	case nn.T3G:
 		k = nn.T3GK
 	}
-	return TrellisOpts{K: k, L: nn.T4GL, Seq: nn.T4GSeq, Gain: 1, Code: Code1MAD,
-		TailBiting: nn.T4GTailBiting(q)}
+	return TrellisOpts{K: k, L: nn.T4GL, Seq: nn.T4GSeq, Gain: 1, Code: Code1MAD}
 }
 
 // EncodeT4G writes one matrix. q is the per-column vector the weights are
