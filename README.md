@@ -158,9 +158,10 @@ In absolute terms, on an i7-9700K with eight threads and Q4_0 weights: Gemma E2B
 
 ## 🗜️ `.golem` — the engine's own weight format
 
-golem reads GGUF like everyone else. It also writes a format of its own, and on the
-model below it is **smaller than llama.cpp's three-bit quantization while reading
-closer to the original than its four-bit one**.
+golem reads GGUF like everyone else. It also writes a format of its own, in two
+tiers: on the model below, T4G reads closer to the original than llama.cpp's
+four-bit quantization while being 16 % smaller, and T3G undercuts llama.cpp's
+three-bit quantization by 18 % while beating it on every column.
 
 Qwen3-4B, 4088 tokens of wikitext, every row measured against the same bf16
 reference:
@@ -174,7 +175,7 @@ reference:
 | **`.golem` T3G** | **1.57 GiB** | **21.11** | **0.1771** | **83.1 %** |
 
 Read the last two rows together: **T3G is 18 % smaller than Q3_K_M and ahead of it
-on every column**, by nearly three points of perplexity and a third of the
+on every column**, by nearly three points of perplexity and a quarter of the
 divergence. The evaluation is paired — both models see the same tokens in the same
 eight windows — so the gap is testable, and it is not noise: t = −2.94, T3G ahead
 in six windows of eight.
@@ -187,8 +188,9 @@ Two things do the work, and neither is new:
   what opens the four-bit tier, where a lattice's table would need 493 KiB against
   the 32 a GPU workgroup has. The structure is QTIP's bitshift trellis.
 - **A rotation and a salience scale**, applied per calibration site rather than
-  per matrix. This is most of the format's value: without the scale, the same
-  codebook costs twenty points of perplexity instead of one and a half.
+  per matrix. This is most of the format's value: dropping it and keeping only
+  signs and rotation costs twenty points of perplexity on Qwen3-0.6B, 39.80
+  against 60.01.
 
 Three widths — T3G at 3.25 bits a weight, T4G at 4.19, T5G at 5.19 for the logit
 head, which is worth more bits than the layers before it. A three-bit file carries
@@ -269,10 +271,11 @@ Every number in this README is a benchmark in this repository, run on the machin
 
 ## 🛠️ Project Structure
 
-- `cmd/golem-cli`, `cmd/golem-server`, `cmd/pocket-tts` — the three commands.
+- `cmd/golem-cli`, `cmd/golem-server`, `cmd/pocket-tts`, `cmd/golemquant` — the commands.
 - `engine/` — reads the architecture out of a GGUF and opens the engine that implements it.
 - `gemma/`, `qwen/`, `qwen35/`, `pockettts/` — standalone engine implementations; they do not import one another. `qwen35/` is Qwen3.8: a package is named for the architecture the GGUF declares, and this checkpoint declares `general.architecture = qwen35`, as llama.cpp's own `models/qwen35.cpp` does.
 - `nn/` & `vk/` — the shared kernels: quantized AVX2 and NEON, and Vulkan compute.
+- `compress/` — the `.golem` format: calibration, the trellis codec, and the conversion pipeline `golemquant` drives.
 - `tensors/`, `token/`, `chat/`, `sample/`, `audio/`, `imageio/` — the rest of the shared layer.
 - `ref/` — what recorded each test fixture, and how to record it again.
 
@@ -295,4 +298,4 @@ Weights are not in this repository, and every test that needs one skips cleanly 
 
 Golem is [MIT Licensed](LICENSE).
 
-Standing on the shoulders of giants: [llama.cpp & ggml](https://github.com/ggml-org/llama.cpp), [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts), [Google Gemma](https://ai.google.dev/gemma).
+Standing on the shoulders of giants: [llama.cpp & ggml](https://github.com/ggml-org/llama.cpp), [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts), [Google Gemma](https://ai.google.dev/gemma), [QTIP](https://github.com/Cornell-RelaxML/qtip) — the bitshift trellis `.golem`'s codec is built on.

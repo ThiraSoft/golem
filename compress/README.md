@@ -8,9 +8,11 @@ A checkpoint in, a `.golem` out. One codebook, and a scheme around it:
 | `T4G` | 128 weights in 67 bytes | 4.19 | 1001 |
 | `T5G` | 128 weights in 83 bytes | 5.19 | 1002 |
 
-`T3G` is the narrow body of a small model or a tight budget, never the head —
-a logit head this narrow spends bits where they are worth least, and
-`golemquant` refuses to write one.
+`T3G` is the narrow body of a small model or a tight budget. The head defaults
+to four bits whatever the body is — a logit head narrower than the body would
+spend bits where they are worth least — but `-head` can still be set to match
+the body; `golemquant` only refuses a head *narrower* than the body, not an
+equal one.
 
 The file is a GGUF. Same container, so the vocabulary, the rope base and the
 chat template travel unchanged; what is new is a tensor type llama.cpp does not
@@ -178,9 +180,9 @@ a shader would have to read and mask around. They cost nothing measured —
 the row is 3.25 bits a weight, not 3.0555, and that eighth of a bit is the
 price already visible in the table at the top of this file.
 
-A `.golem` T3G file is not three bits throughout. `golemquant` still refuses
-to write a head that narrow — the logit head is still worth more bits than
-the body, for the reason above — so it defaults to four-bit `T4G` there.
+A `.golem` T3G file is not three bits throughout. `golemquant` defaults the
+head to four-bit `T4G` there — the logit head is still worth more bits than
+the body, for the reason above — though `-head 3` is accepted if asked for.
 State the body's rate, the head's rate, and the weighted rate together, or a
 file's size will get compared against a Q3_K figure that assumes a codec
 this uneven never happens:
