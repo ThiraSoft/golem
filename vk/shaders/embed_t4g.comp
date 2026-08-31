@@ -2,14 +2,15 @@
 
 // The token embedding of a trellis .golem, read on the card.
 //
-// embed_d4g.comp says what this does and why a row is not the row anybody
-// wants: the table is the logit head, stored the way the logit product wants
-// it, so a row of it has to come back through the site's vector and the
-// rotation before it is a token's embedding. Undoing them is not applying them
-// again in the same order — the transform is its own inverse, the scaling is
-// not, and the scaling went on first so it comes off last.
+// A row here is not the row anybody wants: the table is the logit head, stored
+// the way the logit product wants it, so a row of it has to come back through
+// the site's vector and the rotation before it is a token's embedding. Undoing
+// them is not applying them again in the same order — the transform is its own
+// inverse, the scaling is not, and the scaling went on first so it comes off
+// last.
 //
-// The one thing that is neater here than there: a rotation group is 128 and so
+// The one thing that is neater here than in the lattice shader this replaced:
+// a rotation group is 128 and so
 // is a trellis sequence, so a workgroup is exactly one path and a thread is
 // exactly one weight of it.
 

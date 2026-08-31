@@ -86,7 +86,7 @@ func (m *Model) useVulkanEmbedding() error {
 	}
 	if m.d4gHead != nil {
 		table, lattice, cols := m.d4gHead.Table()
-		return m.stack.SetEmbeddingD4G(table, lattice, cols, m.W.PreHead, m.d4gHead.Quant())
+		return m.stack.SetEmbeddingGolem(table, lattice, cols, m.W.PreHead, m.d4gHead.Quant())
 	}
 	if m.head == nil {
 		return nil

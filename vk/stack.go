@@ -38,7 +38,6 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/combine.comp -o shaders/combine.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_q6k.comp -o shaders/embed_q6k.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_q40.comp -o shaders/embed_q40.spv
-//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_d4g.comp -o shaders/embed_d4g.spv
 
 //go:embed shaders/norm.spv
 var normSPIRV []byte
@@ -57,9 +56,6 @@ var combineSPIRV []byte
 
 //go:embed shaders/embed_q6k.spv
 var embedQ6KSPIRV []byte
-
-//go:embed shaders/embed_d4g.spv
-var embedD4GSPIRV []byte
 
 //go:generate glslc -O -DKBITS=3 --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_t4g.comp -o shaders/embed_t3g.spv
 
@@ -158,9 +154,9 @@ type Stack struct {
 	// embed reads one row of the token embedding into the stream, when the
 	// caller gave the stack a table to read it from.
 	embed, embedQ40 *Pipeline
-	// embedD4G is the same for a .golem table, which is a lattice to expand
-	// and a rotation to undo rather than a nibble to shift.
-	embedD4G *Pipeline
+	// embedGolem is the same for a .golem table, which is a trellis path to
+	// walk and a rotation to undo rather than a nibble to shift.
+	embedGolem *Pipeline
 	// embedPre is the head's vector, uploaded when that table is bound.
 	embedPre *Buffer
 	embedSet        *Set
@@ -322,11 +318,16 @@ func (s *Stack) SetEmbedding(table *Buffer, cols int, scale float32) error {
 }
 
 // SetEmbeddingQ40 gives the stack a Q4_0 token embedding table to read on-card.
-// SetEmbeddingD4G points the stack at a .golem embedding table, so that a token
-// crosses the bus as an identifier rather than as a row of floats. pre is the
-// head's vector, which this undoes along with the rotation.
-func (s *Stack) SetEmbeddingD4G(table, lattice *Buffer, cols int, pre []float32, q nn.Quant) error {
-	spirv := embedD4GSPIRV
+// SetEmbeddingGolem points the stack at a .golem embedding table, so that a
+// token crosses the bus as an identifier rather than as a row of floats. pre is
+// the head's vector, which this undoes along with the rotation.
+//
+// Every tier is a trellis, so an unknown one is refused rather than given a
+// default. It used to fall back to the lattice's decoder, which was the right
+// shape when there were two codebooks and is a way to read a file as a format
+// it is not now that there is one.
+func (s *Stack) SetEmbeddingGolem(table, steps *Buffer, cols int, pre []float32, q nn.Quant) error {
+	var spirv []byte
 	switch q {
 	case nn.T3G:
 		spirv = embedT3GSPIRV
@@ -334,6 +335,8 @@ func (s *Stack) SetEmbeddingD4G(table, lattice *Buffer, cols int, pre []float32,
 		spirv = embedT4GSPIRV
 	case nn.T5G:
 		spirv = embedT5GSPIRV
+	default:
+		return fmt.Errorf("vk: %s is not a trellis tier, so it has no embedding shader", q)
 	}
 	if cols != s.dim {
 		return fmt.Errorf("vk: the embedding is %d wide and the stream is %d", cols, s.dim)
@@ -348,7 +351,7 @@ func (s *Stack) SetEmbeddingD4G(table, lattice *Buffer, cols int, pre []float32,
 		return fmt.Errorf("vk: the embedding is already set")
 	}
 	var err error
-	if s.embedD4G, err = s.d.NewPipeline(spirv, 5, uint32(unsafe.Sizeof(embedPush{}))); err != nil {
+	if s.embedGolem, err = s.d.NewPipeline(spirv, 5, uint32(unsafe.Sizeof(embedPush{}))); err != nil {
 		return err
 	}
 	if s.ids, err = s.d.Host(maxColumns*4, bufferUsageStorage); err != nil {
@@ -357,7 +360,7 @@ func (s *Stack) SetEmbeddingD4G(table, lattice *Buffer, cols int, pre []float32,
 	if s.embedPre, err = s.d.Upload(asBytes(pre)); err != nil {
 		return err
 	}
-	if s.embedSet, err = s.embedD4G.NewSet([]*Buffer{table, lattice, s.ids, s.embedPre, s.xs}); err != nil {
+	if s.embedSet, err = s.embedGolem.NewSet([]*Buffer{table, steps, s.ids, s.embedPre, s.xs}); err != nil {
 		return err
 	}
 	// One workgroup a group of the rotation, and a column has cols/group of
@@ -760,7 +763,7 @@ func (s *Stack) record(r *Recorder, experts, used, columns int, runs []span) {
 		// The embedding before anything, since the stream is what the first
 		// block norms.
 		groups := cols
-		if s.embedD4G != nil {
+		if s.embedGolem != nil {
 			// A workgroup a group of the rotation rather than a column.
 			groups = cols * s.embedOf.superblocks
 		}
@@ -874,9 +877,9 @@ func (s *Stack) Close() {
 		s.embedSet.Close()
 		s.embedSet = nil
 	}
-	if s.embedD4G != nil {
-		s.embedD4G.Close()
-		s.embedD4G = nil
+	if s.embedGolem != nil {
+		s.embedGolem.Close()
+		s.embedGolem = nil
 	}
 	if s.embedPre != nil {
 		s.embedPre.Close()
