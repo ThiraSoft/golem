@@ -51,8 +51,11 @@ func T4GOpts() TrellisOpts { return T4GOptsFor(nn.T4G) }
 // T4GOptsFor is the same for whichever tier.
 func T4GOptsFor(q nn.Quant) TrellisOpts {
 	k := nn.T4GK
-	if q == nn.T5G {
+	switch q {
+	case nn.T5G:
 		k = nn.T5GK
+	case nn.T3G:
+		k = nn.T3GK
 	}
 	return TrellisOpts{K: k, L: nn.T4GL, Seq: nn.T4GSeq, Gain: 1, Code: Code1MAD}
 }
