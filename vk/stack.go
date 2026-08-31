@@ -61,6 +61,11 @@ var embedQ6KSPIRV []byte
 //go:embed shaders/embed_d4g.spv
 var embedD4GSPIRV []byte
 
+//go:generate glslc -O -DKBITS=3 --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_t4g.comp -o shaders/embed_t3g.spv
+
+//go:embed shaders/embed_t3g.spv
+var embedT3GSPIRV []byte
+
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_t4g.comp -o shaders/embed_t4g.spv
 
 //go:embed shaders/embed_t4g.spv
@@ -323,6 +328,8 @@ func (s *Stack) SetEmbedding(table *Buffer, cols int, scale float32) error {
 func (s *Stack) SetEmbeddingD4G(table, lattice *Buffer, cols int, pre []float32, q nn.Quant) error {
 	spirv := embedD4GSPIRV
 	switch q {
+	case nn.T3G:
+		spirv = embedT3GSPIRV
 	case nn.T4G:
 		spirv = embedT4GSPIRV
 	case nn.T5G:

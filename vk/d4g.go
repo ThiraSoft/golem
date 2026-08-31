@@ -39,6 +39,23 @@ var matvecT4G4SPIRV []byte
 //go:embed shaders/matvec_t4g_8.spv
 var matvecT4G8SPIRV []byte
 
+//go:generate glslc -O -DKBITS=3 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t3g.spv
+//go:generate glslc -O -DKBITS=3 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t3g_2.spv
+//go:generate glslc -O -DKBITS=3 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t3g_4.spv
+//go:generate glslc -O -DKBITS=3 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t3g_8.spv
+
+//go:embed shaders/matvec_t3g.spv
+var matvecT3GSPIRV []byte
+
+//go:embed shaders/matvec_t3g_2.spv
+var matvecT3G2SPIRV []byte
+
+//go:embed shaders/matvec_t3g_4.spv
+var matvecT3G4SPIRV []byte
+
+//go:embed shaders/matvec_t3g_8.spv
+var matvecT3G8SPIRV []byte
+
 //go:generate glslc -O -DKBITS=5 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t5g.spv
 //go:generate glslc -O -DKBITS=5 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t5g_2.spv
 //go:generate glslc -O -DKBITS=5 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t5g_4.spv
@@ -106,6 +123,8 @@ func NewGolemKernels(d *Device, q nn.Quant) (*D4GKernels, error) {
 
 func golemSPIRV(q nn.Quant) (map[int][]byte, bool) {
 	switch q {
+	case nn.T3G:
+		return map[int][]byte{1: matvecT3GSPIRV, 2: matvecT3G2SPIRV, 4: matvecT3G4SPIRV, 8: matvecT3G8SPIRV}, true
 	case nn.T4G:
 		return map[int][]byte{1: matvecT4GSPIRV, 2: matvecT4G2SPIRV, 4: matvecT4G4SPIRV, 8: matvecT4G8SPIRV}, true
 	case nn.T5G:

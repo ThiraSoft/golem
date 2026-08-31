@@ -12,10 +12,12 @@
 // The row is two planes, steps then codes: a 67-byte block would start on an
 // odd boundary and this reads words.
 //
-// The window is always two bytes and never three. Every offset is a multiple of
-// four bits, so a twelve-bit field starting at 4t has one of two alignments
-// inside a byte pair, and the last weight of a sequence starts at bit 508 and
-// ends at 519 — the sequence's last byte, not one past it.
+// At four bits the window is always two bytes and never three: every offset is
+// a multiple of four bits, so a twelve-bit field starting at 4t has one of two
+// alignments inside a byte pair, and the last weight of a sequence starts at
+// bit 508 and ends at 519 — the sequence's last byte, not one past it. At three
+// and five bits an offset lands on any bit of a byte, so the window can need
+// three bytes; see the KBITS==3 and KBITS==5 branches below.
 //
 // Workgroup: 128 threads -> 16 output rows, 8 lanes per row, which is
 // matvec_d4g.comp's shape. COLUMNS is how many activations one reading of the
@@ -25,11 +27,12 @@
 #define COLUMNS 1
 #endif
 
-// KBITS is the tier: four bits a weight, or five for the logit head. Only the
+// KBITS is the tier: three bits, four, or five for the logit head. Only the
 // window's arithmetic changes — at four bits every offset is a multiple of four
-// so a window has two alignments and spans two bytes, and at five it has all
-// eight and spans three. The unroll is over eight weights either way, which is
-// where the five-bit offsets come back to a whole number of bytes: 8·5 = 40.
+// so a window has two alignments and spans two bytes, and at three and five it
+// has all eight and can span three. The unroll is over eight weights, which is
+// where the narrower tiers' offsets come back to a whole number of bytes:
+// 8·3 = 24, 8·5 = 40.
 #ifndef KBITS
 #define KBITS 4
 #endif
@@ -64,6 +67,9 @@ const uint BLOCK = 64u;  // weights sharing one step
 #if KBITS == 5
 const uint SEQB  = 81u;  // 127·5 + 12 = 647 bits, rounded up
 const uint HALFB = 40u;  // bytes the first sixty-four weights of a path occupy
+#elif KBITS == 3
+const uint SEQB  = 50u;  // 127·3 + 12 = 393 bits, rounded up to 400
+const uint HALFB = 24u;  // 3·64 = 192 bits, which is byte 24 exactly
 #else
 const uint SEQB  = 65u;  // 127·4 + 12 = 520 bits exactly
 const uint HALFB = 32u;
@@ -124,6 +130,31 @@ void main() {
                 } else {
                     uint take = 32u - at;                 // bits still in lo
                     v = ((lo << (12u - take)) | (hi >> (16u - (12u - take)))) & 0xFFFu;
+                }
+                float wv = t4gValue(v) * step;
+                [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+                    sum[c] += wv * x[(p.col + c) * p.ffn + xOffset + g * 8u + i];
+                }
+            }
+        }
+#elif KBITS == 3
+        // Eight weights, twenty-four bits, five bytes read. 8·3 is a whole byte
+        // count, so the shifts fold away and nothing branches — the wide tier's
+        // trick at a narrower rate.
+        [[unroll]] for (uint g = 0u; g < BLOCK / 8u; g++) {
+            uint o = seqAt + g * 3u;
+            uint w0 = byteAt(o), w1 = byteAt(o + 1u), w2 = byteAt(o + 2u);
+            uint w3 = byteAt(o + 3u), w4 = byteAt(o + 4u);
+            uint lo = (w0 << 24u) | (w1 << 16u) | (w2 << 8u) | w3;
+            uint hi = w4;
+            [[unroll]] for (uint i = 0u; i < 8u; i++) {
+                uint at = i * 3u;
+                uint v;
+                if (at + 12u <= 32u) {
+                    v = (lo >> (32u - at - 12u)) & 0xFFFu;
+                } else {
+                    uint take = 32u - at;                // bits still in lo
+                    v = ((lo << (12u - take)) | (hi >> (8u - (12u - take)))) & 0xFFFu;
                 }
                 float wv = t4gValue(v) * step;
                 [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {

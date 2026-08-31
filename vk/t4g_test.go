@@ -53,41 +53,45 @@ func t4gMatrixAs(tb testing.TB, rows, cols int, kind nn.Quant) ([]byte, []float3
 // step codes, and both alignments a twelve-bit window can have inside a byte
 // pair — which is the whole of what there is to get wrong.
 func TestT4GDecodeMatchesCPUExactly(t *testing.T) {
+	testGolemDecodeMatchesCPUExactly(t, nn.T4G)
+	testGolemDecodeMatchesCPUExactly(t, nn.T5G)
+}
+
+// testGolemDecodeMatchesCPUExactly is the sweep every trellis tier is held to,
+// factored so a new tier gets it by calling in rather than by copying it —
+// two copies of an exactness sweep drift apart.
+func testGolemDecodeMatchesCPUExactly(t *testing.T, kind nn.Quant) {
 	const rows, cols = 32, 256
 	d := open(t)
 	defer d.Close()
 
-	for _, kind := range []nn.Quant{nn.T4G, nn.T5G} {
-		data, _ := t4gMatrixAs(t, rows, cols, kind)
-		m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols}
-		want := make([]float32, cols)
+	data, _ := t4gMatrixAs(t, rows, cols, kind)
+	m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols}
+	want := make([]float32, cols)
 
-		gpu, err := newHostGolemMatrix(d, data, rows, cols, kind)
-		if err != nil {
+	gpu, err := newHostGolemMatrix(d, data, rows, cols, kind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gpu.Close()
+
+	x := make([]float32, cols)
+	got := make([]float32, rows)
+	for j := 0; j < cols; j++ {
+		for i := range x {
+			x[i] = 0
+		}
+		x[j] = 1
+		if err := gpu.MatVec(x, got); err != nil {
 			t.Fatal(err)
 		}
-
-		x := make([]float32, cols)
-		got := make([]float32, rows)
-		for j := 0; j < cols; j++ {
-			for i := range x {
-				x[i] = 0
-			}
-			x[j] = 1
-			if err := gpu.MatVec(x, got); err != nil {
-				gpu.Close()
-				t.Fatal(err)
-			}
-			for r := 0; r < rows; r++ {
-				m.Row(r, want)
-				if got[r] != want[j] {
-					gpu.Close()
-					t.Fatalf("%s weight [%d,%d]: the card reads %v, the processor %v",
-						kind, r, j, got[r], want[j])
-				}
+		for r := 0; r < rows; r++ {
+			m.Row(r, want)
+			if got[r] != want[j] {
+				t.Fatalf("%s weight [%d,%d]: the card reads %v, the processor %v",
+					kind, r, j, got[r], want[j])
 			}
 		}
-		gpu.Close()
 	}
 }
 
