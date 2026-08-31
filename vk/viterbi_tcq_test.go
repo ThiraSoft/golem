@@ -28,7 +28,7 @@ import (
 // None of it is visible in the answer: the two reconstructions land within a
 // few parts in a hundred million of each other, which is what this asserts.
 func TestViterbiMatchesCPU(t *testing.T) {
-	for _, k := range []int{TrellisGPUK, TrellisGPUK5} {
+	for _, k := range []int{TrellisGPUK, TrellisGPUK5, TrellisGPUK3} {
 		t.Run(fmt.Sprintf("k%d", k), func(t *testing.T) { viterbiAgainstCPU(t, k) })
 	}
 }

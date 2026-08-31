@@ -44,6 +44,15 @@ var viterbiTCQSPIRV []byte
 //go:embed shaders/viterbi_tcq5.spv
 var viterbiTCQ5SPIRV []byte
 
+//go:generate glslc -O -DKBITS=3 --target-env=vulkan1.1 -fshader-stage=compute shaders/viterbi_tcq.comp -o shaders/viterbi_tcq3.spv
+
+// viterbiTCQ3SPIRV is the narrow tier's. Narrowing k widens the trellis rather
+// than the planes — the prefix count is 2^(L−k) — so the backpointers double in
+// number and halve in width, which is the wide tier's trade run backwards.
+//
+//go:embed shaders/viterbi_tcq3.spv
+var viterbiTCQ3SPIRV []byte
+
 // What the shader is compiled for. They are not parameters: the sequence
 // length is what makes the backpointers fit beside the two cost planes in a
 // workgroup's sixty-four kibibytes, and changing either means recompiling with
@@ -52,11 +61,14 @@ const (
 	TrellisGPUSeq = 128 // weights coded as one sequence
 	TrellisGPUK   = 4   // bits emitted per weight in the ordinary tier
 	TrellisGPUK5  = 5   // and in the wide one, which is the logit head's
+	TrellisGPUK3  = 3   // and in the narrow one
 	TrellisGPUL   = 12  // state bits
 )
 
 // TrellisGPUHasK says whether a kernel was built for that rate.
-func TrellisGPUHasK(k int) bool { return k == TrellisGPUK || k == TrellisGPUK5 }
+func TrellisGPUHasK(k int) bool {
+	return k == TrellisGPUK || k == TrellisGPUK5 || k == TrellisGPUK3
+}
 
 // maxWorkgroups is what every Vulkan implementation promises on the first axis
 // of a dispatch. Cards allow more and this one allows a great deal more, but a
@@ -119,7 +131,9 @@ func NewTrellisEncoder(d *Device, capacity int) (*TrellisEncoder, error) {
 		}
 	}
 	bufs := []*Buffer{e.z, e.rec, e.path}
-	for k, spirv := range map[int][]byte{TrellisGPUK: viterbiTCQSPIRV, TrellisGPUK5: viterbiTCQ5SPIRV} {
+	for k, spirv := range map[int][]byte{
+		TrellisGPUK: viterbiTCQSPIRV, TrellisGPUK5: viterbiTCQ5SPIRV, TrellisGPUK3: viterbiTCQ3SPIRV,
+	} {
 		pipe, err := d.NewPipeline(spirv, len(bufs), uint32(unsafe.Sizeof(viterbiPush{})))
 		if err != nil {
 			e.Close()

@@ -26,12 +26,15 @@
 //     cheap to compute is not a detail of this format, it is the reason the
 //     format has no table at all.
 //
-// k = 4 and k = 5. Widening k narrows the trellis rather than the planes: the
+// k = 3, 4 and 5. Widening k narrows the trellis rather than the planes: the
 // prefix count is 2^(L−k), so five bits halves the backpointers where three
-// would double them. What changes is how a backpointer is stored — a nibble
-// holds four bits and not five — so the wide tier spends a byte each and 16
-// KiB rather than 8. Both fit beside the 32 KiB of costs; k = 3 does not, and
-// the processor side refuses it rather than compute nonsense.
+// doubles them. What changes is how a backpointer is stored: five bits spend
+// a byte each over 128 prefixes (8 KiB), four bits a nibble each over 256
+// (16 KiB), and three bits — the narrow tier, going the other way — pack ten
+// to a word instead of eight, wasting two of the word's 32 bits rather than
+// widening every field, over 512 prefixes (25.6 KiB). All three fit beside
+// the 32 KiB of costs and the 2.5 KiB of small change; k = 3 is the tightest,
+// with under 4 KiB of the 64 to spare.
 #ifndef KBITS
 #define KBITS 4
 #endif
@@ -60,18 +63,26 @@ const uint NPREFIX = 1u << (L - K); // 256
 const uint FAN = 1u << K;           // 16
 const uint SHIFT = L - K;
 
-// 32 KiB of costs and 16 KiB of backpointers — a nibble each over 256 prefixes
-// at four bits, a byte each over 128 at five — plus the small change: 50 KiB
-// against the 64 the card allows, either way.
+// 32 KiB of costs, plus backpointers sized to the tier: a byte each over 128
+// prefixes at five bits (8 KiB), a nibble each over 256 at four (16 KiB), or
+// ten 3-bit fields to a word over 512 at three (25.6 KiB, ceiling-divided —
+// 512 does not split evenly by tens). Plus 2.5 KiB of small change: costliest
+// at k = 3, at 60.1 KiB against the 64 the card allows.
 #if KBITS == 5
 #define BPPERWORD 4u
 #define BPWIDTH   8u
+#elif KBITS == 3
+#define BPPERWORD 10u
+#define BPWIDTH   3u
 #else
 #define BPPERWORD 8u
 #define BPWIDTH   4u
 #endif
+// Ceiling division: only k = 3's ten-per-word packing doesn't split T*NPREFIX
+// evenly, and a floor here would undersize the array by one word.
+#define BPWORDS ((T * NPREFIX + BPPERWORD - 1u) / BPPERWORD)
 shared float cost[2u * NSTATES];
-shared uint bp[T * NPREFIX / BPPERWORD];
+shared uint bp[BPWORDS];
 shared float zs[T];
 shared float redVal[256];
 shared uint redAt[256];
@@ -96,7 +107,7 @@ void main() {
     uint base = seq * T;
 
     for (uint i = tid; i < T; i += 256u) zs[i] = z[base + i] * p.gain;
-    for (uint i = tid; i < T * NPREFIX / BPPERWORD; i += 256u) bp[i] = 0u;
+    for (uint i = tid; i < BPWORDS; i += 256u) bp[i] = 0u;
     barrier();
 
     // t = 0: every window is a legal start, so the cost is the distortion.
