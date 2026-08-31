@@ -31,7 +31,7 @@
 // window's arithmetic changes — at four bits every offset is a multiple of four
 // so a window has two alignments and spans two bytes, and at three and five it
 // has all eight and can span three. The unroll is over eight weights, which is
-// where the narrower tiers' offsets come back to a whole number of bytes:
+// where three and five bits both come back to a whole number of bytes:
 // 8·3 = 24, 8·5 = 40.
 #ifndef KBITS
 #define KBITS 4

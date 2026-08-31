@@ -71,10 +71,12 @@ void main() {
     uint at = rowBase + nb + seq * SEQB + (bit >> 3u);
 #if KBITS == 5 || KBITS == 3
     // Three bytes, because at three and five bits a window starts at any bit
-    // of a byte — but only when it actually reaches into the third, which the
-    // last weight of a sequence does not: at KBITS==5 it starts at bit 635 and
-    // ends at 646, at KBITS==3 at bit 381 and ends at 392, and an unconditional
-    // read there would be one byte past the last row.
+    // of a byte. The guard is a real bounds check at k=5: the last weight
+    // starts at bit 635 and ends at 646, one short of the third byte, so an
+    // unconditional read there would be one byte past the last row. At k=3 the
+    // guard is a no-op: the last weight starts at bit 381 (bit & 7 == 5, so
+    // the condition is always true) and its third byte is 49 — SEQB-1, the
+    // sequence's last byte, not one past it.
     uint third = ((bit & 7u) > 4u) ? byteAt(at + 2u) : 0u;
     uint word = (byteAt(at) << 16u) | (byteAt(at + 1u) << 8u) | third;
     uint state = (word >> (12u - (bit & 7u))) & 0xFFFu;

@@ -14,6 +14,7 @@ import (
 	"math"
 	"math/rand"
 	"testing"
+	"unsafe"
 
 	"github.com/ThiraSoft/golem/compress"
 	"github.com/ThiraSoft/golem/nn"
@@ -184,5 +185,102 @@ func TestT4GUnalignedRowsDecode(t *testing.T) {
 				t.Fatalf("weight [%d,%d]: the card reads %v, the processor %v", r, j, got[r], want[j])
 			}
 		}
+	}
+}
+
+// TestGolemWidePassesMatchCPU exercises the COLUMNS=2/4/8 pipelines, which the
+// exactness sweep above never dispatches — that sweep goes through
+// hostD4GMatrix.MatVec, which is hard-wired to Set(1). A wrong wide kernel
+// would otherwise ship silently: prefill runs through the wide passes, and a
+// bug there reads back as a bad perplexity rather than as a shader bug.
+func TestGolemWidePassesMatchCPU(t *testing.T) {
+	testGolemWidePassesMatchCPU(t, nn.T3G)
+	testGolemWidePassesMatchCPU(t, nn.T4G)
+	testGolemWidePassesMatchCPU(t, nn.T5G)
+}
+
+func testGolemWidePassesMatchCPU(t *testing.T, kind nn.Quant) {
+	const rows, cols = 512, 1024
+	d := open(t)
+	defer d.Close()
+
+	data, q := t4gMatrixAs(t, rows, cols, kind)
+	m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols}
+
+	pre := make([]float32, cols)
+	for j := range pre {
+		pre[j] = 1 / q[j]
+	}
+
+	k, err := NewGolemKernels(d, kind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+
+	for _, width := range D4GWidths {
+		// A different activation a column, so a kernel that mixed up which
+		// column it read would not pass by accident.
+		xs := make([][]float32, width)
+		want := make([][]float32, width)
+		b := nn.NewBatch(cols, 1)
+		for c := range xs {
+			xs[c] = make([]float32, cols)
+			for i := range xs[c] {
+				xs[c][i] = float32(math.Sin(float64(i)*0.37+float64(c))) * float32(1+i%17) * 0.11
+			}
+			nn.PrepareD4G(xs[c], pre, 128)
+			copy(b.F[0], xs[c])
+			want[c] = make([]float32, rows)
+			m.MatVec(b, want[c])
+		}
+
+		act, err := d.Host(cols*width*4, bufferUsageStorage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := d.Readback(rows*width*4, bufferUsageStorage)
+		if err != nil {
+			act.Close()
+			t.Fatal(err)
+		}
+		af := act.Floats()
+		for c := range xs {
+			copy(af[c*cols:(c+1)*cols], xs[c])
+		}
+
+		gm, err := NewD4GMatrixOn(k, data, rows, cols, act, out)
+		if err != nil {
+			act.Close()
+			out.Close()
+			t.Fatal(err)
+		}
+		push := gm.Push(0)
+		if err := gm.Set(width).Dispatch(gm.Groups(), unsafe.Pointer(&push)); err != nil {
+			gm.Close()
+			t.Fatal(err)
+		}
+		of := out.Floats()
+
+		var scale, worst float64
+		var whereC, whereI int
+		for c := range want {
+			for _, v := range want[c] {
+				scale = math.Max(scale, math.Abs(float64(v)))
+			}
+		}
+		for c := range want {
+			for i := range want[c] {
+				got := of[c*rows+i]
+				if e := math.Abs(float64(got - want[c][i])); e/scale > worst {
+					worst, whereC, whereI = e/scale, c, i
+				}
+			}
+		}
+		if worst > 1e-5 {
+			t.Fatalf("%s width %d, row %d col %d diverges (relative %g)", kind, width, whereI, whereC, worst)
+		}
+		gm.Close()
+		t.Logf("%s width %d: worst gap %g of the largest output", kind, width, worst)
 	}
 }
