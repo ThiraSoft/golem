@@ -29,6 +29,12 @@ const (
 	// logits, and which llama.cpp's K-quant mixes have always given more bits
 	// than the rest of the model.
 	T5G
+	// T3G is the trellis at three bits a weight: 128 weights in 52 bytes, 3.25
+	// each, which is D4G's rate to the bit. Same 1MAD, same window, seven bits
+	// of padding at the end of a sequence because 12 + 127·3 is 393 and not a
+	// whole number of bytes. It is what retires the lattice: the same size, two
+	// decibels better on a Gaussian, and no table at all.
+	T3G
 )
 
 // Golem says the format is one of golem's own — a matrix stored as A·(q ⊙ W),
@@ -40,7 +46,7 @@ const (
 // format that has no lattice code at all came to need a name for the question.
 func (q Quant) Golem() bool {
 	switch q {
-	case T4G, T5G:
+	case T4G, T5G, T3G:
 		return true
 	}
 	return false
@@ -72,6 +78,8 @@ func (q Quant) String() string {
 		return "T4G"
 	case T5G:
 		return "T5G"
+	case T3G:
+		return "T3G"
 	}
 	return "unknown"
 }
@@ -103,6 +111,8 @@ func QuantOf(dtype string) (Quant, bool) {
 		return T4G, true
 	case "T5G":
 		return T5G, true
+	case "T3G":
+		return T3G, true
 	}
 	return 0, false
 }

@@ -79,6 +79,12 @@ const (
 	// power of two makes five bits come out whole, and one bit per 128 weights
 	// is 0.008 of one.
 	T5GSeqBytes = ((T4GSeq-1)*T5GK + T4GL + 7) / 8
+	// T3GK is the narrow tier's, one bit a weight less than the ordinary one.
+	T3GK = 3
+	// T3GSeqBytes is 12 + 127·3 = 393 bits rounded up to 400, which is 50. The
+	// seven bits are written as zero and never read; nn/t3g_test.go holds a
+	// reader to that. They are also most of what tail-biting would give back.
+	T3GSeqBytes = ((T4GSeq-1)*T3GK + T4GL + 7) / 8
 	// t4gStepsPerSeq is how many step codes a sequence carries.
 	t4gStepsPerSeq = T4GSeq / T4GBlock
 )
@@ -88,8 +94,11 @@ func T4GSeqBytesN(q Quant) int { _, sb := t4gRate(q); return sb }
 
 // t4gRate is a tier's code width and what one sequence of it occupies.
 func t4gRate(q Quant) (k, seqBytes int) {
-	if q == T5G {
+	switch q {
+	case T5G:
 		return T5GK, T5GSeqBytes
+	case T3G:
+		return T3GK, T3GSeqBytes
 	}
 	return T4GK, T4GSeqBytes
 }
@@ -201,16 +210,18 @@ func PutT4GStatesN(dst []byte, states []uint16, q Quant) {
 // which is the sequence's last byte and not one past it.
 func T4GStateAt(codes []byte, t int) uint16 { return T4GStateAtN(codes, t, T4G) }
 
-// T4GStateAtN is the same for whichever tier. At five bits a window can start
-// at any bit of a byte, so it spans three rather than two; the ordinary tier
-// keeps its two-byte read, which is the one the hot kernel uses.
+// T4GStateAtN is the same for whichever tier. The two-byte read is T4G's
+// alone: a four-bit offset is the only one that keeps a twelve-bit window
+// inside two bytes, so every other tier — five bits and now three — spans a
+// window that can start at any bit of a byte, which is three bytes, not two.
 func T4GStateAtN(codes []byte, t int, q Quant) uint16 {
-	if q != T5G {
+	if q == T4G {
 		at := t * T4GK
 		v := uint32(codes[at>>3])<<8 | uint32(codes[at>>3+1])
 		return uint16(v >> uint(4-(at&7)) & 0xFFF)
 	}
-	at := t * T5GK
+	k, _ := t4gRate(q)
+	at := t * k
 	v := uint32(codes[at>>3])<<16 | uint32(codes[at>>3+1])<<8
 	if n := at>>3 + 2; n < len(codes) {
 		v |= uint32(codes[n])

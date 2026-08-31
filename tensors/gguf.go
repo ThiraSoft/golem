@@ -214,11 +214,16 @@ var ggmlTypes = map[uint32]string{
 	14: "Q6_K",
 	30: "BF16",
 	// golem's own, which llama.cpp will not recognise and is not meant to.
-	// 1000-1002 were the lattice's — D4G, L8G, D4G16 — retired along with it;
-	// a number that means two formats is a file that loads and answers
-	// nonsense, so they stay empty rather than being reused here.
-	1003: "T4G",
-	1004: "T5G",
+	// In order of rate, from the base of the range: nothing golem has written
+	// has ever left this machine, so the numbering owes nothing to a file on
+	// disk and is free to say what the format is rather than which one was
+	// written first.
+	1000: "T3G",
+	1001: "T4G",
+	1002: "T5G",
+	// 1003 and 1004 were T4G and T5G, and 1000-1002 were the lattice, Lloyd and
+	// the wide lattice. None is reused: a file that still names one should fail
+	// to load rather than be read as a tier it is not.
 }
 
 // blockGeometry gives, per type, how many weights sit in one block and how many
@@ -234,6 +239,7 @@ var blockGeometry = map[string][2]int{
 	"Q4_K": {256, 144}, // 2 fp16 (d, dmin) + 12 scales + 128 nibbles
 	"Q5_K": {256, 176}, // 2 fp16 (d, dmin) + 12 scales + 32 high bits + 128 nibbles
 	"Q6_K": {256, 210}, // 128 low nibbles, 64 high pairs, 16 scales, one fp16
+	"T3G":  {128, 52},  // two step codes, then a 393-bit path in 400
 	"T4G":  {128, 67},  // two step codes, then a 520-bit trellis path
 	"T5G":  {128, 83},  // the same at five bits a weight, 648 of them
 }
