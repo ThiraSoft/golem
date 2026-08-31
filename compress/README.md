@@ -133,6 +133,13 @@ Sixteen percent smaller than Q4_K_M, twenty-six percent closer to the original's
 opinion, half a point better at naming the same word, and 1.7 % behind on
 perplexity.
 
+Every row above and in the T3G table below, `bf16` included, was read by
+`cmd/vqdiff` — golem's own dequantizers reading each file, llama.cpp's Q4_K_M,
+Q3_K_M and Q3_K_S included, not llama.cpp itself. Same corpus, same tokenizer,
+same eight windows for every row, so the comparison is apples to apples on the
+one axis that matters here: what a Go implementation actually gets back out of
+each file.
+
 **That last figure is not a difference.** The evaluation is 4088 tokens in eight
 windows and the two models see the same ones, so the comparison is paired and
 can be tested: the mean gap is 0.017 nats against a standard error of 0.012 —
