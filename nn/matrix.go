@@ -68,6 +68,8 @@ func (m Matrix) RowBytes() int {
 		return m.Cols / QuantBlock * q4_0BlockBytes
 	case Q4_1:
 		return m.Cols / QuantBlock * q4_1BlockBytes
+	case Q3_K:
+		return m.Cols / SuperBlock * q3_kBlockBytes
 	case Q4_K:
 		return m.Cols / SuperBlock * q4_kBlockBytes
 	case Q5_K:
@@ -171,6 +173,8 @@ func (m Matrix) rows(b *Batch, ys [][]float32, start, end int) {
 				ys[c][r] = DotF32(row, b.F[c])
 			}
 		}
+	case Q3_K:
+		matVecQ3_KRows(m.Data, b, m.Cols, ys, start, end)
 	case Q4_K:
 		matVecQ4_KRows(m.Data, b, m.Cols, ys, start, end)
 	case Q5_K:
@@ -255,6 +259,8 @@ func (m Matrix) Row(index int, out []float32) {
 		DequantizeQ6_K(row, m.Cols, out)
 	case Q5_K:
 		DequantizeQ5_K(row, m.Cols, out)
+	case Q3_K:
+		DequantizeQ3_K(row, m.Cols, out)
 	case Q4_K:
 		DequantizeQ4_K(row, m.Cols, out)
 	case L8G:

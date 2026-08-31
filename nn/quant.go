@@ -15,6 +15,7 @@ const (
 	F16
 	Q4_0
 	Q4_1
+	Q3_K
 	Q4_K
 	Q5_K
 	Q6_K
@@ -80,6 +81,8 @@ func (q Quant) String() string {
 		return "Q4_0"
 	case Q4_1:
 		return "Q4_1"
+	case Q3_K:
+		return "Q3_K"
 	case Q4_K:
 		return "Q4_K"
 	case Q5_K:
@@ -115,6 +118,8 @@ func QuantOf(dtype string) (Quant, bool) {
 		return Q4_0, true
 	case "Q4_1":
 		return Q4_1, true
+	case "Q3_K":
+		return Q3_K, true
 	case "Q4_K":
 		return Q4_K, true
 	case "Q5_K":
@@ -146,6 +151,9 @@ const (
 	q4_1BlockBytes = 20
 	// SuperBlock is the block size of the K-quants.
 	SuperBlock = 256
+	// q3_kBlockBytes is 32 bytes of high-bit mask, 64 bytes of two-bit
+	// quants, 12 packed six-bit scales, and one fp16 super-scale.
+	q3_kBlockBytes = 110
 	// q4_kBlockBytes is 2 fp16 scales (d, dmin), 12 scales bytes, and 128 nibbles.
 	q4_kBlockBytes = 144
 	// q5_kBlockBytes is 2 fp16 scales (d, dmin), 12 scales bytes, 32 high bits, and 128 nibbles.
