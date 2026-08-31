@@ -570,11 +570,22 @@ func main() {
 	for k, v := range g.Meta {
 		meta[k] = v
 	}
+	// golem.format is what makes this a golem file. The tensor types say which
+	// tier each tensor is; this says the file is ours and which layout it uses,
+	// and a reader that meets a private type without it refuses the file.
+	meta["golem.format"] = tensors.GolemFormat
 	meta["golem.hadamard_group"] = uint32(*hadGroup)
 	meta["golem.scale_block"] = uint32(nn.T4GBlock)
-	// The body's tier is what the file is called: a three-bit body under a
-	// four-bit head is a T3G file, whatever the head turns out to be.
-	meta["general.file_type"] = uint32(fileTypeOf(*bodyBits))
+	// general.file_type is llama.cpp's ftype, and unlike the tensor numbers it
+	// is read by tools that do not understand this file — Hugging Face's GGUF
+	// viewer renders it as the quantization's name. A private value there would
+	// be the mistake this format was just moved away from, and worse: a
+	// confident wrong answer shown to somebody with no way to check it.
+	// GGML_FTYPE_UNKNOWN is the honest one. The body's tier is
+	// golem.trellis.bits, in golem's own namespace, where it belongs.
+	meta["general.file_type"] = int32(-1)
+	// The geometry the file was written with, which the loader checks against
+	// what it implements rather than assuming they agree.
 	meta["golem.trellis.seq"] = uint32(nn.T4GSeq)
 	meta["golem.trellis.bits"] = uint32(*bodyBits)
 	meta["golem.trellis.state"] = uint32(nn.T4GL)
@@ -600,21 +611,6 @@ func dtypeFor(bits int) string {
 		return "T5G"
 	default:
 		return "T4G"
-	}
-}
-
-// fileTypeOf is general.file_type's value for the body's rate: 1000, 1001 or
-// 1002 for T3G, T4G or T5G. This is a separate table from tensors' tensor-type
-// switch on purpose — that one already owns the fact of which id a dtype
-// string is, and a second mapping here would be the same fact written twice.
-func fileTypeOf(bodyBits int) int {
-	switch bodyBits {
-	case nn.T3GK:
-		return 1000
-	case nn.T5GK:
-		return 1002
-	default:
-		return 1001
 	}
 }
 

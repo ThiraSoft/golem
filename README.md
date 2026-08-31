@@ -205,7 +205,10 @@ go build ./cmd/golemquant
 
 The file is a GGUF — same container, same vocabulary, same chat template — with a
 tensor type llama.cpp does not know, which is why it is named `.golem` rather than
-`.gguf`: the extension is the warning that only this engine reads it. The
+`.gguf`: the extension is the warning that only this engine reads it. What says
+the file is golem's is a `golem.format` key rather than that tensor type, which
+lives in somebody else's enum; the loader checks the key, the type and the
+declared block geometry, and refuses a file where any of the three disagrees. The
 conversion runs on the card, and [`compress/README.md`](compress/README.md) has
 the method, the measurements, a list of what was tried and did not work, and
 what this format is built on.

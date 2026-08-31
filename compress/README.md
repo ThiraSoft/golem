@@ -4,9 +4,9 @@ A checkpoint in, a `.golem` out. One codebook, and a scheme around it:
 
 | | block | bits/weight | tensor type |
 |---|---|---|---|
-| `T3G` | 128 weights in 52 bytes | 3.25 | 1000 |
-| `T4G` | 128 weights in 67 bytes | 4.19 | 1001 |
-| `T5G` | 128 weights in 83 bytes | 5.19 | 1002 |
+| `T3G` | 128 weights in 52 bytes | 3.25 | `0x676C6D03` |
+| `T4G` | 128 weights in 67 bytes | 4.19 | `0x676C6D04` |
+| `T5G` | 128 weights in 83 bytes | 5.19 | `0x676C6D05` |
 
 `T3G` is the narrow body of a small model or a tight budget. The head defaults
 to four bits whatever the body is — a logit head narrower than the body would
@@ -37,9 +37,8 @@ either format reached — so the lattice was retired rather than kept beside it.
 
 `golem.hadamard_group` and `golem.scale_block` in the metadata say what the
 file was written with — both name the scheme, and are unchanged by which
-codebook a block holds. `general.file_type` is 1000 for `T3G`, 1001 for
-`T4G`, 1002 for `T5G` — the body's tier, since the body is what the file is
-named for even when the head is written wider.
+codebook a block holds. What says the file is golem's at all is three separate
+things, below.
 
 The state is the last twelve bits of the code stream, so
 weight *t* reads the twelve bits at offset 4·*t* and hashes them:
@@ -80,6 +79,55 @@ half a byte of output.
 and a Viterbi is a chain of comparisons over a codebook with 1021 distinct
 values for 4096 states — near ties are everywhere and one bit moves whole paths.
 It was 7 % of the weights.
+
+### What says a file is a golem file
+
+A `.golem` is a GGUF with private tensor types in it, and for one day it was
+identified by nothing else: the number 1000. That is an integer in ggml's enum,
+which ggml owns and grows, and it turned out not even to be safe against this
+repository's own past. Before the trellis, 1000 meant `D4G`: a lattice, 64
+weights in 26 bytes. It now means `T3G`: a trellis, 128 in 52. **The same 3.25
+bits a weight** — so a lattice-era file passed the type lookup, passed the row
+size, decoded lattice codes through the trellis hash, and read its rotation from
+a key that no longer existed, silently, as none. The file agreed about every
+shape and answered nonsense, which is this format's named failure mode.
+
+Three independent layers now have to agree before a file is read:
+
+1. **`golem.format = "trellis/1"`** — a positive discriminator in golem's own
+   namespace, with a version. *This* is what makes a file a golem file. A file
+   carrying a private tensor type without it is refused, because a missing key
+   cannot be told from agreement: it means "written before this key existed",
+   and that file has to be rebuilt.
+2. **The tensor type**, which the metadata cannot replace: it is per tensor, and
+   it is what distinguishes a `T3G` body from a `T4G` head inside one file. The
+   three are `0x676C6D03`, `04` and `05`. The top three bytes are ASCII `glm`,
+   so a hex dump names the format to somebody with no tooling, and **the low
+   byte is the bits a weight**, so a six-bit tier is `0x676C6D06` and needs no
+   decision. 1000–1004 are retired and never reused.
+3. **The declared geometry.** `golem.trellis.seq`, `golem.trellis.bits` and
+   `golem.trellis.state` are checked against what the build implements and
+   against the block size each tensor type claims. A mismatch is an error naming
+   both numbers, not a reinterpretation.
+
+Each catches what the others do not. The type number alone collides with its own
+history — that is the D4G case above, and `golem.format` is what refuses it.
+`golem.format` alone cannot say which tier a tensor is, because it is per file.
+And both together would still let a file written by a build with a different
+sequence length or state width decode at the right size and the wrong offsets,
+which is what the geometry check refuses. Reading a file as a format it is not
+now needs three coincidences at once.
+
+**`general.file_type` is `-1`, `GGML_FTYPE_UNKNOWN`, on purpose.** It used to
+carry the body's tier as a private number. That field is llama.cpp's `ftype`,
+and unlike the tensor types it is read by tools that do not understand this
+file — Hugging Face's GGUF viewer renders it as the quantization's name. Putting
+a private value there is the same mistake as squatting the tensor enum, and
+worse in one respect: the tensor numbers are only read by readers that already
+know what the file is, whereas `ftype` is read by ones that do not, and would
+show a confident wrong answer to somebody with no way to check it. The body's
+tier is `golem.trellis.bits`, in golem's own namespace, where it belongs. Do not
+put it back.
 
 ### The step, and where its window sits
 

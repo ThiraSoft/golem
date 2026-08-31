@@ -22,9 +22,12 @@ func TestGGUFRoundTrip(t *testing.T) {
 		"tokenizer.ggml.bos_id":    int32(11),
 		"tokenizer.ggml.add_bos":   true,
 		"tokenizer.ggml.scores":    []any{float32(1), float32(-2)},
+		"golem.format":             GolemFormat,
 		"golem.hadamard_group":     uint32(128),
 		"golem.scale_block":        uint32(64),
+		"golem.trellis.seq":        uint32(128),
 		"golem.trellis.bits":       uint32(4),
+		"golem.trellis.state":      uint32(12),
 		"general.quantization_ver": uint64(2),
 	}
 	tensors := []OutTensor{
@@ -128,12 +131,16 @@ func TestGGUFRefusesLatticeEraEvenWithTrellisBits(t *testing.T) {
 }
 
 // TestGGUFRefusesTrellisWithoutBits checks the other half of the same guard:
-// trellis-tier tensors (1000-1002) with no golem.trellis.bits to say which
-// tier wrote them.
+// trellis-tier tensors with no golem.trellis.bits to say which tier wrote
+// them. The file is otherwise well formed and declares golem.format, so this
+// is layer three refusing on its own.
 func TestGGUFRefusesTrellisWithoutBits(t *testing.T) {
 	meta := map[string]any{
 		"general.architecture": "qwen3",
 		"general.alignment":    uint32(32),
+		"golem.format":         GolemFormat,
+		"golem.trellis.seq":    uint32(128),
+		"golem.trellis.state":  uint32(12),
 	}
 	tensors := []OutTensor{
 		{Name: "blk.0.attn_q.weight", Shape: []int{128, 2}, DType: "T3G",

@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 )
 
@@ -200,6 +201,31 @@ func (g *GGUF) readHeader() error {
 	return g.readTensorTable(r, tensorCount)
 }
 
+// The tensor types golem writes for its own formats. The base is ASCII "glm"
+// in the top three bytes and the bits a weight in the low one, so `67 6C 6D 03`
+// in a hex dump names both the format and the tier to a reader with no tooling,
+// and a sixth tier is 0x676C6D06 and needs no decision. ggml's own types run
+// 0-39 and grow over time; nothing will ever be allocated up here.
+//
+// This is only the second of three layers. A type number lives in somebody
+// else's enum and cannot be a safe discriminator on its own — see
+// checkGolemFile, which is what actually decides that a file is a golem file.
+const (
+	golemTypeBase uint32 = 0x676C6D00 // "glm\0"
+	golemT3G      uint32 = golemTypeBase | 3
+	golemT4G      uint32 = golemTypeBase | 4
+	golemT5G      uint32 = golemTypeBase | 5
+)
+
+// GolemFormat is the value of the `golem.format` key: the codec family and the
+// layout version. It is what makes a file a golem file — not the tensor type,
+// which is per tensor and borrowed. A reader that meets a private tensor type
+// without this key refuses the file rather than guessing which era wrote it.
+//
+// Bump the version when the bytes of a block change meaning. The name changes
+// when the codec family does.
+const GolemFormat = "trellis/1"
+
 // ggmlTypes maps the type numbers used in the tensor table onto the names the
 // rest of golem uses. Only the types this repository actually reads are listed:
 // an unknown one is an error rather than a silent misreading.
@@ -215,47 +241,119 @@ var ggmlTypes = map[uint32]string{
 	14: "Q6_K",
 	30: "BF16",
 	// golem's own, which llama.cpp will not recognise and is not meant to.
-	// In order of rate, from the base of the range: nothing golem has written
-	// has ever left this machine, so the numbering owes nothing to a file on
-	// disk and is free to say what the format is rather than which one was
-	// written first.
-	1000: "T3G",
-	1001: "T4G",
-	1002: "T5G",
-	// 1003 and 1004 were T4G and T5G, and 1000-1002 were the lattice, Lloyd and
-	// the wide lattice: 1001 and 1002 changed geometry, so an old file fails on
-	// row size before it fails on meaning. 1000 did not — D4G was 26 bytes per
-	// 64 weights and T3G is 52 per 128, the same 3.25 bits a weight — so a
-	// pre-trellis D4G file passes the type lookup and the row-size check and
-	// decodes as a trellis tier, silently reading `golem.d4.hadamard_group`'s
-	// group as absent and every row's salience as nonsense. checkTrellisMeta
-	// below is what actually catches this one.
+	golemT3G: "T3G",
+	golemT4G: "T4G",
+	golemT5G: "T5G",
+	// 1000-1004 are retired and never reused. They were, in turn, the lattice,
+	// Lloyd, the wide lattice, T4G and T5G, and then 1000-1002 were the three
+	// trellis tiers. The collision that ended that numbering is the reason for
+	// everything above: 1000 meant D4G, 26 bytes per 64 weights, and then T3G,
+	// 52 per 128 — the same 3.25 bits a weight, so a lattice-era file passed
+	// the type lookup, passed the row-size check, and decoded through the
+	// trellis hash with its rotation silently read as absent. An integer in
+	// another project's enum can collide with its own past as easily as with
+	// its owner's future.
 }
 
-// checkTrellisMeta refuses two things a type number and a row size cannot
-// catch on their own: a file still carrying a `golem.d4.*` key from the
-// lattice era, and a trellis-tier tensor (1000-1002) with no
-// `golem.trellis.bits` to say which tier wrote it. Type 1000 is numerically
-// identical between D4G and T3G — same block size, same bytes — so this is
-// the only place a pre-trellis file is told apart from the one that replaced
-// it.
-func (g *GGUF) checkTrellisMeta() error {
+// The geometry this build implements. It is a second copy of nn's constants
+// because tensors cannot import nn — nn's own tests read GGUFs — and
+// TestGolemBlockGeometryMatchesNN is the join that holds the two equal.
+const (
+	golemSeq        = 128 // weights coded as one trellis path
+	golemState      = 12  // bits of state the path carries
+	golemScaleBlock = 64  // weights under one step code, a byte each
+)
+
+// golemTierBits is the bits a weight each private type codes at, which is by
+// construction the low byte of its type number.
+var golemTierBits = map[string]int{"T3G": 3, "T4G": 4, "T5G": 5}
+
+// golemBlockBytes is what a block of seq weights occupies at k bits each with
+// a state of the given width: one step code per scale block, then the path,
+// which is the state once and k bits for every weight after the first.
+func golemBlockBytes(seq, state, k int) int {
+	return seq/golemScaleBlock + ((seq-1)*k+state+7)/8
+}
+
+// checkGolemFile decides whether a file carrying golem's private tensor types
+// is a file this build can read. It is the third layer, and the one that does
+// the deciding: the type numbers say which tier a tensor is, and this says
+// whether the file means what those numbers mean here.
+//
+// It refuses four things a type number and a row size cannot catch:
+//
+//   - a `golem.d4.*` key, which only the lattice-era converter wrote. That era
+//     is numerically indistinguishable from the trellis at three bits, so the
+//     retired key is the only evidence left;
+//   - a private tensor type with no `golem.format`, which is a file written
+//     before the key existed. A missing key cannot be read as agreement;
+//   - a `golem.format` this build does not implement;
+//   - a declared geometry that disagrees with what this build codes, or that
+//     names a body tier no tensor in the file uses.
+func (g *GGUF) checkGolemFile() error {
 	for key := range g.Meta {
 		if strings.HasPrefix(key, "golem.d4.") {
 			return fmt.Errorf("gguf: carries %q, which the lattice-era converter wrote; this file predates the trellis format and has to be rebuilt with golemquant", key)
 		}
 	}
-	hasTrellis := false
+	tiers := map[string]bool{}
 	for _, t := range g.Tensors {
-		switch t.DType {
-		case "T3G", "T4G", "T5G":
-			hasTrellis = true
+		if _, ok := golemTierBits[t.DType]; ok {
+			tiers[t.DType] = true
 		}
 	}
-	if hasTrellis {
-		if _, err := g.Uint32("golem.trellis.bits"); err != nil {
-			return fmt.Errorf("gguf: trellis tensors with no golem.trellis.bits; rebuild the file with golemquant")
+	if len(tiers) == 0 {
+		return nil
+	}
+
+	format, err := g.String("golem.format")
+	if err != nil {
+		return fmt.Errorf("gguf: golem's own tensor types with no golem.format key; the file predates the key and has to be rebuilt with golemquant")
+	}
+	if format != GolemFormat {
+		return fmt.Errorf("gguf: golem.format is %q and this build reads %q", format, GolemFormat)
+	}
+
+	seq, err := g.Uint32("golem.trellis.seq")
+	if err != nil {
+		return fmt.Errorf("gguf: %s file with no golem.trellis.seq: %w", format, err)
+	}
+	if int(seq) != golemSeq {
+		return fmt.Errorf("gguf: the file codes %d weights as one path and this build codes %d", seq, golemSeq)
+	}
+	state, err := g.Uint32("golem.trellis.state")
+	if err != nil {
+		return fmt.Errorf("gguf: %s file with no golem.trellis.state: %w", format, err)
+	}
+	if int(state) != golemState {
+		return fmt.Errorf("gguf: the file carries %d bits of trellis state and this build carries %d", state, golemState)
+	}
+
+	bits, err := g.Uint32("golem.trellis.bits")
+	if err != nil {
+		return fmt.Errorf("gguf: %s file with no golem.trellis.bits to say which tier the body is: %w", format, err)
+	}
+	bodySeen := false
+	names := make([]string, 0, len(tiers))
+	for name := range tiers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		k := golemTierBits[name]
+		if k == int(bits) {
+			bodySeen = true
 		}
+		// The declared geometry has to imply the block size the tensor type
+		// claims. Both sides are already pinned above, so this only fires when
+		// blockGeometry drifts from the arithmetic that produced it — which is
+		// the failure that reads every row at the wrong offset.
+		if want, got := blockGeometry[name][1], golemBlockBytes(int(seq), int(state), k); want != got {
+			return fmt.Errorf("gguf: %s reads %d bytes a block and a %d-weight path of %d bits with %d of state is %d", name, want, seq, k, state, got)
+		}
+	}
+	if !bodySeen {
+		return fmt.Errorf("gguf: golem.trellis.bits says the body is %d bits and no tensor in the file is that tier (%s)", bits, strings.Join(names, ", "))
 	}
 	return nil
 }
@@ -322,6 +420,15 @@ func (g *GGUF) readTensorTable(r *reader, count uint64) error {
 		}
 		dtype, ok := ggmlTypes[kind]
 		if !ok {
+			// The two ways a number can be golem's and still unreadable are
+			// worth naming, because "unsupported ggml type 1000" sends the
+			// reader to look for a missing decoder rather than to rebuild.
+			if kind >= 1000 && kind <= 1004 {
+				return fmt.Errorf("tensor %q: ggml type %d is one of golem's retired numbers; this file predates the move to %#x and has to be rebuilt with golemquant", name, kind, golemTypeBase)
+			}
+			if kind>>8 == golemTypeBase>>8 {
+				return fmt.Errorf("tensor %q: %#x is a golem type at %d bits a weight, which this build does not implement", name, kind, kind&0xFF)
+			}
 			return fmt.Errorf("tensor %q: unsupported ggml type %d", name, kind)
 		}
 		// shape[0] is the row length; everything above it counts rows.
@@ -355,7 +462,7 @@ func (g *GGUF) readTensorTable(r *reader, count uint64) error {
 			Offset: start,
 		}
 	}
-	return g.checkTrellisMeta()
+	return g.checkGolemFile()
 }
 
 // Get returns a tensor by name.
