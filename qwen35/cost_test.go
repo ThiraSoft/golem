@@ -17,6 +17,14 @@ import (
 //
 // The numbers this prints are the ones in README.md.
 func TestGenerationCost(t *testing.T) {
+	// A bench, not a test: everything below is fmt.Printf and the numbers go in
+	// README.md. It asserts nothing, and it is 384 seconds of a 660-second
+	// package — so it is the thing to skip when the question is whether the
+	// code is still correct, and the thing to run when the question is what it
+	// costs.
+	if testing.Short() {
+		t.Skip("a bench; -short is for correctness")
+	}
 	g, err := tensors.OpenGGUF(qwen38)
 	if err != nil {
 		t.Skipf("open: %v", err)
