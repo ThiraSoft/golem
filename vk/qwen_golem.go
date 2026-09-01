@@ -156,7 +156,7 @@ func (p *QwenPipeline) golemProduct(r *Recorder, m *GolemMatrix, columns int) {
 			}
 		}
 		push := m.Push(at)
-		r.Dispatch(m.Set(w), m.Groups(), unsafe.Pointer(&push))
+		r.Dispatch(m.Set(w), m.Groups(w), unsafe.Pointer(&push))
 		at += w
 	}
 }

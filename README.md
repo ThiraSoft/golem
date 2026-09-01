@@ -184,9 +184,12 @@ Two things do the work, and neither is new:
 
 - **A trellis instead of a table.** The codebook is a state machine, not a list of
   points: a weight is twelve bits of the code stream hashed by four instructions,
-  so there is nothing to look up and nothing to keep in shared memory. That is
-  what opens the four-bit tier, where a lattice's table would need 493 KiB against
-  the 32 a GPU workgroup has. The structure is QTIP's bitshift trellis.
+  so there is nothing to look up. That is what opens the four-bit tier, where a
+  lattice's table would need 493 KiB against the 32 a GPU workgroup has. The
+  structure is QTIP's bitshift trellis. Nothing in a file points at a codebook —
+  though the kernel, at a narrow pass, does build the whole image of that state
+  machine in shared memory before it starts, because twelve bits of state is 4096
+  floats and hashing each weight cost more than reading them.
 - **A rotation and a salience scale**, applied per calibration site rather than
   per matrix. This is most of the format's value: dropping it and keeping only
   signs and rotation costs twenty points of perplexity on Qwen3-0.6B, 39.80
@@ -275,7 +278,7 @@ Every number in this README is a benchmark in this repository, run on the machin
 
 ## 🛠️ Project Structure
 
-- `cmd/golem-cli`, `cmd/golem-server`, `cmd/pocket-tts`, `cmd/golemquant` — the commands.
+- `cmd/golem-cli`, `cmd/golem-server`, `cmd/pocket-tts`, `cmd/golemquant`, `cmd/golemtune` — the commands.
 - `engine/` — reads the architecture out of a GGUF and opens the engine that implements it.
 - `gemma/`, `qwen/`, `qwen35/`, `pockettts/` — standalone engine implementations; they do not import one another. `qwen35/` is Qwen3.8: a package is named for the architecture the GGUF declares, and this checkpoint declares `general.architecture = qwen35`, as llama.cpp's own `models/qwen35.cpp` does.
 - `nn/` & `vk/` — the shared kernels: quantized AVX2 and NEON, and Vulkan compute.

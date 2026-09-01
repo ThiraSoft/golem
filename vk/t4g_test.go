@@ -256,7 +256,7 @@ func testGolemWidePassesMatchCPU(t *testing.T, kind nn.Quant) {
 			t.Fatal(err)
 		}
 		push := gm.Push(0)
-		if err := gm.Set(width).Dispatch(gm.Groups(), unsafe.Pointer(&push)); err != nil {
+		if err := gm.Set(width).Dispatch(gm.Groups(width), unsafe.Pointer(&push)); err != nil {
 			gm.Close()
 			t.Fatal(err)
 		}

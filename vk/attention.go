@@ -273,7 +273,7 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, slotContext, s
 		{&a.scores, scoresSPIRV(coop), 7, unsafe.Sizeof(scorePush{}), scoresWave},
 		{&a.rope, ropeTableSPIRV, 4, unsafe.Sizeof(ropePush{}), 0},
 	} {
-		if *spec.into, err = d.newPipeline(spec.spirv, spec.bindings, uint32(spec.push), spec.wave); err != nil {
+		if *spec.into, err = d.newPipeline(spec.spirv, spec.bindings, uint32(spec.push), spec.wave, nil); err != nil {
 			a.Close()
 			return nil, err
 		}

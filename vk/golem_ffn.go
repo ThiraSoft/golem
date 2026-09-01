@@ -121,7 +121,7 @@ func (f *GolemFFN) Record(r *Recorder, columns int) error {
 
 	for first := 0; first < columns; first += width {
 		p := f.gateUp.Push(first)
-		r.Dispatch(f.gateUp.Set(width), f.gateUp.Groups(), unsafe.Pointer(&p))
+		r.Dispatch(f.gateUp.Set(width), f.gateUp.Groups(width), unsafe.Pointer(&p))
 	}
 	r.Barrier()
 
@@ -135,7 +135,7 @@ func (f *GolemFFN) Record(r *Recorder, columns int) error {
 
 	for first := 0; first < columns; first += width {
 		p := f.down.Push(first)
-		r.Dispatch(f.down.Set(width), f.down.Groups(), unsafe.Pointer(&p))
+		r.Dispatch(f.down.Set(width), f.down.Groups(width), unsafe.Pointer(&p))
 	}
 	return nil
 }

@@ -1,43 +1,108 @@
 #version 450
 #extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_control_flow_attributes : enable
 
 // y = W * x for a T4G matrix against float activations.
 //
 // A sequence is 128 weights: two eight-bit step codes, one per sixty-four, and
-// 520 bits of trellis path. Expanding a weight is a twelve-bit window at bit
-// offset 4t, a multiply, an add and a byte sum — and no codebook to look up at
+// a path of 127·k + 12 bits. Expanding a weight is a twelve-bit window at bit
+// offset k·t, a multiply, a byte sum and an add — and no codebook to look up at
 // all, which is the whole reason this format exists.
 //
 // The row is two planes, steps then codes: a 67-byte block would start on an
 // odd boundary and this reads words.
 //
-// At four bits the window is always two bytes and never three: every offset is
-// a multiple of four bits, so a twelve-bit field starting at 4t has one of two
-// alignments inside a byte pair, and the last weight of a sequence starts at
-// bit 508 and ends at 519 — the sequence's last byte, not one past it. At three
-// and five bits an offset lands on any bit of a byte, so the window can need
-// three bytes; see the KBITS==3 and KBITS==5 branches below.
+// Eight lanes to an output row, and a workgroup of THREADS answers an eighth of
+// itself. COLUMNS is how many activations one reading of the weights answers.
 //
-// Workgroup: 128 threads -> 16 output rows, 8 lanes per row, the shape every
-// tier's matvec shader shares. COLUMNS is how many activations one reading of
-// the weights answers.
+// What it was, and what the measurement said
+// ------------------------------------------------------------------
+// This kernel used to reach the code stream a byte at a time, through a helper
+// that turned every byte into its own dword load — one memory instruction per
+// weight, where matvec_q40.comp spends one per eight. The tell was that the
+// three tiers took the same time as each other: T3G reads 52 bytes a sequence
+// and T5G reads 83, and both answered a 9728x2560 product in 108 microseconds.
+// A kernel whose time does not move when a third of its bytes do is not reading
+// bytes for a living. It was decoding for a living.
+//
+// Three things came out of that, each of them measured and none of them
+// guessed, and vk/golem_ablate_test.go is where the measuring is kept:
+//
+//   - The sixty-four weights of a block are read as SD+1 aligned words,
+//     byte-swapped into the big-endian bit order the format numbers its stream
+//     in, and slid into place by the byte the sequence starts on. Everything
+//     after that is registers: the window of weight i sits at a constant bit
+//     offset in a constant pair of them, so the unrolled loop has no addressing
+//     arithmetic left in it and the three tiers stop needing a branch each —
+//     they are one loop now, which is what the byte-at-a-time reader could not
+//     be.
+//   - The byte sum of the 1MAD hash is one v_dot4_u32_u8 against (1,1,1,1),
+//     where it was three shifts, three masks and three adds.
+//   - The hash was still 35 of the remaining 80 microseconds, more than reading
+//     the weights, so its whole image — 4096 floats, because the state is
+//     twelve bits — is built once a workgroup in shared memory. That is worth
+//     doing at a narrow pass and not at a wide one, which is what the TABLE
+//     constant is for.
+//
+// Together: about 1.6 times a single-column product, and 1.12 times a pass of
+// eight. The tiers now differ from each other, which is the sign the kernel is
+// reading bytes again.
+//
+// The shift by `(u >> 1u) >> (31u - sh)` is not a flourish: a shift by 32 is
+// undefined in GLSL and sh is zero a quarter of the time, and two shifts that
+// are each under 32 cost the same as one shift and a select.
 
 #ifndef COLUMNS
 #define COLUMNS 1
 #endif
 
-// KBITS is the tier: three bits, four, or five for the logit head. Only the
-// window's arithmetic changes — at four bits every offset is a multiple of four
-// so a window has two alignments and spans two bytes, and at three and five it
-// has all eight and can span three. The unroll is over eight weights, which is
-// where three and five bits both come back to a whole number of bytes:
-// 8·3 = 24, 8·5 = 40.
+// KBITS is the tier: three bits, four, or five for the logit head. Nothing but
+// the geometry changes with it now — the stream is read and the windows are cut
+// the same way at every rate.
 #ifndef KBITS
 #define KBITS 4
 #endif
 
-layout(local_size_x = 128) in;
+// ABLATE is for vk/golem_ablate_test.go and is zero in every shipped binary:
+// it removes one part of the product at a time so that a benchmark can say
+// what that part costs. 1 drops the 1MAD hash, 2 drops the window cut, 3 drops
+// the activation load, 4 keeps nothing but the stream read.
+#ifndef ABLATE
+#define ABLATE 0
+#endif
+
+// Three specialization constants, because the fastest shape is the card's
+// answer and not this file's. They are given values when the pipeline is made,
+// so one binary a tier and a width becomes every shape of it; vk.GolemShapes
+// holds the choice, cmd/golemtune measures it, and GOLEM_MATVEC_SHAPE overrides
+// it without recompiling anything.
+//
+//   0 THREADS   the workgroup. OUTS below is an eighth of it, eight lanes to a
+//               row. A wider workgroup spends less shared memory per row and
+//               fills the table once for more work.
+//   1 TABLE     the codebook's image in shared memory, against hashing every
+//               weight. Not a free win at every width: a pass of eight reads a
+//               weight once and spends it eight times, so the hash is already
+//               amortized and what is left of the table is sixteen kibibytes
+//               against the occupancy.
+//   2 PREFETCH  a block's stream read one iteration before it is decoded. The
+//               outer loop runs ffn/512 times — five, on the shape this is
+//               measured against — so five memory latencies are five stalls a
+//               wave cannot hide behind anything. It costs SD+1 registers, and
+//               it earns them back only where the table is also worth having.
+// The defaults are what a pipeline made without a specialization block gets,
+// and they are the shape this repository measured fastest at one column rather
+// than something inert: a module whose workgroup defaults to one thread is a
+// kernel that works and takes twenty times as long, which is the kind of
+// mistake that gets shipped.
+layout(local_size_x = 256, local_size_x_id = 0) in;
+layout(constant_id = 1) const int TABLE = 1;
+layout(constant_id = 2) const int PREFETCH = 1;
+
+// LDS_SIZE is the table's, and it is a constant expression of TABLE so that a
+// build without the table does not reserve sixteen kibibytes to never read.
+const uint LDS_SIZE = TABLE != 0 ? (1u << 12) : 1u;
 
 layout(std430, binding = 0) readonly  buffer W { uint  w[]; };
 // Binding 1 is the step grid: 256 floats, one per code, a kibibyte uploaded
@@ -61,7 +126,7 @@ layout(push_constant) uniform Push {
 } p;
 
 const uint LANES = 8u;
-const uint OUTS  = 16u;
+const uint OUTS  = gl_WorkGroupSize.x / 8u;
 const uint SEQ   = 128u; // weights in one path
 const uint BLOCK = 64u;  // weights sharing one step
 #if KBITS == 5
@@ -75,19 +140,92 @@ const uint SEQB  = 65u;  // 127·4 + 12 = 520 bits exactly
 const uint HALFB = 32u;
 #endif
 
-uint byteAt(uint at) { return (w[at >> 2u] >> ((at & 3u) * 8u)) & 0xFFu; }
+// SD is how many words of stream a block's sixty-four windows reach into: the
+// last one starts at bit 63·KBITS and is twelve wide. Nine at four bits, seven
+// at three, eleven at five. One more word than that is read, because the
+// realignment pairs word j with word j+1.
+const uint SD = ((BLOCK - 1u) * KBITS + 12u + 31u) / 32u;
+
+// The format numbers the stream's bits from the top of byte zero, so a word of
+// it read little-endian has its bytes the wrong way round.
+//
+// ACO does not fold this into the v_perm_b32 the card has — there is no GLSL
+// spelling that reaches it — so it costs about seven instructions. It is worth
+// leaving that way: it runs SD+1 times a block, a sixth of a time a weight, and
+// the alternative is cutting the windows out of little-endian words, where the
+// offsets stop being constants of the unrolled loop.
+uint bswap(uint v) {
+    return (v >> 24u) | ((v >> 8u) & 0xFF00u) | ((v << 8u) & 0xFF0000u) | (v << 24u);
+}
 
 // The 1MAD code of nn/t4g.go. It has to be these constants and this arithmetic:
 // a decoder is a pure function of the bits it reads, so a shader that hashes a
 // state differently is a second format sharing a name. Written as a multiply
-// and not a division for the reason compress/trellis.go gives.
-float t4gValue(uint s) {
-    uint v = 34038481u * s + 76625530u;
-    uint sum = (v & 0xffu) + ((v >> 8) & 0xffu) + ((v >> 16) & 0xffu) + ((v >> 24) & 0xffu);
+// and not a division for the reason compress/trellis.go gives, and left in that
+// order — (sum - 510) scaled, then the step — because nn.T4GValue is in that
+// order and the two are held to being bit-identical.
+//
+// The byte sum is the same four bytes against (1,1,1,1), which is one
+// v_dot4_u32_u8 in place of three shifts, three masks and three adds.
+//
+// It runs 4096 times a workgroup and not once a weight: see ldsValues below.
+float t4gHash(uint s) {
+    // 34038481 = 519·65536 + 25297, and both halves fit the twenty-four bits a
+    // v_mul_u32_u24 takes — where the constant itself needs twenty-six and
+    // costs a quarter-rate v_mul_lo_u32. The state is twelve bits, so neither
+    // half-product can overflow before the sum wraps, and the sum is the same
+    // thirty-two bits either way. The mask is load-bearing: without it ACO
+    // folds the shift back into the constant and reaches for v_mul_lo_u32
+    // again, and a shift by sixteen keeps only sixteen bits regardless.
+    uint v = (((519u * s) & 0xFFFFu) << 16u) + (25297u * s + 76625530u);
+    uint sum = uint(dotPacked4x8EXT(v, 0x01010101u));
     return (float(sum) - 510.0) * 0.00676589971;
 }
 
+// The whole image of the codebook, in shared memory, built once a workgroup.
+//
+// The state is twelve bits wide, so the function has four thousand and
+// ninety-six values and they are sixteen kibibytes. A workgroup decodes
+// THREADS/8 rows of ffn weights, which at 256 threads and ffn 2560 is 320 a
+// thread, so filling the table costs a thread sixteen hashes against the 320 it
+// would otherwise do — a twentieth — and every one after that is a ds_read.
+// This is why THREADS matters here and nowhere else in the directory: the
+// sixteen kibibytes are charged to a workgroup however wide it is.
+//
+// Both places it could live were measured, and this is the one that works: the
+// same 4096 floats read out of a buffer on the card cost 123 microseconds
+// against this table's 64 on the 9728x2560 product, because a wave whose lanes
+// want sixty-four different addresses pays for sixty-four address generations
+// whatever cache they hit in. Shared memory has banks instead, and a
+// pseudo-random twelve-bit index spreads across them.
+//
+// The format still has no codebook. Nothing in a file points into this, nothing
+// in it depends on the model, and it is built by the same arithmetic
+// nn.T4GValue uses rather than by a second copy of it.
+shared float ldsValues[LDS_SIZE];
+
+// seqOf is the byte a block's stream starts at. A half is a whole number of
+// bytes in every tier, which is why the block is 64 and not something the step
+// would have to straddle.
+uint seqOf(uint codeBase, uint b) {
+    return codeBase + (b >> 1u) * SEQB + (b & 1u) * HALFB;
+}
+
+// readRaw takes the SD+1 aligned words a block's stream lies in, whatever byte
+// it starts on.
+void readRaw(uint seqAt, out uint raw[SD + 1u]) {
+    uint at = seqAt >> 2u;
+    [[unroll]] for (uint j = 0u; j <= SD; j++) raw[j] = w[at + j];
+}
+
 void main() {
+    if (TABLE != 0) {
+        for (uint i = gl_LocalInvocationID.x; i < LDS_SIZE; i += gl_WorkGroupSize.x) {
+            ldsValues[i] = t4gHash(i);
+        }
+    }
+    barrier();
+
     uint row = gl_WorkGroupID.x * OUTS + (gl_LocalInvocationID.x / LANES);
     uint lane = gl_LocalInvocationID.x % LANES;
     bool live = row < p.dim;
@@ -101,77 +239,67 @@ void main() {
     float sum[COLUMNS];
     [[unroll]] for (uint c = 0u; c < COLUMNS; c++) sum[c] = 0.0;
 
+    uint raw[SD + 1u];
+    if (PREFETCH != 0 && live && lane < nb) readRaw(seqOf(codeBase, lane), raw);
     for (uint b = lane; live && b < nb; b += LANES) {
-        float step = steps[byteAt(rowBase + b)];
-        // Which path this block is the first or second half of. A half is a
-        // whole number of bytes in both tiers, which is why the block is 64
-        // and not something the step would have to straddle.
-        uint seqAt = codeBase + (b >> 1u) * SEQB + (b & 1u) * HALFB;
+        uint stepAt = rowBase + b;
+        float step = steps[(w[stepAt >> 2u] >> ((stepAt & 3u) * 8u)) & 0xFFu];
+        uint seqAt = seqOf(codeBase, b);
         uint xOffset = b * BLOCK;
 
-#if KBITS == 5
-        // Eight weights, forty bits, six bytes read. Every offset inside the
-        // group is a compile-time constant because 8·5 is a whole byte count,
-        // so the shifts fold away and nothing branches.
-        [[unroll]] for (uint g = 0u; g < BLOCK / 8u; g++) {
-            uint o = seqAt + g * 5u;
-            uint w0 = byteAt(o), w1 = byteAt(o + 1u), w2 = byteAt(o + 2u);
-            uint w3 = byteAt(o + 3u), w4 = byteAt(o + 4u), w5 = byteAt(o + 5u);
-            uint lo = (w0 << 24u) | (w1 << 16u) | (w2 << 8u) | w3;
-            uint hi = (w4 << 8u) | w5;
-            [[unroll]] for (uint i = 0u; i < 8u; i++) {
-                // Bit 5i of a 48-bit window held as lo:hi.
-                uint at = i * 5u;
-                uint v;
-                if (at + 12u <= 32u) {
-                    v = (lo >> (32u - at - 12u)) & 0xFFFu;
-                } else if (at >= 32u) {
-                    v = (hi >> (16u - (at - 32u) - 12u)) & 0xFFFu;
-                } else {
-                    uint take = 32u - at;                 // bits still in lo
-                    v = ((lo << (12u - take)) | (hi >> (16u - (12u - take)))) & 0xFFFu;
-                }
-                float wv = t4gValue(v) * step;
-                [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
-                    sum[c] += wv * x[(p.col + c) * p.ffn + xOffset + g * 8u + i];
-                }
+        uint cur[SD + 1u];
+        if (PREFETCH != 0) {
+            cur = raw;
+            if (b + LANES < nb) readRaw(seqOf(codeBase, b + LANES), raw);
+        } else {
+            readRaw(seqAt, cur);
+        }
+        // The block's stream, in registers, in the format's own bit order.
+        uint s[SD];
+        {
+            uint sh = (seqAt & 3u) * 8u;
+            uint prev = bswap(cur[0]);
+            [[unroll]] for (uint j = 0u; j < SD; j++) {
+                uint next = bswap(cur[j + 1u]);
+                s[j] = (prev << sh) | ((next >> 1u) >> (31u - sh));
+                prev = next;
             }
         }
-#elif KBITS == 3
-        // Eight weights, twenty-four bits, five bytes read. 8·3 is a whole byte
-        // count, so the shifts fold away and nothing branches — the wide tier's
-        // trick at a narrower rate.
-        [[unroll]] for (uint g = 0u; g < BLOCK / 8u; g++) {
-            uint o = seqAt + g * 3u;
-            uint w0 = byteAt(o), w1 = byteAt(o + 1u), w2 = byteAt(o + 2u);
-            uint w3 = byteAt(o + 3u), w4 = byteAt(o + 4u);
-            uint lo = (w0 << 24u) | (w1 << 16u) | (w2 << 8u) | w3;
-            uint hi = w4;
-            [[unroll]] for (uint i = 0u; i < 8u; i++) {
-                uint at = i * 3u;
-                uint v;
-                if (at + 12u <= 32u) {
-                    v = (lo >> (32u - at - 12u)) & 0xFFFu;
-                } else {
-                    uint take = 32u - at;                // bits still in lo
-                    v = ((lo << (12u - take)) | (hi >> (8u - (12u - take)))) & 0xFFFu;
-                }
-                float wv = t4gValue(v) * step;
-                [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
-                    sum[c] += wv * x[(p.col + c) * p.ffn + xOffset + g * 8u + i];
-                }
-            }
-        }
+
+#if ABLATE == 4
+        [[unroll]] for (uint j = 0u; j < SD; j++) sum[0] += float(s[j]) * step;
 #else
-        // Two weights a byte pair: the even one is the pair's top twelve bits,
-        // the odd one its bottom twelve.
-        [[unroll]] for (uint m = 0u; m < BLOCK / 2u; m++) {
-            uint pair = (byteAt(seqAt + m) << 8u) | byteAt(seqAt + m + 1u);
-            float a = t4gValue(pair >> 4u) * step;
-            float e = t4gValue(pair & 0xFFFu) * step;
+        [[unroll]] for (uint i = 0u; i < BLOCK; i++) {
+            const uint o  = i * KBITS;
+            const uint wi = o >> 5u;
+            const uint bi = o & 31u;
+#if ABLATE == 2
+            // Masked to twelve bits: the point is to drop the cut, not to index
+            // the table out of its four thousand and ninety-six entries. It is
+            // a confounded ablation either way — a state that is the same for
+            // eight weights in a row lets the compiler hash it once — and it is
+            // kept because it bounds the cut from above.
+            uint v = s[wi] & 0xFFFu;
+#else
+            // bi is a constant of the unrolled iteration, so this is a shift
+            // and a funnel shift and the branch is not one. Written with the
+            // zero case spelled out because a shift by thirty-two is undefined
+            // and the folded form is what ACO turns into v_alignbit_b32.
+            uint v = bi == 0u
+                ? (s[wi] >> 20u)
+                : (((s[wi] << bi) | (s[wi + 1u] >> (32u - bi))) >> 20u);
+#endif
+#if ABLATE == 1
+            float wv = float(v) * step;
+#else
+            float wv = (TABLE != 0 ? ldsValues[v] : t4gHash(v)) * step;
+#endif
             [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
-                uint xc = (p.col + c) * p.ffn + xOffset + m * 2u;
-                sum[c] += a * x[xc] + e * x[xc + 1u];
+#if ABLATE == 3
+                sum[c] += wv * x[p.col + c];
+#else
+                sum[c] += wv * x[(p.col + c) * p.ffn + xOffset + i];
+#endif
             }
         }
 #endif

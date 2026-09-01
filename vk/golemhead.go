@@ -61,7 +61,7 @@ func NewGolemHead(k *GolemKernels, data []byte, rows, cols int, pre []float32) (
 	// axis, and a vocabulary of a quarter of a million rows wants sixteen
 	// thousand — a count rather than a ceiling, but say so, because a larger
 	// vocabulary would fail silently.
-	if g := h.m.Groups(); g > 65535 {
+	if g := h.m.Groups(1); g > 65535 {
 		return fail(fmt.Errorf("vk: %d rows want %d workgroups, past the 65535 an axis holds", rows, g))
 	}
 	return h, nil
@@ -83,7 +83,7 @@ func (h *GolemHead) Logits(hidden, out []float32) error {
 		return err
 	}
 	p := h.m.Push(0)
-	if err := h.m.Set(1).Dispatch(h.m.Groups(), unsafe.Pointer(&p)); err != nil {
+	if err := h.m.Set(1).Dispatch(h.m.Groups(1), unsafe.Pointer(&p)); err != nil {
 		return err
 	}
 	copy(out, h.out.Floats())

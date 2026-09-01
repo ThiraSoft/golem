@@ -18,6 +18,7 @@ package vk
 
 import (
 	"fmt"
+	"runtime"
 	"sort"
 	"unsafe"
 )
@@ -47,10 +48,23 @@ type Pipeline struct {
 // NewPipeline compiles one SPIR-V compute shader that reads the given number
 // of storage buffers, at bindings 0..bindings-1.
 func (d *Device) NewPipeline(spirv []byte, bindings int, pushBytes uint32) (*Pipeline, error) {
-	return d.newPipeline(spirv, bindings, pushBytes, 0)
+	return d.newPipeline(spirv, bindings, pushBytes, 0, nil)
 }
 
-func (d *Device) newPipeline(spirv []byte, bindings int, pushBytes uint32, wave uint32) (*Pipeline, error) {
+// NewPipelineSpec is NewPipeline with the module's specialization constants
+// given values: spec[i] is constant i, and the module keeps its own default for
+// any constant past the end of the slice.
+//
+// It is how one shader becomes several kernels without becoming several
+// binaries. vk/golem.go builds a matvec whose workgroup, decoder and read-ahead
+// are all constant ids, so the shape that is fastest on a card is chosen when
+// the pipeline is made rather than when the repository is compiled — see
+// GolemShapes and cmd/golemtune.
+func (d *Device) NewPipelineSpec(spirv []byte, bindings int, pushBytes uint32, spec []uint32) (*Pipeline, error) {
+	return d.newPipeline(spirv, bindings, pushBytes, 0, spec)
+}
+
+func (d *Device) newPipeline(spirv []byte, bindings int, pushBytes uint32, wave uint32, spec []uint32) (*Pipeline, error) {
 	p := &Pipeline{d: d, pushBytes: pushBytes, bindings: bindings}
 
 	smci := shaderModuleCreateInfo{
@@ -104,14 +118,32 @@ func (d *Device) newPipeline(spirv []byte, bindings int, pushBytes uint32, wave 
 	if wave != 0 {
 		pNext = uintptr(unsafe.Pointer(&size))
 	}
+	// The specialization block, which like the wave width above has to outlive
+	// the call and does: the driver reads it there and then.
+	var pSpec uintptr
+	entries := make([]specializationMapEntry, len(spec))
+	for i := range entries {
+		entries[i] = specializationMapEntry{constantID: uint32(i), offset: uint32(i * 4), size: 4}
+	}
+	if len(spec) > 0 {
+		si := specializationInfo{
+			mapEntryCount: uint32(len(entries)),
+			pMapEntries:   uintptr(unsafe.Pointer(&entries[0])),
+			dataSize:      uint64(len(spec) * 4),
+			pData:         uintptr(unsafe.Pointer(&spec[0])),
+		}
+		pSpec = uintptr(unsafe.Pointer(&si))
+		defer runtime.KeepAlive(&si)
+	}
 	cpci := computePipelineCreateInfo{
 		sType: structComputePipelineCreateInfo,
 		stage: pipelineShaderStageCreateInfo{
-			sType:  structPipelineShaderStageInfo,
-			pNext:  pNext,
-			stage:  shaderStageCompute,
-			module: p.module,
-			pName:  uintptr(unsafe.Pointer(&name[0])),
+			sType:               structPipelineShaderStageInfo,
+			pNext:               pNext,
+			stage:               shaderStageCompute,
+			module:              p.module,
+			pName:               uintptr(unsafe.Pointer(&name[0])),
+			pSpecializationInfo: pSpec,
 		},
 		layout: p.layout,
 	}

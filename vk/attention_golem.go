@@ -153,7 +153,7 @@ func (a *Attention) recordGolemInput(r *Recorder, b *attentionBlock, columns int
 		}
 		for first := 0; first < columns; first += width {
 			p := m.Push(first)
-			r.Dispatch(m.Set(width), m.Groups(), unsafe.Pointer(&p))
+			r.Dispatch(m.Set(width), m.Groups(width), unsafe.Pointer(&p))
 		}
 	}
 }
@@ -168,6 +168,6 @@ func (a *Attention) recordGolemOutput(r *Recorder, b *attentionBlock, columns in
 	width, _ := golemPassWidth(columns)
 	for first := 0; first < columns; first += width {
 		p := x.o.Push(first)
-		r.Dispatch(x.o.Set(width), x.o.Groups(), unsafe.Pointer(&p))
+		r.Dispatch(x.o.Set(width), x.o.Groups(width), unsafe.Pointer(&p))
 	}
 }

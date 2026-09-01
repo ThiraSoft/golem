@@ -261,7 +261,7 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int, coop bool) (*Mat
 			return nil, err
 		}
 		target = m.parts
-		if m.reducePipe, err = d.newPipeline(matmulReduceSPIRV, 2, uint32(unsafe.Sizeof(moePush{})), 0); err != nil {
+		if m.reducePipe, err = d.newPipeline(matmulReduceSPIRV, 2, uint32(unsafe.Sizeof(moePush{})), 0, nil); err != nil {
 			m.Close()
 			return nil, err
 		}
@@ -271,7 +271,7 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int, coop bool) (*Mat
 		}
 	}
 	buffers := []*Buffer{m.weights, m.aq, m.as, target}
-	if m.pipe, err = d.newPipeline(spirv, len(buffers), uint32(unsafe.Sizeof(moePush{})), wave); err != nil {
+	if m.pipe, err = d.newPipeline(spirv, len(buffers), uint32(unsafe.Sizeof(moePush{})), wave, nil); err != nil {
 		m.Close()
 		return nil, err
 	}
@@ -345,7 +345,7 @@ func NewMatMulByID(d *Device, stack []byte, rows, cols, experts, columns int) (*
 	}
 	buffers := []*Buffer{m.weights, m.aq, m.as, m.out, m.counts, m.pairs, m.plan}
 	push := uint32(unsafe.Sizeof(moePush{}))
-	if m.pipe, err = d.newPipeline(spirv, len(buffers), push, wave); err != nil {
+	if m.pipe, err = d.newPipeline(spirv, len(buffers), push, wave, nil); err != nil {
 		m.Close()
 		return nil, err
 	}

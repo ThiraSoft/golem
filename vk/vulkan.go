@@ -392,6 +392,23 @@ type pipelineShaderStageCreateInfo struct {
 	pSpecializationInfo uintptr
 }
 
+// specializationMapEntry: constantID 0, offset 4, size 8. Sixteen bytes.
+type specializationMapEntry struct {
+	constantID uint32
+	offset     uint32
+	size       uint64
+}
+
+// specializationInfo: mapEntryCount 0, pMapEntries 8, dataSize 16, pData 24.
+// Thirty-two bytes.
+type specializationInfo struct {
+	mapEntryCount uint32
+	_             uint32
+	pMapEntries   uintptr
+	dataSize      uint64
+	pData         uintptr
+}
+
 // computePipelineCreateInfo: sType 0, pNext 8, flags 16, stage 24 (48 bytes),
 // layout 72, basePipelineHandle 80, basePipelineIndex 88.
 type computePipelineCreateInfo struct {

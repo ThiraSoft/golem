@@ -187,7 +187,7 @@ func newLlamaMM(dev *Device, tile llamaTile, weights []byte, rows, cols, columns
 	for i, h := range bhalf {
 		raw[2*i], raw[2*i+1] = byte(h), byte(h>>8)
 	}
-	if l.pipe, err = dev.newPipeline(tile.spirv, 3, uint32(unsafe.Sizeof(llamaMMPush{})), coopmatWave); err != nil {
+	if l.pipe, err = dev.newPipeline(tile.spirv, 3, uint32(unsafe.Sizeof(llamaMMPush{})), coopmatWave, nil); err != nil {
 		return nil, err
 	}
 	if l.set, err = l.pipe.NewSet([]*Buffer{l.a, l.b, l.d}); err != nil {

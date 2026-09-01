@@ -397,6 +397,83 @@ That last paragraph is the part to carry forward. **Any future change argued for
 on the grounds that it reads fewer bytes has to clear this first**: at an eighth
 of the bandwidth ceiling, bytes are not what the kernel is short of.
 
+### What the kernel *was* short of
+
+The paragraph above is right and it was also an unanswered question for a month.
+A kernel at an eighth of the memory ceiling is short of something; nobody had
+asked what. The tell was in a table nobody had drawn: on a 9728x2560 product,
+**T3G took 108.0 microseconds, T4G 108.5 and T5G 115.7** — 52, 67 and 83 bytes
+a sequence, and the same time for all three. A kernel whose time does not move
+when a third of its bytes do is not reading bytes for a living.
+
+`vk/golem_ablate_test.go` takes the product apart one piece at a time and says
+where the time went. On T4G, of 80 microseconds:
+
+| | microseconds |
+|---|---|
+| reading the code stream and nothing else | ~27 |
+| the 1MAD hash | ~35 |
+| reading the activation | ~4 |
+| cutting the twelve-bit windows, and the rest | the remainder, ~14 |
+
+The first three are differences between two builds of the same kernel; the last
+is what is left over, because an ablation that drops the window cut lets the
+compiler hash one state for eight weights and stops measuring only the cut.
+
+Three things came out of that, and `vk/shaders/matvec_t4g.comp` carries the
+reasoning for each:
+
+1. **Read words, not bytes.** The kernel reached the stream through a helper
+   that turned every byte into its own dword load — one memory instruction a
+   weight, where `matvec_q40.comp` spends one per eight. A block's sixty-four
+   weights are now nine or ten aligned words, byte-swapped and slid into place
+   once, and every window after that is cut out of registers at a constant
+   offset. This also collapsed the three tiers into one loop.
+2. **The byte sum is a dot product.** `v_dot4_u32_u8` against (1,1,1,1) replaces
+   three shifts, three masks and three adds.
+3. **The codebook has an image, and it fits.** The hash was still 35 of the
+   remaining 80 microseconds — more than reading the weights. The state is
+   twelve bits, so the whole image of the function is 4096 floats, sixteen
+   kibibytes, and a workgroup builds it in its own shared memory before it
+   starts. This does not give the format a codebook: nothing in a file points
+   into it, nothing in it depends on the model, and `nn.T4GValue` is still the
+   only definition. It is the difference between a lattice's 493 KiB shell,
+   which is why the trellis exists, and sixteen kibibytes, which is nothing.
+   The same 4096 floats in a buffer on the card instead cost **123**
+   microseconds against the shared table's 64 — a wave whose lanes want
+   sixty-four different addresses pays for sixty-four address generations
+   whatever cache they hit in.
+
+Measured interleaved against the old kernel in one process — which is the only
+way this card can be measured, see below — that is **about 1.6× a single-column
+product and 1.12× a pass of eight**, and the tiers now differ from each other,
+which is the sign the kernel is reading bytes again.
+
+Two things follow for anyone reading this next.
+
+**The standing lesson survives, sharpened.** T4G is still not bandwidth-bound —
+it now moves about 190 GB/s of 640 — so a change argued for on bytes read still
+has to clear that bar. What has changed is that "it is not bandwidth-bound" is
+no longer where the analysis stops.
+
+**The third knob is the card's, not ours.** Whether the table is worth its
+sixteen kibibytes depends on the pass width: a pass of one decodes a weight for
+one activation, and a pass of eight spends each decoded weight eight times, so
+the hash is already amortized and all the table has left to offer is its cost in
+occupancy. Four columns is where they cross *on this card*. So the workgroup,
+the table and the read-ahead are specialization constants rather than defines:
+`cmd/golemtune` times every shape of every width interleaved and prints a
+`GOLEM_MATVEC_SHAPE` setting, and `vk.TestGolemBuildsAgree` holds every shape to
+answering the same numbers bit for bit. Nothing about the file changes.
+
+**And a note on measuring at all.** This card's clock drifts far enough over a
+few minutes that a sweep which runs its cases one after another cannot compare
+them: the same two shapes came out 16 % apart one way and 3 % apart the other,
+on two runs of the same benchmark. Every number above is from one process with
+the cases interleaved round-robin, keeping the fastest round of each. A Go
+benchmark, which runs its cases in sequence, is the wrong instrument for this
+and was believed twice before that was noticed.
+
 ### The head, which is the one tensor worth more bits
 
 `-head 5` writes `token_embd` — the tied logit head — in the wide tier and

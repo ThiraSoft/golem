@@ -448,7 +448,7 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 			{&m.scatter, moeScatterSPIRV, 4, 0},
 			{&m.idCombine, moeIDCombineSPIRV, 3, 0},
 		} {
-			if *spec.into, err = d.newPipeline(spec.spirv, spec.bindings, push, spec.wave); err != nil {
+			if *spec.into, err = d.newPipeline(spec.spirv, spec.bindings, push, spec.wave, nil); err != nil {
 				m.Close()
 				return nil, err
 			}
