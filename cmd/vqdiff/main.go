@@ -41,6 +41,7 @@ func main() {
 	limit := flag.Int("limit", 4096, "how many corpus tokens to read")
 	steps := flag.Int("steps", 40, "greedy steps")
 	vulkan := flag.Bool("vulkan", false, "run the model on a Vulkan device")
+	stream := flag.Bool("stream", false, "carry a float checkpoint past the card a window of blocks at a time. For a BF16, which no kernel here reads and which is therefore the processor's otherwise — and the processor reads every weight for every token")
 	flag.Parse()
 
 	// The window, not a fixed four thousand. A context is the cache a model
@@ -78,12 +79,43 @@ func main() {
 			must(err)
 			defer cf.Close()
 		}
+		// The windows, settled before any of them is run, because the streamed
+		// path wants them all at once: it carries the model past the card a
+		// window of blocks at a time and every position has to meet a block
+		// while that block is resident.
+		var windows [][]int32
+		for start := 0; start+*ctx <= len(ids); start += *ctx {
+			windows = append(windows, ids[start:start+*ctx])
+		}
+		// A checkpoint no kernel reads whole. -stream is what makes a BF16
+		// measurable at all: the processor reads every weight for every token —
+		// qwen35's ForwardBatch steps one at a time — which for a
+		// fifty-four-gigabyte checkpoint is twenty-three minutes for twenty-four
+		// positions, and thirty hours for this corpus. The same corpus on the
+		// card is minutes, and the two answer the same logits to two parts in a
+		// million.
+		var streamed [][][]float32
+		if *stream {
+			sm, ok := m.(streamedModel)
+			if !ok {
+				must(fmt.Errorf("vqdiff: this engine has nothing that streams"))
+			}
+			if !sm.FloatWeights() {
+				must(fmt.Errorf("vqdiff: -stream is for a checkpoint the card cannot read whole, and this one it can"))
+			}
+			streamed, err = sm.ForwardStreamed(windows, 0, *ctx)
+			must(err)
+		}
 		var sum float64
 		var n int
-		for start := 0; start+*ctx <= len(ids); start += *ctx {
-			m.Reset()
-			window := ids[start : start+*ctx]
-			h := m.ForwardBatch(window, 0)
+		for w, window := range windows {
+			var h [][]float32
+			if streamed != nil {
+				h = streamed[w]
+			} else {
+				m.Reset()
+				h = m.ForwardBatch(window, 0)
+			}
 			// The first token of a window has nothing before it, so it is not
 			// predicted and does not count.
 			for i := 0; i < len(window)-1; i++ {
@@ -95,7 +127,7 @@ func main() {
 				n++
 			}
 			fmt.Printf("  window %d: running perplexity %.4f over %d tokens\n",
-				start / *ctx, math.Exp(-sum/float64(n)), n)
+				w, math.Exp(-sum/float64(n)), n)
 		}
 		fmt.Printf("%s\n  corpus perplexity %.4f over %d tokens in %s\n",
 			*model, math.Exp(-sum/float64(n)), n, time.Since(t0).Round(time.Second))
@@ -202,6 +234,14 @@ func (m qwen35Model) Vocab() int { return m.Cfg.Vocab }
 // vulkanModel is a model that can put itself on a device. Both engines can;
 // naming it here keeps open's return type the narrow one above.
 type vulkanModel interface{ UseVulkan() error }
+
+// streamedModel is a model that can carry itself past the card a window of
+// blocks at a time. Only the hybrid engine has one, and only a checkpoint whose
+// weights no kernel reads — a BF16 — has any reason to use it.
+type streamedModel interface {
+	FloatWeights() bool
+	ForwardStreamed(runs [][]int32, window, ctx int) ([][][]float32, error)
+}
 
 // open reads a checkpoint with whichever engine claims it. qwen refuses an
 // architecture it does not know, which is how the second gets its turn.
