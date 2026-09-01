@@ -43,7 +43,7 @@ func Fp16round(x float32) float32 {
 // StepCodeRound rounds a block's scale onto the eight-bit grid a file stores it
 // on — powers of two a sixteenth apart — so that the bench pays for a scale
 // what the format pays. Which grid depends on the codec: nn/t4g.go's window
-// sits two octaves above nn/d4g.go's, because a lattice step is a fraction of
+// sits two octaves above nn/golem.go's, because a lattice step is a fraction of
 // its block's RMS and a trellis step is the RMS itself.
 //
 // The grid is 4.4 % wide, against fp16's 0.05 %, and half a bit a block cheaper
@@ -60,11 +60,11 @@ func StepCodeRound(x float32, trellis bool) float32 {
 	if trellis {
 		return nn.T4GStep(nn.T4GStepCode(x))
 	}
-	c := nn.D4StepCode(x)
+	c := nn.GolemStepCode(x)
 	if c == 0 || c == 255 {
 		atomic.AddInt64(&stepClipped, 1)
 	}
-	return nn.D4Step(c)
+	return nn.GolemStep(c)
 }
 
 // stepClipped counts the blocks whose scale landed on an end of the lattice's

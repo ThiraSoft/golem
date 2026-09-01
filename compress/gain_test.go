@@ -38,12 +38,12 @@ func TestPerRowGainIsNotWorthCarrying(t *testing.T) {
 	for i, v := range q {
 		inv[i] = 1 / v
 	}
-	p := D4Params{ScaleBlock: nn.T4GBlock, HadGroup: 128}
+	p := GolemParams{ScaleBlock: nn.T4GBlock, HadGroup: 128}
 	data := EncodeT4GAs(w, rows, cols, q, p, nn.T4G)
 
 	xr := cloneRows(x)
 	for _, r := range xr {
-		nn.PrepareD4G(r, inv, 128)
+		nn.PrepareGolem(r, inv, 128)
 	}
 	m := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols}
 	rec := make([]float32, cols)

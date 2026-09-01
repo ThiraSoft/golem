@@ -13,20 +13,20 @@ import (
 // granularity it pays for.
 func TestD4StepCodeRoundTrip(t *testing.T) {
 	for _, v := range []float32{1e-5, 1e-4, 3e-3, 0.0125, 0.1, 0.4} {
-		got := D4Step(D4StepCode(v))
+		got := GolemStep(GolemStepCode(v))
 		if ratio := float64(got / v); ratio < 0.96 || ratio > 1.045 {
 			t.Errorf("step %g came back as %g", v, got)
 		}
 	}
-	if lo, hi := D4Step(0), D4Step(255); lo > 1e-5 || hi < 0.4 {
+	if lo, hi := GolemStep(0), GolemStep(255); lo > 1e-5 || hi < 0.4 {
 		t.Errorf("the codes reach %g to %g, which does not cover what weights ask for", lo, hi)
 	}
 	// Past either end the code saturates rather than wrapping, which is the
 	// difference between a block that is a little wrong and one that is noise.
-	if c := D4StepCode(1e-12); c != 0 {
+	if c := GolemStepCode(1e-12); c != 0 {
 		t.Errorf("a step under the range named code %d, not 0", c)
 	}
-	if c := D4StepCode(1e6); c != 255 {
+	if c := GolemStepCode(1e6); c != 255 {
 		t.Errorf("a step over the range named code %d, not 255", c)
 	}
 }
@@ -34,7 +34,7 @@ func TestD4StepCodeRoundTrip(t *testing.T) {
 // The rotation has to be its own inverse up to the sign vector it is folded
 // with, or the weights and the activations disagree about which space they are
 // in and the product is quietly wrong.
-func TestPrepareD4GIsOrthogonal(t *testing.T) {
+func TestPrepareGolemIsOrthogonal(t *testing.T) {
 	const n, group = 256, 128
 	r := rand.New(rand.NewSource(11))
 	x := make([]float32, n)
@@ -49,7 +49,7 @@ func TestPrepareD4GIsOrthogonal(t *testing.T) {
 	before := make([]float32, n)
 	copy(before, x)
 
-	PrepareD4G(x, pre, group)
+	PrepareGolem(x, pre, group)
 	// A norm the transform must preserve, group by group.
 	for base := 0; base < n; base += group {
 		var a, b float64
@@ -86,8 +86,8 @@ func TestUnprepareInvertsPrepare(t *testing.T) {
 	for i, v := range pre {
 		inv[i] = 1 / v
 	}
-	PrepareD4G(x, inv, group)
-	UnprepareD4G(x, pre, group)
+	PrepareGolem(x, inv, group)
+	UnprepareGolem(x, pre, group)
 	for i := range x {
 		if d := math.Abs(float64(x[i] - want[i])); d > 1e-5 {
 			t.Fatalf("value %d came back as %g, not %g", i, x[i], want[i])

@@ -1,14 +1,14 @@
 #version 450
 
-// What an activation goes through before it meets D4G weights.
+// What an activation goes through before it meets Golem weights.
 //
 // Two things, and both are the matrix's rather than the block's: every value is
 // multiplied by its column's entry of the site's vector, and then each group of
 // GROUP values is rotated by the normalised Walsh-Hadamard transform. The
 // weights went through the reciprocal of the first and the same second, and the
 // transform is orthogonal, so the product is the one the unrotated weights and
-// the unscaled activation would have given. nn/d4g_prepare.go is the other copy
-// of this, and TestPrepareD4GMatchesCPU holds the two together.
+// the unscaled activation would have given. nn/golem_prepare.go is the other
+// copy of this, and TestPrepareGolemMatchesCPU holds the two together.
 //
 // One workgroup a group, GROUP threads, one value each. The transform is log2
 // GROUP passes of butterflies through shared memory: at pass l, the thread

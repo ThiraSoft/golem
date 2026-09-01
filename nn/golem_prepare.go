@@ -1,6 +1,6 @@
 package nn
 
-// What the activations go through before they meet D4G weights.
+// What the activations go through before they meet Golem weights.
 //
 // Two things happen to a matrix before it is quantized, and neither can be
 // stored in the weights: its columns are scaled by how much signal the
@@ -15,11 +15,11 @@ package nn
 
 import "math"
 
-// PrepareD4G applies a matrix's Pre vector to one activation and then the
+// PrepareGolem applies a matrix's Pre vector to one activation and then the
 // normalised Walsh–Hadamard transform over each group of `group` values, in
 // place. group must be a power of two dividing len(x), or zero to leave the
 // activation unrotated.
-func PrepareD4G(x, pre []float32, group int) {
+func PrepareGolem(x, pre []float32, group int) {
 	for i := range x {
 		x[i] *= pre[i]
 	}
@@ -43,9 +43,9 @@ func PrepareD4G(x, pre []float32, group int) {
 	}
 }
 
-// UnprepareD4G recovers a weight row from its rotated, scaled form: it is
-// PrepareD4G run backwards, and the order matters. The normalised transform is
-// its own inverse, so the rotation is undone by applying it again — but the
+// UnprepareGolem recovers a weight row from its rotated, scaled form: it is
+// PrepareGolem run backwards, and the order matters. The normalised transform
+// is its own inverse, so the rotation is undone by applying it again — but the
 // scaling was applied first, so it must be undone last. pre here is the
 // activation-side vector, the reciprocal of what the weights met, which is
 // exactly the factor a row has to be multiplied by to come back.
@@ -53,7 +53,7 @@ func PrepareD4G(x, pre []float32, group int) {
 // This is what a tied head costs the input path: the embedding table is stored
 // the way the logit product wants it, and reading one token's row means one
 // transform of the model's width. That is nothing beside the row itself.
-func UnprepareD4G(x, pre []float32, group int) {
+func UnprepareGolem(x, pre []float32, group int) {
 	if group > 1 {
 		inv := float32(1 / math.Sqrt(float64(group)))
 		for base := 0; base+group <= len(x); base += group {

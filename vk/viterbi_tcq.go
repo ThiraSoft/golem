@@ -19,7 +19,7 @@ package vk
 //
 // The path comes back wide, one state a weight, and is packed into the file's
 // 520-bit sequences by nn.PutT4GStates — the same division of labour
-// vk/encode_d4g.go makes, and for the same reason: a shader that packed
+// vk/encode_golem.go makes, and for the same reason: a shader that packed
 // twelve-bit fields straddling words would cost more to write than the packing
 // costs to do on the processor.
 

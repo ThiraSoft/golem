@@ -7,7 +7,7 @@ import (
 
 // TestT3GGeometry is the arithmetic the format is: 400 bits of path and two
 // step codes for 128 weights, which is 52 bytes and 3.25 bits a weight — the
-// same 3.25 D4G costs, to the bit.
+// same 3.25 the D4G lattice cost, to the bit.
 func TestT3GGeometry(t *testing.T) {
 	if T3GSeqBytes != 50 {
 		t.Fatalf("a three-bit sequence is 50 bytes of path, not %d", T3GSeqBytes)

@@ -11,14 +11,14 @@ import (
 
 // A whole feed forward on the card against the same one on the processor.
 //
-// This is the first stage of the D4G path that is a block of a model rather
+// This is the first stage of the Golem path that is a block of a model rather
 // than a kernel: the input prepared, the gate and the up in one product, the
 // SiLU between them, the intermediate prepared for its own site, and the down
 // projection. Five dispatches and two rotations, and any one of them wrong in
 // a way a single kernel's test would not have caught — the wrong vector on the
 // wrong site, the halves of the stacked product swapped, a barrier missing
 // between a write and the read of it.
-func TestD4GFFNMatchesCPU(t *testing.T) {
+func TestGolemFFNMatchesCPU(t *testing.T) {
 	d, err := Open()
 	if err != nil {
 		t.Skip(err)
@@ -35,7 +35,7 @@ func TestD4GFFNMatchesCPU(t *testing.T) {
 	qDown := compress.RandomSigns(ffn, 43)
 	preGateUp, preDown := reciprocal(qGateUp), reciprocal(qDown)
 
-	p := compress.D4Params{ScaleBlock: nn.T4GBlock, HadGroup: 128}
+	p := compress.GolemParams{ScaleBlock: nn.T4GBlock, HadGroup: 128}
 	gateD := compress.EncodeT4GAs(gateW, ffn, dim, qGateUp, p, nn.T4G)
 	upD := compress.EncodeT4GAs(upW, ffn, dim, qGateUp, p, nn.T4G)
 	downD := compress.EncodeT4GAs(downW, dim, ffn, qDown, p, nn.T4G)
@@ -56,7 +56,7 @@ func TestD4GFFNMatchesCPU(t *testing.T) {
 	}
 	defer out.Close()
 
-	f, err := NewD4GFFN(k, dim, ffn, columns, gateD, upD, downD, preGateUp, preDown, in, out)
+	f, err := NewGolemFFN(k, dim, ffn, columns, gateD, upD, downD, preGateUp, preDown, in, out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestD4GFFNMatchesCPU(t *testing.T) {
 	got := out.Floats()
 	for c := 0; c < columns; c++ {
 		x := append([]float32(nil), xs[c]...)
-		nn.PrepareD4G(x, preGateUp, 128)
+		nn.PrepareGolem(x, preGateUp, 128)
 		b := nn.NewBatch(dim, 1)
 		copy(b.F[0], x)
 		g := make([]float32, ffn)
@@ -98,7 +98,7 @@ func TestD4GFFNMatchesCPU(t *testing.T) {
 		for i := range a {
 			a[i] = float32(float64(g[i])/(1+math.Exp(-float64(g[i])))) * u[i]
 		}
-		nn.PrepareD4G(a, preDown, 128)
+		nn.PrepareGolem(a, preDown, 128)
 		ab := nn.NewBatch(ffn, 1)
 		copy(ab.F[0], a)
 		want := make([]float32, dim)

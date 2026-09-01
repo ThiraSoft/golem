@@ -38,7 +38,7 @@ func testEmbedGolemMatchesCPU(t *testing.T, kind nn.Quant) {
 		pre[j] = 1 / q[j]
 	}
 
-	m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols, Pre: pre, HadGroup: prepareD4GGroup}
+	m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols, Pre: pre, HadGroup: prepareGolemGroup}
 	want := make([]float32, cols)
 
 	var spirv []byte
@@ -90,7 +90,7 @@ func testEmbedGolemMatchesCPU(t *testing.T, kind nn.Quant) {
 	defer set.Close()
 
 	push := embedPush{cols: uint32(cols)}
-	groups := uint32(cols / prepareD4GGroup)
+	groups := uint32(cols / prepareGolemGroup)
 
 	for r := 0; r < rows; r++ {
 		m.Row(r, want)

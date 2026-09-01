@@ -40,7 +40,7 @@ func t4gMatrixAs(tb testing.TB, rows, cols int, kind nn.Quant) ([]byte, []float3
 			q[j] = -1
 		}
 	}
-	data := compress.EncodeT4GAs(w, rows, cols, q, compress.D4Params{
+	data := compress.EncodeT4GAs(w, rows, cols, q, compress.GolemParams{
 		ScaleBlock: nn.T4GBlock, HadGroup: 128}, kind)
 	return data, q
 }
@@ -112,7 +112,7 @@ func TestT4GMatVecMatchesCPU(t *testing.T) {
 	for j := range pre {
 		pre[j] = 1 / q[j]
 	}
-	nn.PrepareD4G(x, pre, 128)
+	nn.PrepareGolem(x, pre, 128)
 
 	b := nn.NewBatch(cols, 1)
 	copy(b.F[0], x)
@@ -190,7 +190,7 @@ func TestT4GUnalignedRowsDecode(t *testing.T) {
 
 // TestGolemWidePassesMatchCPU exercises the COLUMNS=2/4/8 pipelines, which the
 // exactness sweep above never dispatches — that sweep goes through
-// hostD4GMatrix.MatVec, which is hard-wired to Set(1). A wrong wide kernel
+// hostGolemMatrix.MatVec, which is hard-wired to Set(1). A wrong wide kernel
 // would otherwise ship silently: prefill runs through the wide passes, and a
 // bug there reads back as a bad perplexity rather than as a shader bug.
 func TestGolemWidePassesMatchCPU(t *testing.T) {
@@ -218,7 +218,7 @@ func testGolemWidePassesMatchCPU(t *testing.T, kind nn.Quant) {
 	}
 	defer k.Close()
 
-	for _, width := range D4GWidths {
+	for _, width := range GolemWidths {
 		// A different activation a column, so a kernel that mixed up which
 		// column it read would not pass by accident.
 		xs := make([][]float32, width)
@@ -229,7 +229,7 @@ func testGolemWidePassesMatchCPU(t *testing.T, kind nn.Quant) {
 			for i := range xs[c] {
 				xs[c][i] = float32(math.Sin(float64(i)*0.37+float64(c))) * float32(1+i%17) * 0.11
 			}
-			nn.PrepareD4G(xs[c], pre, 128)
+			nn.PrepareGolem(xs[c], pre, 128)
 			copy(b.F[0], xs[c])
 			want[c] = make([]float32, rows)
 			m.MatVec(b, want[c])
@@ -249,7 +249,7 @@ func testGolemWidePassesMatchCPU(t *testing.T, kind nn.Quant) {
 			copy(af[c*cols:(c+1)*cols], xs[c])
 		}
 
-		gm, err := NewD4GMatrixOn(k, data, rows, cols, act, out)
+		gm, err := NewGolemMatrixOn(k, data, rows, cols, act, out)
 		if err != nil {
 			act.Close()
 			out.Close()

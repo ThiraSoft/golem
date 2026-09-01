@@ -15,7 +15,7 @@ import (
 // rotation applied to the weights but not the activations, a reciprocal taken
 // once too often, a scale folded into the wrong side. Each of those leaves the
 // weights looking plausible and the answer somebody else's.
-func TestD4GProductSurvivesTheRoundTrip(t *testing.T) {
+func TestGolemProductSurvivesTheRoundTrip(t *testing.T) {
 	const rows, cols = 96, 256
 	r := rand.New(rand.NewSource(5))
 
@@ -51,7 +51,7 @@ func TestD4GProductSurvivesTheRoundTrip(t *testing.T) {
 
 	var unrotated float64
 	for _, group := range []int{0, 128} {
-		params := D4Params{ScaleBlock: nn.T4GBlock, HadGroup: group}
+		params := GolemParams{ScaleBlock: nn.T4GBlock, HadGroup: group}
 		data := EncodeT4GAs(w, rows, cols, q, params, nn.T4G)
 		if want := rows * nn.T4GRowBytesN(cols, nn.T4G); len(data) != want {
 			t.Fatalf("group %d: %d bytes, want %d", group, len(data), want)
@@ -60,7 +60,7 @@ func TestD4GProductSurvivesTheRoundTrip(t *testing.T) {
 		// What the kernel does: prepare the activation, then the product.
 		xp := make([]float32, cols)
 		copy(xp, x)
-		nn.PrepareD4G(xp, pre, group)
+		nn.PrepareGolem(xp, pre, group)
 
 		m := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols}
 		b := nn.NewBatch(cols, 1)
@@ -99,14 +99,14 @@ func TestD4GProductSurvivesTheRoundTrip(t *testing.T) {
 
 // A matrix with no vector and no rotation is the plain case the embedding
 // table takes, and it has to work on its own.
-func TestD4GWithoutRotationOrScaling(t *testing.T) {
+func TestGolemWithoutRotationOrScaling(t *testing.T) {
 	const rows, cols = 32, 128
 	r := rand.New(rand.NewSource(9))
 	w := make([]float32, rows*cols)
 	for i := range w {
 		w[i] = float32(r.NormFloat64()) * 0.05
 	}
-	data := EncodeT4GAs(w, rows, cols, nil, D4Params{ScaleBlock: nn.T4GBlock}, nn.T4G)
+	data := EncodeT4GAs(w, rows, cols, nil, GolemParams{ScaleBlock: nn.T4GBlock}, nn.T4G)
 
 	out := make([]float32, cols)
 	m := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols}
@@ -151,7 +151,7 @@ func TestARowReadsBackAsTheRowThatWentIn(t *testing.T) {
 		q[j] = s
 		pre[j] = 1 / s
 	}
-	p := D4Params{ScaleBlock: nn.T4GBlock, HadGroup: group}
+	p := GolemParams{ScaleBlock: nn.T4GBlock, HadGroup: group}
 	data := EncodeT4GAs(w, rows, cols, q, p, nn.T4G)
 
 	// Bound the way a loader binds it: the vector the file carries beside it.

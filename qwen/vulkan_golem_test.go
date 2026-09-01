@@ -9,7 +9,7 @@ import (
 // A .golem checkpoint through the card against the same one through the
 // processor, block by block.
 //
-// This is the acceptance test for the whole D4G device path: the two norms
+// This is the acceptance test for the whole Golem device path: the two norms
 // writing floats rather than Q8_0, the site vectors and the rotation on the
 // activations, the four projections and the three of the feed forward, and the
 // mix coming back out of its quantized form before the output projection. Any
@@ -17,7 +17,7 @@ import (
 // it moved in — which is the instrument this engine was built with.
 //
 // GOLEM_MODEL_GOLEM points at the file; the test says nothing without it.
-func TestVulkanD4GMatchesCPU(t *testing.T) {
+func TestVulkanGolemMatchesCPU(t *testing.T) {
 	path := os.Getenv("GOLEM_MODEL_GOLEM")
 	if path == "" {
 		t.Skip("GOLEM_MODEL_GOLEM unset")

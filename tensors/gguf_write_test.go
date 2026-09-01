@@ -82,10 +82,10 @@ func TestGGUFRoundTrip(t *testing.T) {
 	}
 }
 
-// TestGGUFRefusesLatticeEra checks the guard that catches the one tensor type
-// a D4G file and a T3G file cannot be told apart by size or type number alone:
-// both are 26 bytes per 64 weights. A file still carrying a golem.d4.* key
-// must fail to open rather than decode through the trellis as nonsense.
+// TestGGUFRefusesLatticeEra checks the guard that catches the one tensor type a
+// D4G file and a T3G file cannot be told apart by size or type number alone:
+// both are 26 bytes per 64 weights. A file still carrying a golem.d4.* key must
+// fail to open rather than decode through the trellis as nonsense.
 func TestGGUFRefusesLatticeEra(t *testing.T) {
 	meta := map[string]any{
 		"general.architecture":    "qwen3",

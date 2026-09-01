@@ -19,10 +19,17 @@ chat template travel unchanged; what is new is a tensor type llama.cpp does not
 know and one vector per calibration site beside the matrices.
 
 Everything below about the scheme — the salience, the bound of 24×, the rotation
-by 128, `nn.D4GVectorNames` and the `A·(q ⊙ W)` convention with its two rules —
+by 128, `nn.GolemVectorNames` and the `A·(q ⊙ W)` convention with its two rules —
 is where most of the format's value is, and it is independent of the codebook:
 a lattice carried it before the trellis did, and lost only the codebook question
 when it was retired.
+
+The scheme is named for the format rather than for any codebook — `nn/golem.go`,
+`vk/golem.go`, `nn.PrepareGolem`, `compress.GolemParams`. It was called `D4G`
+until 2026-09-01, after the D4 lattice that first carried it, which outlived
+that codebook by a month and read, wrongly, as the name of a codec this
+repository no longer has. Where `D4G` still appears below it names that retired
+lattice and its files, and is meant to.
 
 ## What a block holds: a trellis, with nothing to look up
 
@@ -476,7 +483,7 @@ in groups of 128 with random signs folded in.
 
 Nothing undoes that on the weight side. The activation meets **A·(x / q)**
 instead — the same function with the reciprocal vector — and since AᵀA = I the
-product is unchanged. `nn.PrepareD4G` is both directions; it runs once per site
+product is unchanged. `nn.PrepareGolem` is both directions; it runs once per site
 rather than once per matrix, which is why the scheme is cheap at inference.
 
 Two consequences, and both have cost this repository a day:
@@ -484,7 +491,7 @@ Two consequences, and both have cost this repository a day:
 **A matrix reads the vector of its site, not its own.** The three projections
 of an attention read one stream and so share one vector; a hybrid's four input
 projections share the same one; the feed forward's gate and up share another.
-`nn.D4GVectorNames` is where that convention lives, for the converter and every
+`nn.GolemVectorNames` is where that convention lives, for the converter and every
 reader alike — a copy of it anywhere else drifts, and a file whose matrices were
 quantized against one vector and are read through another loads, agrees about
 every shape, and answers nonsense.

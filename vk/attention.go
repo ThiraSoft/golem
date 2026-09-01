@@ -147,9 +147,9 @@ type Attention struct {
 	// One position's traffic. Only the two ends of it cross the bus: the
 	// normed stream in, and the output projection's answer back.
 	xq, xs, out *Buffer
-	// xf and af are the D4G path's: the normed stream as floats, and the mix
-	// as floats. Both are nil until a D4G block is added.
-	xf, af *Buffer
+	// xf and af are the Golem path's: the normed stream as floats, and the mix
+	// as floats. Both are nil until a Golem block is added.
+	xf, af      *Buffer
 	rcos, rsin  []*Buffer // one pair per rotation geometry
 	rinv        []*Buffer // its inverse frequencies, written once
 	ropeSets    []*Set
@@ -176,9 +176,9 @@ type attentionBlock struct {
 	setScores    *Set
 	setOParts    *Set // the output projection when its shared dimension is split
 
-	// d4g is the block's D4G side when its projections are in that format,
-	// and nil when they are Q4_0. vk/attention_d4g.go is all of it.
-	d4g *d4gAttn
+	// golem is the block's Golem side when its projections are in that format,
+	// and nil when they are Q4_0. vk/attention_golem.go is all of it.
+	golem *golemAttn
 }
 
 // maxBlocks is how many entries the position buffer holds, which caps the
@@ -697,8 +697,8 @@ func (a *Attention) Record(r *Recorder, block, columns int, runs []span) {
 		r.DispatchWide(set, width, a.productGroups(width, outs), push)
 	}
 
-	if b.d4g != nil {
-		a.recordD4GInput(r, b, columns)
+	if b.golem != nil {
+		a.recordGolemInput(r, b, columns)
 	} else {
 		product(b.setQ, heads, unsafe.Pointer(&project))
 		if b.setK != nil {
@@ -725,8 +725,8 @@ func (a *Attention) Record(r *Recorder, block, columns int, runs []span) {
 	}
 	r.Barrier()
 	a.tl.Stamp(r, "attn scores")
-	if b.d4g != nil {
-		a.recordD4GOutput(r, b, columns)
+	if b.golem != nil {
+		a.recordGolemOutput(r, b, columns)
 		return
 	}
 	if b.setOParts != nil && width >= tiledColumns {
@@ -820,8 +820,8 @@ func pointers(bs []*Buffer) []**Buffer {
 }
 
 func (b *attentionBlock) close() {
-	b.d4g.close()
-	b.d4g = nil
+	b.golem.close()
+	b.golem = nil
 	for _, s := range []**Set{&b.setScores, &b.setPrepare, &b.setOParts, &b.setO, &b.setV, &b.setK, &b.setQ} {
 		if *s != nil {
 			(*s).Close()

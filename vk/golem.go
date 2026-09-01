@@ -8,8 +8,8 @@ package vk
 // sum, and what it saves is a third of the bytes a Q4_K row would have cost to
 // read.
 //
-// The activation arrives already through PrepareD4G: the per-column vector and
-// the rotation belong to the site, not to the block, and both are undone on
+// The activation arrives already through PrepareGolem: the per-column vector
+// and the rotation belong to the site, not to the block, and both are undone on
 // this side before the product rather than stored with the weights.
 
 import (
@@ -73,24 +73,24 @@ var matvecT5G4SPIRV []byte
 //go:embed shaders/matvec_t5g_8.spv
 var matvecT5G8SPIRV []byte
 
-type d4gPush struct {
+type golemPush struct {
 	dim uint32 // outputs
 	ffn uint32 // inputs
 	col uint32 // the first column this dispatch answers
 }
 
-// d4gRowsPerGroup is the shader's OUTS: a workgroup of 128 answers sixteen
+// golemRowsPerGroup is the shader's OUTS: a workgroup of 128 answers sixteen
 // rows, eight lanes to a row.
-const d4gRowsPerGroup = 16
+const golemRowsPerGroup = 16
 
-// D4GWidths are the pass widths the kernels are built for, and the reason is
+// GolemWidths are the pass widths the kernels are built for, and the reason is
 // vk/qwen_pipeline.go's: a pass of two costs 1.056 of a pass of one because the
 // weights are read once either way, and eight is where a mat-vec stops.
-var D4GWidths = []int{1, 2, 4, 8}
+var GolemWidths = []int{1, 2, 4, 8}
 
-// D4GKernels is everything about the golem product that belongs to the device
+// GolemKernels is everything about the golem product that belongs to the device
 // rather than to a matrix: the step grid, and one pipeline a pass width.
-type D4GKernels struct {
+type GolemKernels struct {
 	d     *Device
 	q     nn.Quant
 	table *Buffer
@@ -100,18 +100,18 @@ type D4GKernels struct {
 // NewGolemKernels builds the pipelines of one of golem's own formats, and
 // whatever else belongs to the device rather than to a matrix: the step grid,
 // uploaded once for the device and shared by every matrix of every model.
-func NewGolemKernels(d *Device, q nn.Quant) (*D4GKernels, error) {
+func NewGolemKernels(d *Device, q nn.Quant) (*GolemKernels, error) {
 	spirv, ok := golemSPIRV(q)
 	if !ok {
 		return nil, fmt.Errorf("vk: there is no kernel for %s", q)
 	}
-	k := &D4GKernels{d: d, q: q, pipes: map[int]*Pipeline{}}
+	k := &GolemKernels{d: d, q: q, pipes: map[int]*Pipeline{}}
 	var err error
 	if k.table, err = d.Upload(golemTable()); err != nil {
 		return nil, err
 	}
-	for _, columns := range D4GWidths {
-		p, err := d.NewPipeline(spirv[columns], 4, uint32(unsafe.Sizeof(d4gPush{})))
+	for _, columns := range GolemWidths {
+		p, err := d.NewPipeline(spirv[columns], 4, uint32(unsafe.Sizeof(golemPush{})))
 		if err != nil {
 			k.Close()
 			return nil, err
@@ -145,18 +145,18 @@ func golemTable() []byte {
 }
 
 // Quant is the format these kernels read.
-func (k *D4GKernels) Quant() nn.Quant { return k.q }
+func (k *GolemKernels) Quant() nn.Quant { return k.q }
 
 // Table is the step-grid buffer, for a caller binding its own sets.
-func (k *D4GKernels) Table() *Buffer { return k.table }
+func (k *GolemKernels) Table() *Buffer { return k.table }
 
 // Pipeline is the kernel for a pass of that many columns.
-func (k *D4GKernels) Pipeline(columns int) (*Pipeline, bool) {
+func (k *GolemKernels) Pipeline(columns int) (*Pipeline, bool) {
 	p, ok := k.pipes[columns]
 	return p, ok
 }
 
-func (k *D4GKernels) Close() {
+func (k *GolemKernels) Close() {
 	for _, p := range k.pipes {
 		p.Close()
 	}
@@ -167,11 +167,11 @@ func (k *D4GKernels) Close() {
 	}
 }
 
-// D4GMatrix is one D4G weight matrix resident on the device, bound to the
+// GolemMatrix is one Golem weight matrix resident on the device, bound to the
 // activation it reads and the output it writes.
-type D4GMatrix struct {
+type GolemMatrix struct {
 	d          *Device
-	k          *D4GKernels
+	k          *GolemKernels
 	rows, cols int
 	owned      []*Buffer // what this matrix allocated and must free
 
@@ -180,11 +180,11 @@ type D4GMatrix struct {
 	groups  uint32
 }
 
-// NewD4GMatrixOn uploads a matrix and binds it to buffers the caller owns: the
-// activation it reads, already prepared, and the output it writes. This is the
-// form a pipeline uses, where both are stages of a recording and neither is
+// NewGolemMatrixOn uploads a matrix and binds it to buffers the caller owns:
+// the activation it reads, already prepared, and the output it writes. This is
+// the form a pipeline uses, where both are stages of a recording and neither is
 // visible to the host.
-func NewD4GMatrixOn(k *D4GKernels, data []byte, rows, cols int, act, out *Buffer) (*D4GMatrix, error) {
+func NewGolemMatrixOn(k *GolemKernels, data []byte, rows, cols int, act, out *Buffer) (*GolemMatrix, error) {
 	// A path is the unit, not a block: a row that held half of one would have a
 	// step with no codes under it.
 	unit := nn.T4GSeq
@@ -194,37 +194,37 @@ func NewD4GMatrixOn(k *D4GKernels, data []byte, rows, cols int, act, out *Buffer
 	if want := rows * (nn.Matrix{Quant: k.q, Cols: cols}).RowBytes(); len(data) != want {
 		return nil, fmt.Errorf("vk: %d rows of %d columns need %d bytes, given %d", rows, cols, want, len(data))
 	}
-	m := &D4GMatrix{d: k.d, k: k, rows: rows, cols: cols, sets: map[int]*Set{}}
+	m := &GolemMatrix{d: k.d, k: k, rows: rows, cols: cols, sets: map[int]*Set{}}
 	var err error
 	if m.weights, err = k.d.Upload(data); err != nil {
 		return nil, err
 	}
 	m.owned = append(m.owned, m.weights)
-	for _, columns := range D4GWidths {
+	for _, columns := range GolemWidths {
 		pipe := k.pipes[columns]
 		if m.sets[columns], err = pipe.NewSet([]*Buffer{m.weights, k.table, act, out}); err != nil {
 			m.Close()
 			return nil, err
 		}
 	}
-	m.groups = uint32((rows + d4gRowsPerGroup - 1) / d4gRowsPerGroup)
+	m.groups = uint32((rows + golemRowsPerGroup - 1) / golemRowsPerGroup)
 	return m, nil
 }
 
 // Set is the descriptor for a pass of that many columns, and Push the block
 // that goes with it. A recording dispatches the two; MatVec below is what a
 // caller with a host buffer does instead.
-func (m *D4GMatrix) Set(columns int) *Set { return m.sets[columns] }
+func (m *GolemMatrix) Set(columns int) *Set { return m.sets[columns] }
 
 // Push is the block a dispatch sends, answering columns starting at first.
-func (m *D4GMatrix) Push(first int) d4gPush {
-	return d4gPush{dim: uint32(m.rows), ffn: uint32(m.cols), col: uint32(first)}
+func (m *GolemMatrix) Push(first int) golemPush {
+	return golemPush{dim: uint32(m.rows), ffn: uint32(m.cols), col: uint32(first)}
 }
 
 // Groups is how many workgroups one dispatch needs.
-func (m *D4GMatrix) Groups() uint32 { return m.groups }
+func (m *GolemMatrix) Groups() uint32 { return m.groups }
 
-func (m *D4GMatrix) Close() {
+func (m *GolemMatrix) Close() {
 	for _, s := range m.sets {
 		s.Close()
 	}
@@ -235,26 +235,26 @@ func (m *D4GMatrix) Close() {
 	m.owned = nil
 }
 
-// hostD4GMatrix is a matrix with its own host-visible activation and output,
+// hostGolemMatrix is a matrix with its own host-visible activation and output,
 // for a caller outside a pipeline: a test that wants one product, or a
 // benchmark that wants to time one. Everything in a model goes through
-// NewD4GMatrixOn instead, where both ends are stages of a recording and the
+// NewGolemMatrixOn instead, where both ends are stages of a recording and the
 // host never sees them.
-type hostD4GMatrix struct {
-	*D4GMatrix
-	k   *D4GKernels
+type hostGolemMatrix struct {
+	*GolemMatrix
+	k   *GolemKernels
 	act *Buffer
 	out *Buffer
 }
 
 // newHostGolemMatrix is the same for whichever of golem's formats wrote the
 // bytes.
-func newHostGolemMatrix(d *Device, data []byte, rows, cols int, q nn.Quant) (*hostD4GMatrix, error) {
+func newHostGolemMatrix(d *Device, data []byte, rows, cols int, q nn.Quant) (*hostGolemMatrix, error) {
 	k, err := NewGolemKernels(d, q)
 	if err != nil {
 		return nil, err
 	}
-	h := &hostD4GMatrix{k: k}
+	h := &hostGolemMatrix{k: k}
 	if h.act, err = d.Host(cols*4, bufferUsageStorage); err != nil {
 		h.Close()
 		return nil, err
@@ -263,7 +263,7 @@ func newHostGolemMatrix(d *Device, data []byte, rows, cols int, q nn.Quant) (*ho
 		h.Close()
 		return nil, err
 	}
-	if h.D4GMatrix, err = NewD4GMatrixOn(k, data, rows, cols, h.act, h.out); err != nil {
+	if h.GolemMatrix, err = NewGolemMatrixOn(k, data, rows, cols, h.act, h.out); err != nil {
 		h.Close()
 		return nil, err
 	}
@@ -271,8 +271,8 @@ func newHostGolemMatrix(d *Device, data []byte, rows, cols int, q nn.Quant) (*ho
 }
 
 // MatVec computes y = W*x for one activation, which must already have been
-// through PrepareD4G.
-func (h *hostD4GMatrix) MatVec(x []float32, out []float32) error {
+// through PrepareGolem.
+func (h *hostGolemMatrix) MatVec(x []float32, out []float32) error {
 	if len(x) != h.cols {
 		return fmt.Errorf("vk: the matrix reads %d inputs, given %d", h.cols, len(x))
 	}
@@ -288,10 +288,10 @@ func (h *hostD4GMatrix) MatVec(x []float32, out []float32) error {
 	return nil
 }
 
-func (h *hostD4GMatrix) Close() {
-	if h.D4GMatrix != nil {
-		h.D4GMatrix.Close()
-		h.D4GMatrix = nil
+func (h *hostGolemMatrix) Close() {
+	if h.GolemMatrix != nil {
+		h.GolemMatrix.Close()
+		h.GolemMatrix = nil
 	}
 	for _, b := range []*Buffer{h.act, h.out} {
 		if b != nil {

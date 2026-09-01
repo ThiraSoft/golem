@@ -74,7 +74,7 @@ layout(std430, binding = 2) readonly  buffer CV { uint  cv[];     };  // the val
 layout(std430, binding = 3) buffer          SC { float scores[];  };  // unused; the online softmax has no scratch
 layout(std430, binding = 4) writeonly buffer AQ { uint  aq[];     };  // the mixed values, Q8_0
 #ifdef FLOATOUT
-// The mix as floats, for a D4G output projection, which reads floats and not
+// The mix as floats, for a Golem output projection, which reads floats and not
 // the Q8_0 form the rest of the engine passes between its stages. Written
 // beside that form and not instead of it: the two cost one store each and the
 // caller binds whichever it will read.

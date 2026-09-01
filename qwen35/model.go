@@ -32,8 +32,8 @@ type Model struct {
 	headQ6K *vk.Q6KHead
 	// The .golem head, and the lattice it reads. The head is the one matrix
 	// the pipeline does not hold, so it carries its own kernels.
-	d4gHead    *vk.D4GHead
-	d4gKernels *vk.D4GKernels
+	golemHead    *vk.GolemHead
+	golemKernels *vk.GolemKernels
 
 	// vision is nil until a projector is opened. The tower runs once per
 	// image and shares nothing with the text path.
@@ -307,8 +307,8 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 	copy(batchH.F[0], hidden)
 	batchH.QuantizeK()
 
-	if m.d4gHead != nil {
-		if err := m.d4gHead.Logits(hidden, out); err == nil {
+	if m.golemHead != nil {
+		if err := m.golemHead.Logits(hidden, out); err == nil {
 			return
 		}
 	}
@@ -335,8 +335,8 @@ func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
 	batchH.QuantizeK()
 
 	for i := 0; i < batch; i++ {
-		if m.d4gHead != nil {
-			if err := m.d4gHead.Logits(hidden[i], out[i]); err == nil {
+		if m.golemHead != nil {
+			if err := m.golemHead.Logits(hidden[i], out[i]); err == nil {
 				continue
 			}
 		}

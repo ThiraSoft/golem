@@ -19,28 +19,28 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 )
 
-// A D4GHead is the head matrix resident in device memory, with the transform
+// A GolemHead is the head matrix resident in device memory, with the transform
 // its activation goes through in front of it.
-type D4GHead struct {
+type GolemHead struct {
 	d          *Device
-	k          *D4GKernels
+	k          *GolemKernels
 	rows, cols int
 
 	act  *Buffer // the hidden state, written by the host and transformed in place
 	out  *Buffer // one float a row
-	prep *PrepareD4G
-	m    *D4GMatrix
+	prep *PrepareGolem
+	m    *GolemMatrix
 }
 
-// NewD4GHead uploads the head. data is the tensor as the file holds it, and
+// NewGolemHead uploads the head. data is the tensor as the file holds it, and
 // pre is the vector the checkpoint carries for it — output.pre, the same one
 // the input path undoes a row at a time.
-func NewD4GHead(k *D4GKernels, data []byte, rows, cols int, pre []float32) (*D4GHead, error) {
+func NewGolemHead(k *GolemKernels, data []byte, rows, cols int, pre []float32) (*GolemHead, error) {
 	if len(pre) != cols {
 		return nil, fmt.Errorf("vk: the head's vector is %d wide, the head reads %d", len(pre), cols)
 	}
-	h := &D4GHead{d: k.d, k: k, rows: rows, cols: cols}
-	fail := func(err error) (*D4GHead, error) {
+	h := &GolemHead{d: k.d, k: k, rows: rows, cols: cols}
+	fail := func(err error) (*GolemHead, error) {
 		h.Close()
 		return nil, err
 	}
@@ -51,13 +51,13 @@ func NewD4GHead(k *D4GKernels, data []byte, rows, cols int, pre []float32) (*D4G
 	if h.out, err = k.d.Readback(rows*4, bufferUsageStorage); err != nil {
 		return fail(err)
 	}
-	if h.prep, err = NewPrepareD4G(k.d, h.act, pre, prepareD4GGroup); err != nil {
+	if h.prep, err = NewPrepareGolem(k.d, h.act, pre, prepareGolemGroup); err != nil {
 		return fail(err)
 	}
-	if h.m, err = NewD4GMatrixOn(k, data, rows, cols, h.act, h.out); err != nil {
+	if h.m, err = NewGolemMatrixOn(k, data, rows, cols, h.act, h.out); err != nil {
 		return fail(err)
 	}
-	// A workgroup writes d4gRowsPerGroup rows. Vulkan promises 65535 on an
+	// A workgroup writes golemRowsPerGroup rows. Vulkan promises 65535 on an
 	// axis, and a vocabulary of a quarter of a million rows wants sixteen
 	// thousand — a count rather than a ceiling, but say so, because a larger
 	// vocabulary would fail silently.
@@ -70,7 +70,7 @@ func NewD4GHead(k *D4GKernels, data []byte, rows, cols int, pre []float32) (*D4G
 // Logits computes the whole vocabulary for one hidden state, which arrives as
 // the model's final norm left it — unscaled and unrotated, because this does
 // both.
-func (h *D4GHead) Logits(hidden, out []float32) error {
+func (h *GolemHead) Logits(hidden, out []float32) error {
 	if len(hidden) != h.cols {
 		return fmt.Errorf("vk: the head reads %d inputs, given %d", h.cols, len(hidden))
 	}
@@ -92,15 +92,15 @@ func (h *D4GHead) Logits(hidden, out []float32) error {
 
 // Table is the head matrix and its step grid, so that a caller holding both
 // this and a Stack can have the card look a token up for itself.
-func (h *D4GHead) Table() (weights, steps *Buffer, cols int) {
+func (h *GolemHead) Table() (weights, steps *Buffer, cols int) {
 	return h.m.weights, h.k.table, h.cols
 }
 
 // Quant is the format the head is stored in, which the stack needs to pick the
 // kernel that reads a row of it.
-func (h *D4GHead) Quant() nn.Quant { return h.k.q }
+func (h *GolemHead) Quant() nn.Quant { return h.k.q }
 
-func (h *D4GHead) Close() {
+func (h *GolemHead) Close() {
 	if h.m != nil {
 		h.m.Close()
 		h.m = nil

@@ -1,6 +1,6 @@
 #version 450
 
-// The gate between a D4G feed forward's two halves.
+// The gate between a Golem feed forward's two halves.
 //
 // The gate and the up projection read the same activation through the same
 // vector, so they are one matrix of twice the rows and one dispatch, and their
@@ -9,8 +9,8 @@
 //
 // It works on floats because everything on this path does. The Q8_0 form the
 // rest of the engine carries between its stages exists so a Q4_0 kernel can
-// read an activation cheaply; a D4G kernel reads floats, and the transform that
-// precedes it — a scale and a rotation — has to happen in floats anyway.
+// read an activation cheaply; a Golem kernel reads floats, and the transform
+// that precedes it — a scale and a rotation — has to happen in floats anyway.
 
 layout(local_size_x = 256) in;
 

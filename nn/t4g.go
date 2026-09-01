@@ -7,17 +7,18 @@ package nn
 // state is the last twelve bits of the code stream, so weight t reads the
 // twelve bits at offset 4t and hashes them. Nothing about the codebook is
 // stored, and nothing has to be — which is the whole of why this format exists,
-// and what D4G could not do at four bits, where its shell needs 493 KiB against
-// the 32 a workgroup has.
+// and what the D4G lattice could not do at four bits, where its shell needs
+// 493 KiB against the 32 a workgroup has.
 //
-// A row is two planes, the steps then the codes, for the reason D4G's is: a
+// A row is two planes, the steps then the codes, for the reason D4G's was: a
 // 67-byte block would start on an odd boundary and a shader reads words.
 //
 // Per sequence of 128 weights:
 //
 //   - two step codes, one for each 64 weights. Eight bits each, naming powers
-//     of two a sixteenth apart — the same spacing D4G uses, and nn/d4g.go says
-//     why a coarser one costs a whole point of perplexity. The window is not
+//     of two a sixteenth apart — the spacing the scheme has always used, and
+//     nn/golem.go says why a coarser one costs a whole point of perplexity.
+//     The window is not
 //     D4G's: a lattice step is a fraction of its block's RMS, because the shell
 //     the block is scaled into is several units across, and a trellis step is
 //     the block's RMS itself. Two octaves up, and wider at the top, for that
@@ -46,7 +47,7 @@ package nn
 //
 // What the block does not carry is the rest of the scheme — the per-column
 // vector and the Hadamard rotation the activations meet — which belongs to the
-// site and not to the block. See nn/d4g_prepare.go; T4G shares all of it.
+// site and not to the block. See nn/golem_prepare.go; T4G shares all of it.
 
 import (
 	"math"

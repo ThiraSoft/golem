@@ -23,7 +23,7 @@ func TestEncodeT3GDecodesToWhatItReconstructed(t *testing.T) {
 	for i := range q {
 		q[i] = 1
 	}
-	p := D4Params{ScaleBlock: 64, HadGroup: 0}
+	p := GolemParams{ScaleBlock: 64, HadGroup: 0}
 
 	data := EncodeT4GAs(w, rows, cols, q, p, nn.T3G)
 	if want := rows * nn.T4GRowBytesN(cols, nn.T3G); len(data) != want {

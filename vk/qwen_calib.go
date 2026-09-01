@@ -15,7 +15,7 @@ package vk
 // tap moved here: one accumulator a site, a vector of the site's own width,
 // added to where the activations already are.
 //
-// The four sites are nn/d4g.go's, and the names are the ones
+// The four sites are nn/golem.go's, and the names are the ones
 // cmd/golemquant files them under. A checkpoint the card can read is not the
 // checkpoint being converted — this pipeline reads llama.cpp's types and the
 // converter's input may be any of them — but the statistics are the same
@@ -67,7 +67,7 @@ func (p *QwenPipeline) StartCalibration() error {
 	if p.calib != nil {
 		return nil
 	}
-	if p.usesD4G() {
+	if p.usesGolem() {
 		// The activations a .golem meets have already been through the site's
 		// own scale and rotation, so their power is not what the salience is
 		// measured from. A calibration reads a checkpoint of one of

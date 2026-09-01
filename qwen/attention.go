@@ -130,7 +130,7 @@ func Attention(
 	if bw.PreO != nil {
 		nn.InParallel(batch, batch*cfg.Dim, func(first, last int) {
 			for t := first; t < last; t++ {
-				nn.PrepareD4G(set.F[t], bw.PreO, bw.HadGroup)
+				nn.PrepareGolem(set.F[t], bw.PreO, bw.HadGroup)
 			}
 		})
 	}

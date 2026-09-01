@@ -24,7 +24,7 @@ func hybridBlock(rotated func(string) string) ([]tensors.OutStream, map[string]s
 	}
 	by := map[string]string{}
 	for name, cols := range mats {
-		out = append(out, tensors.OutStream{Name: name, Shape: []int{cols}, DType: "D4G"})
+		out = append(out, tensors.OutStream{Name: name, Shape: []int{cols}, DType: "T3G"})
 		by[name] = rotated(name)
 		if strings.HasSuffix(by[name], ".weight.pre") {
 			out = append(out, tensors.OutStream{Name: by[name], Shape: []int{cols}, DType: "F32"})
@@ -64,9 +64,9 @@ func TestSiteRotationIsWhatTheLoaderReads(t *testing.T) {
 // A matrix no site names keeps its own vector, and nothing shadows it.
 func TestOwnVectorIsReadWhenNoSiteExists(t *testing.T) {
 	out := []tensors.OutStream{
-		{Name: "blk.64.nextn.eh_proj.weight", Shape: []int{10240}, DType: "D4G"},
+		{Name: "blk.64.nextn.eh_proj.weight", Shape: []int{10240}, DType: "T3G"},
 		{Name: "blk.64.nextn.eh_proj.weight.pre", Shape: []int{10240}, DType: "F32"},
-		{Name: "blk.64.attn_q.weight", Shape: []int{5120}, DType: "D4G"},
+		{Name: "blk.64.attn_q.weight", Shape: []int{5120}, DType: "T3G"},
 		{Name: "blk.64.attn_q.weight.pre", Shape: []int{5120}, DType: "F32"},
 	}
 	by := map[string]string{
@@ -81,7 +81,7 @@ func TestOwnVectorIsReadWhenNoSiteExists(t *testing.T) {
 // A matrix left unrotated must find no vector at all.
 func TestUnrotatedMatrixMustFindNothing(t *testing.T) {
 	out := []tensors.OutStream{
-		{Name: "blk.3.ffn_down.weight", Shape: []int{17408}, DType: "D4G"},
+		{Name: "blk.3.ffn_down.weight", Shape: []int{17408}, DType: "T3G"},
 		{Name: "blk.3.down.pre", Shape: []int{17408}, DType: "F32"},
 	}
 	if err := checkVectors(out, map[string]string{"blk.3.ffn_down.weight": ""}); err == nil {
@@ -90,7 +90,7 @@ func TestUnrotatedMatrixMustFindNothing(t *testing.T) {
 }
 
 // A site nothing was measured at is still a site. The reader asks
-// nn.D4GVectorNames, which offers a site's name before a tensor's own, so
+// nn.GolemVectorNames, which offers a site's name before a tensor's own, so
 // every matrix of that site has to be rotated by one vector filed under it —
 // not by three of its own that the reader will never look at.
 //
@@ -104,7 +104,7 @@ func TestAnUnmeasuredSiteStillHasOneVector(t *testing.T) {
 	}
 	by := map[string]string{}
 	for _, n := range []string{"blk.64.attn_q.weight", "blk.64.attn_k.weight", "blk.64.attn_v.weight"} {
-		out = append(out, tensors.OutStream{Name: n, Shape: []int{cols}, DType: "D4G"})
+		out = append(out, tensors.OutStream{Name: n, Shape: []int{cols}, DType: "T3G"})
 		by[n] = "blk.64.qkv.pre"
 	}
 	if err := checkVectors(out, by); err != nil {
@@ -117,7 +117,7 @@ func TestAnUnmeasuredSiteStillHasOneVector(t *testing.T) {
 	by = map[string]string{}
 	for _, n := range []string{"blk.64.attn_q.weight", "blk.64.attn_k.weight", "blk.64.attn_v.weight"} {
 		out = append(out,
-			tensors.OutStream{Name: n, Shape: []int{cols}, DType: "D4G"},
+			tensors.OutStream{Name: n, Shape: []int{cols}, DType: "T3G"},
 			tensors.OutStream{Name: n + ".pre", Shape: []int{cols}, DType: "F32"})
 		by[n] = n + ".pre"
 	}

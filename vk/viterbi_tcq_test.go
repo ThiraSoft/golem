@@ -13,7 +13,7 @@ import (
 // same path — and that is a weaker contract than the lattice encoder's on
 // purpose.
 //
-// TestEncodeD4GMatchesCPU demands byte equality because a D4 code is an index
+// TestEncodeGolemMatchesCPU demands byte equality because a D4 code is an index
 // into a shared enumeration: two encoders that disagree write different files
 // for the same weights. A trellis records the path it chose, and the decoder is
 // a pure function of the bits it reads, so any minimum-cost path is an equally

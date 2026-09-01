@@ -71,7 +71,7 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 		Rows:  cfg.Vocab,
 		Cols:  cfg.Dim,
 	}
-	bindD4G(g, &w.TokenEmbd, "token_embd.weight")
+	bindGolem(g, &w.TokenEmbd, "token_embd.weight")
 
 	outNorm, ok := g.Tensors["output_norm.weight"]
 	if !ok {
@@ -90,7 +90,7 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 			Rows:  cfg.Vocab,
 			Cols:  cfg.Dim,
 		}
-		bindD4G(g, &w.OutputHead, "output.weight")
+		bindGolem(g, &w.OutputHead, "output.weight")
 	} else {
 		w.OutputHead = w.TokenEmbd
 	}
@@ -173,19 +173,20 @@ func bindMatrix(g *tensors.GGUF, name string, m *nn.Matrix, rows, cols int) {
 	m.Quant = q
 	m.Rows = rows
 	m.Cols = cols
-	bindD4G(g, m, name)
+	bindGolem(g, m, name)
 }
 
-// bindD4G gives a D4G matrix the vector its activation must go through and the
-// rotation that follows it, both from the file under a name nn.D4GVectorNames
-// knows. A matrix in any other format has neither and this leaves it alone; the
-// product does the transform itself, so nothing else in this package changes.
-func bindD4G(g *tensors.GGUF, m *nn.Matrix, name string) {
+// bindGolem gives a Golem matrix the vector its activation must go through and
+// the rotation that follows it, both from the file under a name
+// nn.GolemVectorNames knows. A matrix in any other format has neither and this
+// leaves it alone; the product does the transform itself, so nothing else in
+// this package changes.
+func bindGolem(g *tensors.GGUF, m *nn.Matrix, name string) {
 	width, err := g.Uint32("golem.hadamard_group")
 	if err != nil || width == 0 || !m.Quant.Golem() {
 		return
 	}
-	for _, at := range nn.D4GVectorNames(name) {
+	for _, at := range nn.GolemVectorNames(name) {
 		t, ok := g.Tensors[at]
 		if !ok {
 			continue

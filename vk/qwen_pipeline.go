@@ -311,7 +311,7 @@ type QwenShape struct {
 
 	// Golem is the format of a .golem checkpoint, and the zero value for one of
 	// llama.cpp's own types. It decides which of two forms every projection in
-	// the model takes; vk/qwen_d4g.go is the other one.
+	// the model takes; vk/qwen_golem.go is the other one.
 	//
 	// A code width would not answer it any more: the trellis has no lattice
 	// code, so the question is which format and not how wide.
@@ -352,7 +352,7 @@ const scanColumns = 8
 type QwenSSMData struct {
 	// PreQKV is the vector the four input projections read their activation
 	// through, and PreO the one the output projection reads. Both nil for a
-	// checkpoint that is not .golem; nn.D4GVectorNames says where they come
+	// checkpoint that is not .golem; nn.GolemVectorNames says where they come
 	// from and cmd/golemquant writes them.
 	PreQKV []float32
 	PreO   []float32
@@ -435,11 +435,11 @@ type qwenSSMBlock struct {
 	setOutWide *Set
 	// f32 is qwenFFNBlock's.
 	f32 bool
-	// d4g is the five projections in their .golem form, and nil for a
+	// golem is the five projections in their .golem form, and nil for a
 	// checkpoint of any other type. Everything above it that is not a
 	// projection — the convolution, the recurrence, the two norms — is the
 	// same either way and is used by both.
-	d4g *qwenD4GSSM
+	golem *qwenGolemSSM
 }
 
 type qwenAttnBlock struct {
@@ -454,8 +454,8 @@ type qwenAttnBlock struct {
 	setO, setOWide   *Set
 	// f32 is qwenFFNBlock's.
 	f32 bool
-	// d4g is the four projections in their .golem form; see qwenSSMBlock.
-	d4g *qwenD4GAttn
+	// golem is the four projections in their .golem form; see qwenSSMBlock.
+	golem *qwenGolemAttn
 }
 
 type qwenFFNBlock struct {
@@ -476,9 +476,9 @@ type qwenFFNBlock struct {
 	// dispatched differently: the Q4_1 one answers a fixed tile of columns
 	// where the Q4_0 one is a width-compiled binary.
 	q41 bool
-	// d4g is the three projections in their .golem form, and nil for a
+	// golem is the three projections in their .golem form, and nil for a
 	// checkpoint of any other type. See qwenSSMBlock.
-	d4g *qwenD4GFFN
+	golem *qwenGolemFFN
 }
 
 type QwenPipeline struct {
@@ -516,8 +516,8 @@ type QwenPipeline struct {
 	// The lattice and the transform, for a .golem checkpoint. Both belong to
 	// the device rather than to a matrix — one table and two pipelines serve
 	// every site of every block — and both are nil for any other type.
-	d4g   *D4GKernels
-	preps *D4GPrepares
+	golem *GolemKernels
+	preps *GolemPrepares
 
 	// calib is the per-site accumulators, when a conversion is measuring what
 	// each matrix is fed. Nil the rest of the time, and every dispatch it
@@ -740,10 +740,10 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 	// A .golem checkpoint: one lattice table and two transform pipelines for
 	// the whole model, whatever any block does with them.
 	if shape.Golem.Golem() {
-		if p.d4g, err = NewGolemKernels(d, shape.Golem); err != nil {
+		if p.golem, err = NewGolemKernels(d, shape.Golem); err != nil {
 			return nil, err
 		}
-		if p.preps, err = NewD4GPrepares(d); err != nil {
+		if p.preps, err = NewGolemPrepares(d); err != nil {
 			p.Close()
 			return nil, err
 		}
@@ -879,7 +879,7 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 	b := &qwenSSMBlock{index: i}
 	var err error
 
-	if !p.usesD4G() {
+	if !p.usesGolem() {
 		if err := p.uploadSSMProjections(b, d); err != nil {
 			return err
 		}
@@ -909,8 +909,8 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 	if b.setNormGate, err = p.pipeGate.NewSet([]*Buffer{p.ySSM, p.gateZBuf, b.ssmNorm}); err != nil {
 		return err
 	}
-	if p.usesD4G() {
-		if b.d4g, err = p.newD4GSSM(b, d); err != nil {
+	if p.usesGolem() {
+		if b.golem, err = p.newGolemSSM(b, d); err != nil {
 			return err
 		}
 	}
@@ -920,7 +920,7 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 
 // uploadSSMProjections is a delta net's five weight matrices in one of
 // llama.cpp's types, and the descriptors that read them. A .golem checkpoint
-// takes vk/qwen_d4g.go's path instead and none of this runs.
+// takes vk/qwen_golem.go's path instead and none of this runs.
 func (p *QwenPipeline) uploadSSMProjections(b *qwenSSMBlock, d QwenSSMData) error {
 	s := p.shape
 	var err error
@@ -1030,8 +1030,8 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 	b := &qwenAttnBlock{index: -1}
 	var err error
 
-	if p.usesD4G() {
-		if b.d4g, err = p.newD4GAttn(d); err != nil {
+	if p.usesGolem() {
+		if b.golem, err = p.newGolemAttn(d); err != nil {
 			return nil, err
 		}
 	} else if s.Float {
@@ -1081,7 +1081,7 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 				return nil, err
 			}
 		}
-	} else if b.d4g == nil {
+	} else if b.golem == nil {
 		if b.setQ, err = p.pipeMatvec.NewSet([]*Buffer{b.wQ, p.normedQ, p.normedS, p.qIn}); err != nil {
 			return nil, err
 		}
@@ -1104,7 +1104,7 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 		if b.setO, err = p.pipeMatF32.NewSet([]*Buffer{b.wO, p.attnOut, p.mixOut}); err != nil {
 			return nil, err
 		}
-	} else if b.d4g == nil {
+	} else if b.golem == nil {
 		if b.setO, err = p.pipeMatQ40.NewSet([]*Buffer{b.wO, p.attnOut, p.mixOut}); err != nil {
 			return nil, err
 		}
@@ -1134,8 +1134,8 @@ func (p *QwenPipeline) newFFNBlock(d QwenFFNData) (*qwenFFNBlock, error) {
 	s := p.shape
 	b := &qwenFFNBlock{index: -1}
 	var err error
-	if p.usesD4G() {
-		if b.d4g, err = p.newD4GFFN(d); err != nil {
+	if p.usesGolem() {
+		if b.golem, err = p.newGolemFFN(d); err != nil {
 			return nil, err
 		}
 		return b, nil
@@ -1823,8 +1823,8 @@ func (p *QwenPipeline) HiddenColumn(c int) []float32 {
 }
 
 func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt int) {
-	if b.d4g != nil {
-		p.recordD4GSSM(r, b.d4g, b, columns, snapAt)
+	if b.golem != nil {
+		p.recordGolemSSM(r, b.golem, b, columns, snapAt)
 		return
 	}
 	s := p.shape
@@ -1871,7 +1871,7 @@ func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt i
 // recordSSMState is everything between a delta net's input projections and its
 // output one: the convolution, the two norms and the recurrence. None of them
 // reads a quantized weight — a delta net's convolution, its decay and its norms
-// are floats in every checkpoint — so all of it is shared with the D4G path.
+// are floats in every checkpoint — so all of it is shared with the Golem path.
 func (p *QwenPipeline) recordSSMState(r *Recorder, b *qwenSSMBlock, columns, snapAt int) {
 	s := p.shape
 	conv := ssmConvPush{Channels: uint32(s.ConvDim), Kernel: 4, Columns: uint32(columns), SnapAt: uint32(snapAt)}
@@ -1914,8 +1914,8 @@ func (p *QwenPipeline) recordSSMState(r *Recorder, b *qwenSSMBlock, columns, sna
 }
 
 func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
-	if b.d4g != nil {
-		p.recordD4GAttn(r, b.d4g, b, columns)
+	if b.golem != nil {
+		p.recordGolemAttn(r, b.golem, b, columns)
 		return
 	}
 	s := p.shape
@@ -1958,8 +1958,8 @@ func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
 // recordAttnMix is everything between a full attention's input projections and
 // its output one: the rotation and the caches, then the softmax. Neither reads
 // a weight matrix, so both are the same kernels over the same buffers whatever
-// the projections around them are stored as — which is what lets the D4G path
-// in vk/qwen_d4g.go be four matrices and two transforms rather than a block.
+// the projections around them are stored as — which is what lets the Golem path
+// in vk/qwen_golem.go be four matrices and two transforms rather than a block.
 func (p *QwenPipeline) recordAttnMix(r *Recorder, b *qwenAttnBlock, columns int) {
 	s := p.shape
 	prep := attnPrepPush{
@@ -1994,8 +1994,8 @@ func (p *QwenPipeline) recordAttnMix(r *Recorder, b *qwenAttnBlock, columns int)
 }
 
 func (p *QwenPipeline) recordFFN(r *Recorder, b *qwenFFNBlock, columns int) {
-	if b.d4g != nil {
-		p.recordD4GFFN(r, b.d4g, columns)
+	if b.golem != nil {
+		p.recordGolemFFN(r, b.golem, columns)
 		return
 	}
 	s := p.shape
@@ -2081,46 +2081,46 @@ func (p *QwenPipeline) Close() {
 		if p.mtp.pass != nil {
 			p.mtp.pass.Close()
 		}
-		if p.mtp.d4gEH != nil {
-			p.mtp.d4gEH.Close()
+		if p.mtp.golemEH != nil {
+			p.mtp.golemEH.Close()
 		}
 		if p.mtp.preEH != nil {
 			p.mtp.preEH.Close()
 		}
-		for _, b := range []*qwenD4GAttn{mtpAttnD4G(p.mtp)} {
+		for _, b := range []*qwenGolemAttn{mtpAttnGolem(p.mtp)} {
 			if b != nil {
 				b.Close()
 			}
 		}
-		if p.mtp.ffn != nil && p.mtp.ffn.d4g != nil {
-			p.mtp.ffn.d4g.Close()
+		if p.mtp.ffn != nil && p.mtp.ffn.golem != nil {
+			p.mtp.ffn.golem.Close()
 		}
 		p.mtp.ehIn.Close()
 		p.mtp = nil
 	}
 	// The .golem form of every block, before the buffers they read.
 	for _, b := range p.ffnBlocks {
-		if b != nil && b.d4g != nil {
-			b.d4g.Close()
+		if b != nil && b.golem != nil {
+			b.golem.Close()
 		}
 	}
 	for _, b := range p.attnBlocks {
-		if b != nil && b.d4g != nil {
-			b.d4g.Close()
+		if b != nil && b.golem != nil {
+			b.golem.Close()
 		}
 	}
 	for _, b := range p.ssmBlocks {
-		if b != nil && b.d4g != nil {
-			b.d4g.Close()
+		if b != nil && b.golem != nil {
+			b.golem.Close()
 		}
 	}
 	if p.preps != nil {
 		p.preps.Close()
 		p.preps = nil
 	}
-	if p.d4g != nil {
-		p.d4g.Close()
-		p.d4g = nil
+	if p.golem != nil {
+		p.golem.Close()
+		p.golem = nil
 	}
 	for _, b := range p.owned {
 		b.Close()
@@ -2199,8 +2199,8 @@ type qwenMTPBlock struct {
 	setEH *Set
 	// The .golem form of that projection: the transform its input goes
 	// through, and the matrix. Both nil for a checkpoint of any other type.
-	preEH       *PrepareD4G
-	d4gEH       *D4GMatrix
+	preEH       *PrepareGolem
+	golemEH     *GolemMatrix
 	setAttnNorm *Set
 	setFFNNorm  *Set
 	setFinal    *Set
@@ -2215,7 +2215,7 @@ func (p *QwenPipeline) AddMTPBlock(d QwenMTPData) error {
 	b := &qwenMTPBlock{}
 	var err error
 
-	if !p.usesD4G() && p.pipeMatQ80 == nil {
+	if !p.usesGolem() && p.pipeMatQ80 == nil {
 		if p.pipeMatQ80, err = p.d.NewPipeline(matvecQ80SPIRV, 3, uint32(unsafe.Sizeof(matvecKPush{}))); err != nil {
 			return err
 		}
@@ -2226,14 +2226,14 @@ func (p *QwenPipeline) AddMTPBlock(d QwenMTPData) error {
 	if b.ehBuf, err = p.local(s.Dim * 2 * 4); err != nil {
 		return err
 	}
-	if p.usesD4G() {
+	if p.usesGolem() {
 		if len(d.PreEH) != s.Dim*2 {
 			return fmt.Errorf("vk: the prediction block's vector is %d wide, its projection reads %d", len(d.PreEH), s.Dim*2)
 		}
-		if b.preEH, err = p.preps.Bind(b.ehBuf, d.PreEH, prepareD4GGroup); err != nil {
+		if b.preEH, err = p.preps.Bind(b.ehBuf, d.PreEH, prepareGolemGroup); err != nil {
 			return err
 		}
-		if b.d4gEH, err = NewD4GMatrixOn(p.d4g, d.EHProj, s.Dim, s.Dim*2, b.ehBuf, p.xs); err != nil {
+		if b.golemEH, err = NewGolemMatrixOn(p.golem, d.EHProj, s.Dim, s.Dim*2, b.ehBuf, p.xs); err != nil {
 			return err
 		}
 	} else if b.wEH, err = p.upload(d.EHProj); err != nil {
@@ -2254,7 +2254,7 @@ func (p *QwenPipeline) AddMTPBlock(d QwenMTPData) error {
 		}
 	}
 
-	if !p.usesD4G() {
+	if !p.usesGolem() {
 		if b.setEH, err = p.pipeMatQ80.NewSet([]*Buffer{b.wEH, b.ehBuf, p.xs}); err != nil {
 			return err
 		}
@@ -2273,14 +2273,14 @@ func (p *QwenPipeline) AddMTPBlock(d QwenMTPData) error {
 	return nil
 }
 
-// mtpAttnD4G is the prediction block's attention in its .golem form, or nil.
+// mtpAttnGolem is the prediction block's attention in its .golem form, or nil.
 // Its blocks are not in the pipeline's maps — it holds its own — so Close has
 // to reach them here.
-func mtpAttnD4G(b *qwenMTPBlock) *qwenD4GAttn {
+func mtpAttnGolem(b *qwenMTPBlock) *qwenGolemAttn {
 	if b.attn == nil {
 		return nil
 	}
-	return b.attn.d4g
+	return b.attn.golem
 }
 
 func (p *QwenPipeline) HasMTP() bool { return p.mtp != nil }
@@ -2300,25 +2300,26 @@ func (p *QwenPipeline) WidthFor(n int) int {
 	return 1
 }
 
-// d4gWidestPass is how wide a pass a .golem model takes.
+// golemWidestPass is how wide a pass a .golem model takes.
 //
-// Not because a wider one is wrong — vk/qwen_d4g.go answers any width and
-// TestVulkanD4GWidePassMatchesTokenPath holds it to the token path bit for bit
-// — but because of what a wide one costs to record. The D4G kernels are built
-// for eight columns and no more, where the quantized products have a tiled form
-// for a wide pass, so a pass of two hundred and fifty-six columns is thirty-two
-// dispatches for every matrix: seventeen thousand of them and as many barriers,
-// in one submission, which the driver's watchdog ends by resetting the card
-// mid-pass. Sixty-four keeps a submission to something a card finishes.
+// Not because a wider one is wrong — vk/qwen_golem.go answers any width and
+// TestVulkanGolemWidePassMatchesTokenPath holds it to the token path bit for
+// bit — but because of what a wide one costs to record. The Golem kernels are
+// built for eight columns and no more, where the quantized products have a
+// tiled form for a wide pass, so a pass of two hundred and fifty-six columns is
+// thirty-two dispatches for every matrix: seventeen thousand of them and as
+// many barriers, in one submission, which the driver's watchdog ends by
+// resetting the card mid-pass. Sixty-four keeps a submission to something a
+// card finishes.
 //
-// The cost is prefill throughput, and the fix is a tiled D4G product rather
+// The cost is prefill throughput, and the fix is a tiled Golem product rather
 // than a smaller number here.
-const d4gWidestPass = 64
+const golemWidestPass = 64
 
 // widestPass is the widest a submission of this pipeline may carry.
 func (p *QwenPipeline) widestPass() int {
-	if p.usesD4G() {
-		return d4gWidestPass
+	if p.usesGolem() {
+		return golemWidestPass
 	}
 	return qwenWide
 }
@@ -2380,10 +2381,10 @@ func (p *QwenPipeline) recordMTP(r *Recorder) {
 	r.Copy(p.mposBuf, 0, p.mposIn, 16)
 	r.Barrier()
 
-	if b.d4gEH != nil {
+	if b.golemEH != nil {
 		p.prepare(r, b.preEH, 1)
 		r.Barrier()
-		p.d4gProduct(r, b.d4gEH, 1)
+		p.golemProduct(r, b.golemEH, 1)
 	} else {
 		r.Dispatch(b.setEH, matvecGroups(s.Dim), unsafe.Pointer(&eh))
 	}

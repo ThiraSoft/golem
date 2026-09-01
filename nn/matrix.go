@@ -33,8 +33,8 @@ type Matrix struct {
 
 	// Pre is the per-column vector this matrix's activation has to go through
 	// before the product, and HadGroup the width of the rotation that follows
-	// it. Both belong to a D4G matrix and are nil and zero for every other
-	// format — see nn/d4g_prepare.go for what they are and why the weights do
+	// it. Both belong to a Golem matrix and are nil and zero for every other
+	// format — see nn/golem_prepare.go for what they are and why the weights do
 	// not carry them.
 	//
 	// A product finds them here and does the transform itself, on a copy. A
@@ -214,14 +214,14 @@ func (m Matrix) prepare(b *Batch) *Batch {
 	for c := 0; c < b.Size; c++ {
 		out.F[c] = make([]float32, b.Width)
 		copy(out.F[c], b.F[c])
-		PrepareD4G(out.F[c], m.Pre, m.HadGroup)
+		PrepareGolem(out.F[c], m.Pre, m.HadGroup)
 	}
 	return out
 }
 
 // unrotate recovers a weight row from the form the file holds it in.
 //
-// A D4G matrix is stored as A·(q ⊙ W), and a product never undoes that: it
+// A Golem matrix is stored as A·(q ⊙ W), and a product never undoes that: it
 // puts the activation through the reciprocal instead, which is the whole
 // bargain of the scheme. But a row read on its own is not a product. The
 // embedding table is the case that matters — every engine here reads a token's
@@ -235,7 +235,7 @@ func (m Matrix) prepare(b *Batch) *Batch {
 // products read Data.
 func (m Matrix) unrotate(out []float32) {
 	if m.Pre != nil && m.HadGroup > 0 {
-		UnprepareD4G(out, m.Pre, m.HadGroup)
+		UnprepareGolem(out, m.Pre, m.HadGroup)
 	}
 }
 

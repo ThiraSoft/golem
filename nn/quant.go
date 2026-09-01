@@ -30,10 +30,10 @@ const (
 	// than the rest of the model.
 	T5G
 	// T3G is the trellis at three bits a weight: 128 weights in 52 bytes, 3.25
-	// each, which is D4G's rate to the bit. Same 1MAD, same window, seven bits
-	// of padding at the end of a sequence because 12 + 127·3 is 393 and not a
-	// whole number of bytes. It is what retires the lattice: the same size, two
-	// decibels better on a Gaussian, and no table at all.
+	// each, which is the D4G lattice's rate to the bit. Same 1MAD, same window,
+	// seven bits of padding at the end of a sequence because 12 + 127·3 is 393
+	// and not a whole number of bytes. It is what retires the lattice: the same
+	// size, two decibels better on a Gaussian, and no table at all.
 	T3G
 )
 

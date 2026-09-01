@@ -30,7 +30,7 @@ import (
 // read it there. It fails, and changes nothing, when there is no device, when
 // the head is not Q4_0, or when the tensor does not fit in device memory.
 func (m *Model) UseVulkanHead() error {
-	if m.head != nil || m.d4gHead != nil {
+	if m.head != nil || m.golemHead != nil {
 		return nil
 	}
 	if gq := m.W.TokenEmbd.Quant; gq.Golem() {
@@ -45,12 +45,12 @@ func (m *Model) UseVulkanHead() error {
 		if err != nil {
 			return err
 		}
-		h, err := vk.NewD4GHead(k, m.W.TokenEmbd.Data, m.W.TokenEmbd.Rows, m.W.TokenEmbd.Cols, m.W.PreHead)
+		h, err := vk.NewGolemHead(k, m.W.TokenEmbd.Data, m.W.TokenEmbd.Rows, m.W.TokenEmbd.Cols, m.W.PreHead)
 		if err != nil {
 			k.Close()
 			return err
 		}
-		m.d4gHead = h
+		m.golemHead = h
 		if m.stack != nil {
 			if err := m.useVulkanEmbedding(); err != nil {
 				return err
@@ -84,9 +84,9 @@ func (m *Model) useVulkanEmbedding() error {
 	if m.stack == nil || m.stack.Embedding() {
 		return nil
 	}
-	if m.d4gHead != nil {
-		table, steps, cols := m.d4gHead.Table()
-		return m.stack.SetEmbeddingGolem(table, steps, cols, m.W.PreHead, m.d4gHead.Quant())
+	if m.golemHead != nil {
+		table, steps, cols := m.golemHead.Table()
+		return m.stack.SetEmbeddingGolem(table, steps, cols, m.W.PreHead, m.golemHead.Quant())
 	}
 	if m.head == nil {
 		return nil
@@ -189,9 +189,9 @@ func (m *Model) UseVulkanStack() error {
 	// different activation: floats through a scale and a rotation, rather than
 	// Q8_0. The lattice table belongs to the device and is uploaded once for
 	// the model, whatever a block does with it.
-	var d4g *vk.D4GKernels
+	var golem *vk.GolemKernels
 	if gq := m.W.Blocks[0].Q.Quant; gq.Golem() {
-		if d4g, err = vk.NewGolemKernels(d, gq); err != nil {
+		if golem, err = vk.NewGolemKernels(d, gq); err != nil {
 			stack.Close()
 			return err
 		}
@@ -200,7 +200,7 @@ func (m *Model) UseVulkanStack() error {
 	for i := range cfg.Blocks {
 		bc, bw := cfg.Blocks[i], &m.W.Blocks[i]
 		want := nn.Q4_0
-		if d4g != nil {
+		if golem != nil {
 			want = bw.Q.Quant
 		}
 		for _, q := range []nn.Quant{bw.Q.Quant, bw.K.Quant, bw.V.Quant, bw.O.Quant, bw.Gate.Quant, bw.Up.Quant, bw.Down.Quant} {
@@ -217,13 +217,13 @@ func (m *Model) UseVulkanStack() error {
 			// query; qwen/attention.go is the other copy.
 			Scale: float32(1 / sqrtOf(bc.HeadDim)),
 		}
-		if d4g != nil {
-			if err := attn.AddBlockD4G(d4g, shape, bw.Q.Data, bw.K.Data, bw.V.Data, bw.O.Data,
+		if golem != nil {
+			if err := attn.AddBlockGolem(golem, shape, bw.Q.Data, bw.K.Data, bw.V.Data, bw.O.Data,
 				bw.QNorm, bw.KNorm, bw.PreQKV, bw.PreO); err != nil {
 				stack.Close()
 				return err
 			}
-			if err := mix.AddBlockD4G(d4g, bw.Gate.Data, bw.Up.Data, bw.Down.Data,
+			if err := mix.AddBlockGolem(golem, bw.Gate.Data, bw.Up.Data, bw.Down.Data,
 				bw.PreGateUp, bw.PreDown); err != nil {
 				stack.Close()
 				return err
@@ -313,7 +313,7 @@ func (m *Model) NewStackTimeline() (*vk.Timeline, error) {
 func (m *Model) VulkanStack() bool { return m.stack != nil }
 
 // VulkanHead says whether the head is on a device.
-func (m *Model) VulkanHead() bool { return m.head != nil || m.d4gHead != nil }
+func (m *Model) VulkanHead() bool { return m.head != nil || m.golemHead != nil }
 
 // device opens the Vulkan device the model shares between its parts, or
 // returns the one it already has. The head and the blocks sit on the same card

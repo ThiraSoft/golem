@@ -37,12 +37,12 @@ type Model struct {
 	batch       int
 
 	// The Vulkan path, when the caller asked for it. qwen/vulkan.go.
-	dev       *vk.Device
-	stack     *vk.Stack
-	head      *vk.Q40Head
-	// d4gHead is the same tensor when the file is a .golem, which needs its
+	dev   *vk.Device
+	stack *vk.Stack
+	head  *vk.Q40Head
+	// golemHead is the same tensor when the file is a .golem, which needs its
 	// own kernel and its own transform. Only one of the two is ever set.
-	d4gHead *vk.D4GHead
+	golemHead *vk.GolemHead
 	rotations []rotation
 }
 
@@ -127,7 +127,7 @@ func Embed(w *Weights, token int32, out []float32) {
 	if w.PreHead != nil {
 		// The table is stored the way the logit product wants it, rotated and
 		// scaled. The input path wants the row itself.
-		nn.UnprepareD4G(out, w.PreHead, w.HadGroup)
+		nn.UnprepareGolem(out, w.PreHead, w.HadGroup)
 	}
 }
 
@@ -262,10 +262,10 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 	if len(out) != m.Cfg.Vocab {
 		panic(fmt.Sprintf("qwen: logits need %d entries, given %d", m.Cfg.Vocab, len(out)))
 	}
-	if m.d4gHead != nil {
+	if m.golemHead != nil {
 		// The card does the transform as well as the product, so the hidden
 		// state goes over as the final norm left it.
-		if err := m.d4gHead.Logits(hidden, out); err != nil {
+		if err := m.golemHead.Logits(hidden, out); err != nil {
 			panic(fmt.Sprintf("qwen: the device head failed: %v", err))
 		}
 		return
@@ -273,7 +273,7 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 	v := m.scratch.Batch(m.Cfg.Dim, 1)
 	copy(v.F[0], hidden)
 	if m.W.PreHead != nil {
-		nn.PrepareD4G(v.F[0], m.W.PreHead, m.W.HadGroup)
+		nn.PrepareGolem(v.F[0], m.W.PreHead, m.W.HadGroup)
 	}
 	// Rounds to bfloat16 when the head is bfloat16, and builds the Q8_0 form
 	// otherwise.
@@ -300,7 +300,7 @@ func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
 			panic(fmt.Sprintf("qwen: logits need %d entries, given %d", m.Cfg.Vocab, len(o)))
 		}
 	}
-	if m.head != nil || m.d4gHead != nil {
+	if m.head != nil || m.golemHead != nil {
 		for i := range hidden {
 			m.Logits(hidden[i], out[i])
 		}
@@ -311,7 +311,7 @@ func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
 	for i := range hidden {
 		copy(v.F[i], hidden[i])
 		if m.W.PreHead != nil {
-			nn.PrepareD4G(v.F[i], m.W.PreHead, m.W.HadGroup)
+			nn.PrepareGolem(v.F[i], m.W.PreHead, m.W.HadGroup)
 		}
 		v.QuantizeColumnRange(i, 0, m.Cfg.Dim)
 	}

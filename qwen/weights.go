@@ -30,10 +30,10 @@ type BlockWeights struct {
 	Q, K, V, O     nn.Matrix
 	Gate, Up, Down nn.Matrix
 
-	// What the activations of each site meet before they reach a D4G matrix:
+	// What the activations of each site meet before they reach a Golem matrix:
 	// the reciprocal of the per-column scale the weights were quantized under,
 	// with the rotation's sign flips folded in. Empty for every other format.
-	// nn/d4g.go says why the scheme is split this way.
+	// nn/golem.go says why the scheme is split this way.
 	PreQKV, PreO, PreGateUp, PreDown []float32
 
 	// HadGroup is the width of that rotation, zero when there is none.
@@ -50,7 +50,7 @@ type Weights struct {
 	// it a row at a time. Nil for a table stored plain.
 	PreHead []float32
 
-	// HadGroup is the width of the rotation a D4G checkpoint's activations go
+	// HadGroup is the width of the rotation a Golem checkpoint's activations go
 	// through, and zero for every other format.
 	HadGroup int
 
@@ -196,7 +196,7 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 			b := &w.Blocks[i]
 			// A vector belongs to a matrix, not to a block: a checkpoint that
 			// left some tensors alone has vectors for the others and none for
-			// those, and a matrix that is not D4G must not meet one.
+			// those, and a matrix that is not Golem must not meet one.
 			for _, bind := range []struct {
 				dst  *[]float32
 				site string

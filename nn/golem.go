@@ -1,19 +1,19 @@
 package nn
 
-// The D4G scheme: what every one of golem's own formats shares, whatever
+// The Golem scheme: what every one of golem's own formats shares, whatever
 // codebook sits inside a block.
 //
-// A matrix is stored as A·(q ⊙ W): a per-column salience scale, then a
-// Hadamard rotation. The activation meets the reciprocal on the way in — see
-// PrepareD4G — so the product is unchanged and the rotation is undone nowhere
+// A matrix is stored as A·(q ⊙ W): a per-column salience scale, then a Hadamard
+// rotation. The activation meets the reciprocal on the way in — see
+// PrepareGolem — so the product is unchanged and the rotation is undone nowhere
 // but here, in Prepare and Unprepare. What varies between formats is only the
-// codebook a block's weights are rounded onto; the vector, the rotation and
-// the site a matrix reads are the same question for all of them, and this file
-// is where that question is answered once.
+// codebook a block's weights are rounded onto; the vector, the rotation and the
+// site a matrix reads are the same question for all of them, and this file is
+// where that question is answered once.
 //
-// D4Block and D4SubBlock name the block a step covers, and the step grid
-// itself — d4Steps, D4Step, D4StepCode — is shared by every tier that has
-// existed: two eight-bit codes a block, one per thirty-two weights, naming
+// GolemBlock and GolemSubBlock name the block a step covers, and the step grid
+// itself — golemSteps, GolemStep, GolemStepCode — is shared by every tier that
+// has existed: two eight-bit codes a block, one per thirty-two weights, naming
 // powers of two a sixteenth apart. A grid an eighth apart costs a whole point
 // of perplexity against an fp16 step at the same granularity, which is more
 // than the finer granularity wins back; a sixteenth apart is four percent over
@@ -26,14 +26,15 @@ import (
 	"strings"
 )
 
-// d4Steps is what the eight bits of a step code name.
-var d4Steps [256]float32
+// golemSteps is what the eight bits of a step code name.
+var golemSteps [256]float32
 
-// D4Step expands a step code.
-func D4Step(code byte) float32 { return d4Steps[code] }
+// GolemStep expands a step code.
+func GolemStep(code byte) float32 { return golemSteps[code] }
 
-// D4StepCode is the code nearest a step, in the ratio the codes are spaced by.
-func D4StepCode(v float32) byte {
+// GolemStepCode is the code nearest a step, in the ratio the codes are spaced
+// by.
+func GolemStepCode(v float32) byte {
 	if !(v > 0) {
 		return 0
 	}
@@ -49,16 +50,16 @@ func D4StepCode(v float32) byte {
 
 func init() {
 	for c := 0; c < 256; c++ {
-		d4Steps[c] = float32(math.Exp2((float64(c) - 272) / 16))
+		golemSteps[c] = float32(math.Exp2((float64(c) - 272) / 16))
 	}
 }
 
-// d4gSites says which activation a matrix reads, by the name of the tensor.
+// golemSites says which activation a matrix reads, by the name of the tensor.
 // Matrices sharing a site share the vector and the rotation, because they read
 // the same activation — the three attention projections read the stream, the
 // gate and the up read the feed forward's norm, and a mixture's two stacks read
 // neither of those.
-var d4gSites = map[string]string{
+var golemSites = map[string]string{
 	"attn_q": "qkv", "attn_k": "qkv", "attn_v": "qkv",
 	"attn_output": "o",
 	"ffn_gate":    "gateup", "ffn_up": "gateup",
@@ -74,18 +75,18 @@ var d4gSites = map[string]string{
 	"ssm_out": "o",
 }
 
-// D4GSite names the activation a block's matrix reads, given the field of the
+// GolemSite names the activation a block's matrix reads, given the field of the
 // tensor's name that says which matrix it is — attn_k of blk.7.attn_k.weight.
 // A converter needs it to decide which site's statistics a matrix is quantized
-// against, and it is the same table D4GVectorNames files the result under, so
+// against, and it is the same table GolemVectorNames files the result under, so
 // that the two answers cannot be given differently.
-func D4GSite(matrix string) (string, bool) {
-	site, ok := d4gSites[matrix]
+func GolemSite(matrix string) (string, bool) {
+	site, ok := golemSites[matrix]
 	return site, ok
 }
 
-// D4GVectorNames is where to look for the vector a matrix's activation must go
-// through, most specific first. A converter writes one of these and a reader
+// GolemVectorNames is where to look for the vector a matrix's activation must
+// go through, most specific first. A converter writes one of these and a reader
 // takes the first it finds, so that the two cannot drift apart: the naming is
 // part of the format and lives here rather than in either of them.
 //
@@ -93,7 +94,7 @@ func D4GSite(matrix string) (string, bool) {
 // blk.7.qkv.pre — and anything else under its own name. The tied head is both:
 // output.pre when the converter had activations to measure it from, and its own
 // name when it did not.
-func D4GVectorNames(tensor string) []string {
+func GolemVectorNames(tensor string) []string {
 	// The logit head, whether it is the table read the other way round or a
 	// matrix of its own. Both read what the final norm made, so both are the
 	// same site, and a model with an untied head has the two of them filed
@@ -102,7 +103,7 @@ func D4GVectorNames(tensor string) []string {
 		return []string{"output.pre", tensor + ".pre"}
 	}
 	if parts := strings.Split(tensor, "."); len(parts) == 4 && parts[0] == "blk" {
-		if site, ok := d4gSites[parts[2]]; ok {
+		if site, ok := golemSites[parts[2]]; ok {
 			return []string{parts[0] + "." + parts[1] + "." + site + ".pre", tensor + ".pre"}
 		}
 	}

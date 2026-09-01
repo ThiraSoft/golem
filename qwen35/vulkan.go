@@ -23,7 +23,7 @@ func (m *Model) device() (*vk.Device, error) {
 
 // UseVulkanHead uploads the logit head to the Vulkan device.
 func (m *Model) UseVulkanHead() error {
-	if m.headQ6K != nil || m.head != nil || m.d4gHead != nil {
+	if m.headQ6K != nil || m.head != nil || m.golemHead != nil {
 		return nil
 	}
 	d, err := m.device()
@@ -33,17 +33,17 @@ func (m *Model) UseVulkanHead() error {
 	if gq := m.W.OutputHead.Quant; gq.Golem() {
 		// A .golem head is a site like any other: the hidden state meets the
 		// reciprocal of its scale and the same rotation before the product,
-		// and vk/d4ghead.go does both.
+		// and vk/golemhead.go does both.
 		k, err := vk.NewGolemKernels(d, gq)
 		if err != nil {
 			return fmt.Errorf("qwen35: cannot build the %s kernels: %w", gq, err)
 		}
-		h, err := vk.NewD4GHead(k, m.W.OutputHead.Data, m.W.OutputHead.Rows, m.W.OutputHead.Cols, m.W.OutputHead.Pre)
+		h, err := vk.NewGolemHead(k, m.W.OutputHead.Data, m.W.OutputHead.Rows, m.W.OutputHead.Cols, m.W.OutputHead.Pre)
 		if err != nil {
 			k.Close()
-			return fmt.Errorf("qwen35: cannot upload the D4G head to Vulkan: %w", err)
+			return fmt.Errorf("qwen35: cannot upload the Golem head to Vulkan: %w", err)
 		}
-		m.d4gKernels, m.d4gHead = k, h
+		m.golemKernels, m.golemHead = k, h
 		return nil
 	}
 	if m.W.OutputHead.Quant == nn.Q6_K {
@@ -63,7 +63,7 @@ func (m *Model) UseVulkanHead() error {
 }
 
 func (m *Model) VulkanHead() bool {
-	return m.headQ6K != nil || m.head != nil || m.d4gHead != nil
+	return m.headQ6K != nil || m.head != nil || m.golemHead != nil
 }
 
 // StartVulkanCalibration turns on the per-site accumulators of the block
@@ -291,13 +291,13 @@ func (m *Model) UseVulkan() error {
 }
 
 func (m *Model) closeVulkan() {
-	if m.d4gHead != nil {
-		m.d4gHead.Close()
-		m.d4gHead = nil
+	if m.golemHead != nil {
+		m.golemHead.Close()
+		m.golemHead = nil
 	}
-	if m.d4gKernels != nil {
-		m.d4gKernels.Close()
-		m.d4gKernels = nil
+	if m.golemKernels != nil {
+		m.golemKernels.Close()
+		m.golemKernels = nil
 	}
 	if m.headQ6K != nil {
 		m.headQ6K.Close()

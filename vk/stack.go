@@ -340,8 +340,8 @@ func (s *Stack) SetEmbeddingGolem(table, steps *Buffer, cols int, pre []float32,
 	if cols != s.dim {
 		return fmt.Errorf("vk: the embedding is %d wide and the stream is %d", cols, s.dim)
 	}
-	if cols%prepareD4GGroup != 0 {
-		return fmt.Errorf("vk: a rotated row needs a multiple of %d columns, given %d", prepareD4GGroup, cols)
+	if cols%prepareGolemGroup != 0 {
+		return fmt.Errorf("vk: a rotated row needs a multiple of %d columns, given %d", prepareGolemGroup, cols)
 	}
 	if len(pre) != cols {
 		return fmt.Errorf("vk: the head's vector is %d wide, the row is %d", len(pre), cols)
@@ -364,7 +364,7 @@ func (s *Stack) SetEmbeddingGolem(table, steps *Buffer, cols int, pre []float32,
 	}
 	// One workgroup a group of the rotation, and a column has cols/group of
 	// them: the dispatch is per column times that, which record multiplies in.
-	s.embedOf = embedPush{cols: uint32(cols), superblocks: uint32(cols / prepareD4GGroup), scale: 1}
+	s.embedOf = embedPush{cols: uint32(cols), superblocks: uint32(cols / prepareGolemGroup), scale: 1}
 	s.programs = nil
 	return nil
 }
@@ -540,15 +540,15 @@ func (s *Stack) AddBlock(n BlockNorms) error {
 		fromAttn = s.attn.Output()
 	}
 
-	// A D4G block reads its two inputs as floats rather than in their Q8_0
+	// A Golem block reads its two inputs as floats rather than in their Q8_0
 	// form, so the two norms write the float half of what they can write and
 	// not the quantized one. Nothing else about them changes, and the flags
 	// in record follow the same two questions.
 	attnY, shY := s.none, s.none
-	if s.attn.D4G() {
+	if s.attn.Golem() {
 		attnY, attnQ, attnS = s.attn.FloatInput(), s.none, s.none
 	}
-	if s.mix.D4G() {
+	if s.mix.Golem() {
 		shY, shQ, shS = s.mix.SharedFloatInput(), s.none, s.none
 	}
 
@@ -736,12 +736,12 @@ func shapeKey(runs []span) string {
 func (s *Stack) record(r *Recorder, experts, used, columns int, runs []span) {
 	cols := uint32(columns)
 	quant := normPush{n: uint32(s.dim), flags: normGain | normQuant, eps: s.eps, scalar: 1}
-	if s.attn.D4G() {
+	if s.attn.Golem() {
 		quant.flags = normGain | normFloat
 	}
 	post := normPush{n: uint32(s.dim), flags: normGain | normFloat, eps: s.eps, scalar: 1}
 	resid := normPush{n: uint32(s.dim), flags: normAdd | normSum | normGain | normQuant, eps: s.eps, scalar: 1}
-	if s.mix.D4G() {
+	if s.mix.Golem() {
 		resid.flags = normAdd | normSum | normGain | normFloat
 	}
 	route := routerPush{

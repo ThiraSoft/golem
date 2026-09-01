@@ -2,7 +2,7 @@ package compress
 
 // Turning a matrix into the bytes nn/t4g.go reads.
 //
-// The scheme around the codes is D4G's and unchanged — the per-column vector,
+// The scheme around the codes is Golem's and unchanged — the per-column vector,
 // the Hadamard rotation, one step per sixty-four weights — because none of it
 // was ever about the codebook. What changes is the middle: where the lattice
 // searched a step per block and then rounded four weights at a time, this runs
@@ -11,10 +11,10 @@ package compress
 //
 // The order is not a preference. A block's RMS is the scale that makes it unit
 // variance, which is not the scale that reconstructs it best; the lattice buys
-// that difference with a grid of candidate steps per block and a trellis cannot,
-// because one path spans two blocks and the search would have to be joint.
-// Least squares takes it exactly and for nothing, once the path exists, and
-// compress/codec.go measures it at about four percent of the error.
+// that difference with a grid of candidate steps per block and a trellis
+// cannot, because one path spans two blocks and the search would have to be
+// joint. Least squares takes it exactly and for nothing, once the path exists,
+// and compress/codec.go measures it at about four percent of the error.
 //
 // The number that normalises a block on the way in is therefore not the number
 // the file stores, and it is not rounded to anything: rounding it would move
@@ -27,16 +27,16 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 )
 
-// D4Params is what the converter chose, and what the file then no longer needs
-// to say. The name is the scheme's, not the lattice's: ScaleBlock and HadGroup
-// describe the per-column vector and the rotation, which the trellis shares
-// with everything golem's own format has ever written. There is no scale-search
-// parameter here — a lattice's step was a fraction of its block's RMS, tried at
-// a few candidate multiples because the block was scaled up into a shell; a
-// trellis step is the block's RMS itself, fitted by least squares after the
-// path is chosen, which is a question the codebook answers and not one this
-// struct has anything to say about.
-type D4Params struct {
+// GolemParams is what the converter chose, and what the file then no longer
+// needs to say. The name is the scheme's, not the lattice's: ScaleBlock and
+// HadGroup describe the per-column vector and the rotation, which the trellis
+// shares with everything golem's own format has ever written. There is no
+// scale-search parameter here — a lattice's step was a fraction of its block's
+// RMS, tried at a few candidate multiples because the block was scaled up into
+// a shell; a trellis step is the block's RMS itself, fitted by least squares
+// after the path is chosen, which is a question the codebook answers and not
+// one this struct has anything to say about.
+type GolemParams struct {
 	ScaleBlock int // weights sharing one step code; must be a multiple of 32
 	HadGroup   int // 0 leaves the matrix unrotated
 }
@@ -68,7 +68,7 @@ func T4GOptsFor(q nn.Quant) TrellisOpts {
 // time, because the encoder that matters is on a card and a pass of sixteen
 // million weights is what pays for the round trip. compress.TrellisPathAccel is
 // where it hooks in, and the processor takes any shape the card refuses.
-func EncodeT4G(w []float32, rows, cols int, q []float32, p D4Params) []byte {
+func EncodeT4G(w []float32, rows, cols int, q []float32, p GolemParams) []byte {
 	return EncodeT4GAs(w, rows, cols, q, p, nn.T4G)
 }
 
@@ -76,7 +76,7 @@ func EncodeT4G(w []float32, rows, cols int, q []float32, p D4Params) []byte {
 // head and nothing else: a bit a weight over a tenth of a model is a tenth of
 // a bit, and it is the tensor that makes the logits rather than one whose
 // error the layers after it absorb.
-func EncodeT4GAs(w []float32, rows, cols int, q []float32, p D4Params, kind nn.Quant) []byte {
+func EncodeT4GAs(w []float32, rows, cols int, q []float32, p GolemParams, kind nn.Quant) []byte {
 	if cols%nn.T4GSeq != 0 {
 		panic("compress: a T4G row must be a multiple of 128 wide")
 	}
@@ -96,7 +96,7 @@ func EncodeT4GAs(w []float32, rows, cols int, q []float32, p D4Params, kind nn.Q
 			row := prep[r*cols : (r+1)*cols]
 			copy(row, w[r*cols:(r+1)*cols])
 			if q != nil {
-				nn.PrepareD4G(row, q, p.HadGroup)
+				nn.PrepareGolem(row, q, p.HadGroup)
 			}
 		}
 	})
@@ -160,7 +160,7 @@ func EncodeT4GAs(w []float32, rows, cols int, q []float32, p D4Params, kind nn.Q
 // quantizer's own error and nothing else's, which is what says whether there is
 // room left in the quantizer or only in what surrounds it. kind says which of
 // golem's own formats wrote the bytes.
-func RelErr(w []float32, rows, cols int, q []float32, p D4Params, data []byte, kind nn.Quant) float64 {
+func RelErr(w []float32, rows, cols int, q []float32, p GolemParams, data []byte, kind nn.Quant) float64 {
 	m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols}
 	var num, den float64
 	row := make([]float32, cols)
@@ -168,7 +168,7 @@ func RelErr(w []float32, rows, cols int, q []float32, p D4Params, data []byte, k
 	for r := 0; r < rows; r++ {
 		copy(row, w[r*cols:(r+1)*cols])
 		if q != nil {
-			nn.PrepareD4G(row, q, p.HadGroup)
+			nn.PrepareGolem(row, q, p.HadGroup)
 		}
 		m.Row(r, rec)
 		for j := range row {
@@ -180,7 +180,7 @@ func RelErr(w []float32, rows, cols int, q []float32, p D4Params, data []byte, k
 	return math.Sqrt(num / den)
 }
 
-// EnergyD4G is what a matrix's quantization costs the product it sits in,
+// EnergyGolem is what a matrix's quantization costs the product it sits in,
 // relative to what the product is: ‖(W-Ŵ)X‖² over ‖WX‖², estimated from the
 // activations the accumulator saw. kind says which of golem's own formats wrote
 // the bytes.
@@ -189,7 +189,7 @@ func RelErr(w []float32, rows, cols int, q []float32, p D4Params, data []byte, k
 // carried back to the one the activations were measured in, because that is
 // where the Hessian lives. Which is also why pre is needed and not just q: the
 // two are reciprocal, and undoing a rotation is not the same as applying it.
-func EnergyD4G(w []float32, rows, cols int, q, pre []float32, p D4Params, data []byte, kind nn.Quant, a *Acc) (float64, float64) {
+func EnergyGolem(w []float32, rows, cols int, q, pre []float32, p GolemParams, data []byte, kind nn.Quant, a *Acc) (float64, float64) {
 	m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols}
 	nums := make([]float64, rows)
 	dens := make([]float64, rows)
@@ -200,14 +200,14 @@ func EnergyD4G(w []float32, rows, cols int, q, pre []float32, p D4Params, data [
 		for r := lo; r < hi; r++ {
 			copy(row, w[r*cols:(r+1)*cols])
 			if q != nil {
-				nn.PrepareD4G(row, q, p.HadGroup)
+				nn.PrepareGolem(row, q, p.HadGroup)
 			}
 			m.Row(r, rec)
 			for j := range d {
 				d[j] = row[j] - rec[j]
 			}
 			if pre != nil {
-				nn.UnprepareD4G(d, pre, p.HadGroup)
+				nn.UnprepareGolem(d, pre, p.HadGroup)
 			}
 			nums[r] = a.Energy(d)
 			copy(d, w[r*cols:(r+1)*cols])

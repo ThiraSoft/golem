@@ -37,7 +37,7 @@ func golemPath(t *testing.T) string {
 // change at all. So this asserts the two things that say the swap was done
 // right: the hidden state stays inside the gap two arithmetics leave, and both
 // paths name the same token.
-func TestVulkanD4GMatchesCPU(t *testing.T) {
+func TestVulkanGolemMatchesCPU(t *testing.T) {
 	path := golemPath(t)
 	m, err := Open(path, 512)
 	if err != nil {
@@ -90,7 +90,7 @@ func TestVulkanD4GMatchesCPU(t *testing.T) {
 // Block by block, which is what says where a divergence begins rather than
 // that there is one. Probe stops the card after n blocks and hands back the
 // stream; the processor is run to the same point.
-func TestVulkanD4GWaypoints(t *testing.T) {
+func TestVulkanGolemWaypoints(t *testing.T) {
 	path := golemPath(t)
 	m, err := Open(path, 512)
 	if err != nil {
@@ -157,11 +157,11 @@ func TestVulkanD4GWaypoints(t *testing.T) {
 }
 
 // A pass carrying several columns has to answer what that many passes of one
-// answer. The D4G products are dispatched in runs of the widest binary the
+// answer. The Golem products are dispatched in runs of the widest binary the
 // kernels were built for, with the rest at narrower widths, and every one of
 // them is told where its columns start — an offset that is easy to write and
 // impossible to see in a pass of one, which is what the waypoints are.
-func TestVulkanD4GWidePassMatchesTokenPath(t *testing.T) {
+func TestVulkanGolemWidePassMatchesTokenPath(t *testing.T) {
 	path := golemPath(t)
 	m, err := Open(path, 1024)
 	if err != nil {
@@ -217,7 +217,7 @@ func TestVulkanD4GWidePassMatchesTokenPath(t *testing.T) {
 // verifies a draft answers, for the column that was already committed, what a
 // plain pass answers for it. The second is the half that can corrupt the state
 // rather than merely waste a draft.
-func TestVulkanD4GPredictionBlock(t *testing.T) {
+func TestVulkanGolemPredictionBlock(t *testing.T) {
 	path := golemPath(t)
 	m, err := Open(path, 1024)
 	if err != nil {
@@ -279,7 +279,7 @@ func TestVulkanD4GPredictionBlock(t *testing.T) {
 // there. engine/media.go puts the tower on the card when the blocks are on it,
 // which they now can be, so a .golem model sees on the card exactly as a Q4_0
 // one does.
-func TestVulkanD4GDescribesAnImage(t *testing.T) {
+func TestVulkanGolemDescribesAnImage(t *testing.T) {
 	path := golemPath(t)
 	g, err := tensors.OpenGGUF(path)
 	if err != nil {
@@ -392,7 +392,7 @@ func TestVulkanD4GDescribesAnImage(t *testing.T) {
 //
 // So: the same continuation drawn twice, once through the speculator and once
 // a token at a time, and they have to be the same tokens.
-func TestVulkanD4GSpeculationDrawsWhatTheModelDraws(t *testing.T) {
+func TestVulkanGolemSpeculationDrawsWhatTheModelDraws(t *testing.T) {
 	path := golemPath(t)
 	m, err := Open(path, 1024)
 	if err != nil {
@@ -471,7 +471,7 @@ func TestVulkanD4GSpeculationDrawsWhatTheModelDraws(t *testing.T) {
 // is internally consistent and collectively wrong, which is what a stream that
 // grows or collapses through the trunk looks like. This prints the size of it
 // so that the block where it leaves the rails can be named.
-func TestVulkanD4GStreamNorms(t *testing.T) {
+func TestVulkanGolemStreamNorms(t *testing.T) {
 	path := golemPath(t)
 	m, err := Open(path, 512)
 	if err != nil {
@@ -529,7 +529,7 @@ func TestVulkanD4GStreamNorms(t *testing.T) {
 // head in it. This gives the same hidden state to both heads and asks what
 // each makes of it, which is the only way to say which of the two is wrong
 // when a generation goes somewhere the processor does not.
-func TestVulkanD4GHeadMatchesCPU(t *testing.T) {
+func TestVulkanGolemHeadMatchesCPU(t *testing.T) {
 	path := golemPath(t)
 	m, err := Open(path, 512)
 	if err != nil {

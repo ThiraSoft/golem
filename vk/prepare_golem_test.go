@@ -12,7 +12,7 @@ import (
 // means, to the last bit that matters. A rotation applied one way on one side
 // and another way on the other is the failure this catches, and it is silent:
 // the weights still look like weights and the answer is somebody else's.
-func TestPrepareD4GMatchesCPU(t *testing.T) {
+func TestPrepareGolemMatchesCPU(t *testing.T) {
 	d, err := Open()
 	if err != nil {
 		t.Skip(err)
@@ -41,7 +41,7 @@ func TestPrepareD4GMatchesCPU(t *testing.T) {
 	defer act.Close()
 	copy(act.Floats(), x)
 
-	p, err := NewPrepareD4G(d, act, pre, group)
+	p, err := NewPrepareGolem(d, act, pre, group)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestPrepareD4GMatchesCPU(t *testing.T) {
 	want := make([]float32, n*columns)
 	copy(want, x)
 	for c := 0; c < columns; c++ {
-		nn.PrepareD4G(want[c*n:(c+1)*n], pre, group)
+		nn.PrepareGolem(want[c*n:(c+1)*n], pre, group)
 	}
 	got := act.Floats()
 	worst := 0.0
@@ -79,7 +79,7 @@ func TestPrepareD4GMatchesCPU(t *testing.T) {
 // one signed byte a value packed four to a word, and per column the scales of
 // its blocks of thirty-two before their corrections. Reading the corrections as
 // scales would be a shift of one block and a plausible, wrong answer.
-func TestPrepareD4GFromQ8MatchesCPU(t *testing.T) {
+func TestPrepareGolemFromQ8MatchesCPU(t *testing.T) {
 	d, err := Open()
 	if err != nil {
 		t.Skip(err)
@@ -130,7 +130,7 @@ func TestPrepareD4GFromQ8MatchesCPU(t *testing.T) {
 	}
 	defer scales.Close()
 
-	p, err := NewPrepareD4GFromQ8(d, out, values, scales, pre, group)
+	p, err := NewPrepareGolemFromQ8(d, out, values, scales, pre, group)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestPrepareD4GFromQ8MatchesCPU(t *testing.T) {
 	}
 
 	for c := 0; c < columns; c++ {
-		nn.PrepareD4G(want[c*n:(c+1)*n], pre, group)
+		nn.PrepareGolem(want[c*n:(c+1)*n], pre, group)
 	}
 	got := out.Floats()
 	worst, scale := 0.0, 0.0

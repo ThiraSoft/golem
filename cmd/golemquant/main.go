@@ -185,14 +185,14 @@ func main() {
 	// The trellis settles all of this: the sequence, the rate and the state
 	// width are what a workgroup's shared memory holds, the step is one per
 	// sixty-four weights, and the codebook has no parameter at all.
-	params := compress.D4Params{ScaleBlock: nn.T4GBlock, HadGroup: *hadGroup}
+	params := compress.GolemParams{ScaleBlock: nn.T4GBlock, HadGroup: *hadGroup}
 	dtype := dtypeFor(*bodyBits)
 	// What a row has to be a multiple of: a trellis sequence.
 	unit := nn.T4GSeq
 
 	// One vector a site: the sign flips of the rotation over the salience
 	// scale. The weights are multiplied by it, the activations by its
-	// reciprocal, and nn.PrepareD4G is both.
+	// reciprocal, and nn.PrepareGolem is both.
 	signs := map[int][]float32{}
 	pre := map[string][]float32{}    // what the activations meet
 	weight := map[string][]float32{} // its reciprocal, what the weights meet
@@ -232,7 +232,7 @@ func main() {
 	// a different winner each time and lands where it started. The first run
 	// read 39.20 and it would have been easy to keep only that one.
 	//
-	// What survives is the machinery — Acc.Energy and EnergyD4G measure what a
+	// What survives is the machinery — Acc.Energy and EnergyGolem measure what a
 	// matrix costs the product rather than what it costs the weights, and that
 	// is the right question whatever asks it next.
 	type cand struct{ alpha, clamp float64 }
@@ -259,7 +259,7 @@ func main() {
 		for _, c := range cands {
 			pv, qv := build(key, c.alpha, c.clamp)
 			data := compress.EncodeT4GAs(w[:n*cols], n, cols, qv, p, kind)
-			num, den := compress.EnergyD4G(w[:n*cols], n, cols, qv, pv, p, data, kind, accs[key])
+			num, den := compress.EnergyGolem(w[:n*cols], n, cols, qv, pv, p, data, kind, accs[key])
 			if e := num / den; e < best {
 				best, bestAt = e, c
 			}
@@ -300,7 +300,7 @@ func main() {
 		rows     int // rows of one matrix; a stack has that many each
 		stack    int
 		key      string // the site this matrix is filed under, or nothing
-		params   compress.D4Params
+		params   compress.GolemParams
 		size     int
 	}
 
@@ -502,7 +502,7 @@ func main() {
 			// came to be rotated blind while the reader bound them to the
 			// site vector the three of a full attention share — a file that
 			// loads and answers nonsense.
-			if site, known := nn.D4GSite(mat); known {
+			if site, known := nn.GolemSite(mat); known {
 				pl.key = fmt.Sprintf("%d/%s", blk, site)
 				q = weight[pl.key]
 			}
@@ -521,7 +521,7 @@ func main() {
 			// reader can undo them.
 			//
 			// Where that vector goes is the whole of what went wrong twice.
-			// The reader asks nn.D4GVectorNames, which offers a site's name
+			// The reader asks nn.GolemVectorNames, which offers a site's name
 			// before the tensor's own — so a matrix that HAS a site must be
 			// rotated by the site's vector whether or not anything was
 			// measured there, and the matrices of one site must all get the
@@ -698,8 +698,8 @@ func siteTensor(key, embd string) string {
 // checkVectors reads the file back the way the loader will and insists that
 // every matrix finds the vector it was rotated by.
 //
-// The loader takes the first name nn.D4GVectorNames offers that the file has, a
-// site's before a tensor's own. So a matrix quantized blind, under its own
+// The loader takes the first name nn.GolemVectorNames offers that the file has,
+// a site's before a tensor's own. So a matrix quantized blind, under its own
 // name, is silently given the site's vector instead whenever that site exists —
 // which is what happened to a hybrid's four input projections when this
 // converter kept its own table of sites and did not know theirs. The file
@@ -718,7 +718,7 @@ func checkVectors(out []tensors.OutStream, rotatedBy map[string]string) error {
 			continue
 		}
 		got := ""
-		for _, at := range nn.D4GVectorNames(t.Name) {
+		for _, at := range nn.GolemVectorNames(t.Name) {
 			// The loader also refuses a vector that is not the width of the
 			// row, so this asks the same question it does.
 			if n, ok := have[at]; ok && n == t.Shape[0] {
@@ -789,19 +789,19 @@ func sweep(g *tensors.GGUF, text string, ntok, ctx int,
 
 // calibrate keeps, for each site, the per-column power of the activations that
 // reach it. That is all the salience scaling needs, and it is what the second
-// pass has to know before it can build anything.
-// calibrateVulkan is the same measurement with the model on a card: the
-// accumulators live beside the activations and the host never sees a row.
+// pass has to know before it can build anything. calibrateVulkan is the same
+// measurement with the model on a card: the accumulators live beside the
+// activations and the host never sees a row.
 //
 // It answers only the salience, which is the per-column power of a site. A
-// compensation pass wants the whole Hessian of a site, and that is rows —
-// there is no summary of them — so -gptq keeps to the processor.
-// streamBudget is how much of the card a window of blocks may take. Deliberately
-// short of what the card holds: the pipeline's own scratch — the caches, the
-// activations of a five-hundred-column pass, the accumulators — lives beside the
-// window, and nothing here asks the driver what is free. A window one block wide
-// is always allowed, whatever this says, because a model whose single block does
-// not fit has no streamed answer either.
+// compensation pass wants the whole Hessian of a site, and that is rows — there
+// is no summary of them — so -gptq keeps to the processor. streamBudget is how
+// much of the card a window of blocks may take. Deliberately short of what the
+// card holds: the pipeline's own scratch — the caches, the activations of a
+// five-hundred-column pass, the accumulators — lives beside the window, and
+// nothing here asks the driver what is free. A window one block wide is always
+// allowed, whatever this says, because a model whose single block does not fit
+// has no streamed answer either.
 const streamBudget = 8 << 30
 
 // calibrateStreamed measures a checkpoint the card cannot read whole: the model
@@ -1191,7 +1191,7 @@ func expandRows(t tensors.Tensor, from, to int) ([]float32, error) {
 }
 
 // reciprocal is the weights' half of a vector given the activations', which is
-// what nn.PrepareD4G undoes. The two are elementwise reciprocal by definition
+// what nn.PrepareGolem undoes. The two are elementwise reciprocal by definition
 // of the scheme; compress/encode_t4g.go says why.
 func reciprocal(v []float32) []float32 {
 	if v == nil {

@@ -48,7 +48,7 @@ func Block(
 			copy(normed.F[t], xs[t])
 			nn.RMSNormPlain(normed.F[t], bw.AttnNorm, cfg.Eps)
 			if bw.PreQKV != nil {
-				nn.PrepareD4G(normed.F[t], bw.PreQKV, bw.HadGroup)
+				nn.PrepareGolem(normed.F[t], bw.PreQKV, bw.HadGroup)
 			}
 			normed.QuantizeColumnRange(t, 0, cfg.Dim)
 		}
@@ -68,7 +68,7 @@ func Block(
 			copy(normed.F[t], xs[t])
 			nn.RMSNormPlain(normed.F[t], bw.FFNNorm, cfg.Eps)
 			if bw.PreGateUp != nil {
-				nn.PrepareD4G(normed.F[t], bw.PreGateUp, bw.HadGroup)
+				nn.PrepareGolem(normed.F[t], bw.PreGateUp, bw.HadGroup)
 			}
 			normed.QuantizeColumnRange(t, 0, cfg.Dim)
 		}
@@ -108,7 +108,7 @@ func Block(
 	if bw.PreDown != nil {
 		nn.InParallel(batch, batch*bc.FFN, func(first, last int) {
 			for t := first; t < last; t++ {
-				nn.PrepareD4G(gate.F[t], bw.PreDown, bw.HadGroup)
+				nn.PrepareGolem(gate.F[t], bw.PreDown, bw.HadGroup)
 			}
 		})
 	}
