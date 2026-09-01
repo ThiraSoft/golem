@@ -449,6 +449,23 @@ way this card can be measured, see below — that is **about 1.6× a single-colu
 product and 1.12× a pass of eight**, and the tiers now differ from each other,
 which is the sign the kernel is reading bytes again.
 
+End to end on Qwen3-4B, three alternating runs of each build with no overlap
+between the two sets, greedy, on the 9070 XT:
+
+| | | before | after | |
+|---|---|---|---|---|
+| **T4G** | generating, short cache | 52.1–52.6 t/s | **64.2–64.3** | +22 % |
+| | generating, 765 positions held | 42.7 | **49.3** | +15 % |
+| | reading a 765-token prompt | 220–231 t/s | **317–322** | +40 % |
+| **T3G** | generating, short cache | 50.7–54.0 t/s | **67.4–67.8** | +29 % |
+| | generating, 765 positions held | 43.1 | **49.5** | +15 % |
+| | reading a 765-token prompt | 291–302 t/s | **377–379** | +26 % |
+
+The row worth reading twice is that **T3G now generates faster than T4G** —
+67.6 against 64.3 — where before the change the two were within half a token a
+second of each other, because the kernel did not care how many bytes a tier
+read. The format finally gains speed by spending bits.
+
 Two things follow for anyone reading this next.
 
 **The standing lesson survives, sharpened.** T4G is still not bandwidth-bound —
