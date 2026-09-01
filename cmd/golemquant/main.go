@@ -54,6 +54,7 @@ func main() {
 	vulkan := flag.Bool("vulkan", true, "encode the matrices on a Vulkan device when there is one")
 	calibSrc := flag.String("calib-model", "", "the checkpoint to calibrate on, when it is not the one being converted")
 	salFile := flag.String("salience", "", "read the sites from this file, or write them to it after measuring; the salience does not depend on -alpha, -clamp or the codec, and measuring it again for each of them is most of a sweep's wall clock")
+	calibWindow := flag.Int("calib-window", 0, "how many blocks of a float checkpoint are resident on the card at once while it is calibrated. Zero sizes the window from the block's own weight, which is all this has to go on: nothing here asks the driver what is free")
 	measure := flag.Bool("measure-only", false, "stop once the sites are written, converting nothing. The two halves of a conversion do not want the same device — the card cannot run a BF16 checkpoint at all, and only the card can encode one in reasonable time — so a model too large to calibrate on the card is done in two commands: this one with -vulkan=false to measure the checkpoint exactly, then the conversion with -salience, which reads the file and never runs the model")
 	flag.Parse()
 	if *measure && *salFile == "" {
@@ -107,7 +108,7 @@ func main() {
 		}
 	}
 	if salience == nil {
-		salience, accs = calibrate(calibFrom, text, *ntok, *ctx, win, nn.T4GBlock, *vulkan)
+		salience, accs = calibrate(calibFrom, text, *ntok, *ctx, win, nn.T4GBlock, *calibWindow, *vulkan)
 		if *salFile != "" && win == 0 && len(salience) > 0 {
 			if err := writeSalience(*salFile, salience); err != nil {
 				fmt.Printf("the sites were not kept (%v)\n", err)
@@ -795,12 +796,75 @@ func sweep(g *tensors.GGUF, text string, ntok, ctx int,
 // It answers only the salience, which is the per-column power of a site. A
 // compensation pass wants the whole Hessian of a site, and that is rows —
 // there is no summary of them — so -gptq keeps to the processor.
-func calibrateVulkan(path, text string, ntok, ctx int) (map[string][]float32, bool) {
+// streamBudget is how much of the card a window of blocks may take. Deliberately
+// short of what the card holds: the pipeline's own scratch — the caches, the
+// activations of a five-hundred-column pass, the accumulators — lives beside the
+// window, and nothing here asks the driver what is free. A window one block wide
+// is always allowed, whatever this says, because a model whose single block does
+// not fit has no streamed answer either.
+const streamBudget = 8 << 30
+
+// calibrateStreamed measures a checkpoint the card cannot read whole: the model
+// goes past it a window of blocks at a time, widened to floats on the way up.
+// It is the same measurement the resident stack makes and files its sites under
+// the same keys — qwen35 offsets them by the window's first block, so a site is
+// named for its place in the model rather than in the window.
+func calibrateStreamed(m *qwen35.Model, text string, ntok, ctx, window int) (map[string][]float32, bool) {
+	if window <= 0 {
+		per := m.StreamBlockBytes()
+		window = max(1, streamBudget/max(per, 1))
+	}
+	v, err := bytebpe.Load(m.File())
+	if err != nil {
+		fmt.Printf("no calibration on the card (%v); the processor then\n", err)
+		return nil, false
+	}
+	ids := v.Encode(text, true, false)
+	if len(ids) > ntok {
+		ids = ids[:ntok]
+	}
+	// The corpus cut into independent contexts, exactly as sweep cuts it: each
+	// window of the text is its own conversation, which is what makes one long
+	// text into many samples.
+	var runs [][]int32
+	for start := 0; start+ctx <= len(ids); start += ctx {
+		runs = append(runs, ids[start:start+ctx])
+	}
+	if len(runs) == 0 {
+		fmt.Printf("no calibration on the card: %d tokens do not fill one %d-token context\n", len(ids), ctx)
+		return nil, false
+	}
+	t0 := time.Now()
+	sums, rows, err := m.CalibrateStreamed(runs, window, ctx)
+	if err != nil {
+		fmt.Printf("no calibration on the card (%v); the processor then\n", err)
+		return nil, false
+	}
+	out := make(map[string][]float32, len(sums))
+	for k, val := range sums {
+		u := make([]float32, len(val))
+		for j, x := range val {
+			u[j] = float32(math.Sqrt(float64(x) / float64(rows)))
+		}
+		out[k] = u
+	}
+	fmt.Printf("calibrated on %d tokens in %s on the card, %d blocks at a time, %d sites\n",
+		rows, time.Since(t0).Round(time.Millisecond), window, len(out))
+	return out, true
+}
+
+func calibrateVulkan(path, text string, ntok, ctx, window int) (map[string][]float32, bool) {
 	m, err := qwen35.Open(path, ctx)
 	if err != nil {
 		return nil, false
 	}
 	defer m.Close()
+	// A checkpoint the card can read goes up whole, which is faster and is what
+	// every model that fits has always done. One it cannot — a BF16, which no
+	// kernel in vk reads — goes past it a window at a time instead.
+	if m.FloatWeights() {
+		return calibrateStreamed(m, text, ntok, ctx, window)
+	}
 	if err := m.UseVulkanStack(); err != nil {
 		fmt.Printf("no calibration on the card (%v); the processor then\n", err)
 		return nil, false
@@ -834,9 +898,9 @@ func calibrateVulkan(path, text string, ntok, ctx int) (map[string][]float32, bo
 	return out, true
 }
 
-func calibrate(path, text string, ntok, ctx, win, block int, useVulkan bool) (map[string][]float32, map[string]*compress.Acc) {
+func calibrate(path, text string, ntok, ctx, win, block, window int, useVulkan bool) (map[string][]float32, map[string]*compress.Acc) {
 	if useVulkan && win == 0 {
-		if sal, ok := calibrateVulkan(path, text, ntok, ctx); ok {
+		if sal, ok := calibrateVulkan(path, text, ntok, ctx, window); ok {
 			return sal, nil
 		}
 	}
