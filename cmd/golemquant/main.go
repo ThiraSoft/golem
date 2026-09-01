@@ -54,7 +54,11 @@ func main() {
 	vulkan := flag.Bool("vulkan", true, "encode the matrices on a Vulkan device when there is one")
 	calibSrc := flag.String("calib-model", "", "the checkpoint to calibrate on, when it is not the one being converted")
 	salFile := flag.String("salience", "", "read the sites from this file, or write them to it after measuring; the salience does not depend on -alpha, -clamp or the codec, and measuring it again for each of them is most of a sweep's wall clock")
+	measure := flag.Bool("measure-only", false, "stop once the sites are written, converting nothing. The two halves of a conversion do not want the same device — the card cannot run a BF16 checkpoint at all, and only the card can encode one in reasonable time — so a model too large to calibrate on the card is done in two commands: this one with -vulkan=false to measure the checkpoint exactly, then the conversion with -salience, which reads the file and never runs the model")
 	flag.Parse()
+	if *measure && *salFile == "" {
+		must(fmt.Errorf("golemquant: -measure-only writes the sites and nothing else, so it wants a -salience file to write them to"))
+	}
 
 	if *headBits != nn.T3GK && *headBits != nn.T4GK && *headBits != nn.T5GK {
 		must(fmt.Errorf("golemquant: the head is %d, %d or %d bits, not %d", nn.T3GK, nn.T4GK, nn.T5GK, *headBits))
@@ -111,6 +115,12 @@ func main() {
 				fmt.Printf("%d sites written to %s\n", len(salience), *salFile)
 			}
 		}
+	}
+	if *measure {
+		if len(salience) == 0 {
+			must(fmt.Errorf("golemquant: -measure-only measured nothing, so there is no file to write and no conversion to do"))
+		}
+		return
 	}
 	if len(salience) == 0 && !*blind {
 		must(fmt.Errorf("golemquant: nothing calibrated and -blind is off, so nothing would be rotated"))
