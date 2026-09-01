@@ -41,7 +41,7 @@ func main() {
 	limit := flag.Int("limit", 4096, "how many corpus tokens to read")
 	steps := flag.Int("steps", 40, "greedy steps")
 	vulkan := flag.Bool("vulkan", false, "run the model on a Vulkan device")
-	stream := flag.Bool("stream", false, "carry a float checkpoint past the card a window of blocks at a time. For a BF16, which no kernel here reads and which is therefore the processor's otherwise — and the processor reads every weight for every token")
+	stream := flag.Bool("stream", false, "carry the checkpoint past the card a window of blocks at a time, widened to floats. For one the resident stack cannot take: too large for the card, or a form no kernel here reads. The processor is the alternative and it reads every weight for every token. Not for a .golem: this streams the body and leaves the head on the processor, and a trellis head is 1.27 billion weights decoded per position — 4088 positions of Qwen3.8-27B did not finish in half an hour, where -vulkan does the whole corpus in under three minutes")
 	flag.Parse()
 
 	// The window, not a fixed four thousand. A context is the cache a model
@@ -87,21 +87,28 @@ func main() {
 		for start := 0; start+*ctx <= len(ids); start += *ctx {
 			windows = append(windows, ids[start:start+*ctx])
 		}
-		// A checkpoint no kernel reads whole. -stream is what makes a BF16
-		// measurable at all: the processor reads every weight for every token —
-		// qwen35's ForwardBatch steps one at a time — which for a
-		// fifty-four-gigabyte checkpoint is twenty-three minutes for twenty-four
-		// positions, and thirty hours for this corpus. The same corpus on the
-		// card is minutes, and the two answer the same logits to two parts in a
-		// million.
+		// A checkpoint the resident stack cannot take, for either of the two
+		// reasons it cannot: too large for the card, or a form no kernel here
+		// reads. Both are answered the same way — the model goes past the card
+		// a window of blocks at a time, widened to floats on the way up by the
+		// same nn.Matrix.Row every other reader of a checkpoint uses.
+		//
+		// It is what makes some of these measurable at all. The processor reads
+		// every weight for every token — qwen35's ForwardBatch steps one at a
+		// time — which for the 54 GB BF16 is twenty-three minutes for
+		// twenty-four positions and about thirty hours for this corpus. The same
+		// corpus on the card is nine minutes, and the two answer the same logits
+		// to two parts in a million.
+		//
+		// Note what it does to a comparison: a streamed row is read with float
+		// activations where a resident row rounds them to Q8_0 for some
+		// projections. So a table mixing the two flatters whichever rows were
+		// streamed. Say which is which, or stream all of them.
 		var streamed [][][]float32
 		if *stream {
 			sm, ok := m.(streamedModel)
 			if !ok {
 				must(fmt.Errorf("vqdiff: this engine has nothing that streams"))
-			}
-			if !sm.FloatWeights() {
-				must(fmt.Errorf("vqdiff: -stream is for a checkpoint the card cannot read whole, and this one it can"))
 			}
 			streamed, err = sm.ForwardStreamed(windows, 0, *ctx)
 			must(err)
@@ -239,7 +246,6 @@ type vulkanModel interface{ UseVulkan() error }
 // blocks at a time. Only the hybrid engine has one, and only a checkpoint whose
 // weights no kernel reads — a BF16 — has any reason to use it.
 type streamedModel interface {
-	FloatWeights() bool
 	ForwardStreamed(runs [][]int32, window, ctx int) ([][][]float32, error)
 }
 
