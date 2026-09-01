@@ -26,8 +26,36 @@ package vk
 import (
 	_ "embed"
 	"fmt"
+	"runtime"
+	"sync"
 	"unsafe"
 )
+
+// spread runs fn over [0,n) split across the processors. The card's passes are
+// bracketed by host-side traffic — staging the floats in, taking the
+// reconstruction and the path back out — and that traffic is a whole pass over
+// sixteen million weights each way, through memory the driver maps rather than
+// the allocator. Left on one thread it was the conversion: one core pegged and
+// the card at a fifth of its occupancy, waiting for its next pass to be handed
+// to it.
+func spread(n int, fn func(lo, hi int)) {
+	w := runtime.GOMAXPROCS(0)
+	if w > n {
+		w = n
+	}
+	if w < 2 {
+		fn(0, n)
+		return
+	}
+	var wg sync.WaitGroup
+	chunk := (n + w - 1) / w
+	for lo := 0; lo < n; lo += chunk {
+		hi := min(lo+chunk, n)
+		wg.Add(1)
+		go func(lo, hi int) { defer wg.Done(); fn(lo, hi) }(lo, hi)
+	}
+	wg.Wait()
+}
 
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/viterbi_tcq.comp -o shaders/viterbi_tcq.spv
 
@@ -205,7 +233,7 @@ func (e *TrellisEncoder) quantize(norm []float32, gain float32, states []uint16)
 		if at+n > len(norm) {
 			n = len(norm) - at
 		}
-		copy(xs[:n], norm[at:at+n])
+		spread(n, func(lo, hi int) { copy(xs[lo:hi], norm[at+lo:at+hi]) })
 		seqs := n / TrellisGPUSeq
 		push := viterbiPush{seqs: uint32(seqs), gain: gain}
 		// One submission: the weights across, the kernel, the answer back. A
@@ -221,12 +249,22 @@ func (e *TrellisEncoder) quantize(norm []float32, gain float32, states []uint16)
 		if err != nil {
 			return err
 		}
-		copy(norm[at:at+n], e.recBack.Floats()[:n])
-		if states != nil {
-			for i, v := range e.pathBack.Uints()[:n] {
-				states[at+i] = uint16(v)
+		rec := e.recBack.Floats()[:n]
+		path := e.pathBack.Uints()[:n]
+		spread(n, func(lo, hi int) {
+			copy(norm[at+lo:at+hi], rec[lo:hi])
+			if states == nil {
+				return
 			}
-		}
+			// The path comes back a word a weight and is stored a half-word:
+			// the state is twelve bits. Narrowing it is one instruction and
+			// sixteen million of them, and it reads from a buffer the driver
+			// maps, so it is bus-bound rather than arithmetic-bound and every
+			// thread is worth having.
+			for i := lo; i < hi; i++ {
+				states[at+i] = uint16(path[i])
+			}
+		})
 	}
 	return nil
 }
