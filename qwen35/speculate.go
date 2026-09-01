@@ -18,6 +18,28 @@ import (
 // Measured on Qwen3.8-27B: the draft is the token the model itself chooses
 // 81% of the time.
 //
+// The 1.056 is a Q4_0 kernel's, and a .golem checkpoint's is not. The trellis
+// mat-vec decodes a weight before it can spend it, so a pass of two costs what
+// the decode costs again unless the kernel amortizes it — cmd/golemtune on
+// Qwen3.8-27B's feed forward reads 89.8 microseconds at one column and 112.6 at
+// two, which is **1.25**, not 1.056. At an 81% acceptance rate that is a losing
+// trade, and it is a losing trade that used to win: on this card, with the
+// same file and the same block,
+//
+//	                       a token at a time   drafting
+//	  before the kernel's       18.95 t/s      24.45 t/s   drafting +29%
+//	  read and decode were      29.68 t/s      26.08 t/s   drafting -12%
+//	  taken apart
+//
+// The block did not get worse. The single-token path got 1.57 times faster and
+// the two-token path 1.07, so the gap the draft was paid out of closed. There
+// is nothing wrong with the prediction block and this is not an argument
+// against it: it is an argument that whether to draft is a measurement on a
+// card and a checkpoint, which is why cmd/golem-cli has -draft and why the
+// number above is written down with the date it was true. The way to make it
+// win again is to make a pass of two cost less than 1.25 of a pass of one,
+// which is the mat-vec's problem and not the block's.
+//
 // What a recurrent model adds is the rollback. A refused draft leaves a key in
 // the attention cache at a position it does not occupy, which the token that
 // does occupy it overwrites — but it also leaves its contribution inside every

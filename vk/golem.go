@@ -119,36 +119,51 @@ func (s GolemShape) String() string {
 }
 
 // golemDefaultShapes is what cmd/golemtune measured on an RX 9070 XT (RADV,
-// RDNA4) — every shape interleaved, the fastest of five rounds each, on a
-// 9728x2560 product, three runs agreeing on the order. Microseconds:
+// RDNA4) — every shape interleaved, the fastest of five rounds each, three runs
+// agreeing on the order. Microseconds, on two shapes that matter: Qwen3-4B's
+// feed forward, 9728 by 2560, and Qwen3.8-27B's, 17408 by 5120.
 //
-//	width   hash/128  hash/256  table/128  table/256  +prefetch/128  /256
-//	    1      54.8      54.4       47.3      44.0         46.5      41.8
-//	    2      65.4      59.7       59.7      61.0         56.1      59.7
-//	    4      82.4      82.0       79.9     101.7         85.7     108.6
-//	    8     140.0     140.3      140.0     170.8        149.5     197.8
+//	              hash/128  hash/256  table/128  table/256  +prefetch/128  /256
+//	 4B  width 1     54.8      54.4       47.3      44.0         46.5      45.7
+//	     width 2     65.4      59.7       59.7      61.0         56.1      59.7
+//	     width 4     82.4      82.0       79.9     101.7         85.7     108.6
+//	     width 8    140.0     140.3      140.0     170.8        149.5     197.8
+//	27B  width 1    123.6     122.4      130.2      89.8        103.2      91.3
+//	     width 2    143.0     143.0      169.2     125.1        144.7     112.6
+//	     width 4    199.4     192.5      231.0     231.0        230.1     219.1
+//	     width 8    327.3     326.6      444.8     426.6        425.9     461.1
 //
-// A narrow pass decodes a weight for one activation and wants the table; a pass
-// of eight spends each decoded weight eight times, so the hash is already
-// amortized and all the table has left to offer is sixteen kibibytes against
-// the occupancy. Four is where they cross, and at eight the three cheapest
-// shapes are within half a microsecond of each other. The read-ahead helps
-// exactly where the table does and hurts where it does not, which is the same
-// fact twice: with the table the decode is short enough that the wave is
-// waiting on memory, and without it the extra registers cost more than the
-// stall.
+// Two things come out of that, and the second one cost a wrong default.
 //
-// The shape of that trade follows from the pass width and would come out the
-// same way on any card. Where the crossing falls is the card's own answer, so
-// none of it is compiled in: run cmd/golemtune and set GOLEM_MATVEC_SHAPE to
-// what it prints. Every shape answers the same numbers whatever is fastest, and
-// TestGolemBuildsAgree holds them to it.
+// **The table is worth its sixteen kibibytes at a narrow pass and not at a wide
+// one.** A pass of one decodes a weight for one activation; a pass of eight
+// spends each decoded weight eight times, so the hash is already amortized and
+// all the table has left to offer is its cost in occupancy. Four is where they
+// cross on both shapes. The read-ahead helps where the table does and hurts
+// where it does not, which is the same fact twice: with the table the decode is
+// short enough that the wave is waiting on memory, and without it the extra
+// registers cost more than the stall.
+//
+// **The workgroup is not the 4B's to choose.** Tuned on the 4B alone, width two
+// picks 128 threads — and that shape costs the 27B 28%, which is most of why
+// its prediction block stopped paying for itself. 256 threads is within 4% of
+// the best on the 4B at every width and is the best on the 27B at every width,
+// so it is what every width takes. A shape that is only ever tuned on one
+// matrix is tuned on one matrix.
 var golemDefaultShapes = map[int]GolemShape{
 	1: {Threads: 256, Table: true, Prefetch: true},
-	2: {Threads: 128, Table: true, Prefetch: true},
-	4: {Threads: 128, Table: true, Prefetch: false},
-	8: {Threads: 128, Table: false, Prefetch: false},
+	2: {Threads: 256, Table: true, Prefetch: true},
+	4: {Threads: 256, Table: false, Prefetch: false},
+	8: {Threads: 256, Table: false, Prefetch: false},
 }
+
+// The shape of the trade above follows from the pass width and would come out
+// the same way on any card. Where the crossing falls, and which workgroup wins,
+// is the card's and the matrix's answer together, so none of it is compiled in:
+// run cmd/golemtune — at the geometry of a matrix the model actually has, with
+// -rows and -cols — and set GOLEM_MATVEC_SHAPE to what it prints. Every shape
+// answers the same numbers whatever is fastest, and TestGolemBuildsAgree holds
+// them to it.
 
 // GolemShapes is the shape each pass width is built with. It is
 // golemDefaultShapes unless GOLEM_MATVEC_SHAPE says otherwise, in the form

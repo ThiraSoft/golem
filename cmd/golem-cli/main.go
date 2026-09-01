@@ -54,6 +54,7 @@ func main() {
 	context := flag.Int("context", 4096, "positions to keep; the files declare far more than any machine here would survive")
 	system := flag.String("system", "", "system message opening the conversation")
 	think := flag.Bool("think", false, "open the system turn with the thinking marker")
+	draft := flag.Bool("draft", true, "let a checkpoint that carries a prediction block draft with it; -draft=false generates a token at a time, which is what the block is worth measured against")
 	maxTokens := flag.Int("n", 512, "most tokens to draw for one answer")
 	temp := flag.Float64("temp", -1, "temperature; 0 is greedy, negative takes the file's own value")
 	topK := flag.Int("top-k", -1, "candidates kept; 0 keeps all, negative takes the file's own value")
@@ -146,6 +147,9 @@ func main() {
 		}
 		if v, ok := m.Media(); ok {
 			s.SetVision(v)
+		}
+		if !*draft {
+			s.NoDraft()
 		}
 		return s
 	}

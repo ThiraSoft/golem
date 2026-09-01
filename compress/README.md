@@ -466,6 +466,31 @@ The row worth reading twice is that **T3G now generates faster than T4G** —
 second of each other, because the kernel did not care how many bytes a tier
 read. The format finally gains speed by spending bits.
 
+On Qwen3.8-27B in T3G, where a mixture makes the weights most of the token, the
+same measurement is larger and it moves something else:
+
+| | a token at a time | drafting with the prediction block |
+|---|---|---|
+| before | 18.95 t/s | 24.45 t/s — drafting **+29 %** |
+| after | **29.68 t/s** | 26.08 t/s — drafting **−12 %** |
+
+**A pass of one got 1.57 times faster and a pass of two 1.07, so speculative
+decoding stopped paying.** That is not the prediction block getting worse. Its
+bargain is that a pass of two costs 1.056 of a pass of one, which is true of a
+Q4_0 kernel and is not true here: a trellis weight has to be decoded before it
+can be spent, and `cmd/golemtune` reads 89.8 microseconds at one column against
+112.6 at two on this model's feed forward — 1.25. At an 81 % acceptance rate
+1.25 is a losing trade. `cmd/golem-cli -draft=false` is how to not take it, and
+making a pass of two cost less than 1.25 of a pass of one is how to make it win
+again. `qwen35/speculate.go` carries the same note.
+
+**And a warning about the tuning.** The first shapes shipped here were measured
+on the 4B's feed forward alone, 9728 by 2560. On the 27B's, 17408 by 5120, the
+workgroup that won for the 4B at two columns costs **28 %** — which was most of
+why drafting looked worse than it is. The defaults are now the consensus of both
+geometries, and `cmd/golemtune` takes `-rows` and `-cols` so that a model with a
+shape unlike either can be measured on its own.
+
 Two things follow for anyone reading this next.
 
 **The standing lesson survives, sharpened.** T4G is still not bandwidth-bound —

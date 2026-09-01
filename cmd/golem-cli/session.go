@@ -83,6 +83,11 @@ type Session struct {
 	maxContext int
 	maxTokens  int
 	thinking   bool
+	// noDraft turns the prediction block off for a checkpoint that carries
+	// one. Drafting is what the block is for and is on wherever it can be, so
+	// this exists to measure it: what a draft is worth is a number about a
+	// model and a card, and it moves whenever the kernels do.
+	noDraft bool
 
 	// history is the conversation as messages, because the template is what
 	// turns it into text and only the template knows how.
@@ -131,6 +136,10 @@ func (s *Session) promptWidth() int {
 // OnDevice says the model's blocks are on a card, which is the only thing that
 // changes the width. cmd/golem-cli calls it once, before the first prompt.
 func (s *Session) OnDevice() { s.width = devicePassWidth }
+
+// NoDraft makes this conversation generate a token at a time even where the
+// checkpoint carries a prediction block. See Session.noDraft.
+func (s *Session) NoDraft() { s.noDraft = true }
 
 func NewSession(m forward, v vocabulary, tpl chat.Template, p sample.Params,
 	vocabSize, maxContext, maxTokens int, system string, thinking bool) *Session {
@@ -258,7 +267,7 @@ func (s *Session) AskWithMedia(text string, images, audio [][]byte, w io.Writer)
 	// actually costs; qwen35/speculate.go says how, and what a refused draft
 	// has to undo.
 	var draft speculator
-	if sp, ok := s.model.(speculative); ok && sp.Speculate() {
+	if sp, ok := s.model.(speculative); ok && sp.Speculate() && !s.noDraft {
 		if d, err := sp.NewSpeculator(); err == nil {
 			draft = d
 		}
