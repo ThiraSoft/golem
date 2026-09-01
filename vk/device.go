@@ -467,3 +467,23 @@ func (d *Device) run(record func(commandBuffer)) error {
 	}
 	return check("vkQueueWaitIdle", vkQueueWaitIdle(d.queue))
 }
+
+// DeviceLocalBytes is the largest device-local heap the card reports. It is
+// what a caller sizing a working set against the card has to divide, and it is
+// asked rather than assumed: this repository's own card holds sixteen
+// gigabytes, and a constant tuned against that is wrong on a twelve-gigabyte
+// card in one direction and on a twenty-four in the other.
+//
+// It is the heap's size and not what is free in it. Vulkan reports the free
+// figure only through VK_EXT_memory_budget, which is not required and is not
+// asked for here; a caller keeps a margin instead.
+func (d *Device) DeviceLocalBytes() uint64 {
+	var most uint64
+	for i := uint32(0); i < d.memory.memoryHeapCount; i++ {
+		h := d.memory.memoryHeaps[i]
+		if h.flags&memoryDeviceLocal != 0 && h.size > most {
+			most = h.size
+		}
+	}
+	return most
+}

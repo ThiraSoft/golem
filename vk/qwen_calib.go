@@ -83,21 +83,23 @@ func (p *QwenPipeline) StartCalibration() error {
 	// The head's site, which belongs to no block and so is filed under -1 —
 	// the same key cmd/golemquant gives it. What it reads is what the final
 	// norm made, which vk/qwen_pipeline.go writes to stage.
-	head := &calibSite{key: "-1/head", n: s.Dim}
-	if head.acc, err = p.d.Local(s.Dim*4, bufferUsageStorage|bufferUsageTransferSrc|bufferUsageTransferDst); err != nil {
-		c.close()
-		return err
+	if !p.noHead {
+		head := &calibSite{key: "-1/head", n: s.Dim}
+		if head.acc, err = p.d.Local(s.Dim*4, bufferUsageStorage|bufferUsageTransferSrc|bufferUsageTransferDst); err != nil {
+			c.close()
+			return err
+		}
+		if head.back, err = p.d.Readback(s.Dim*4, bufferUsageTransferDst); err != nil {
+			c.close()
+			return err
+		}
+		if head.set, err = c.pipe.NewSet([]*Buffer{p.stage, head.acc}); err != nil {
+			c.close()
+			return err
+		}
+		c.sites = append(c.sites, head)
+		c.byKey[head.key] = head
 	}
-	if head.back, err = p.d.Readback(s.Dim*4, bufferUsageTransferDst); err != nil {
-		c.close()
-		return err
-	}
-	if head.set, err = c.pipe.NewSet([]*Buffer{p.stage, head.acc}); err != nil {
-		c.close()
-		return err
-	}
-	c.sites = append(c.sites, head)
-	c.byKey[head.key] = head
 
 	blocks := min(len(p.isSSM), len(p.ffnBlocks))
 	for i := 0; i < blocks; i++ {
@@ -115,7 +117,7 @@ func (p *QwenPipeline) StartCalibration() error {
 			{"gateup", p.ffnNorm, s.Dim},
 			{"down", p.actBuf, s.FFN},
 		} {
-			cs := &calibSite{key: fmt.Sprintf("%d/%s", i, site.name), n: site.n}
+			cs := &calibSite{key: fmt.Sprintf("%d/%s", p.blockBase+i, site.name), n: site.n}
 			if cs.acc, err = p.d.Local(site.n*4, bufferUsageStorage|bufferUsageTransferSrc|bufferUsageTransferDst); err != nil {
 				c.close()
 				return err
@@ -150,6 +152,9 @@ func (p *QwenPipeline) StartCalibration() error {
 func (p *QwenPipeline) accumulate(r *Recorder, block int, site string, columns int) {
 	if p.calib == nil {
 		return
+	}
+	if block >= 0 {
+		block += p.blockBase
 	}
 	cs := p.calib.byKey[fmt.Sprintf("%d/%s", block, site)]
 	if cs == nil {
@@ -219,4 +224,15 @@ func (c *qwenCalib) close() {
 		c.pipe.Close()
 		c.pipe = nil
 	}
+}
+
+// SetBlockWindow says which block of the model this pipeline's first block is,
+// and whether this window holds the last of them. It has to be called before
+// StartCalibration, which is what reads it.
+//
+// A pipeline that holds the whole trunk needs neither: the base is zero and the
+// head is here.
+func (p *QwenPipeline) SetBlockWindow(base int, last bool) {
+	p.blockBase = base
+	p.noHead = !last
 }

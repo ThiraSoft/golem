@@ -316,6 +316,23 @@ type QwenShape struct {
 	// A code width would not answer it any more: the trellis has no lattice
 	// code, so the question is which format and not how wide.
 	Golem nn.Quant
+
+	// Float says every projection arrives as float32 and is read by
+	// shaders/matvec_f32.comp, which is the same y = W·x the delta net's two
+	// 48-wide projections have always run — only over the whole model.
+	//
+	// This is not an inference form. Nobody would run a model at four bytes a
+	// weight on a card that reads it at half of one. It exists because a
+	// conversion has to calibrate the checkpoint it is converting, and a BF16
+	// checkpoint is exactly what a conversion reads: the alternative was to
+	// measure a quantized twin and hope the salience did not notice, which is
+	// a claim nobody here has measured. A BF16 matrix is widened to float on
+	// the way up — the shift the host already does everywhere else — so no
+	// shader knows this format exists.
+	//
+	// It costs four bytes a weight in device memory, which is why it only ever
+	// makes sense beside a window: see AddBlockWindow.
+	Float bool
 }
 
 func (s QwenShape) qDim() int     { return s.Heads * s.HeadDim }
@@ -399,6 +416,8 @@ type qwenSSMBlock struct {
 	// setOutWide is that projection through the tiled Q5_K product against the
 	// output's Q8_0 form. Nil where the weights are not Q5_K.
 	setOutWide *Set
+	// f32 is qwenFFNBlock's.
+	f32 bool
 	// d4g is the five projections in their .golem form, and nil for a
 	// checkpoint of any other type. Everything above it that is not a
 	// projection — the convolution, the recurrence, the two norms — is the
@@ -416,6 +435,8 @@ type qwenAttnBlock struct {
 	setQ, setK, setV *Set
 	setPrep, setGQA  *Set
 	setO, setOWide   *Set
+	// f32 is qwenFFNBlock's.
+	f32 bool
 	// d4g is the four projections in their .golem form; see qwenSSMBlock.
 	d4g *qwenD4GAttn
 }
@@ -430,6 +451,10 @@ type qwenFFNBlock struct {
 	// reaches. It is nil where the weights are Q4_1, which has no tiled form
 	// here — eight blocks of sixty-five in this checkpoint, the rest Q4_0.
 	setDownWide *Set
+	// f32 says the three projections are float32 and read by pipeMatF32. It is
+	// the shape's Float, kept on the block so that record does not reach for
+	// the shape to answer a question about the matrices in front of it.
+	f32 bool
 	// q41 says which of the two the weights are, because the tiled forms are
 	// dispatched differently: the Q4_1 one answers a fixed tile of columns
 	// where the Q4_0 one is a width-compiled binary.
@@ -481,6 +506,16 @@ type QwenPipeline struct {
 	// each matrix is fed. Nil the rest of the time, and every dispatch it
 	// would have added is nil too.
 	calib *qwenCalib
+	// blockBase is which block of the model this pipeline's first block is.
+	// Zero for a pipeline holding the whole trunk, and the window's first
+	// block when a calibration is streaming the model past the card a window
+	// at a time: the accumulators are filed under the model's numbering, not
+	// the window's, or every window would answer for block zero.
+	blockBase int
+	// noHead drops the head's accumulator. Only the window that holds the last
+	// block sees what the final norm really makes; every earlier one runs that
+	// norm over a state the rest of the model has not finished with.
+	noHead bool
 
 	// The stream, which lives in device memory. xin and stage are its host
 	// ends: one copy in at the head of a pass and one out at the foot, rather
@@ -872,13 +907,24 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 func (p *QwenPipeline) uploadSSMProjections(b *qwenSSMBlock, d QwenSSMData) error {
 	s := p.shape
 	var err error
-	if b.wQKV, err = p.uploadQ4_0(d.WQKV, s.ConvDim, s.Dim); err != nil {
-		return err
+	if s.Float {
+		b.f32 = true
 	}
-	if b.wGate, err = p.uploadQ4_0(d.WGate, s.Inner, s.Dim); err != nil {
+	if b.f32 {
+		if b.wQKV, err = p.upload(d.WQKV); err != nil {
+			return err
+		}
+		if b.wGate, err = p.upload(d.WGate); err != nil {
+			return err
+		}
+	} else if b.wQKV, err = p.uploadQ4_0(d.WQKV, s.ConvDim, s.Dim); err != nil {
+		return err
+	} else if b.wGate, err = p.uploadQ4_0(d.WGate, s.Inner, s.Dim); err != nil {
 		return err
 	}
 	switch {
+	case b.f32:
+		b.wOut, err = p.upload(d.WOut)
 	case d.OutIsQ5K:
 		// splitQ5_K, not the file's own superblocks: both readers of this
 		// matrix — the mat-vec a token runs and the cooperative tile a prompt
@@ -902,11 +948,20 @@ func (p *QwenPipeline) uploadSSMProjections(b *qwenSSMBlock, d QwenSSMData) erro
 			return err
 		}
 	}
-	if b.setQKV, err = p.pipeMatvec.NewSet([]*Buffer{b.wQKV, p.normedQ, p.normedS, p.qkvBuf}); err != nil {
-		return err
-	}
-	if b.setGate, err = p.pipeMatvec.NewSet([]*Buffer{b.wGate, p.normedQ, p.normedS, p.gateZBuf}); err != nil {
-		return err
+	if b.f32 {
+		if b.setQKV, err = p.pipeMatF32.NewSet([]*Buffer{b.wQKV, p.normed, p.qkvBuf}); err != nil {
+			return err
+		}
+		if b.setGate, err = p.pipeMatF32.NewSet([]*Buffer{b.wGate, p.normed, p.gateZBuf}); err != nil {
+			return err
+		}
+	} else {
+		if b.setQKV, err = p.pipeMatvec.NewSet([]*Buffer{b.wQKV, p.normedQ, p.normedS, p.qkvBuf}); err != nil {
+			return err
+		}
+		if b.setGate, err = p.pipeMatvec.NewSet([]*Buffer{b.wGate, p.normedQ, p.normedS, p.gateZBuf}); err != nil {
+			return err
+		}
 	}
 	if b.setAlpha, err = p.pipeMatF32.NewSet([]*Buffer{b.wAlpha, p.normed, p.alphaBuf}); err != nil {
 		return err
@@ -916,7 +971,7 @@ func (p *QwenPipeline) uploadSSMProjections(b *qwenSSMBlock, d QwenSSMData) erro
 	}
 	outPipe := p.pipeMatQ41
 	switch {
-	case d.OutIsF32:
+	case b.f32, d.OutIsF32:
 		outPipe = p.pipeMatF32
 	case d.OutIsQ5K:
 		outPipe = p.pipeMatQ5K
@@ -954,6 +1009,16 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 		if b.d4g, err = p.newD4GAttn(d); err != nil {
 			return nil, err
 		}
+	} else if s.Float {
+		b.f32 = true
+		for _, u := range []struct {
+			into **Buffer
+			data []byte
+		}{{&b.wQ, d.WQ}, {&b.wK, d.WK}, {&b.wV, d.WV}, {&b.wO, d.WO}} {
+			if *u.into, err = p.upload(u.data); err != nil {
+				return nil, err
+			}
+		}
 	} else {
 		for _, u := range []struct {
 			into       **Buffer
@@ -982,7 +1047,16 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 			return nil, err
 		}
 	}
-	if b.d4g == nil {
+	if b.f32 {
+		for _, u := range []struct {
+			into **Set
+			w, y *Buffer
+		}{{&b.setQ, b.wQ, p.qIn}, {&b.setK, b.wK, p.kIn}, {&b.setV, b.wV, p.vIn}} {
+			if *u.into, err = p.pipeMatF32.NewSet([]*Buffer{u.w, p.normed, u.y}); err != nil {
+				return nil, err
+			}
+		}
+	} else if b.d4g == nil {
 		if b.setQ, err = p.pipeMatvec.NewSet([]*Buffer{b.wQ, p.normedQ, p.normedS, p.qIn}); err != nil {
 			return nil, err
 		}
@@ -999,7 +1073,13 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 	if b.setGQA, err = p.pipeAttnGQA.NewSet([]*Buffer{p.qOut, b.kCache, b.vCache, p.qIn, p.attnOut, p.posBuf}); err != nil {
 		return nil, err
 	}
-	if b.d4g == nil {
+	if b.f32 {
+		// The mix arrives in floats and stays there: there is no eight-bit
+		// form of this projection to reach for, so no wide set either.
+		if b.setO, err = p.pipeMatF32.NewSet([]*Buffer{b.wO, p.attnOut, p.mixOut}); err != nil {
+			return nil, err
+		}
+	} else if b.d4g == nil {
 		if b.setO, err = p.pipeMatQ40.NewSet([]*Buffer{b.wO, p.attnOut, p.mixOut}); err != nil {
 			return nil, err
 		}
@@ -1032,6 +1112,33 @@ func (p *QwenPipeline) newFFNBlock(d QwenFFNData) (*qwenFFNBlock, error) {
 	if p.usesD4G() {
 		if b.d4g, err = p.newD4GFFN(d); err != nil {
 			return nil, err
+		}
+		return b, nil
+	}
+	if s.Float {
+		b.f32 = true
+		for _, u := range []struct {
+			into **Buffer
+			data []byte
+		}{{&b.wGate, d.Gate}, {&b.wUp, d.Up}, {&b.wDown, d.Down}} {
+			if *u.into, err = p.upload(u.data); err != nil {
+				return nil, err
+			}
+		}
+		// Against the float form of what feeds each: the norm writes both its
+		// float and its Q8_0 output, and the activation between the gate and
+		// the down projection likewise, so this reads what is already there.
+		for _, u := range []struct {
+			into    **Set
+			w, x, y *Buffer
+		}{
+			{&b.setGate, b.wGate, p.ffnNorm, p.gateBuf},
+			{&b.setUp, b.wUp, p.ffnNorm, p.upBuf},
+			{&b.setDown, b.wDown, p.actBuf, p.ffnOut},
+		} {
+			if *u.into, err = p.pipeMatF32.NewSet([]*Buffer{u.w, u.x, u.y}); err != nil {
+				return nil, err
+			}
 		}
 		return b, nil
 	}
@@ -1695,8 +1802,13 @@ func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt i
 	small := matvecKPush{Dim: uint32(s.Rank), FFN: uint32(s.Dim)}
 	out := matvecKPush{Dim: uint32(s.Dim), FFN: uint32(s.Inner)}
 
-	p.product(r, b.setQKV, s.ConvDim, columns, qkv)
-	p.product(r, b.setGate, s.Inner, columns, gate)
+	if b.f32 {
+		p.productK(r, b.setQKV, s.ConvDim, columns, matvecKPush{Dim: uint32(s.ConvDim), FFN: uint32(s.Dim)})
+		p.productK(r, b.setGate, s.Inner, columns, matvecKPush{Dim: uint32(s.Inner), FFN: uint32(s.Dim)})
+	} else {
+		p.product(r, b.setQKV, s.ConvDim, columns, qkv)
+		p.product(r, b.setGate, s.Inner, columns, gate)
+	}
 	p.productK(r, b.setAlpha, s.Rank, columns, small)
 	p.productK(r, b.setBeta, s.Rank, columns, small)
 	r.Barrier()
@@ -1780,6 +1892,18 @@ func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
 	kv := moePush{dim: uint32(s.kvDim()), ffn: uint32(s.Dim), used: 1}
 	out := matvecKPush{Dim: uint32(s.Dim), FFN: uint32(s.qDim())}
 
+	if b.f32 {
+		p.productK(r, b.setQ, s.qFullDim(), columns, matvecKPush{Dim: uint32(s.qFullDim()), FFN: uint32(s.Dim)})
+		p.productK(r, b.setK, s.kvDim(), columns, matvecKPush{Dim: uint32(s.kvDim()), FFN: uint32(s.Dim)})
+		p.productK(r, b.setV, s.kvDim(), columns, matvecKPush{Dim: uint32(s.kvDim()), FFN: uint32(s.Dim)})
+		r.Barrier()
+		p.tl.Stamp(r, "attn qkv")
+		p.recordAttnMix(r, b, columns)
+		p.accumulate(r, b.index, "o", columns)
+		p.productK(r, b.setO, s.Dim, columns, out)
+		return
+	}
+
 	p.product(r, b.setQ, s.qFullDim(), columns, q)
 	p.product(r, b.setK, s.kvDim(), columns, kv)
 	p.product(r, b.setV, s.kvDim(), columns, kv)
@@ -1849,6 +1973,23 @@ func (p *QwenPipeline) recordFFN(r *Recorder, b *qwenFFNBlock, columns int) {
 	// pass is the same kernel over more of the buffer.
 	act := swigluPush{N: uint32(s.FFN), Columns: uint32(columns)}
 	down := matvecKPush{Dim: uint32(s.Dim), FFN: uint32(s.FFN)}
+
+	if b.f32 {
+		// The float projections have no tiled form: productK is the mat-vec at
+		// whichever compiled width the pass reaches, which is what the K-quant
+		// and Q4_1 projections have always taken.
+		wide := matvecKPush{Dim: uint32(s.FFN), FFN: uint32(s.Dim)}
+		p.productK(r, b.setGate, s.FFN, columns, wide)
+		p.productK(r, b.setUp, s.FFN, columns, wide)
+		r.Barrier()
+		p.tl.Stamp(r, "ffn up")
+		r.Dispatch(p.setAct, uint32((s.FFN/quantBlock*columns+255)/256), unsafe.Pointer(&act))
+		r.Barrier()
+		p.tl.Stamp(r, "ffn act")
+		p.accumulate(r, b.index, "down", columns)
+		p.productK(r, b.setDown, s.Dim, columns, down)
+		return
+	}
 
 	p.product(r, b.setGate, s.FFN, columns, up)
 	p.product(r, b.setUp, s.FFN, columns, up)
@@ -2278,4 +2419,19 @@ func (p *QwenPipeline) recordRestore(r *Recorder) {
 		r.Copy(b.convState, 0, b.shadowConv, b.shadowConv.Size())
 	}
 	r.Barrier()
+}
+
+// DeviceBytes is what this pipeline has allocated on the card so far: its own
+// scratch, plus every block added to it. It is exact rather than estimated,
+// because a window sized against an estimate of the scratch is what took the
+// card down — the buffers a five-hundred-column pass needs are not small, and
+// counting only the weights put the working set past the heap.
+func (p *QwenPipeline) DeviceBytes() uint64 {
+	var n uint64
+	for _, b := range p.owned {
+		if b != nil {
+			n += b.size
+		}
+	}
+	return n
 }
