@@ -319,61 +319,103 @@ func main() {
 		kind, _ := nn.QuantOf(pl.dtype)
 		stride := rowBytes(pl.cols, pl.dtype)
 		perChunk := max(1, expandBudget/(pl.cols*4))
-		var relerr float64
+
+		// The runs this matrix is written in, settled before any of it is
+		// read. A run never straddles two experts: a stack's rows are laid out
+		// expert after expert, and the chunk that crossed the seam would be
+		// the only one whose rows are not a matrix's own.
+		type run struct{ from, to int }
+		var runs []run
 		for e := 0; e < pl.stack; e++ {
 			for at := 0; at < pl.rows; at += perChunk {
 				n := min(perChunk, pl.rows-at)
-				rows, err := expandRows(pl.t, e*pl.rows+at, e*pl.rows+at+n)
+				runs = append(runs, run{e*pl.rows + at, e*pl.rows + at + n})
+			}
+		}
+
+		// One run read ahead of the one being encoded. A conversion alternates
+		// between a pass the card does and a pass only the host can — reading
+		// the checkpoint back as floats — and done in step each waits for the
+		// other. The channel holds one, so the reader stays exactly one run in
+		// front and never more: two runs of floats in flight is the memory
+		// this bound exists to keep.
+		type expanded struct {
+			rows []float32
+			n    int
+			err  error
+		}
+		ahead := make(chan expanded, 1)
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			defer close(ahead)
+			for _, r := range runs {
+				rows, err := expandRows(pl.t, r.from, r.to)
+				select {
+				case ahead <- expanded{rows, r.to - r.from, err}:
+				case <-done:
+					return
+				}
 				if err != nil {
-					return err
-				}
-				if e == 0 && at == 0 {
-					pickSalience(pl.key, rows, n, pl.cols, kind)
-					if pl.key != "" {
-						q = reciprocal(pre[pl.key])
-					}
-				}
-				data := compress.EncodeT4GAs(rows, n, pl.cols, q, pl.params, kind)
-				if e == 0 && at == 0 {
-					// What the codes cost in the basis they were written in.
-					// The theoretical floor for a memoryless Gaussian at this
-					// rate is about seventeen decibels, so this says how much
-					// of the gap is the quantizer's own and how much is
-					// everything else.
-					//
-					// It is measured on every matrix and not only under
-					// -report, because it is also the only thing that notices
-					// a matrix quantized against a vector that is not the one
-					// written beside it. That mistake changes no shape and no
-					// name — the file loads, every tensor is the size it
-					// should be — and it takes this number from 0.15 to 1.4,
-					// which is a matrix with nothing left of the one it stands
-					// for. Twice now: a hybrid's linear-attention projections,
-					// and the token table of a model whose engine taps no head
-					// site.
-					//
-					// It is measured against the vector the FILE holds, not
-					// the one the encoder happened to hold, and that is the
-					// whole of its value. A guard that asks the encoder to
-					// check its own arithmetic cannot see the mistake this
-					// format keeps making, which is a matrix quantized against
-					// one vector and read back through another: both halves
-					// agree with themselves and disagree with each other.
-					//
-					// A sample of rows, because the whole of a 248320-row
-					// table would cost more than the encoding did, and the
-					// error is the same in every row.
-					sample := min(n, 64)
-					relerr = compress.RelErr(rows[:sample*pl.cols], sample, pl.cols, q, pl.params, data[:sample*stride], kind)
-					if relerr > relErrCeiling {
-						return fmt.Errorf("golemquant: %s came back at %.4f of its own size, so it was not quantized against the vector written beside it",
-							pl.name, relerr)
-					}
-				}
-				if _, err := w.Write(data); err != nil {
-					return err
+					return
 				}
 			}
+		}()
+
+		var relerr float64
+		first := true
+		for ex := range ahead {
+			if ex.err != nil {
+				return ex.err
+			}
+			rows, n := ex.rows, ex.n
+			if first {
+				pickSalience(pl.key, rows, n, pl.cols, kind)
+				if pl.key != "" {
+					q = reciprocal(pre[pl.key])
+				}
+			}
+			data := compress.EncodeT4GAs(rows, n, pl.cols, q, pl.params, kind)
+			if first {
+				// What the codes cost in the basis they were written in.
+				// The theoretical floor for a memoryless Gaussian at this
+				// rate is about seventeen decibels, so this says how much
+				// of the gap is the quantizer's own and how much is
+				// everything else.
+				//
+				// It is measured on every matrix and not only under
+				// -report, because it is also the only thing that notices
+				// a matrix quantized against a vector that is not the one
+				// written beside it. That mistake changes no shape and no
+				// name — the file loads, every tensor is the size it
+				// should be — and it takes this number from 0.15 to 1.4,
+				// which is a matrix with nothing left of the one it stands
+				// for. Twice now: a hybrid's linear-attention projections,
+				// and the token table of a model whose engine taps no head
+				// site.
+				//
+				// It is measured against the vector the FILE holds, not
+				// the one the encoder happened to hold, and that is the
+				// whole of its value. A guard that asks the encoder to
+				// check its own arithmetic cannot see the mistake this
+				// format keeps making, which is a matrix quantized against
+				// one vector and read back through another: both halves
+				// agree with themselves and disagree with each other.
+				//
+				// A sample of rows, because the whole of a 248320-row
+				// table would cost more than the encoding did, and the
+				// error is the same in every row.
+				sample := min(n, 64)
+				relerr = compress.RelErr(rows[:sample*pl.cols], sample, pl.cols, q, pl.params, data[:sample*stride], kind)
+				if relerr > relErrCeiling {
+					return fmt.Errorf("golemquant: %s came back at %.4f of its own size, so it was not quantized against the vector written beside it",
+						pl.name, relerr)
+				}
+			}
+			if _, err := w.Write(data); err != nil {
+				return err
+			}
+			first = false
 		}
 		note := ""
 		if *report {
@@ -1007,7 +1049,19 @@ func encodable(t tensors.Tensor, block int) bool {
 // machine's: 248320 rows of 5120 is five gigabytes expanded, and a converter
 // that asks for that beside the checkpoint it is reading is a converter the
 // kernel stops.
-const expandBudget = 64 << 20
+//
+// It was 64 MiB, which is sixteen million weights — the same number the card's
+// encoder is built for, so that one chunk was one pass. That pairing is not
+// needed: vk.TrellisEncoder.QuantizePath already walks a longer run at its own
+// capacity, so the host chunk only has to be a size the host can hold. Bigger
+// is better here because everything a chunk costs beyond the encoding — the
+// expansion, the two reductions, the packing — is paid once per chunk with a
+// parallel section's ramp on either side of it.
+//
+// What one chunk actually costs at this size: the floats themselves, then
+// prep, norm and the states inside EncodeT4GAs, then the codes. About a
+// gigabyte, and one more chunk of floats in flight for the prefetch below.
+const expandBudget = 256 << 20
 
 // expandRows reads a run of a tensor's rows back as floats, whatever the
 // tensor is stored as. from and to count rows of the whole tensor, a stack of
@@ -1018,19 +1072,29 @@ func expandRows(t tensors.Tensor, from, to int) ([]float32, error) {
 	switch t.DType {
 	case "F32":
 		out := make([]float32, n*cols)
-		for i := range out {
-			out[i] = math.Float32frombits(binary.LittleEndian.Uint32(t.Raw[(from*cols+i)*4:]))
-		}
+		compress.Parallel(n, func(lo, hi int) {
+			for i := lo * cols; i < hi*cols; i++ {
+				out[i] = math.Float32frombits(binary.LittleEndian.Uint32(t.Raw[(from*cols+i)*4:]))
+			}
+		})
 		return out, nil
 	case "BF16":
 		// A brain float is the top half of a float, so widening is a shift.
 		// Done here rather than through Tensor.F32 because that expands the
 		// whole tensor, which for a vocabulary table is the five gigabytes
 		// this function exists to avoid.
+		//
+		// Split across the cores like the quantized branch below, and for the
+		// same reason: this reads a mmapped checkpoint, so it is a shift and a
+		// page fault a weight, and a chunk is sixteen million of them. Left on
+		// one core it was the whole of a conversion's wall clock — the card sat
+		// idle between passes while a single thread widened the next one.
 		out := make([]float32, n*cols)
-		for i := range out {
-			out[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(t.Raw[(from*cols+i)*2:])) << 16)
-		}
+		compress.Parallel(n, func(lo, hi int) {
+			for i := lo * cols; i < hi*cols; i++ {
+				out[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(t.Raw[(from*cols+i)*2:])) << 16)
+			}
+		})
 		return out, nil
 	}
 	q, ok := nn.QuantOf(t.DType)
