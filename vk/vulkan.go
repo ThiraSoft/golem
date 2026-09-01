@@ -277,12 +277,19 @@ type memoryHeap struct {
 }
 
 // physicalDeviceMemoryProperties: typeCount 0, types 4..260, heapCount 260,
-// heaps 264 (the array of uint64-aligned heaps forces four bytes of padding).
+// heaps 264. No padding before the heaps: 264 is already a multiple of eight,
+// so the uint64 the heap starts with is aligned where it lies.
+//
+// There was a filler here, on the reasoning that the alignment had to be
+// forced. It pushed the array to 272 and every heap was read eight bytes past
+// itself: sizes of zero and flags of 0xfb000000. Nothing noticed, because the
+// only reader of this structure was memoryTypeFor, and the types sit before the
+// heaps. It surfaced the first time anything asked the card how large it is —
+// which answered zero, and sized a working set to one block.
 type physicalDeviceMemoryProperties struct {
 	memoryTypeCount uint32
 	memoryTypes     [32]memoryType
 	memoryHeapCount uint32
-	_               uint32
 	memoryHeaps     [16]memoryHeap
 }
 
