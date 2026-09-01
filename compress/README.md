@@ -279,6 +279,56 @@ Qwen3-0.6B, same corpora, calibrated on 2048 tokens: 34.8552 against bf16's
 fallback on the 4B — which is what a shader landing the new codebook should
 show; a large processor figure would mean the kernel was never reached.
 
+### Qwen3.8-27B, the model this format is for
+
+The tables above are Qwen3-4B and Qwen3-0.6B, because until 2026-09-01 the 27B
+had no reference: its bf16 is 51 GiB, no kernel here reads a bf16, and the
+processor's forward steps one token at a time, so every token reads every
+weight — twenty-three minutes for twenty-four positions and about thirty hours
+for these eight windows. There was no divergence to publish, so there was no
+row.
+
+`vqdiff -stream` carries a checkpoint past the card a window of blocks at a
+time instead of holding it, which puts the same reference at **nine minutes**.
+The two agree: the streamed and resident readings of `t3g` over the same window
+are 11.0273 and 11.0272.
+
+Same corpus, same tokenizer, the same eight windows of 512 as every table above,
+all five rows read by `cmd/vqdiff` with golem's own dequantizers:
+
+| | size | PPL | KL | top-1 | top-5 |
+|---|---|---|---|---|---|
+| bf16 | 51.0 GiB | 9.4368 | — | — | — |
+| Q4_K_M | 15.65 GiB | 9.3488 | 0.0291 | **92.6 %** | 99.9 % |
+| `.golem` T4G | **13.34 GiB** | 9.4653 | **0.0247** | 92.5 % | **100.0 %** |
+| Q3_K_M | 12.57 GiB | 10.0637 | 0.0900 | 86.1 % | 99.3 % |
+| `.golem` T3G | **10.63 GiB** | **9.9495** | **0.0723** | **87.5 %** | 99.3 % |
+
+**T4G is 14.8 % smaller than Q4_K_M and 15.1 % closer to bf16**, with the same
+top-1 to a tenth of a point and a top-5 that misses nothing in 4088 positions.
+**T3G is 15.4 % smaller than Q3_K_M and 19.7 % closer**, and here it also wins
+the perplexity outright — 9.9495 against 10.0637 — which it did not do at four
+bits. That is the same three-bit cliff the 4B table describes, on a model seven
+times the size: the K-quants fall off it and the trellis does not.
+
+**Q4_K_M reads below bf16 at 9.3488, and this is exactly why perplexity is never
+published here on its own.** A compressed file cannot know more than what it was
+made from; a lower perplexity on held-out text means the rounding happened to
+help on this corpus, not that the model is better. The divergence says the thing
+perplexity cannot: Q4_K_M is 0.0291 nats from the original where T4G is 0.0247,
+in a file 2.3 GiB larger.
+
+The salience for both `.golem` rows was measured **on the bf16 being converted**,
+which the 4B and 0.6B rows were not — those read a quantized build of the same
+model through `-calib-model`, on the argument that what a site is fed does not
+depend on which four-bit form fed it. That argument was never measured. It no
+longer has to be: the same streaming carries the bf16 past the card for a
+calibration, three minutes and forty-two seconds for 257 sites.
+
+Both conversions ran on the card end to end — **27318 of 27321 M weights**, the
+remaining three million being the shapes no kernel is compiled for — in 34m25
+for T4G and 32m46 for T3G.
+
 ### Tail-biting: built, measured, and not taken
 
 The seven padding bits and the twelve priming bits are what a **tail-biting**
