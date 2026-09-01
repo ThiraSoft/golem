@@ -195,3 +195,62 @@ func TestStreamedCalibrationMatchesResident(t *testing.T) {
 		t.Fatalf("site %q differs by %.4f between the streamed float path and the resident Q4_0 one", at, worst)
 	}
 }
+
+// The BF16 checkpoint, which is the one a conversion reads and the one no
+// kernel on the card can hold whole. It is the only checkpoint that exercises
+// what the streamed path is for.
+const qwen38BF16 = "/mnt/data/LLMs_models/unsloth/Qwen3.8-27B-GGUF/BF16/Qwen3.8-27B-BF16-merged.gguf"
+
+// TestForwardStreamedMatchesCPU holds the streamed path to the processor on the
+// same checkpoint. Both compute in floats over the same BF16 weights —
+// nn/matrix.go's BF16 branch reads the float activation, not its Q8_0 form —
+// so there is no approximation on either side to explain a difference away
+// with. What is left is the order the sums are taken in, and that is small.
+//
+// This is what a reference has to pass before anything is measured against it.
+// A logit dump is the number every divergence in compress/README.md is taken
+// from, and a wrong one looks exactly like a right one.
+func TestForwardStreamedMatchesCPU(t *testing.T) {
+	if testing.Short() {
+		t.Skip("streams a fifty-four gigabyte checkpoint")
+	}
+	m, err := Open(qwen38BF16, 256)
+	if err != nil {
+		t.Skipf("open: %v", err)
+	}
+	defer m.Close()
+	if !m.FloatWeights() {
+		t.Fatalf("%s is not a float checkpoint", qwen38BF16)
+	}
+
+	// Short, because the processor is what costs here: it reads the whole
+	// checkpoint for every window of positions.
+	ids := calibTokens(24)
+	t0 := time.Now()
+	got, err := m.ForwardStreamed([][]int32{ids}, 0, 256)
+	if err != nil {
+		t.Fatalf("streamed: %v", err)
+	}
+	fmt.Printf("streamed %d positions in %v\n", len(ids), time.Since(t0).Round(time.Millisecond))
+
+	c, err := Open(qwen38BF16, 256)
+	if err != nil {
+		t.Skipf("open: %v", err)
+	}
+	defer c.Close()
+	t0 = time.Now()
+	c.Reset()
+	want := c.ForwardBatch(ids, 0)
+	fmt.Printf("processor %d positions in %v\n", len(ids), time.Since(t0).Round(time.Millisecond))
+
+	worst, at := 0.0, -1
+	for i := range ids {
+		if d := rel(got[0][i], want[i]); d > worst {
+			worst, at = d, i
+		}
+	}
+	fmt.Printf("worst position %d at %.3e\n", at, worst)
+	if worst > 5e-3 {
+		t.Fatalf("position %d differs by %.3e between the streamed path and the processor", at, worst)
+	}
+}

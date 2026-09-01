@@ -340,3 +340,82 @@ func (m *Model) StreamBlockBytes() int {
 	}
 	return n * 4
 }
+
+// ForwardStreamed runs every position of every run through the model a window
+// of blocks at a time and answers what the head reads: the state after the
+// output norm, one row a position, in the order they were given.
+//
+// It is CalibrateStreamed without the accumulators and with the last window's
+// answer kept instead of thrown away. Both exist because the same mechanism
+// serves two questions — what the matrices are fed, and what the model says —
+// and only the second needs the states to come back.
+//
+// The head is not here. It is one matrix and the host already owns it: Logits
+// reads the same state a resident stack hands back, so a caller writes the same
+// line whichever path produced it.
+func (m *Model) ForwardStreamed(runs [][]int32, window, ctx int) ([][][]float32, error) {
+	trunk := m.trunk()
+	if trunk == 0 {
+		return nil, fmt.Errorf("qwen35: the model has no blocks to stream")
+	}
+	for _, ids := range runs {
+		if len(ids) > ctx {
+			return nil, fmt.Errorf("qwen35: a run of %d positions past the %d these windows are built for", len(ids), ctx)
+		}
+	}
+
+	dim := m.Cfg.Dim
+	xs := make([][][]float32, len(runs))
+	out := make([][][]float32, len(runs))
+	for r, ids := range runs {
+		xs[r] = make([][]float32, len(ids))
+		out[r] = make([][]float32, len(ids))
+		for i, id := range ids {
+			xs[r][i] = make([]float32, dim)
+			m.W.TokenEmbd.Row(int(id), xs[r][i])
+		}
+	}
+
+	for from := 0; from < trunk; {
+		pipe, to, err := m.buildWindow(from, ctx, window)
+		if err != nil {
+			return nil, err
+		}
+		last := to == trunk
+		for r, run := range xs {
+			if err := pipe.ResetState(); err != nil {
+				pipe.Close()
+				return nil, err
+			}
+			for t := 0; t < len(run); {
+				n := pipe.WidthFor(len(run) - t)
+				at := make([]vk.QwenPlace, n)
+				for c := 0; c < n; c++ {
+					p := t + c
+					at[c] = vk.QwenPlace{Pos: p, T: p, H: p, W: p}
+				}
+				hs, err := pipe.ForwardPlaces(run[t:t+n], at)
+				if err != nil {
+					pipe.Close()
+					return nil, fmt.Errorf("qwen35: window %d-%d at position %d: %w", from, to, t, err)
+				}
+				for c := 0; c < n; c++ {
+					if last {
+						// What the head reads, which is the only thing the last
+						// window is asked for.
+						out[r][t+c] = append([]float32(nil), hs[c]...)
+					} else {
+						// What the next window reads: the state before the
+						// output norm, because that norm belongs to the end of
+						// the model and this is the middle of it.
+						copy(run[t+c], pipe.HiddenColumn(c))
+					}
+				}
+				t += n
+			}
+		}
+		pipe.Close()
+		from = to
+	}
+	return out, nil
+}
