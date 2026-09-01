@@ -185,7 +185,7 @@ func (m *Model) buildWindow(from, ctx, want int) (*vk.QwenPipeline, int, error) 
 				WAlpha:     floatOf(bw.SSMAlpha),
 				WBeta:      floatOf(bw.SSMBeta),
 				WOut:       floatOf(bw.SSMOut),
-				OutIsF32:   true,
+				Out:        nn.F32,
 				ConvWeight: bw.Conv1D,
 				SSMA:       bw.SSMA,
 				SSMDtBias:  bw.SSMDtBias,

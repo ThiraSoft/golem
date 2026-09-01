@@ -357,13 +357,22 @@ type QwenSSMData struct {
 	PreQKV []float32
 	PreO   []float32
 
-	WQKV     []byte
-	WGate    []byte
-	WAlpha   []byte
-	WBeta    []byte
-	WOut     []byte
-	OutIsQ5K bool
-	OutIsF32 bool
+	WQKV   []byte
+	WGate  []byte
+	WAlpha []byte
+	WBeta  []byte
+	WOut   []byte
+	// Out is what WOut is stored as. It is a type and not a pair of booleans
+	// because the pair had a default, and the default was wrong: a Q4_K_M
+	// checkpoint keeps this projection in Q4_0, matched neither flag, and was
+	// read as the Q4_1 the default assumed — 20 bytes a block against 18. It
+	// happened to run off the end of the tensor and panic. Had the shapes
+	// allowed it, the projection would have decoded as noise with nothing to
+	// say so.
+	//
+	// A form this pipeline has no kernel for is an error naming it, never a
+	// guess.
+	Out nn.Quant
 
 	ConvWeight []float32
 	SSMA       []float32
@@ -389,10 +398,18 @@ type QwenFFNData struct {
 	PreGateUp []float32
 	PreDown   []float32
 
-	Gate     []byte
-	Up       []byte
-	Down     []byte
-	DownQ4_1 bool
+	Gate []byte
+	Up   []byte
+	Down []byte
+	// GateUp and DownQ are what those matrices are stored as. Types and not
+	// booleans, for the reason QwenSSMData.Out gives: a boolean has a default,
+	// and a default is a guess about somebody else's file. The gate and the up
+	// were uploaded as Q4_0 whatever they were, so a Q3_K_M checkpoint — whose
+	// blocks are 13.75 bytes to Q4_0's 18 — ran off the end of the tensor and
+	// panicked with a slice bound. That is the failure that looks like a bug in
+	// the reader rather than a form it does not support.
+	GateUp nn.Quant
+	DownQ  nn.Quant
 }
 
 type qwenSSMBlock struct {
@@ -925,15 +942,19 @@ func (p *QwenPipeline) uploadSSMProjections(b *qwenSSMBlock, d QwenSSMData) erro
 	switch {
 	case b.f32:
 		b.wOut, err = p.upload(d.WOut)
-	case d.OutIsQ5K:
+	case d.Out == nn.Q5_K:
 		// splitQ5_K, not the file's own superblocks: both readers of this
 		// matrix — the mat-vec a token runs and the cooperative tile a prompt
 		// runs — want a block of thirty-two that stands alone.
 		b.wOut, err = p.upload(splitQ5_K(d.WOut, s.Dim, s.Inner))
-	case d.OutIsF32:
+	case d.Out == nn.F32:
 		b.wOut, err = p.upload(d.WOut)
-	default:
+	case d.Out == nn.Q4_1:
 		b.wOut, err = p.uploadQ4_1(d.WOut, s.Dim, s.Inner)
+	case d.Out == nn.Q4_0:
+		b.wOut, err = p.uploadQ4_0(d.WOut, s.Dim, s.Inner)
+	default:
+		return fmt.Errorf("vk: the delta net's output projection is %s, which this pipeline has no kernel for", d.Out)
 	}
 	if err != nil {
 		return err
@@ -971,15 +992,19 @@ func (p *QwenPipeline) uploadSSMProjections(b *qwenSSMBlock, d QwenSSMData) erro
 	}
 	outPipe := p.pipeMatQ41
 	switch {
-	case b.f32, d.OutIsF32:
+	case b.f32, d.Out == nn.F32:
 		outPipe = p.pipeMatF32
-	case d.OutIsQ5K:
+	case d.Out == nn.Q5_K:
 		outPipe = p.pipeMatQ5K
+	case d.Out == nn.Q4_0:
+		// Q4_0 against floats, which is what the feed forward's down
+		// projection takes in the same case.
+		outPipe = p.pipeMatQ40
 	}
 	// The tiled form of it, which only a Q5_K block has and only a wide pass
 	// reaches. It reads the delta net's output in eight bits where the mat-vec
 	// reads it in floats, so a token draws exactly as it did.
-	if d.OutIsQ5K && p.coop {
+	if d.Out == nn.Q5_K && p.coop {
 		if b.setOutWide, err = p.pipeMatT5K.NewSet([]*Buffer{b.wOut, p.ySSMQ, p.ySSMS, p.mixOut}); err != nil {
 			return err
 		}
@@ -1142,16 +1167,22 @@ func (p *QwenPipeline) newFFNBlock(d QwenFFNData) (*qwenFFNBlock, error) {
 		}
 		return b, nil
 	}
+	if d.GateUp != nn.Q4_0 {
+		return nil, fmt.Errorf("vk: the feed forward's gate and up are %s, which this pipeline reads only as Q4_0", d.GateUp)
+	}
 	if b.wGate, err = p.uploadQ4_0(d.Gate, s.FFN, s.Dim); err != nil {
 		return nil, err
 	}
 	if b.wUp, err = p.uploadQ4_0(d.Up, s.FFN, s.Dim); err != nil {
 		return nil, err
 	}
-	if d.DownQ4_1 {
+	switch d.DownQ {
+	case nn.Q4_1:
 		b.wDown, err = p.uploadQ4_1(d.Down, s.Dim, s.FFN)
-	} else {
+	case nn.Q4_0:
 		b.wDown, err = p.uploadQ4_0(d.Down, s.Dim, s.FFN)
+	default:
+		return nil, fmt.Errorf("vk: the feed forward's down projection is %s, which this pipeline has no kernel for", d.DownQ)
 	}
 	if err != nil {
 		return nil, err
@@ -1164,15 +1195,15 @@ func (p *QwenPipeline) newFFNBlock(d QwenFFNData) (*qwenFFNBlock, error) {
 		return nil, err
 	}
 	down := p.pipeMatQ40
-	if d.DownQ4_1 {
+	if d.DownQ == nn.Q4_1 {
 		down = p.pipeMatQ41
 	}
 	if b.setDown, err = down.NewSet([]*Buffer{b.wDown, p.actBuf, p.ffnOut}); err != nil {
 		return nil, err
 	}
-	b.q41 = d.DownQ4_1
+	b.q41 = d.DownQ == nn.Q4_1
 	wide := p.pipeMatvec // Q4_0 against the Q8_0 activation
-	if d.DownQ4_1 {
+	if d.DownQ == nn.Q4_1 {
 		wide = p.pipeMatT41
 	}
 	if b.setDownWide, err = wide.NewSet([]*Buffer{b.wDown, p.actQ, p.actS, p.ffnOut}); err != nil {
