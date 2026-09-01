@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/engine"
+	"github.com/ThiraSoft/golem/qwen35"
 )
 
 // debugBatches says what went into each pass, for measuring how well the
@@ -74,6 +75,28 @@ type pass struct {
 	ple    []int32
 	until  []int
 	axes   [][3]int
+	// state, when it is not nil, receives a copy of the hidden state the pass
+	// ended on. Only a conversation about to draft asks for it: that state is
+	// the prediction block's second input, and nothing else in the server has
+	// ever needed one.
+	state *[]float32
+}
+
+// speculator draws the token after the one just decided, and the one after
+// that when the checkpoint's prediction block guessed it right — two tokens out
+// of one reading of the weights. qwen35.Speculator is the only implementation;
+// the tests have their own.
+type speculator interface {
+	Step(token int32, hidden []float32, pos int, pick func([]float32) int32) ([]int32, []float32, error)
+}
+
+// drafter is the part of an engine that can build one. Nothing outside qwen35
+// implements it, and a model that does not draws a token at a time — which is
+// not a failure and is not reported as one.
+type drafter interface {
+	Speculate() bool
+	NewSpeculator() (*qwen35.Speculator, error)
+	ResetMTP()
 }
 
 // aside is anything else the model has to do, which cannot overlap a pass:
@@ -101,6 +124,19 @@ type Runner struct {
 	span time.Duration
 	// width is how wide a pass may be; zero means the processor's.
 	width int
+
+	// draft is the checkpoint's prediction block, or nil. It runs as an aside
+	// rather than as a pass: it is two columns of one conversation, and it
+	// cannot share a read of the weights with anybody.
+	//
+	// There is one of it because there is one prediction block on the card,
+	// with one key-value cache of its own. Two conversations drafting in turn
+	// would each read the other's keys — harmless, a bad guess is thrown away,
+	// but a bad guess is also the thing this exists to avoid — so the cache is
+	// forgotten whenever the conversation drafting changes.
+	draft      speculator
+	draftReset func()
+	draftSlot  int
 }
 
 // PassWidth is how many positions go through the model in one pass, which is
@@ -128,10 +164,43 @@ func (r *Runner) SetVision(v engine.Media) { r.vision = v }
 
 func NewRunner(e Engine) *Runner {
 	return &Runner{
-		engine: e,
-		passes: make(chan *pass),
-		asides: make(chan *aside),
+		engine:    e,
+		passes:    make(chan *pass),
+		asides:    make(chan *aside),
+		draftSlot: -1,
 	}
+}
+
+// UseDrafter gives the runner the checkpoint's prediction block, and the way to
+// forget its cache. main.go calls it once, when the model carries one and its
+// blocks are on a card; without it the runner draws a token at a time.
+func (r *Runner) UseDrafter(s speculator, reset func()) {
+	r.draft, r.draftReset = s, reset
+}
+
+// CanDraft reports whether the next token should be drafted.
+//
+// Only for a conversation drawing alone. With two in flight the pass that
+// carries both is the better bargain by far: drafting turns one read of the
+// weights into two, and batching turns two into one.
+func (r *Runner) CanDraft() bool { return r.draft != nil && r.inFlight() <= 1 }
+
+// Draft advances one conversation by the token just decided and, when the
+// prediction block guessed right, by the one after it. It returns the tokens
+// decided after `token` and the state of the last of them.
+func (r *Runner) Draft(slot int, token int32, hidden []float32, pos int,
+	pick func([]float32) int32) (ids []int32, state []float32, err error) {
+	r.do(func() {
+		r.engine.UseSlot(slot)
+		if r.draftSlot != slot {
+			if r.draftReset != nil {
+				r.draftReset()
+			}
+			r.draftSlot = slot
+		}
+		ids, state, err = r.draft.Step(token, hidden, pos, pick)
+	})
+	return ids, state, err
 }
 
 // Enter and Leave bracket a conversation, so that the runner knows how many
@@ -165,8 +234,14 @@ func (r *Runner) window() time.Duration {
 // last of them into logits. A nil logits is a chunk in the middle of a prompt,
 // which nobody reads the scores of.
 func (r *Runner) Forward(slot int, tokens []int32, positions []int, logits []float32) {
+	r.ForwardState(slot, tokens, positions, logits, nil)
+}
+
+// ForwardState is Forward that also keeps the hidden state the pass ended on,
+// which is what a conversation about to draft needs and no other has a use for.
+func (r *Runner) ForwardState(slot int, tokens []int32, positions []int, logits []float32, state *[]float32) {
 	p := &pass{slot: slot, tokens: tokens, positions: positions, logits: logits,
-		reply: make(chan struct{})}
+		state: state, reply: make(chan struct{})}
 	r.passes <- p
 	<-p.reply
 }
@@ -308,6 +383,11 @@ func (r *Runner) run(batch []*pass) {
 	end := 0
 	for _, p := range batch {
 		end += len(p.tokens)
+		if p.state != nil {
+			// A copy: the engine owns what it handed back, and the next pass
+			// is free to write over it before this conversation drafts.
+			*p.state = append((*p.state)[:0], states[end-1]...)
+		}
 		if p.logits != nil {
 			last = append(last, states[end-1])
 			outs = append(outs, p.logits)

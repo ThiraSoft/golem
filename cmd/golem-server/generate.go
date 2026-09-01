@@ -68,7 +68,10 @@ func (g *Generator) Generate(ctx context.Context, ids []int32, p sample.Params, 
 // GeneratePrompt is the same for a prompt that may hold pictures.
 func (g *Generator) GeneratePrompt(ctx context.Context, prompt engine.Prompt, p sample.Params, stop []string, emit func(string) error) (Answer, error) {
 	start := time.Now()
-	fed, err := g.ctx.PrefillPrompt(prompt, g.logits)
+	// The state the prompt ended on, which is the prediction block's second
+	// input. A conversation that cannot draft never reads it.
+	var state []float32
+	fed, err := g.ctx.PrefillPromptState(prompt, g.logits, &state)
 	if err != nil {
 		return Answer{}, err
 	}
@@ -80,38 +83,95 @@ func (g *Generator) GeneratePrompt(ctx context.Context, prompt engine.Prompt, p 
 	sent := 0                 // how much of it has left through emit
 	inCall := false
 
-	for answer.Generated < g.maxTokens && !g.ctx.Full() {
-		if err := ctx.Err(); err != nil {
-			return answer, err
-		}
-		id := sampler.Pick(g.logits)
+	// take puts one drawn token into the answer and says whether the answer
+	// ends there. A stop string is the one ending that decides what the answer
+	// holds, so it comes back with the text rather than as a flag.
+	stopped := false
+	var cut *string
+	take := func(id int32) error {
 		answer.Generated++
 		if g.vocab.IsEOG(id) {
-			break
+			stopped = true
+			return nil
 		}
 		piece := g.vocab.Piece(id, false)
-
-		if cut, hit := cutAtStop(drawn.String()+piece, stop); hit {
-			answer.Decode = time.Since(start)
-			return g.finish(answer, cut)
+		if text, hit := cutAtStop(drawn.String()+piece, stop); hit {
+			stopped, cut = true, &text
+			return nil
 		}
 		drawn.WriteString(piece)
 
 		// Prose goes out up to the first call; from there on the output is
 		// held, and what it holds leaves as a call rather than as text.
-		if !inCall {
-			text := drawn.String()[sent:]
-			if at := strings.Index(text, g.tpl.CallOpen()); at >= 0 {
-				text, inCall = text[:at], true
+		if inCall {
+			return nil
+		}
+		text := drawn.String()[sent:]
+		if at := strings.Index(text, g.tpl.CallOpen()); at >= 0 {
+			text, inCall = text[:at], true
+		}
+		if text != "" && emit != nil {
+			if err := emit(text); err != nil {
+				return err
 			}
-			if text != "" && emit != nil {
-				if err := emit(text); err != nil {
+		}
+		sent += len(text)
+		return nil
+	}
+
+	// pending is a token a speculative step already drew from the model's own
+	// distribution. Drawing it again would be a second reading of the head,
+	// which is the largest matrix in the model.
+	pending := int32(-1)
+
+	for answer.Generated < g.maxTokens && !g.ctx.Full() {
+		if err := ctx.Err(); err != nil {
+			return answer, err
+		}
+		id := pending
+		if id < 0 {
+			id = sampler.Pick(g.logits)
+		}
+		pending = -1
+		if err := take(id); err != nil {
+			return answer, err
+		}
+		if stopped {
+			break
+		}
+
+		// Two tokens out of one reading of the weights, when the checkpoint
+		// carries a prediction block and no other conversation is waiting for
+		// a pass — a pass carrying two of them is the better bargain, and
+		// Runner.CanDraft is what weighs the two.
+		if g.ctx.CanDraft(state) && answer.Generated+1 < g.maxTokens && g.ctx.Room(2) {
+			next, err := g.ctx.Draft(id, &state, sampler.Pick)
+			if err != nil {
+				return answer, err
+			}
+			// The last of what came back is the token after everything the
+			// model has read, which is this loop's next id. Everything before
+			// it is decided and is already in the cache.
+			for _, tok := range next[:len(next)-1] {
+				if err := take(tok); err != nil {
 					return answer, err
 				}
+				if stopped {
+					break
+				}
 			}
-			sent += len(text)
+			if stopped {
+				break
+			}
+			pending = next[len(next)-1]
+			continue
 		}
-		g.ctx.Advance(id, g.logits)
+
+		g.ctx.AdvanceState(id, g.logits, &state)
+	}
+	if cut != nil {
+		answer.Decode = time.Since(start)
+		return g.finish(answer, *cut)
 	}
 	if answer.Generated >= g.maxTokens {
 		answer.Reason = "length"

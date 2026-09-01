@@ -87,6 +87,13 @@ func (c *Context) Prefill(ids []int32, logits []float32) (int, error) {
 // PrefillPrompt is the same for a prompt that may hold pictures: the rows go
 // in where the soft tokens are, and a batch is never cut inside one.
 func (c *Context) PrefillPrompt(p engine.Prompt, logits []float32) (int, error) {
+	return c.PrefillPromptState(p, logits, nil)
+}
+
+// PrefillPromptState is PrefillPrompt that also keeps the hidden state of the
+// last position. A conversation that is about to draft needs it: the prediction
+// block reads the state of the token before the one it drafts from.
+func (c *Context) PrefillPromptState(p engine.Prompt, logits []float32, state *[]float32) (int, error) {
 	ids := p.Tokens()
 	if len(ids) == 0 {
 		return 0, fmt.Errorf("serve: an empty prompt")
@@ -123,16 +130,23 @@ func (c *Context) PrefillPrompt(p engine.Prompt, logits []float32) (int, error) 
 		// Only the chunk that ends the prompt is scored: the ones before it
 		// are read for their keys and values alone.
 		var out []float32
+		var keep *[]float32
 		if to == len(ids) {
-			out = logits
+			out, keep = logits, state
 		}
 		if p.Embeds() == nil {
-			c.runner.Forward(c.slot, ids[at:to], span(at, to-at), out)
+			c.runner.ForwardState(c.slot, ids[at:to], span(at, to-at), out, keep)
 		} else {
 			chunk := p.Slice(at, to)
 			ple, until, axes := chunk.Extras(at)
 			c.runner.ForwardEmbedded(c.slot, chunk.Tokens(), chunk.Embeds(), ple,
 				span(at, to-at), until, axes, out)
+			if keep != nil {
+				// A prompt carrying a picture goes through the vision path,
+				// which does not keep states. Such a conversation draws a
+				// token at a time until its next plain pass.
+				*keep = (*keep)[:0]
+			}
 		}
 		at = to
 	}
@@ -143,9 +157,40 @@ func (c *Context) PrefillPrompt(p engine.Prompt, logits []float32) (int, error) 
 
 // Advance feeds one drawn token and scores what it produced.
 func (c *Context) Advance(id int32, logits []float32) {
-	c.runner.Forward(c.slot, []int32{id}, span(len(c.held), 1), logits)
+	c.AdvanceState(id, logits, nil)
+}
+
+// AdvanceState is Advance that also keeps the hidden state the token produced.
+func (c *Context) AdvanceState(id int32, logits []float32, state *[]float32) {
+	c.runner.ForwardState(c.slot, []int32{id}, span(len(c.held), 1), logits, state)
 	c.held = append(c.held, id)
 	c.last = c.now()
+}
+
+// CanDraft reports whether this conversation should draft its next token: the
+// model has to carry a prediction block, the runner has to be otherwise idle,
+// and there has to be a state to draft from — a prompt that ended in a picture
+// leaves none.
+func (c *Context) CanDraft(state []float32) bool {
+	return len(state) > 0 && c.runner.CanDraft()
+}
+
+// Draft feeds the token just drawn and draws whatever the prediction block got
+// right after it, in one reading of the weights.
+//
+// It returns the tokens decided after id. The last of them has been drawn but
+// not fed — it is the caller's next id — and everything before it is in the
+// cache. state is replaced by the hidden state of the last of them.
+func (c *Context) Draft(id int32, state *[]float32, pick func([]float32) int32) ([]int32, error) {
+	next, h, err := c.runner.Draft(c.slot, id, *state, len(c.held), pick)
+	if err != nil {
+		return nil, err
+	}
+	c.held = append(c.held, id)
+	c.held = append(c.held, next[:len(next)-1]...)
+	*state = append((*state)[:0], h...)
+	c.last = c.now()
+	return next, nil
 }
 
 // span is the positions a run of n tokens starting at from occupies.
@@ -158,7 +203,11 @@ func span(from, n int) []int {
 }
 
 // Full reports whether the context has no room left for another token.
-func (c *Context) Full() bool { return len(c.held) >= c.maxContext }
+func (c *Context) Full() bool { return !c.Room(1) }
+
+// Room reports whether n more positions fit, which a speculative step asks
+// before it writes two.
+func (c *Context) Room(n int) bool { return len(c.held)+n <= c.maxContext }
 
 // expire drops what is held once the time to live has passed. The memory is
 // allocated at startup and is not released here: what expires is the record of

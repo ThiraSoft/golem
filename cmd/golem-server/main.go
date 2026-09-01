@@ -76,6 +76,20 @@ func main() {
 	if v, ok := m.Media(); ok {
 		runner.SetVision(v)
 	}
+	// The checkpoint's own prediction block, when it carries one and the card
+	// holds the blocks it needs. It draws a second token out of the same
+	// reading of the weights, for a conversation drawing alone; two of them are
+	// better served by the pass that carries both, and Runner.CanDraft is what
+	// weighs the two. qwen35/speculate.go says what the bargain is.
+	drafting := false
+	if d, ok := m.Forward.(drafter); ok && d.Speculate() {
+		sp, err := d.NewSpeculator()
+		if err != nil {
+			fail(err)
+		}
+		runner.UseDrafter(sp, d.ResetMTP)
+		drafting = true
+	}
 	stop := make(chan struct{})
 	defer close(stop)
 	go runner.Run(stop)
@@ -98,8 +112,12 @@ func main() {
 	}
 
 	head := vulkanLine(m.Vulkan())
-	fmt.Fprintf(os.Stderr, "%s: %s, %d blocks, %d positions in %d slot(s) of %d, %s, loaded in %s on %d cores\n",
-		name, m.Name, m.Blocks, *context, m.Slots(), m.SlotContext(), head,
+	draft := ""
+	if drafting {
+		draft = ", drafting with the prediction block"
+	}
+	fmt.Fprintf(os.Stderr, "%s: %s, %d blocks, %d positions in %d slot(s) of %d, %s%s, loaded in %s on %d cores\n",
+		name, m.Name, m.Blocks, *context, m.Slots(), m.SlotContext(), head, draft,
 		time.Since(start).Round(time.Millisecond), runtime.NumCPU())
 
 	// The image tower, when there is one. It is worth a line of its own: a
