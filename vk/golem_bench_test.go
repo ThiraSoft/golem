@@ -138,3 +138,75 @@ func BenchmarkQ40MatVecRef(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkQ40DotMatVecRef is the bar that matters, and it is not the one
+// above.
+//
+// matvec_q40.comp reads float activations; matvec.comp reads them quantized to
+// Q8_0 and spends one dotPacked4x8AccSatEXT on eight weights, which is the path
+// most of a Q4_0 model's projections actually take. A trellis kernel that beat
+// the float one and lost to this would still lose the model, so this is what a
+// golem product has to be measured against.
+func BenchmarkQ40DotMatVecRef(b *testing.B) {
+	const rows, cols = 9728, 2560
+	for _, columns := range []int{1, 8} {
+		b.Run("c"+itoa(columns), func(b *testing.B) {
+			d := open(b)
+			defer d.Close()
+			spirv := map[int][]byte{1: matvecSPIRV, 8: matvecWideSPIRV}[columns]
+			if spirv == nil {
+				b.Skip("no binary of that width")
+			}
+			pipe, err := d.NewPipeline(spirv, 4, uint32(unsafe.Sizeof(moePush{})))
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer pipe.Close()
+
+			data := make([]byte, rows*rowBytesQ4_0(cols))
+			r := rand.New(rand.NewSource(23))
+			r.Read(data)
+			w, err := d.Upload(data)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer w.Close()
+			// The activation in its Q8_0 form: values, then a scale and a
+			// correction for every block of thirty-two.
+			aq, err := d.Host(cols*columns, bufferUsageStorage)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer aq.Close()
+			as, err := d.Host(2*cols/32*columns*4, bufferUsageStorage)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer as.Close()
+			out, err := d.Readback(rows*columns*4, bufferUsageStorage)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer out.Close()
+			set, err := pipe.NewSet([]*Buffer{w, aq, as, out})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer set.Close()
+
+			const times = 64
+			push := moePush{dim: rows, ffn: cols, used: 1}
+			groups := uint32((rows + 15) / 16)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := set.DispatchTimes(groups, unsafe.Pointer(&push), times); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			seconds := b.Elapsed().Seconds() / float64(b.N) / times
+			b.ReportMetric(float64(len(data))/seconds/1e9, "GB/s")
+			b.ReportMetric(seconds*1e6, "us")
+		})
+	}
+}

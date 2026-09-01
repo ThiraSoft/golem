@@ -2,6 +2,9 @@ package qwen35
 
 import (
 	"fmt"
+
+	"github.com/ThiraSoft/golem/vk"
+	"os"
 	"testing"
 	"time"
 
@@ -16,6 +19,10 @@ import (
 // saves, and that is not true everywhere.
 //
 // The numbers this prints are the ones in README.md.
+// onCard skips the processor half of TestGenerationCost. Set GOLEM_CARD_ONLY
+// for a checkpoint only the card can run at a useful rate.
+var onCard = os.Getenv("GOLEM_CARD_ONLY") != ""
+
 func TestGenerationCost(t *testing.T) {
 	// A bench, not a test: everything below is fmt.Printf and the numbers go in
 	// README.md. It asserts nothing, and it is 384 seconds of a 660-second
@@ -76,6 +83,24 @@ func TestGenerationCost(t *testing.T) {
 		return float64(len(toks)) / time.Since(start).Seconds()
 	}
 
+	// headCost is what one reading of the logit head costs on its own.
+	//
+	// It is here because a speculative step reads the head three times where a
+	// plain token reads it once, so whether drafting pays turns on this number
+	// and it was being inferred rather than measured.
+	headCost := func() time.Duration {
+		m.Reset()
+		hs := m.ForwardBatch(toks, 0)
+		hidden := hs[len(hs)-1]
+		const reps = 16
+		m.Logits(hidden, logits)
+		start := time.Now()
+		for i := 0; i < reps; i++ {
+			m.Logits(hidden, logits)
+		}
+		return time.Since(start) / reps
+	}
+
 	// draftCost is what one call of the prediction block costs, and pairCost
 	// what a pass of two columns costs — the two halves of a speculative step.
 	costs := func() (draft, pair time.Duration) {
@@ -101,6 +126,42 @@ func TestGenerationCost(t *testing.T) {
 		return draft, pair
 	}
 
+	// specPair is the pass a speculative step actually takes, which is not the
+	// pass of two above: it snapshots every delta net's state so that a refused
+	// draft can be undone. The two are recorded from the same function and
+	// differ by a push constant, so they ought to cost the same — and this is
+	// here because they did not, and a step was paying for the difference
+	// three times over before anyone timed the halves separately.
+	specPair := func() time.Duration {
+		if !m.Speculate() {
+			return 0
+		}
+		m.Reset()
+		hs := m.ForwardBatch(toks, 0)
+		hidden := hs[len(hs)-1]
+		pos := len(toks)
+		e0 := make([]float32, m.Cfg.Dim)
+		e1 := make([]float32, m.Cfg.Dim)
+		m.W.TokenEmbd.Row(int(toks[0]), e0)
+		m.W.TokenEmbd.Row(int(toks[1]), e1)
+		at := Place{Pos: pos, T: pos, H: pos, W: pos}
+		next := at.Next()
+		const reps = 8
+		run := func() {
+			if _, err := m.gpuPipe.ForwardSpeculativeAt(
+				[][]float32{e0, e1}, []vk.QwenPlace{at.gpu(), next.gpu()}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		run()
+		start := time.Now()
+		for i := 0; i < reps; i++ {
+			run()
+		}
+		_ = hidden
+		return time.Since(start) / reps
+	}
+
 	report := func(where string, n int) {
 		pf := prefill()
 		rate, each := plain(n)
@@ -112,6 +173,13 @@ func TestGenerationCost(t *testing.T) {
 			draft.Seconds()/each.Seconds())
 		fmt.Printf("a pass of two       %v (%.2f of a token)\n", pair.Round(100*time.Microsecond),
 			pair.Seconds()/each.Seconds())
+		if sp := specPair(); sp > 0 {
+			fmt.Printf("the speculative two %v (%.2f of a token, %.2f of a plain pass of two)\n",
+				sp.Round(100*time.Microsecond), sp.Seconds()/each.Seconds(), sp.Seconds()/pair.Seconds())
+		}
+		head := headCost()
+		fmt.Printf("the logit head      %v (%.2f of a token), read three times a step\n",
+			head.Round(100*time.Microsecond), head.Seconds()/each.Seconds())
 		// A step costs the draft and the pass of two, and returns one token
 		// plus the accepted one. Break-even is where that beats a plain token.
 		step := (draft + pair).Seconds() / each.Seconds()
@@ -155,7 +223,13 @@ func TestGenerationCost(t *testing.T) {
 		}
 	}
 
-	report("processor", 16)
+	// The processor half is skipped for a checkpoint the processor cannot run
+	// in any reasonable time. A .golem 27B decodes a trellis for every weight
+	// of every token on eight cores; sixteen tokens that way is half an hour,
+	// and the question this file asks is what the card costs.
+	if !onCard {
+		report("processor", 16)
+	}
 
 	if err := m.UseVulkan(); err != nil {
 		t.Skipf("no Vulkan: %v", err)

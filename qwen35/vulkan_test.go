@@ -3,11 +3,24 @@ package qwen35
 import (
 	"fmt"
 	"math"
+	"os"
 	"testing"
 	"time"
 )
 
-const qwen38 = "/mnt/data/LLMs_models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_0.gguf"
+// qwen38 is the checkpoint these tests read. GOLEM_MODEL_QWEN35 points them at
+// another one — a .golem of the same model, most usefully, since what a token
+// costs and what a draft is worth are different numbers per format and
+// TestGenerationCost is where both are read off.
+var qwen38 = envOr("GOLEM_MODEL_QWEN35",
+	"/mnt/data/LLMs_models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_0.gguf")
+
+func envOr(name, fallback string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
+}
 
 func diff(a, b []float32) (maxAbs, rel float64) {
 	var num, den float64

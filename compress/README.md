@@ -466,23 +466,37 @@ The row worth reading twice is that **T3G now generates faster than T4G** —
 second of each other, because the kernel did not care how many bytes a tier
 read. The format finally gains speed by spending bits.
 
-On Qwen3.8-27B in T3G, where a mixture makes the weights most of the token, the
-same measurement is larger and it moves something else:
+On Qwen3.8-27B in T3G, where the model is dense and the weights are most of what
+a token costs, the same measurement is larger — and it comes with a lesson about
+measuring that is worth more than the number.
 
 | | a token at a time | drafting with the prediction block |
 |---|---|---|
-| before | 18.95 t/s | 24.45 t/s — drafting **+29 %** |
-| after | **29.68 t/s** | 26.08 t/s — drafting **−12 %** |
+| before | 19.25 / 19.29 t/s | 26.30 / 26.35 / 26.41 t/s |
+| after | **30.96 / 31.20 / 31.55** | 27.85 / 28.06 / 35.39 |
 
-**A pass of one got 1.57 times faster and a pass of two 1.07, so speculative
-decoding stopped paying.** That is not the prediction block getting worse. Its
-bargain is that a pass of two costs 1.056 of a pass of one, which is true of a
-Q4_0 kernel and is not true here: a trellis weight has to be decoded before it
-can be spent, and `cmd/golemtune` reads 89.8 microseconds at one column against
-112.6 at two on this model's feed forward — 1.25. At an 81 % acceptance rate
-1.25 is a losing trade. `cmd/golem-cli -draft=false` is how to not take it, and
-making a pass of two cost less than 1.25 of a pass of one is how to make it win
-again. `qwen35/speculate.go` carries the same note.
+**A pass of one got about 1.6 times faster and a pass of two much less**, so the
+gap speculative decoding is paid out of narrowed. Its bargain is that a pass of
+two costs 1.056 of a pass of one, which is true of a Q4_0 kernel and is not true
+here: a trellis weight is decoded before it is spent, and `cmd/golemtune` reads
+89.8 microseconds at one column against 112.6 at two on this model's feed
+forward — 1.25.
+
+**Whether that leaves drafting ahead is not settled, and the reason is the
+card.** Look at the third column: the same 128 tokens from the same prompt, at
+the same 54-of-73 acceptance, take 4.6 seconds or 3.6 — while a token at a time
+holds 4.1 within two per cent, run after run. The drafting path is bimodal on
+this machine and the plain path is not, and forcing the card into one mode or
+the other needs a performance level this account cannot write. So the honest
+statement is: drafting is somewhere between a tenth behind and an eighth ahead,
+and `cmd/golem-cli -draft=false` and `-stats` (which now reports the acceptance
+rate) are how to find out on a machine that can be pinned.
+
+An earlier version of this section said drafting had turned from +29 % into
+−12 %. That was three single runs of a few seconds each, taken on a card whose
+clock state varies more than the effect being measured — the same mistake this
+file warns about two paragraphs down, made two paragraphs later. The table
+above is four runs of each with a warm-up turn inside the same process.
 
 **And a warning about the tuning.** The first shapes shipped here were measured
 on the 4B's feed forward alone, 9728 by 2560. On the 27B's, 17408 by 5120, the
@@ -497,6 +511,35 @@ Two things follow for anyone reading this next.
 it now moves about 190 GB/s of 640 — so a change argued for on bytes read still
 has to clear that bar. What has changed is that "it is not bandwidth-bound" is
 no longer where the analysis stops.
+
+**And the bar to beat is not the one this file was measuring against.** Q4_0 has
+two mat-vecs here: `matvec_q40.comp`, which reads float activations, and
+`matvec.comp`, which reads them quantized to Q8_0 and spends one
+`dotPacked4x8AccSatEXT` on eight weights. The second is the path most of a
+model's projections actually take, and it is much the faster of the two. On the
+same 9728x2560 shape, one column:
+
+| | microseconds |
+|---|---|
+| T4G, after everything above | 67.9 |
+| Q4_0 against float activations | 52.4 |
+| **Q4_0 against Q8_0, integer dot product** | **44.7** |
+
+End to end on Qwen3-4B, same engine, same card, warm: Q4_0 generates at 103.6
+tokens a second where T4G does 67.5 and T3G 68.4. **1.53 times**, against the
+mat-vec's 1.52 — so the whole of the difference is the product and none of it is
+anywhere else. The transform each site applies to its activation was measured by
+taking it out: four per cent.
+
+What it would take to close the rest is not another pass over this kernel. A
+trellis weight arrives as a float and is spent on a float multiply-add; Q4_0's
+fast path never leaves the integers, spending one instruction on eight weights
+against an activation packed four to a word — eight times fewer activation loads
+and a seventh of the arithmetic. Reaching that would mean the decoded value
+fitting in eight bits, and it is eleven: 1MAD's byte sum runs 0 to 1020. It can
+be split into a high byte and two low bits and summed as two integer dot
+products, which is the shape of an answer; assembling those bytes out of the
+shared table costs more than it saves, which is the shape of the problem.
 
 **The third knob is the card's, not ours.** Whether the table is worth its
 sixteen kibibytes depends on the pass width: a pass of one decodes a weight for

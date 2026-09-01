@@ -18,28 +18,41 @@ import (
 // Measured on Qwen3.8-27B: the draft is the token the model itself chooses
 // 81% of the time.
 //
-// The 1.056 is a Q4_0 kernel's, and a .golem checkpoint's is not. The trellis
-// mat-vec decodes a weight before it can spend it, so a pass of two costs what
-// the decode costs again unless the kernel amortizes it — cmd/golemtune on
-// Qwen3.8-27B's feed forward reads 89.8 microseconds at one column and 112.6 at
-// two, which is **1.25**, not 1.056. At an 81% acceptance rate that is a losing
-// trade, and it is a losing trade that used to win: on this card, with the
-// same file and the same block,
+// The 1.056 is a Q4_0 kernel's, and a .golem checkpoint's is not. A trellis
+// weight has to be decoded before it can be spent, so a second column costs
+// what an activation load and a multiply-add cost on top of a decode that the
+// two columns share — cmd/golemtune on Qwen3.8-27B's feed forward reads 89.8
+// microseconds at one column and 112.6 at two, which is **1.25**, not 1.056.
+// The bargain survives that on paper: at 74% acceptance a step returns 1.74
+// tokens for 1.25 passes plus the block plus two extra readings of the logit
+// head, which qwen35/cost_test.go measures at 2.2 microseconds against a
+// token's 32.
 //
-//	                       a token at a time   drafting
-//	  before the kernel's       18.95 t/s      24.45 t/s   drafting +29%
-//	  read and decode were      29.68 t/s      26.08 t/s   drafting -12%
-//	  taken apart
+// What it does not survive is being measured. On this card, with T3G weights,
+// the drafting path is **bimodal** and the plain path is not: the same 128
+// tokens from the same prompt take 4.6 seconds or 3.6 (and once 2.7), run to
+// run, at the same 54-of-73 acceptance, while a token at a time holds 4.1
+// within two per cent. In the slow mode drafting loses about a tenth; in the
+// fast mode it wins about an eighth. The cause is not established — the card's
+// clocks cannot be pinned without root here, and every attempt to warm it into
+// one mode or the other landed in both.
 //
-// The block did not get worse. The single-token path got 1.57 times faster and
-// the two-token path 1.07, so the gap the draft was paid out of closed. There
-// is nothing wrong with the prediction block and this is not an argument
-// against it: it is an argument that whether to draft is a measurement on a
-// card and a checkpoint, which is why cmd/golem-cli has -draft and why the
-// number above is written down with the date it was true. The way to make it
-// win again is to make a pass of two cost less than 1.25 of a pass of one,
-// which is the mat-vec's problem and not the block's.
+// So: whether drafting pays is not a property of this code, and this comment
+// is not going to claim it is. cmd/golem-cli has -draft, and -stats reports the
+// acceptance rate; measure it on the card and the checkpoint in hand, several
+// runs alternating, and believe the run-to-run spread before the mean. What is
+// established, four runs of each with a warm-up turn in the same process:
 //
+//	                    a token at a time   drafting
+//	  before the        19.25 / 19.29       26.30 / 26.35 / 26.41
+//	  matvec was reworked
+//	  after             30.96 / 31.20 /     27.85 / 28.06 / 35.39
+//	                    31.55
+//
+// The plain path is where the kernel's 1.57 times went. The drafting path took
+// only a little of it, because the pass it rides on is a pass of two and a pass
+// of two gained less. That much is solid; which side of even it leaves the
+// draft on, on this card, is not.
 // What a recurrent model adds is the rollback. A refused draft leaves a key in
 // the attention cache at a position it does not occupy, which the token that
 // does occupy it overwrites — but it also leaves its contribution inside every
@@ -71,6 +84,9 @@ type Speculator struct {
 	// the acceptance rate the speedup actually came from.
 	Accepted, Drafted int
 }
+
+// Rate is what the run has drafted and what it kept.
+func (s *Speculator) Rate() (accepted, drafted int) { return s.Accepted, s.Drafted }
 
 // Speculate reports whether the model can draft: it needs the prediction block
 // and a card, because a draft made on the processor costs half a token and

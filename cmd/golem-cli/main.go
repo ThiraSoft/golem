@@ -234,6 +234,10 @@ func report(t Turn) {
 	if t.Truncated {
 		note = ", cut short"
 	}
+	if t.Drafted > 0 {
+		note += fmt.Sprintf(", %d of %d drafts kept (%.0f%%)",
+			t.Accepted, t.Drafted, 100*float64(t.Accepted)/float64(t.Drafted))
+	}
 	fmt.Fprintf(os.Stderr, "%d prompt tokens in %s (%.1f/s), %d generated in %s (%.2f/s)%s\n",
 		t.Prompt, t.Prefill.Round(time.Millisecond), rate(t.Prompt, t.Prefill),
 		t.Generated, t.Decode.Round(time.Millisecond), rate(t.Generated, t.Decode), note)

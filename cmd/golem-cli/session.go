@@ -59,6 +59,7 @@ type speculative interface {
 
 type speculator interface {
 	Step(token int32, hidden []float32, pos int, pick func([]float32) int32) ([]int32, []float32, error)
+	Rate() (accepted, drafted int)
 }
 
 // vocabulary is the part of engine.Vocabulary a conversation uses — Gemma's
@@ -122,6 +123,13 @@ type Turn struct {
 	Decode    time.Duration
 	Text      string
 	Truncated bool // stopped on a limit rather than on an end-of-turn token
+	// Accepted and Drafted are the prediction block's, and zero when nothing
+	// drafted. A step that costs a pass of two and a reading of the head three
+	// times is only worth taking when most drafts land, and which it is is a
+	// property of the sampler as much as of the model: a draft is taken at the
+	// peak, so a sampler that does not pick the peak disagrees with it by
+	// construction. Reporting it is how that gets noticed.
+	Accepted, Drafted int
 }
 
 // promptWidth is how many positions of a prompt go through the model together,
@@ -336,6 +344,12 @@ func (s *Session) AskWithMedia(text string, images, audio [][]byte, w io.Writer)
 
 		hidden = s.model.ForwardBatch([]int32{id}, len(s.held))[0]
 		s.held = append(s.held, id)
+	}
+	if draft != nil {
+		turn.Accepted, turn.Drafted = draft.Rate()
+	}
+	if draft != nil {
+		turn.Accepted, turn.Drafted = draft.Rate()
 	}
 	turn.Decode = time.Since(start)
 	turn.Text = answer.String()
