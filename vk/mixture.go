@@ -127,6 +127,31 @@ var moeGateUpQ4KMidSPIRV []byte
 //go:embed shaders/moe_gateup_q4k32.spv
 var moeGateUpQ4KWidestSPIRV []byte
 
+// The expert kernels against Q8_0 weights. A mixture in that form is four
+// bytes a weight where Q4_0 is two and a quarter, so it is the smallest form
+// this engine reads whose expert pool does not fit in the memory a card can
+// address — which is the only reason to have it.
+//
+//go:generate glslc -O -DQ80 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q80.spv
+//go:generate glslc -O -DQ80 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q808.spv
+//go:generate glslc -O -DQ80 -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q8016.spv
+//go:generate glslc -O -DQ80 -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q8032.spv
+//go:generate glslc -O -DQ80 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_down.comp -o shaders/moe_down_q80.spv
+//go:embed shaders/moe_gateup_q80.spv
+var moeGateUpQ80SPIRV []byte
+
+//go:embed shaders/moe_gateup_q808.spv
+var moeGateUpQ80WideSPIRV []byte
+
+//go:embed shaders/moe_gateup_q8016.spv
+var moeGateUpQ80MidSPIRV []byte
+
+//go:embed shaders/moe_gateup_q8032.spv
+var moeGateUpQ80WidestSPIRV []byte
+
+//go:embed shaders/moe_down_q80.spv
+var moeDownQ80SPIRV []byte
+
 //go:embed shaders/moe_gateup32.spv
 var moeGateUpWidestSPIRV []byte
 
@@ -233,6 +258,11 @@ type Mixture struct {
 	// block asks and not before — vk/quantproduct.go says the rest.
 	products  *quantProducts
 	gateUpQ4K *Pipeline
+	// The expert kernels against Q8_0 weights, built on the first block that
+	// brings them. expertQuant is the form the experts arrived in, which every
+	// block of a model shares.
+	gateUpQ80, downQ80 *Pipeline
+	expertQuant        nn.Quant
 	// The prompt path of the expert branch, which reads the stack by expert
 	// rather than by column: idProduct serves both gate/up and down projections,
 	// idActivate runs the activation over the first half's output, scatter
@@ -792,13 +822,26 @@ func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, dow
 		{"the shared down", down, m.dim, m.dense, f.Down},
 	}
 	if m.experts > 0 {
-		if f.GateUpExps != nn.Q4_0 || f.DownExps != nn.Q4_0 {
-			// The expert kernels stage a Q4_0 block per thread out of a stack
-			// indexed by identifier, and nothing here has written the K-quant
-			// forms of those three. No mixture this reads is quantized that way
-			// — llama.cpp's MoE mixes are what they are — so it is refused by
-			// name rather than half-supported.
-			return fmt.Errorf("vk: the experts are %s and %s, and the routed kernels read Q4_0", f.GateUpExps, f.DownExps)
+		if f.GateUpExps != f.DownExps {
+			return fmt.Errorf("vk: the two expert stacks are %s and %s, and one kernel reads both", f.GateUpExps, f.DownExps)
+		}
+		switch f.GateUpExps {
+		case nn.Q4_0, nn.Q8_0:
+		default:
+			// A K-quant expert stack has no kernel here: nothing has written
+			// the routed forms of those three, and no mixture this reads is
+			// quantized that way — llama.cpp's MoE mixes are what they are. It
+			// is refused by name rather than half-supported.
+			return fmt.Errorf("vk: the experts are %s, and the routed kernels read Q4_0 and Q8_0", f.GateUpExps)
+		}
+		if m.expertQuant != 0 && m.expertQuant != f.GateUpExps {
+			return fmt.Errorf("vk: this model's experts arrived as %s and now as %s", m.expertQuant, f.GateUpExps)
+		}
+		m.expertQuant = f.GateUpExps
+		if f.GateUpExps == nn.Q8_0 && m.gateUpQ80 == nil {
+			if err := m.buildQ80Experts(); err != nil {
+				return err
+			}
 		}
 		shapes = append(shapes,
 			struct {
@@ -832,10 +875,14 @@ func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, dow
 		if expertsInHost() {
 			hold = m.d.HostResident
 		}
-		if b.gateUp, err = hold(splitQ4_0(gateUpExps, m.experts*2*m.ffn, m.dim)); err != nil {
+		split := splitQ4_0
+		if m.expertQuant == nn.Q8_0 {
+			split = splitQ8_0
+		}
+		if b.gateUp, err = hold(split(gateUpExps, m.experts*2*m.ffn, m.dim)); err != nil {
 			return fail(err)
 		}
-		if b.down, err = hold(splitQ4_0(downExps, m.experts*m.dim, m.ffn)); err != nil {
+		if b.down, err = hold(split(downExps, m.experts*m.dim, m.ffn)); err != nil {
 			return fail(err)
 		}
 		if m.slots > 0 {
@@ -925,9 +972,13 @@ func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, dow
 		if b.cacheGateUp != nil {
 			up, down = b.cacheGateUp, b.cacheDown
 		}
+		expUp, expDown := m.gateUp, m.down
+		if m.gateUpQ80 != nil {
+			expUp, expDown = m.gateUpQ80, m.downQ80
+		}
 		sets = append(sets,
-			setSpec{&b.setGateUp, m.gateUp, []*Buffer{up, m.xq, m.xs, m.ids, m.gelu, m.aq, m.as}},
-			setSpec{&b.setDown, m.down, []*Buffer{down, m.aq, m.as, m.ids, m.cw, m.out}},
+			setSpec{&b.setGateUp, expUp, []*Buffer{up, m.xq, m.xs, m.ids, m.gelu, m.aq, m.as}},
+			setSpec{&b.setDown, expDown, []*Buffer{down, m.aq, m.as, m.ids, m.cw, m.out}},
 			setSpec{&b.setIDProd, m.idProduct,
 				[]*Buffer{b.gateUp, m.xq, m.xs, m.gateOut, m.counts, m.pairs, m.plan}},
 			setSpec{&b.setIDDown, m.idProduct,
@@ -1232,6 +1283,7 @@ func (m *Mixture) Close() {
 	for _, p := range []**Pipeline{
 		&m.denseDown, &m.down, &m.gateUp, &m.activate, &m.idActivate, &m.reduce,
 		&m.idProduct, &m.scatter, &m.idCombine, &m.admit, &m.fill,
+		&m.gateUpQ80, &m.downQ80,
 	} {
 		if *p != nil {
 			(*p).Close()
@@ -1282,6 +1334,31 @@ func splitQ4_0(src []byte, rows, cols int) []byte {
 			block := in[b*18 : (b+1)*18]
 			binary.LittleEndian.PutUint16(out[2*b:], binary.LittleEndian.Uint16(block))
 			copy(nibbles[b*16:], block[2:])
+		}
+	})
+	return dst
+}
+
+// splitQ8_0 rewrites rows so that a shader can reach them, for the same reason
+// splitQ4_0 does and with the same shape: a Q8_0 block is an fp16 scale and
+// thirty-two signed bytes, and thirty-four is no more a multiple of four than
+// eighteen is. Scales first, then the bytes.
+//
+// The weights come out signed and centred, so a reader has no correction term
+// against a Q8_0 activation — see the note beside splitQ6_K. Q4_0's nibble is
+// nought to fifteen and its weight that less eight, which is what makes the
+// second term in shaders/moe_gateup.comp's Q4_0 branch necessary and this one's
+// absence right.
+func splitQ8_0(src []byte, rows, cols int) []byte {
+	nb := cols / nn.QuantBlock
+	stride := nb * 34
+	dst := make([]byte, len(src))
+	splitRows(src, dst, rows, stride, stride, func(in, out []byte) {
+		data := out[2*nb:]
+		for b := 0; b < nb; b++ {
+			block := in[b*34 : (b+1)*34]
+			binary.LittleEndian.PutUint16(out[2*b:], binary.LittleEndian.Uint16(block))
+			copy(data[b*32:], block[2:])
 		}
 	})
 	return dst
@@ -1593,6 +1670,37 @@ func splitQ5_K(src []byte, rows, cols int) []byte {
 		}
 	})
 	return dst
+}
+
+// buildQ80Experts makes the two routed kernels for a Q8_0 expert stack, at the
+// widths the Q4_0 pair is built at. It runs once, on the first block that
+// brings that form.
+func (m *Mixture) buildQ80Experts() error {
+	push := uint32(unsafe.Sizeof(moePush{}))
+	up, err := m.d.NewPipeline(moeGateUpQ80SPIRV, 7, push)
+	if err != nil {
+		return err
+	}
+	for _, w := range []struct {
+		columns int
+		spirv   []byte
+	}{
+		{smallColumns, moeGateUpQ80WideSPIRV},
+		{16, moeGateUpQ80MidSPIRV},
+		{32, moeGateUpQ80WidestSPIRV},
+	} {
+		if err := up.Wide(w.columns, w.spirv); err != nil {
+			up.Close()
+			return err
+		}
+	}
+	down, err := m.d.NewPipeline(moeDownQ80SPIRV, 6, push)
+	if err != nil {
+		up.Close()
+		return err
+	}
+	m.gateUpQ80, m.downQ80 = up, down
+	return nil
 }
 
 // fusedFor is the gate-and-up kernel for one weight format, built on first ask.

@@ -57,7 +57,8 @@ int abyte(uint k, uint b) {
     return bitfieldExtract(int(aq[at >> 2]), int((at & 3u) * 8u), 8);
 }
 
-// lanePart is one lane's share of a Q4_0 row against expert k's activation.
+// lanePart is one lane's share of a row against expert k's activation, Q4_0 or
+// Q8_0 as the build says.
 // The layout is the one shaders/moe_gateup.comp describes: a row's scales,
 // then its nibbles.
 float lanePart(uint rowBase, uint k, uint lane) {
@@ -71,6 +72,17 @@ float lanePart(uint rowBase, uint k, uint lane) {
         float ws   = pair[b & 1u];
 
         int acc = 0;
+#ifdef Q80
+        // Thirty-two signed bytes against thirty-two signed bytes, and no
+        // offset in either, so the correction the Q4_0 branch carries is not
+        // written here rather than being computed and found to be nought.
+        uint at = (nib + 32u * b) >> 2;
+        uint ab = ((pairOf(k) * p.ffn) >> 2) + b * 8u;
+        for (uint u = 0u; u < 8u; u++) {
+            acc = dotPacked4x8AccSatEXT(int(w[at + u]), int(aq[ab + u]), acc);
+        }
+        sum += float(acc) * ws * as_[p.col * 2u * p.used * nb + k * nb + b];
+#else
         uint at = (nib + 16u * b) >> 2;
         uint ab = ((pairOf(k) * p.ffn) >> 2) + b * 8u;
         // Four products to an instruction. A Q4_0 word holds eight weights
@@ -90,6 +102,7 @@ float lanePart(uint rowBase, uint k, uint lane) {
         uint sb = p.col * 2u * p.used * nb + k * nb + b;
         sum  += float(acc) * ws * as_[sb];
         corr += ws * as_[sb + p.used * nb];
+#endif
     }
     return sum - corr;
 }
@@ -102,7 +115,11 @@ void main() {
     uint i    = gl_WorkGroupID.x * OUTS + j;
 
     uint nb       = p.ffn >> 5;
+#ifdef Q80
+    uint rowBytes = nb * 34u;
+#else
     uint rowBytes = nb * 18u;
+#endif
     uint expert   = uint(ids[pairOf(k)]) * p.dim * rowBytes;
 
     partial[t] = (i < p.dim) ? lanePart(expert + i * rowBytes, k, lane) : 0.0;

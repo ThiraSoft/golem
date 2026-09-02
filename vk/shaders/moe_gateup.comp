@@ -111,8 +111,8 @@ int nearestInt(float f) {
 
 void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
     uint nb  = p.dim >> 5;
-    // Q4_0 and Q4_K put their nibbles at the same offset: two bytes a block of
-    // scales against sixteen a superblock of headers is the same count.
+    // Q4_0, Q4_K and Q8_0 all put their weights at the same offset: two bytes a
+    // block of scales against sixteen a superblock of headers is the same count.
     uint nib = rowBase + 2u * nb;
     uint xw  = p.dim >> 2;   // one column of the input, in uints
 
@@ -144,6 +144,22 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
         float ws   = pair[b & 1u];
 #endif
 
+#ifdef Q80
+        // Thirty-two signed bytes to a block, against the activation's
+        // thirty-two signed bytes: the packed dot takes them as they are. There
+        // is no offset in a Q8_0 weight and so no second term — see splitQ6_K's
+        // note in vk/mixture.go, which is the same observation from the other
+        // side of a K-quant.
+        uint at = (nib + 32u * b) >> 2;
+        [[unroll]] for (uint k = 0u; k < COLUMNS; k++) {
+            uint xc = SRCCOL(k) * xw + b * 8u;
+            int acc = 0;
+            [[unroll]] for (uint u = 0u; u < 8u; u++) {
+                acc = dotPacked4x8AccSatEXT(int(w[at + u]), int(xq[xc + u]), acc);
+            }
+            s[k] += ws * float(acc) * xs[SRCCOL(k) * 2u * nb + b];
+        }
+#else
         uint at = (nib + 16u * b) >> 2;
         uint ab = b * 8u;
         uint lo[4], hi[4];
@@ -169,6 +185,7 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
             s[k] += ws * (float(acc) * xs[sc + b] - xs[sc + nb + b]);
 #endif
         }
+#endif
     }
     [[unroll]] for (uint k = 0u; k < COLUMNS; k++) answer[k] = s[k];
 }
@@ -184,7 +201,11 @@ void main() {
     uint j    = r & 31u;
 
     uint nb       = p.dim >> 5;
+#ifdef Q80
+    uint rowBytes = nb * 34u;
+#else
     uint rowBytes = nb * 18u;
+#endif
     uint row      = (r < 32u) ? (blk * 32u + j) : (p.ffn + blk * 32u + j);
     uint n = COLUMNS;
     // Which expert this workgroup answers. An expert branch routes every
