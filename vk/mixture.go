@@ -14,11 +14,19 @@ package vk
 // submission costs sixty-three microseconds whatever is in it. Two of them a
 // block would be four milliseconds a token spent asking rather than computing.
 //
-// The whole stack is resident — 11.96 gibibytes of experts on this checkpoint
-// and 0.3 more of shared branches, which is why a card with sixteen is the
-// smallest one that can do this. The routing stays on the CPU: it reads the
-// residual, which the CPU already has, and choosing eight of a hundred and
-// twenty-eight is a hundred and twenty-eight comparisons.
+// The stack is resident by default — 11.96 gibibytes of experts on this
+// checkpoint and 0.3 more of shared branches, which is why a card with sixteen
+// is the smallest one that can do this. It does not have to be: see
+// expertsInHost, which leaves the two expert stacks in system memory and lets
+// the kernels read them across the bus, at 7.4 tokens a second against 108 and
+// with the same answers.
+//
+// **The routing is on the card**, and has been since the router became two
+// shaders. It used to be on the processor — the sentence that stood here said
+// so, and said why, long after it stopped being true — which is a thing to know
+// before designing anything around what the host knows and when. shaders/
+// router_logits.comp and shaders/router_pick.comp choose the experts, and the
+// identifiers land in m.ids, which is device memory nothing on this side reads.
 
 import (
 	_ "embed"

@@ -248,6 +248,18 @@ where the 12B has one. Its global blocks publish no value projection either.
 None of that needed a line: the geometry is read, and a number the code never
 wrote down cannot be wrong about a checkpoint it has not met.
 
+It is also the one model here that **does not have to fit on the card**. Its
+experts are 12.85 GB of the 12.8 GiB a resident token reads, and a token routes
+to eight matrices of a hundred and twenty-eight — so eleven of those twelve
+gigabytes sit untouched on any given token. `GOLEM_MOE_EXPERTS_HOST=1` leaves
+the two expert stacks in system memory the card addresses and lets the kernels
+read them there: 7.4 tokens a second against 108, which is the bus rather than
+the card, and the same tokens out. `vk/mixture.go`'s `expertsInHost` is the
+whole of the change, because a compute shader reads a storage buffer the same
+way wherever it lives. The root README's *A mixture larger than the card* says
+what a cache of the hot ones would buy back, and `gemma/expert_cache_test.go`
+measures it.
+
 What it has that nothing else here does is a **mixture of experts**, and it is
 not the usual one. The shared expert is the ordinary dense feed forward, and
 the experts run *beside* it rather than after it:

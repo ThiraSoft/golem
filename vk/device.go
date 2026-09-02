@@ -496,9 +496,12 @@ func (d *Device) newBuffer(size uint64, usage uint32, props uint32) (*Buffer, er
 // Host allocates a buffer the CPU writes and the shader reads directly.
 //
 // It is for what the CPU actually writes each pass — the positions, the
-// rotation angles — and for nothing else. A buffer allocated here lives in
+// rotation angles — and for one other thing, which is the exception that proves
+// the rule: a weight so rarely read that the bus is cheaper than the room it
+// would take on the card. See HostResident. A buffer allocated here lives in
 // system memory, and a shader reading it reaches across the bus for every line
-// of it that is not already in a cache.
+// of it that is not already in a cache — 6.3 gigabytes a second against the 517
+// device memory gives, measured in vk/host_weights_test.go.
 //
 // **That is not a small thing, and it was the largest single cost in the
 // prompt.** The stream between two kernels — the normed activation, what the
