@@ -367,6 +367,20 @@ func idPlanMax(experts, columns, bn int) int {
 // right, so both are run against the same recording.
 const byExpertFrom = 32
 
+// expertsInHost says the expert stacks are to be held in system memory the card
+// reads across the bus, instead of copied into device memory.
+//
+// This is the streamed mixture's first step and its floor. On the 26B A4B the
+// stacks are 12.85 GB against a sixteen-gibibyte card, so they fit and this
+// changes nothing but the speed — which is exactly what makes it the right first
+// measurement: the same model, the same answers, and a number to put against the
+// nought-per-cent row of gemma/expert_cache_test.go's table rather than the
+// arithmetic that row is made of.
+//
+// A cache of hot experts in device memory is what climbs back up that table, and
+// it is not here yet.
+func expertsInHost() bool { return os.Getenv("GOLEM_MOE_EXPERTS_HOST") != "" }
+
 // byExpertWidth is that, with the environment's override if there is one.
 func byExpertWidth() int {
 	v := os.Getenv("GOLEM_MOE_BY_EXPERT_FROM")
@@ -735,10 +749,17 @@ func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, dow
 	}
 	var err error
 	if m.experts > 0 {
-		if b.gateUp, err = m.d.Upload(splitQ4_0(gateUpExps, m.experts*2*m.ffn, m.dim)); err != nil {
+		// The two stacks are the only tensors here that go anywhere else: they
+		// are what a token reads eight of a hundred and twenty-eight of, which
+		// is what makes them worth not keeping.
+		hold := m.d.Upload
+		if expertsInHost() {
+			hold = m.d.HostResident
+		}
+		if b.gateUp, err = hold(splitQ4_0(gateUpExps, m.experts*2*m.ffn, m.dim)); err != nil {
 			return fail(err)
 		}
-		if b.down, err = m.d.Upload(splitQ4_0(downExps, m.experts*m.dim, m.ffn)); err != nil {
+		if b.down, err = hold(splitQ4_0(downExps, m.experts*m.dim, m.ffn)); err != nil {
 			return fail(err)
 		}
 	}

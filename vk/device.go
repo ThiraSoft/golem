@@ -532,6 +532,35 @@ func (d *Device) Readback(size int, usage uint32) (*Buffer, error) {
 	return d.Host(size, usage)
 }
 
+// HostResident holds a tensor in system memory the card addresses, rather than
+// copying it into device memory.
+//
+// It is the whole of what a mixture larger than the card needs, and it is this
+// small because a shader does not care where a storage buffer lives. Measured —
+// vk/host_weights_test.go — a mat-vec reads device memory at 517 GB/s and host
+// memory at 6.3, which is ninety-four per cent of what the copy engine gets
+// across the same bus and the same number gemma/expert_cache_test.go prices a
+// cache miss at.
+//
+// So an expert a token does not route to costs nothing, and one it does route
+// to costs the bus rather than a stall: there is no upload to schedule, no
+// prefetch to predict, and no readback of a routing that lives on the device.
+// What it is not is a place for a weight every token reads. Eighty times the
+// latency, for something read eighty times, is the whole model at bus speed.
+//
+// The bytes are copied once from the caller's slice and the buffer owns them
+// afterwards. The allocation comes out of the GTT aperture — sixteen gibibytes
+// on this machine — not out of the card.
+func (d *Device) HostResident(data []byte) (*Buffer, error) {
+	size := (len(data) + 3) &^ 3
+	b, err := d.Host(size, bufferUsageStorage)
+	if err != nil {
+		return nil, err
+	}
+	copyWide(b.Bytes(), data)
+	return b, nil
+}
+
 // Local allocates a buffer in device memory that no one on this side reads or
 // writes. It is what an intermediate between two dispatches wants: the card
 // produces it and the card consumes it, and a host-visible allocation would
