@@ -91,6 +91,9 @@ func f32Bytes(v []float32) []byte {
 func (m *Model) streamShape(ctx int) vk.QwenShape {
 	cfg := m.Cfg
 	s := vk.QwenShape{
+		// A window never drafts: it is a converter's path over a wide batch,
+		// and there is no prediction block in it to refuse a column.
+		Snapshots:    false,
 		Dim:          cfg.Dim,
 		FFN:          cfg.Blocks[0].FFN,
 		MaxContext:   ctx,

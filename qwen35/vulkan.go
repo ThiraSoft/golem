@@ -131,7 +131,13 @@ func (m *Model) UseVulkanStack() error {
 	// Every block shares one geometry; only which mixer a block has differs.
 	// The first full-attention block names the attention side of it, and the
 	// first delta net the other.
+	// A prediction block is only worth its memory to a caller that will draft
+	// with it, and on the 27B that memory is what decides whether the logit
+	// head stays on the card: the block's own weights and a shadow of every
+	// delta net's recurrence, which together are most of a gigabyte.
+	drafts := m.HasMTP() && !m.noDraft
 	shape := vk.QwenShape{
+		Snapshots:  drafts,
 		Dim:        cfg.Dim,
 		FFN:        cfg.Blocks[0].FFN,
 		MaxContext: cfg.MaxContext,
@@ -153,6 +159,11 @@ func (m *Model) UseVulkanStack() error {
 			shape.StateSize, shape.Groups = bc.SSMStateSize, bc.SSMGroupCount
 		}
 	}
+
+	// What this card can afford: whether the prediction block goes over, and
+	// how wide a prompt pass the scratch may be. Both asked of the device.
+	drafts, width := m.deviceBudget(d, shape, numBlocks, drafts)
+	shape.Snapshots, shape.PassWidth = drafts, width
 
 	pipe, err := vk.NewQwenPipeline(d, shape)
 	if err != nil {
@@ -235,7 +246,7 @@ func (m *Model) UseVulkanStack() error {
 		return fmt.Errorf("qwen35: norms: %w", err)
 	}
 
-	if m.HasMTP() && numBlocks == m.trunk() {
+	if drafts && numBlocks == m.trunk() {
 		il := m.trunk()
 		bw := &m.W.Blocks[il]
 		headNorm := m.W.MTP.SharedHeadNorm
@@ -325,4 +336,133 @@ func (m *Model) closeVulkan() {
 		m.dev.Close()
 		m.dev = nil
 	}
+}
+
+// SkipDraftBlock says this model will not draft, so UseVulkanStack should leave
+// the prediction block and the delta nets' shadow states off the card.
+//
+// It is a saving worth naming. On Qwen3.8-27B-Q4_K_M the block's own weights
+// are about two hundred and thirty megabytes and the shadows a hundred and
+// fifty, and the model is 15.65 GiB on a card that holds 15.92: with them the
+// driver puts the logit head in system memory and the model draws at three and
+// a half tokens a second, and without them it stays resident. Speculation is
+// worth about thirty per cent when it fits; a gigabyte across the bus every
+// token is worth minus eighty-eight.
+//
+// It must be called before UseVulkan, and it is ignored afterwards — the
+// weights are already there.
+func (m *Model) SkipDraftBlock() { m.noDraft = true }
+
+// deviceWeightBytes is what this model will put on the card, exactly: every
+// matrix the upload below walks, plus the logit head as the packing will hold
+// it. It is summed rather than taken from the file's size, because the token
+// embedding is never uploaded — the host looks a row up and hands the pipeline
+// floats — and on the 27B that is seven hundred megabytes of difference.
+func (m *Model) deviceWeightBytes(blocks int, drafts bool) uint64 {
+	var n uint64
+	add := func(w nn.Matrix) { n += uint64(len(w.Data)) }
+	for i := 0; i < blocks; i++ {
+		bw := &m.W.Blocks[i]
+		for _, w := range []nn.Matrix{bw.Q, bw.K, bw.V, bw.O, bw.QKV, bw.AttnGate,
+			bw.SSMAlpha, bw.SSMBeta, bw.SSMOut, bw.Gate, bw.Up, bw.Down} {
+			add(w)
+		}
+	}
+	if drafts && len(m.W.Blocks) > m.trunk() {
+		bw := &m.W.Blocks[m.trunk()]
+		for _, w := range []nn.Matrix{bw.Q, bw.K, bw.V, bw.O, bw.Gate, bw.Up, bw.Down} {
+			add(w)
+		}
+		add(m.W.MTP.EHProj)
+	}
+	// The head, in the layout the card holds it in. A Q6_K superblock is two
+	// hundred and ten bytes in the file and two hundred and twelve here, which
+	// on a quarter of a million rows is ten megabytes and is not noise at this
+	// margin.
+	head := m.W.OutputHead
+	if head.Quant == nn.Q6_K {
+		n += uint64(head.Rows) * uint64(head.Cols) / 256 * 212
+	} else {
+		add(head)
+	}
+	return n
+}
+
+// deviceBudget decides two things together, because they trade against each
+// other on a card that is nearly full: whether the prediction block goes over
+// at all, and how wide a prompt pass the scratch may be.
+//
+// What is at stake is not the scratch. The logit head is the last thing
+// uploaded and the largest single buffer in the model — a gigabyte on the 27B —
+// and when the heap runs out it is the one the driver leaves in system memory,
+// where it is read across the bus for every token drawn. Measured on
+// Qwen3.8-27B-Q4_K_M: 3.5 tokens a second with the head exiled, 26.1 with it
+// resident. Nothing else this file can decide is worth an eighth of that.
+//
+// So both answers are taken from the card's own heap rather than from a
+// constant. Drafting costs the prediction block's weights and a shadow of every
+// delta net's recurrence, together about four hundred mebibytes, and it buys
+// perhaps thirty per cent; it is dropped rather than allowed to exile the head.
+// The width costs scratch and buys prefill, and it is stepped down until it
+// fits.
+//
+// The margin is what the rest of the machine has of the card. A desktop with a
+// browser on it measured five hundred mebibytes here and the driver keeps some
+// of the heap for itself, so this leaves three quarters of a gigabyte. A margin
+// too large costs prefill; one too small costs seven eighths of the generation.
+func (m *Model) deviceBudget(d *vk.Device, shape vk.QwenShape, blocks int, wantDraft bool) (bool, int) {
+	const margin = 768 << 20
+	heap := d.DeviceLocalBytes()
+	attn, ssm := 0, 0
+	for i := 0; i < blocks; i++ {
+		if m.Cfg.Blocks[i].Type == BlockFullAttn {
+			attn++
+		} else {
+			ssm++
+		}
+	}
+
+	// fits says whether that configuration leaves the card room, at its
+	// narrowest useful pass.
+	fits := func(drafts bool, floor int) bool {
+		s := shape
+		s.Snapshots = drafts
+		extra := 0
+		if drafts {
+			extra = 1 // the prediction block's own attention keeps a cache
+		}
+		return m.deviceWeightBytes(blocks, drafts)+
+			vk.QwenBufferBytes(s, floor, attn+extra, ssm)+margin <= heap
+	}
+
+	drafts := wantDraft
+	if drafts && !fits(true, 2) {
+		// A speculative pass carries two columns, so two is the floor; below
+		// it the block cannot be used at all.
+		fmt.Fprintf(os.Stderr,
+			"qwen35: the prediction block does not fit beside the model on this card; drafting is off\n")
+		drafts = false
+	}
+	shape.Snapshots = drafts
+	floor := 1
+	if drafts {
+		floor = 2
+	}
+	extra := 0
+	if drafts {
+		extra = 1
+	}
+	for _, w := range []int{512, 256, 128, 64, 32, 16, 8, 4, 2, 1} {
+		if w < floor {
+			break
+		}
+		if m.deviceWeightBytes(blocks, drafts)+
+			vk.QwenBufferBytes(shape, w, attn+extra, ssm)+margin <= heap {
+			return drafts, w
+		}
+	}
+	// Nothing fits with room to spare. Take the narrowest and let the driver
+	// place what it can: a model that answers slowly is better than one that
+	// refuses.
+	return drafts, floor
 }

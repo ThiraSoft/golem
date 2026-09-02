@@ -25,6 +25,13 @@ type Model struct {
 	// time a draft is asked for.
 	mtp *MTPScratch
 
+	// noDraft says this model will not speculate, so the card need not carry
+	// the prediction block or the shadows a refused draft is undone from. It
+	// has to be set before the upload, which is why it is a field and not an
+	// argument: what a caller wants is known when the model is opened, and the
+	// upload happens later and elsewhere.
+	noDraft bool
+
 	// Vulkan GPU acceleration
 	dev     *vk.Device
 	gpuPipe *vk.QwenPipeline

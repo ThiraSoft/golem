@@ -32,8 +32,9 @@
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly  buffer QOut   { float qOut[];   }; // [cols*heads*256], normed and rotated
-layout(std430, binding = 1) readonly  buffer KCache { float kCache[]; };
-layout(std430, binding = 2) readonly  buffer VCache { float vCache[]; };
+// Two halves to a uint; shaders/qwen_attn_prep.comp writes them and says why.
+layout(std430, binding = 1) readonly  buffer KCache { uint kCache[]; };
+layout(std430, binding = 2) readonly  buffer VCache { uint vCache[]; };
 layout(std430, binding = 3) readonly  buffer QIn    { float qIn[];    }; // [cols*heads*512], the gate at +256
 layout(std430, binding = 4) writeonly buffer Out    { float out_[];   }; // [cols*heads*256]
 // See qwen_attn_prep.comp: the position is a buffer so the pass compiles once.
@@ -109,7 +110,10 @@ void main() {
         float kreg[PERL];
         if (have) {
             uint kBase = cacheBase + i * DIM;
-            [[unroll]] for (uint j = 0u; j < PERL; j++) kreg[j] = kCache[kBase + lane + j * LANES];
+            [[unroll]] for (uint j = 0u; j < PERL; j++) {
+                uint d = kBase + lane + j * LANES;
+                kreg[j] = unpackHalf2x16(kCache[d >> 1])[d & 1u];
+            }
         } else {
             [[unroll]] for (uint j = 0u; j < PERL; j++) kreg[j] = 0.0;
         }
@@ -165,7 +169,8 @@ void main() {
         float mix[QTILE];
         [[unroll]] for (uint q = 0u; q < QTILE; q++) mix[q] = 0.0;
         for (uint j = 0u; j < rows; j++) {
-            float v = vCache[cacheBase + (i0 + j) * DIM + t];
+            uint vd = cacheBase + (i0 + j) * DIM + t;
+            float v = unpackHalf2x16(vCache[vd >> 1])[vd & 1u];
             [[unroll]] for (uint q = 0u; q < QTILE; q++) mix[q] += expw[q * TILE + j] * v;
         }
 

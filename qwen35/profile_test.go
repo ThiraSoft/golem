@@ -68,3 +68,61 @@ func TestVulkanPassProfile(t *testing.T) {
 		tl.Close()
 	}
 }
+
+// TestVulkanTokenProfile is the same instrument on a pass of one column, which
+// is the pass generation runs and the one the wide profile above cannot see.
+// The two are not the same problem: a prompt is bound by the tiled products
+// and a token by everything that is one workgroup, and on the other two
+// engines it was the token profile that found a fifth of the time sitting in
+// an attention built for thirty-two columns.
+func TestVulkanTokenProfile(t *testing.T) {
+	m, err := Open(qwen38, 1024)
+	if err != nil {
+		t.Skipf("open: %v", err)
+	}
+	defer m.Close()
+	if err := m.UseVulkan(); err != nil {
+		t.Skipf("no Vulkan: %v", err)
+	}
+
+	x := make([]float32, m.Cfg.Dim)
+	m.W.TokenEmbd.Row(1000, x)
+
+	// One column and two, because a speculative step is one of each and the
+	// second is meant to be almost free: the weights are read once for both.
+	for _, columns := range []int{1, 2} {
+		xs := make([][]float32, columns)
+		pos := make([]int, columns)
+		for i := range xs {
+			xs[i], pos[i] = x, 32+i
+		}
+		tl, err := m.gpuPipe.NewTimeline()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		m.gpuPipe.ResetState()
+		for p := 0; p < 32; p++ {
+			if _, err := m.gpuPipe.ForwardColumns([][]float32{x}, []int{p}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := m.gpuPipe.ForwardColumns(xs, pos); err != nil {
+			t.Fatal(err)
+		}
+		m.gpuPipe.Profile(tl)
+		start := time.Now()
+		if _, err := m.gpuPipe.ForwardColumns(xs, pos); err != nil {
+			t.Fatal(err)
+		}
+		took := time.Since(start)
+		m.gpuPipe.Profile(nil)
+
+		report, err := tl.Report(took)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%d column(s) in %v\n%s", columns, took, report)
+		tl.Close()
+	}
+}

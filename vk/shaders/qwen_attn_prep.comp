@@ -23,8 +23,15 @@ layout(std430, binding = 2) readonly  buffer VIn    { float vIn[];    }; // [kvH
 layout(std430, binding = 3) readonly  buffer QNorm  { float qNorm[];  }; // [256]
 layout(std430, binding = 4) readonly  buffer KNorm  { float kNorm[];  }; // [256]
 layout(std430, binding = 5) writeonly buffer QOut   { float qOut[];   }; // [heads*256]
-layout(std430, binding = 6)           buffer KCache { float kCache[]; };
-layout(std430, binding = 7)           buffer VCache { float vCache[]; };
+// The caches, two halves to a uint. Sixteen bits a number and not thirty-two,
+// which is what vk/attention.go's caches have always been and what llama.cpp
+// holds its own in. On Qwen3.8-27B it is the difference between a checkpoint
+// that stays on the card and one whose logit head the driver exiles to system
+// memory: four key-value heads, two hundred and fifty-six dimensions, four
+// thousand and ninety-six positions and sixteen attention blocks is five
+// hundred and twelve megabytes in floats and half of that here.
+layout(std430, binding = 6)           buffer KCache { uint kCache[]; };
+layout(std430, binding = 7)           buffer VCache { uint vCache[]; };
 // The position lives in a buffer rather than a push constant, so that the whole
 // pass can be recorded once and replayed: laying down the command buffer again
 // for every token cost 2.4 milliseconds of a 36-millisecond token, on the CPU,
@@ -78,6 +85,38 @@ float mropeAt(uint pair, uint scalarPos) {
     else                                                 return float(mp.w);
 }
 
+// rotated is one dimension of a key or a query after the norm and the rotation.
+// It is a function because a thread now answers two of them: the cache holds
+// pairs of halves, so the even threads write and each needs its odd
+// neighbour's number as well as its own. Recomputing it is three reads and a
+// rotation, against a shared array and a barrier for the alternative.
+float rotated(uint j, uint base, float inv, uint pos, uint half_) {
+    float normed = qIn[base + j] * inv * qNorm[j];
+    if (j >= p.ropeDims) return normed;
+    uint pair = j % half_;
+    float angle = mropeAt(pair, pos) * pow(p.ropeBase, -float(pair * 2u) / float(p.ropeDims));
+    float cosA = cos(angle);
+    float sinA = sin(angle);
+    uint otherJ = (j < half_) ? (j + half_) : (j - half_);
+    float other = qIn[base + otherJ] * inv * qNorm[otherJ];
+    return (j < half_) ? (normed * cosA - other * sinA) : (other * sinA + normed * cosA);
+}
+
+// rotatedK is the same for a key, which reads the other two buffers. GLSL has
+// no way to hand a function the buffer it should read, so this is the one
+// duplication the change costs.
+float rotatedK(uint j, uint base, float inv, uint pos, uint half_) {
+    float normed = kIn[base + j] * inv * kNorm[j];
+    if (j >= p.ropeDims) return normed;
+    uint pair = j % half_;
+    float angle = mropeAt(pair, pos) * pow(p.ropeBase, -float(pair * 2u) / float(p.ropeDims));
+    float cosA = cos(angle);
+    float sinA = sin(angle);
+    uint otherJ = (j < half_) ? (j + half_) : (j - half_);
+    float other = kIn[base + otherJ] * inv * kNorm[otherJ];
+    return (j < half_) ? (normed * cosA - other * sinA) : (other * sinA + normed * cosA);
+}
+
 // rmsOf folds the squares of a 256-wide head across the workgroup.
 float rmsOf(float val, float eps) {
     float folded = subgroupAdd(val * val);
@@ -97,40 +136,21 @@ void main() {
 
     if (head < p.heads) {
         uint base = COL * p.heads * 512u + head * 512u; // this head's [q|gate] pair
-        float val = qIn[base + j];
-        float inv = rmsOf(val, p.eps);
-        float normed = val * inv * qNorm[j];
-
-        if (j < p.ropeDims) {
-            uint pair = j % half_;
-            float angle = mropeAt(pair, pos) * pow(p.ropeBase, -float(pair * 2u) / float(p.ropeDims));
-            float cosA = cos(angle);
-            float sinA = sin(angle);
-            uint otherJ = (j < half_) ? (j + half_) : (j - half_);
-            float other = qIn[base + otherJ] * inv * qNorm[otherJ];
-            normed = (j < half_) ? (normed * cosA - other * sinA)
-                                 : (other * sinA + normed * cosA);
-        }
-        qOut[COL * p.heads * 256u + head * 256u + j] = normed;
+        float inv = rmsOf(qIn[base + j], p.eps);
+        // The queries stay floats: they are read once, by the kernel after
+        // this one, and never held.
+        qOut[COL * p.heads * 256u + head * 256u + j] = rotated(j, base, inv, pos, half_);
     } else {
         uint kv = head - p.heads;
         uint kBase = COL * p.kvHeads * 256u + kv * 256u;
-        float val = kIn[kBase + j];
-        float inv = rmsOf(val, p.eps);
-        float normed = val * inv * kNorm[j];
-
-        if (j < p.ropeDims) {
-            uint pair = j % half_;
-            float angle = mropeAt(pair, pos) * pow(p.ropeBase, -float(pair * 2u) / float(p.ropeDims));
-            float cosA = cos(angle);
-            float sinA = sin(angle);
-            uint otherJ = (j < half_) ? (j + half_) : (j - half_);
-            float other = kIn[kBase + otherJ] * inv * kNorm[otherJ];
-            normed = (j < half_) ? (normed * cosA - other * sinA)
-                                 : (other * sinA + normed * cosA);
+        float inv = rmsOf(kIn[kBase + j], p.eps);
+        // rmsOf has folded across the whole workgroup, so every thread has the
+        // scale; from here the even ones do the writing, a pair each.
+        if ((j & 1u) == 0u) {
+            uint at = ((kv * p.maxContext + pos) * 256u + j) >> 1;
+            kCache[at] = packHalf2x16(vec2(rotatedK(j, kBase, inv, pos, half_),
+                                           rotatedK(j + 1u, kBase, inv, pos, half_)));
+            vCache[at] = packHalf2x16(vec2(vIn[kBase + j], vIn[kBase + j + 1u]));
         }
-        uint at = (kv * p.maxContext + pos) * 256u + j;
-        kCache[at] = normed;
-        vCache[at] = vIn[kBase + j];
     }
 }

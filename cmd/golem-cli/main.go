@@ -95,6 +95,13 @@ func main() {
 			fail(err)
 		}
 	}
+	if !*draft {
+		// Before the upload, not after: what a checkpoint's prediction block
+		// costs on the card is decided when the weights go over, and on the
+		// 27B it is the difference between a resident model and an exiled
+		// logit head.
+		m.SkipDraftBlock()
+	}
 	if *vulkan {
 		if err := m.UseVulkan(); err != nil {
 			fail(err)

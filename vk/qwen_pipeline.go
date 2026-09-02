@@ -310,6 +310,34 @@ type QwenShape struct {
 
 	Eps float32
 
+	// Snapshots says the delta nets must keep a copy of their state aside as a
+	// pass crosses into a drafted column, so that RestoreState can put it back
+	// when the draft is refused. It is the whole of what a prediction block
+	// costs in memory beyond its own weights: a shadow of every block's
+	// recurrence, which on Qwen3.8-27B is forty-eight blocks of three
+	// megabytes — a hundred and fifty of them, on a card where the same model's
+	// logit head is a gigabyte and the difference between resident and exiled.
+	//
+	// A caller that will not draft says so and pays none of it. There is no
+	// default: the field is a boolean and a boolean's default is a guess about
+	// somebody else's checkpoint, which this file has been wrong about before.
+	Snapshots bool
+
+	// PassWidth is the widest pass this pipeline is built for, and zero means
+	// qwenWide. It is a field because it is memory: every scratch buffer below
+	// is a width times a dimension times four bytes, and on Qwen3.8-27B the set
+	// of them is two hundred and sixty-six mebibytes at five hundred and
+	// twelve columns and sixty-six at a hundred and twenty-eight.
+	//
+	// That is not a saving worth making on a card with room. It is worth
+	// making on one without: the 27B's Q4_K_M is 15.65 GiB and the card holds
+	// 15.92 with a desktop on it, and what falls off the end is the logit
+	// head, which is then read across the bus for every token drawn — four
+	// tokens a second where thirty were there for the taking. A narrower
+	// prompt pass costs a fraction of the prefill; an exiled head costs
+	// seven eighths of the generation.
+	PassWidth int
+
 	// Golem is the format of a .golem checkpoint, and the zero value for one of
 	// llama.cpp's own types. It decides which of two forms every projection in
 	// the model takes; vk/qwen_golem.go is the other one.
@@ -698,7 +726,7 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		}
 	}
 
-	dim := shape.Dim * qwenWide
+	dim := shape.Dim * shape.width()
 	if p.xin, err = d.Host(dim*4, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
 		return nil, err
 	}
@@ -713,17 +741,20 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 	// then wrote past the end of it and copied twice the buffer's length into
 	// the device's. That answered rather than failing: every wide pass read
 	// somebody else's positions.
-	if p.posIn, err = d.Host(qwenWide*4, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
+	// The pass width this pipeline is built for, which every buffer below is a
+	// multiple of. QwenShape.PassWidth says why it is not always qwenWide.
+	wide := shape.width()
+	if p.posIn, err = d.Host(wide*4, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
 		return nil, err
 	}
 	// Four uints a column, against the position's one.
-	if p.mposIn, err = d.Host(qwenWide*16, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
+	if p.mposIn, err = d.Host(wide*16, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
 		return nil, err
 	}
-	if p.mposBuf, err = d.Local(qwenWide*16, bufferUsageStorage|bufferUsageTransferDst); err != nil {
+	if p.mposBuf, err = d.Local(wide*16, bufferUsageStorage|bufferUsageTransferDst); err != nil {
 		return nil, err
 	}
-	if p.posBuf, err = d.Local(qwenWide*4, bufferUsageStorage); err != nil {
+	if p.posBuf, err = d.Local(wide*4, bufferUsageStorage); err != nil {
 		return nil, err
 	}
 	for _, into := range []**Buffer{&p.xs, &p.resid, &p.normed, &p.normedQ, &p.normedS, &p.ffnNorm, &p.ffnNormQ, &p.ffnNormS, &p.ffnOut, &p.none} {
@@ -732,31 +763,31 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		}
 	}
 	for _, into := range []**Buffer{&p.gateBuf, &p.upBuf, &p.actBuf} {
-		if *into, err = p.local(shape.FFN * qwenWide * 4); err != nil {
+		if *into, err = p.local(shape.FFN * wide * 4); err != nil {
 			return nil, err
 		}
 	}
 	// The same activation in eight bits, which is what the tiled product reads.
-	if p.actQ, err = p.local(shape.FFN * qwenWide); err != nil {
+	if p.actQ, err = p.local(shape.FFN * wide); err != nil {
 		return nil, err
 	}
-	if p.actS, err = p.local(2 * (shape.FFN / quantBlock) * qwenWide * 4); err != nil {
+	if p.actS, err = p.local(2 * (shape.FFN / quantBlock) * wide * 4); err != nil {
 		return nil, err
 	}
 	// And the delta net's output in the same two forms, for the same reason:
 	// its projection is Q5_K and the tiled product wants eight bits.
-	if p.ySSMQ, err = p.local(shape.Inner * qwenWide); err != nil {
+	if p.ySSMQ, err = p.local(shape.Inner * wide); err != nil {
 		return nil, err
 	}
-	if p.ySSMS, err = p.local(2 * (shape.Inner / quantBlock) * qwenWide * 4); err != nil {
+	if p.ySSMS, err = p.local(2 * (shape.Inner / quantBlock) * wide * 4); err != nil {
 		return nil, err
 	}
 	// And the attention's mix, whose output projection is Q4_0 and wants the
 	// same eight bits.
-	if p.attnOutQ, err = p.local(shape.qDim() * qwenWide); err != nil {
+	if p.attnOutQ, err = p.local(shape.qDim() * wide); err != nil {
 		return nil, err
 	}
-	if p.attnOutS, err = p.local(2 * (shape.qDim() / quantBlock) * qwenWide * 4); err != nil {
+	if p.attnOutS, err = p.local(2 * (shape.qDim() / quantBlock) * wide * 4); err != nil {
 		return nil, err
 	}
 	// The mixer's scratch, one set for every block. See the field comment.
@@ -764,14 +795,14 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		into  **Buffer
 		bytes int
 	}{
-		{&p.convOut, shape.ConvDim * qwenWide * 4}, {&p.qkvBuf, shape.ConvDim * qwenWide * 4},
-		{&p.qkNorm, 4096 * qwenWide * 4},
-		{&p.gateZBuf, shape.Inner * qwenWide * 4}, {&p.ySSM, shape.Inner * qwenWide * 4},
-		{&p.alphaBuf, shape.Rank * qwenWide * 4}, {&p.betaBuf, shape.Rank * qwenWide * 4},
-		{&p.qIn, shape.qFullDim() * qwenWide * 4},
-		{&p.kIn, shape.kvDim() * qwenWide * 4}, {&p.vIn, shape.kvDim() * qwenWide * 4},
-		{&p.qOut, shape.qDim() * qwenWide * 4}, {&p.attnOut, shape.qDim() * qwenWide * 4},
-		{&p.mixOut, shape.Dim * qwenWide * 4},
+		{&p.convOut, shape.ConvDim * wide * 4}, {&p.qkvBuf, shape.ConvDim * wide * 4},
+		{&p.qkNorm, 4096 * wide * 4},
+		{&p.gateZBuf, shape.Inner * wide * 4}, {&p.ySSM, shape.Inner * wide * 4},
+		{&p.alphaBuf, shape.Rank * wide * 4}, {&p.betaBuf, shape.Rank * wide * 4},
+		{&p.qIn, shape.qFullDim() * wide * 4},
+		{&p.kIn, shape.kvDim() * wide * 4}, {&p.vIn, shape.kvDim() * wide * 4},
+		{&p.qOut, shape.qDim() * wide * 4}, {&p.attnOut, shape.qDim() * wide * 4},
+		{&p.mixOut, shape.Dim * wide * 4},
 	} {
 		if *l.into, err = p.local(l.bytes); err != nil {
 			return nil, err
@@ -884,8 +915,13 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 		{&b.ssmNorm, asBytes(d.SSMNorm)},
 		{&b.convState, make([]byte, (s.ConvDim*4)*3)},
 		{&b.ssmState, make([]byte, s.Rank*s.StateSize*s.StateSize*4)},
-		{&b.shadowConv, make([]byte, (s.ConvDim*4)*3)},
-		{&b.shadowState, make([]byte, s.Rank*s.StateSize*s.StateSize*4)},
+		// The shadows, or four bytes standing in for them where nothing drafts.
+		// They stay bound either way — a descriptor set names every binding
+		// whether or not a pass writes it — and nothing writes them unless a
+		// pass says which column to snapshot at, which only a speculative one
+		// does.
+		{&b.shadowConv, make([]byte, shadowBytes(s.Snapshots, (s.ConvDim*4)*3))},
+		{&b.shadowState, make([]byte, shadowBytes(s.Snapshots, s.Rank*s.StateSize*s.StateSize*4))},
 	} {
 		if *u.into, err = p.upload(u.data); err != nil {
 			return err
@@ -1044,8 +1080,11 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 		data []byte
 	}{
 		{&b.qNorm, asBytes(d.QNorm)}, {&b.kNorm, asBytes(d.KNorm)},
-		{&b.kCache, make([]byte, s.KVHeads*s.MaxContext*s.HeadDim*4)},
-		{&b.vCache, make([]byte, s.KVHeads*s.MaxContext*s.HeadDim*4)},
+		// Two bytes a number, not four: shaders/qwen_attn_prep.comp holds the
+		// cache in halves, which is what every other attention here does and
+		// what decides whether the 27B's head stays on the card.
+		{&b.kCache, make([]byte, s.KVHeads*s.MaxContext*s.HeadDim*2)},
+		{&b.vCache, make([]byte, s.KVHeads*s.MaxContext*s.HeadDim*2)},
 	} {
 		if *u.into, err = p.upload(u.data); err != nil {
 			return nil, err
@@ -1288,18 +1327,62 @@ func (p *QwenPipeline) ForwardSpeculativeAt(xs [][]float32, at []QwenPlace) ([][
 	return p.forward(xs, at, true)
 }
 
+// width is the widest pass this shape was built for.
+func (s QwenShape) width() int {
+	if s.PassWidth <= 0 || s.PassWidth > qwenWide {
+		return qwenWide
+	}
+	return s.PassWidth
+}
+
+// QwenBufferBytes is everything a pipeline of that shape allocates that is not
+// a weight: the scratch a pass of `width` columns needs, a key-value cache for
+// every full attention block, and a recurrence for every delta net — twice
+// over where a draft may have to be undone.
+//
+// A caller sizing a model against the card needs all three and not just the
+// first. On Qwen3.8-27B they are two hundred and sixty-six mebibytes of
+// scratch, two hundred and eighty-five of cache and three hundred of state,
+// which together are most of the gigabyte the model overflows the card by.
+func QwenBufferBytes(s QwenShape, width, attn, ssm int) uint64 {
+	n := QwenScratchBytes(s, width)
+	n += uint64(attn) * uint64(2*s.KVHeads*s.MaxContext*s.HeadDim*2)
+	state := uint64((s.ConvDim*4)*3 + s.Rank*s.StateSize*s.StateSize*4)
+	if s.Snapshots {
+		state *= 2
+	}
+	return n + uint64(ssm)*state
+}
+
+// QwenScratchBytes is what a pipeline of that shape spends on working memory at
+// that pass width, before a single weight is uploaded. A caller sizing a model
+// against the card needs it, and it is computed from the same list the
+// allocation walks rather than estimated beside it — vk/qwen_pipeline.go's
+// DeviceBytes says what an estimate of this cost once.
+func QwenScratchBytes(s QwenShape, width int) uint64 {
+	if width <= 0 {
+		width = qwenWide
+	}
+	q8 := func(n int) int { return n*width + 2*(n/quantBlock)*width*4 }
+	n := 10 * s.Dim * 4
+	n += 3 * s.FFN * width * 4
+	n += q8(s.FFN) + q8(s.Inner) + q8(s.qDim())
+	n += (2*s.ConvDim + 4096 + 2*s.Inner + 2*s.Rank + s.qFullDim() + 2*s.kvDim() + 2*s.qDim() + s.Dim) * width * 4
+	return uint64(n)
+}
+
 func (p *QwenPipeline) forward(xs [][]float32, at []QwenPlace, speculative bool) ([][]float32, error) {
 	s := p.shape
 	columns := len(xs)
-	if columns == 0 || columns > qwenWide {
-		return nil, fmt.Errorf("vk: a qwen pass carries one to %d columns, given %d", qwenWide, columns)
+	if columns == 0 || columns > s.width() {
+		return nil, fmt.Errorf("vk: a qwen pass carries one to %d columns, given %d", s.width(), columns)
 	}
 	if len(at) != columns {
 		return nil, fmt.Errorf("vk: %d columns need %d positions, given %d", columns, columns, len(at))
 	}
 	stream := p.xin.Floats()
-	pos := unsafe.Slice((*uint32)(unsafe.Pointer(&p.posIn.Bytes()[0])), qwenWide)
-	mpos := unsafe.Slice((*uint32)(unsafe.Pointer(&p.mposIn.Bytes()[0])), qwenWide*4)
+	pos := unsafe.Slice((*uint32)(unsafe.Pointer(&p.posIn.Bytes()[0])), s.width())
+	mpos := unsafe.Slice((*uint32)(unsafe.Pointer(&p.mposIn.Bytes()[0])), s.width()*4)
 	for c, x := range xs {
 		if at[c].Pos >= s.MaxContext {
 			return nil, fmt.Errorf("vk: position %d is past the %d the pipeline was built for", at[c].Pos, s.MaxContext)
@@ -1515,8 +1598,8 @@ func (p *QwenPipeline) NewTimeline() (*Timeline, error) {
 // CompileAt records a pass and keeps it. It exists for the benchmark that
 // separates the recording's cost from the card's; Forward compiles its own.
 func (p *QwenPipeline) CompileAt(columns int) (*Program, error) {
-	if columns < 1 || columns > qwenWide {
-		return nil, fmt.Errorf("vk: a qwen pass carries one to %d columns, given %d", qwenWide, columns)
+	if columns < 1 || columns > p.shape.width() {
+		return nil, fmt.Errorf("vk: a qwen pass carries one to %d columns, given %d", p.shape.width(), columns)
 	}
 	return p.d.Compile(func(r *Recorder) { p.record(r, columns, int(noSnapshot)) })
 }
@@ -1745,9 +1828,9 @@ func (p *QwenPipeline) setPos(pos int) {
 // other would rotate by whatever the pass before it left, which is a wrong
 // answer that nothing would report.
 func (p *QwenPipeline) setPlace(at QwenPlace) {
-	w := unsafe.Slice((*uint32)(unsafe.Pointer(&p.posIn.Bytes()[0])), qwenWide)
+	w := unsafe.Slice((*uint32)(unsafe.Pointer(&p.posIn.Bytes()[0])), p.shape.width())
 	w[0] = uint32(at.Pos)
-	m := unsafe.Slice((*uint32)(unsafe.Pointer(&p.mposIn.Bytes()[0])), qwenWide*4)
+	m := unsafe.Slice((*uint32)(unsafe.Pointer(&p.mposIn.Bytes()[0])), p.shape.width()*4)
 	m[0], m[1], m[2], m[3] = uint32(at.T), uint32(at.H), uint32(at.W), 0
 }
 
@@ -2143,7 +2226,19 @@ type qwenMTPBlock struct {
 
 // AddMTPBlock uploads the prediction block. It must come after SetNorms, which
 // is what the trunk's own stream bindings wait for.
+// shadowBytes is that allocation: the real size when a pass may snapshot, and
+// the smallest a buffer may be when none will.
+func shadowBytes(snapshots bool, full int) int {
+	if snapshots {
+		return full
+	}
+	return 4
+}
+
 func (p *QwenPipeline) AddMTPBlock(d QwenMTPData) error {
+	if !p.shape.Snapshots {
+		return fmt.Errorf("vk: this pipeline was built without snapshots, so it cannot carry a prediction block")
+	}
 	s := p.shape
 	b := &qwenMTPBlock{}
 	var err error
@@ -2271,9 +2366,9 @@ const golemWidestPass = 64
 // widestPass is the widest a submission of this pipeline may carry.
 func (p *QwenPipeline) widestPass() int {
 	if p.usesGolem() {
-		return golemWidestPass
+		return min(golemWidestPass, p.shape.width())
 	}
-	return qwenWide
+	return p.shape.width()
 }
 
 // DraftMTP runs the prediction block over one already-normed and concatenated

@@ -114,6 +114,19 @@ type vulkanVision interface {
 // It is all or nothing per part, and it fails rather than falling back: a
 // model half on a card the caller believed it was wholly on is a model whose
 // speed nobody can explain.
+// noDrafter is an engine whose checkpoint carries a prediction block it can be
+// told to leave behind. Only Qwen3.8 has one.
+type noDrafter interface{ SkipDraftBlock() }
+
+// SkipDraftBlock tells an engine that will not speculate not to spend the card
+// on what speculation needs. It has to be called before UseVulkan, because
+// what it decides is what gets uploaded; after it, it is a no-op that lies.
+func (m *Model) SkipDraftBlock() {
+	if d, ok := m.Forward.(noDrafter); ok {
+		d.SkipDraftBlock()
+	}
+}
+
 func (m *Model) UseVulkan() error {
 	h, ok := m.Forward.(vulkanHead)
 	if !ok {
