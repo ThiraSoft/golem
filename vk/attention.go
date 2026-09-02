@@ -151,6 +151,12 @@ type Attention struct {
 	// Q8_0 one, for the blocks whose output projection reads floats. Built
 	// only when one is added.
 	scoresFloat *Pipeline
+	// one is the same attention for a single column, and oneFloat is that with
+	// the float copy of the mix beside it. A prompt takes the tiled kernel and
+	// a token takes this; which is a property of the pass and not of the block,
+	// so both sets are made and Record picks.
+	one      *Pipeline
+	oneFloat *Pipeline
 	// rope fills the angle tables from the position buffer, at the head of a
 	// pass. shaders/rope_table.comp says what it replaced.
 	rope *Pipeline
@@ -191,7 +197,10 @@ type attentionBlock struct {
 	setV, setO   *Set
 	setPrepare   *Set
 	setScores    *Set
-	setOParts    *Set // the output projection when its shared dimension is split
+	// setOne is the same weights through shaders/attn_one.comp, which answers
+	// one column. See Attention.one.
+	setOne    *Set
+	setOParts *Set // the output projection when its shared dimension is split
 
 	// golem is the block's Golem side when its projections are in that format,
 	// and nil when they are Q4_0. vk/attention_golem.go is all of it.
@@ -287,6 +296,7 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, slotContext, s
 		{&a.reduce, matmulReduceSPIRV, 2, unsafe.Sizeof(moePush{}), 0},
 		{&a.prepare, attnPrepareSPIRV, 11, unsafe.Sizeof(attnPush{}), 0},
 		{&a.scores, scoresSPIRV(coop), 7, unsafe.Sizeof(scorePush{}), scoresWave},
+		{&a.one, attnOneSPIRV, 7, unsafe.Sizeof(scorePush{}), 0},
 		{&a.rope, ropeTableSPIRV, 4, unsafe.Sizeof(ropePush{}), 0},
 	} {
 		if *spec.into, err = d.newPipeline(spec.spirv, spec.bindings, uint32(spec.push), spec.wave, nil); err != nil {
@@ -567,10 +577,22 @@ func (a *Attention) AddBlock(shape BlockShape, q, k, v, o []byte, qnorm, knorm [
 		}); err != nil {
 			return fail(err)
 		}
-	} else if b.setScores, err = a.scores.NewSet([]*Buffer{
-		a.qh, ck, cv, a.scoreRows, a.aq, a.as, a.where,
-	}); err != nil {
-		return fail(err)
+		if b.setOne, err = a.oneFloat.NewSet([]*Buffer{
+			a.qh, ck, cv, a.scoreRows, a.aq, a.as, a.where, a.af,
+		}); err != nil {
+			return fail(err)
+		}
+	} else {
+		if b.setScores, err = a.scores.NewSet([]*Buffer{
+			a.qh, ck, cv, a.scoreRows, a.aq, a.as, a.where,
+		}); err != nil {
+			return fail(err)
+		}
+		if b.setOne, err = a.one.NewSet([]*Buffer{
+			a.qh, ck, cv, a.scoreRows, a.aq, a.as, a.where,
+		}); err != nil {
+			return fail(err)
+		}
 	}
 	a.blocks = append(a.blocks, b)
 	return nil
@@ -708,6 +730,13 @@ func (a *Attention) Record(r *Recorder, block, columns int, runs []span) {
 	for _, run := range runs {
 		score.col0 = uint32(run.first)
 		score.columns = uint32(run.first + run.count)
+		// A run of one column is a token being drawn, and it takes the kernel
+		// written for that: the tiled one would spend a workgroup's whole
+		// shape on thirty-one columns that are not there.
+		if run.count == 1 {
+			r.Dispatch(b.setOne, uint32(s.Heads), unsafe.Pointer(&score))
+			continue
+		}
 		tiles := uint32((run.count + scoreColumns - 1) / scoreColumns)
 		r.DispatchColumns(b.setScores, uint32(s.Heads), tiles, unsafe.Pointer(&score))
 	}
@@ -794,7 +823,7 @@ func (a *Attention) Close() {
 		a.products.Close()
 		a.products = nil
 	}
-	for _, p := range []**Pipeline{&a.scoresFloat, &a.scores, &a.prepare, &a.reduce, &a.rope} {
+	for _, p := range []**Pipeline{&a.scoresFloat, &a.scores, &a.one, &a.oneFloat, &a.prepare, &a.reduce, &a.rope} {
 		if *p != nil {
 			(*p).Close()
 			*p = nil
@@ -814,7 +843,7 @@ func pointers(bs []*Buffer) []**Buffer {
 func (b *attentionBlock) close() {
 	b.golem.close()
 	b.golem = nil
-	for _, s := range []**Set{&b.setScores, &b.setPrepare, &b.setOParts, &b.setO, &b.setV, &b.setK, &b.setQ} {
+	for _, s := range []**Set{&b.setScores, &b.setOne, &b.setPrepare, &b.setOParts, &b.setO, &b.setV, &b.setK, &b.setQ} {
 		if *s != nil {
 			(*s).Close()
 			*s = nil
@@ -832,6 +861,18 @@ func (b *attentionBlock) close() {
 
 //go:embed shaders/attn_scores_float.spv
 var scoresFloatSPIRV []byte
+
+// The same attention for a pass of one column, which is every token a model
+// generates. shaders/attn_one.comp says what it is for and what it measured.
+//
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/attn_one.comp -o shaders/attn_one.spv
+//go:generate glslc -O -DFLOATOUT --target-env=vulkan1.1 -fshader-stage=compute shaders/attn_one.comp -o shaders/attn_one_float.spv
+
+//go:embed shaders/attn_one.spv
+var attnOneSPIRV []byte
+
+//go:embed shaders/attn_one_float.spv
+var attnOneFloatSPIRV []byte
 
 // scoresSPIRV is the scores kernel built for this card: the block of scores on
 // the matrix cores where there are any, and the scalar dot products where

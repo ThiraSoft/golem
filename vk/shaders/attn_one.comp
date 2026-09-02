@@ -1,0 +1,286 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// The attention of a single column, which is the one generation runs.
+//
+// shaders/attn_scores.comp answers thirty-two columns to a workgroup and that
+// is what makes a prompt fast. A token is one column, and the same binary spends
+// its whole shape on the thirty-one that are not there: an accumulator of
+// BR by DPT floats a thread, a query tile of thirty-three kilobytes of shared
+// memory, and every inner loop written `for r < BR`. The shared memory alone
+// holds a compute unit to one workgroup. Ablated — the scores dispatch removed
+// and the answer left wrong — a Qwen3-4B token went from 9.41 milliseconds to
+// 7.61, so this kernel was costing 1.80 of them where llama.cpp's own spends
+// 0.51 for the same thirty-six blocks.
+//
+// So this is the same FlashAttention with BR fixed at one, and nothing about it
+// is a special case of the other: the geometry is different because one column
+// asks for a different one. LPP lanes cooperate on a position rather than a
+// thread owning a score, which is what keeps the key reads contiguous when the
+// positions of a tile are spread across the workgroup rather than its
+// dimensions.
+//
+// What it does not change: the online softmax, the cache addressing, the ring,
+// the visible range, and the Q8_0 form it writes. Those are attn_scores.comp's
+// and are repeated here rather than shared, because a shader that is one third
+// preprocessor is not clearer than two that are each one thing.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer QH { float qh[];     };
+layout(std430, binding = 1) readonly  buffer CK { uint  ck[];     };
+layout(std430, binding = 2) readonly  buffer CV { uint  cv[];     };
+layout(std430, binding = 3) buffer          SC { float scores[];  };  // unused, as there
+layout(std430, binding = 4) writeonly buffer AQ { uint  aq[];     };
+#ifdef FLOATOUT
+layout(std430, binding = 7) writeonly buffer AF { float af[];     };
+#endif
+layout(std430, binding = 5) writeonly buffer AS { float as_[];    };
+layout(std430, binding = 6) readonly  buffer WH { uvec4 where_[]; };
+
+layout(push_constant) uniform Push {
+    uint heads;
+    uint kvHeads;
+    uint headDim;
+    uint perKV;
+    uint block;
+    uint capacity;
+    uint mask;
+    uint columns;
+    float scale;
+    uint col0;
+} p;
+
+const uint WHERE_COLUMNS = 512u;
+
+// LPP lanes to a position and PPI positions to a tile, which multiply to the
+// workgroup. Eight and thirty-two, and both halves of that matter.
+//
+// Eight because a key row is read across them: lane l takes elements l, l+8,
+// … of the row, so the eight of them read thirty-two consecutive words at
+// once. One lane to a position would read a row per lane and stride the
+// fetches by a whole head, which is the same bytes at a fraction of the rate.
+// Eight is also a cluster a subgroup reduce can fold, which is how the dot
+// becomes a score without shared memory.
+//
+// Thirty-two because it is what the tile of the wide kernel is, and because
+// the mix below amortises the accumulator's rescale over it.
+const uint LPP = 8u;
+const uint PPI = 256u / LPP;
+
+// UNROLL is how many positions of the mix a thread has in flight at once.
+// Measured end to end on Qwen3-4B-Q4_K_M, a token: two gives 8.90 ms, four
+// 8.78, eight 8.64, sixteen 8.67. Eight, and the shape of that curve is the
+// argument — it is latency being covered and not work being saved.
+const uint UNROLL = 8u;
+
+// MAXD is attn_scores.comp's: Gemma 4's global blocks have heads of five
+// hundred and twelve, and a kernel that assumed the workgroup was as wide as a
+// head answered every sixth block with half of it.
+const uint MAXD = 512u;
+const uint DPT  = MAXD / 256u;
+const uint MAXQ = MAXD / 8u;
+
+#define QW (hd >> 3u)
+
+// The one query row, whole, and the tile's probabilities. Two kilobytes and a
+// hundred and twenty-eight bytes against the wide kernel's fifty kilobytes,
+// which is the whole of why more than one workgroup fits on a compute unit.
+shared uvec4 qs[MAXQ];
+shared float ss[PPI];
+
+uint floatToHalf(float f) {
+    uint bits     = floatBitsToUint(f);
+    uint sign     = (bits >> 16) & 0x8000u;
+    int  exponent = int((bits >> 23) & 0xFFu) - 127 + 15;
+    uint mantissa = bits & 0x7FFFFFu;
+
+    if ((bits & 0x7FFFFFFFu) == 0u) return sign;
+    if (exponent >= 0x1F) {
+        if ((bits & 0x7F800000u) == 0x7F800000u && mantissa != 0u) return sign | 0x7E00u;
+        return sign | 0x7C00u;
+    }
+    if (exponent <= 0) {
+        if (exponent < -10) return sign;
+        mantissa |= 0x800000u;
+        uint shift = uint(14 - exponent);
+        uint value = mantissa >> shift;
+        uint rest  = mantissa & ((1u << shift) - 1u);
+        uint mid   = 1u << (shift - 1u);
+        if (rest > mid || (rest == mid && (value & 1u) == 1u)) value++;
+        return sign | value;
+    }
+    uint value = (uint(exponent) << 10) | (mantissa >> 13);
+    uint rest  = mantissa & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (value & 1u) == 1u)) value++;
+    return sign | value;
+}
+
+int nearestInt(float f) {
+    return (floatBitsToInt(f + 12582912.0) & 0x007fffff) - 0x00400000;
+}
+
+uint slotBase;
+
+uint entry(uint pos, uint head) {
+    uint at = (p.mask != 0u) ? (pos & p.mask) : (pos % p.capacity);
+    return ((slotBase + at) * p.kvHeads + head) * p.headDim;
+}
+
+void main() {
+    uint h    = gl_WorkGroupID.x;
+    uint t    = gl_LocalInvocationID.x;
+    uint hd   = p.headDim;
+    uint kv   = h / p.perKV;
+    uint base = p.col0;
+
+    uvec4 mine = where_[p.block * WHERE_COLUMNS + base];
+    slotBase = mine.w * p.capacity;
+    uint lo = mine.y, hi = mine.z;
+    uint total = hi - lo + 1u;
+
+    // The query, read once and kept. Eight dimensions to an element, which is
+    // one shared instruction in the dot below.
+    for (uint j = t; j < QW; j += 256u) {
+        uint qb = base * p.heads * hd + h * hd + (j << 3);
+        qs[j] = uvec4(packHalf2x16(vec2(qh[qb],      qh[qb + 1u])),
+                      packHalf2x16(vec2(qh[qb + 2u], qh[qb + 3u])),
+                      packHalf2x16(vec2(qh[qb + 4u], qh[qb + 5u])),
+                      packHalf2x16(vec2(qh[qb + 6u], qh[qb + 7u])));
+    }
+    barrier();
+
+    uint lane = t % LPP;      // which eighth of the row this thread reads
+    uint slotIn = t / LPP;    // which position of the tile it scores
+
+    float acc[DPT];
+    [[unroll]] for (uint u = 0u; u < DPT; u++) acc[u] = 0.0;
+    float rowMax = -1.0 / 0.0, rowSum = 0.0;
+
+    for (uint start = 0u; start < total; start += PPI) {
+        uint got = min(PPI, total - start);
+        uint pos = lo + start + slotIn;
+
+        // The dot, folded over the lanes that share the position. A thread
+        // reads the key straight from the cache: eight of them cover a row
+        // between them and every element any of them wants is inside the
+        // thirty-two words the eight fetch together.
+        float partial = 0.0;
+        if (slotIn < got) {
+            uint o = entry(pos, kv) >> 1;
+            for (uint j = lane; j < QW; j += LPP) {
+                uvec4 q = qs[j];
+                uint at = o + (j << 2);
+                uvec4 k = uvec4(ck[at], ck[at + 1u], ck[at + 2u], ck[at + 3u]);
+                [[unroll]] for (uint w = 0u; w < 4u; w++) {
+                    partial += dot(unpackHalf2x16(q[w]), unpackHalf2x16(k[w]));
+                }
+            }
+        }
+        float d = subgroupClusteredAdd(partial, LPP);
+
+        // Which positions this column's range admits. A sliding window moves
+        // the first and its own position is the last.
+        float inf = 1.0 / 0.0;
+        float s = (slotIn < got && pos >= mine.y && pos <= mine.z) ? d * p.scale : -inf;
+        barrier();
+        if (lane == 0u) ss[slotIn] = s;
+        barrier();
+
+        // The tile's maximum and sum, computed by every thread out of the
+        // thirty-two scores rather than reduced across them: thirty-two shared
+        // reads against a barrier and a fold, and it leaves the answer in
+        // every thread, which the mix below wants anyway.
+        float tileMax = -inf;
+        for (uint c = 0u; c < got; c++) tileMax = max(tileMax, ss[c]);
+        float newMax = max(rowMax, tileMax);
+        float rescale = (rowMax == newMax) ? 1.0 : exp(rowMax - newMax);
+        float tileSum = 0.0;
+        for (uint c = 0u; c < got; c++) {
+            tileSum += isinf(newMax) ? 0.0 : exp(ss[c] - newMax);
+        }
+        rowSum = rowSum * rescale + tileSum;
+
+        // The probabilities written over the scores they came from. One
+        // exponential a position rather than one a position and a dimension,
+        // which is what recomputing them inside the mix would have cost — and
+        // the reads below are the same address in every thread, which shared
+        // memory broadcasts.
+        barrier();
+        if (t < got) ss[t] = isinf(newMax) ? 0.0 : exp(ss[t] - newMax);
+        barrier();
+
+        // The mix, a thread to a dimension, four positions at a time.
+        //
+        // Four and not one, and this is the whole of what the kernel costs. A
+        // thread's read of a value is four bytes out of the cache and the next
+        // one is a thousand positions away in it; taken one at a time the loop
+        // is a chain of dependent loads and a workgroup a head — thirty-two of
+        // them on sixty-four compute units — has nothing else in flight to
+        // cover the latency with. Measured: the whole scoring and mixing loop
+        // took 42 microseconds a block against llama.cpp's 14 for the same
+        // work, which is a twelve gigaflop rate on a card that does forty
+        // thousand. Four independent loads issue together and the arithmetic
+        // is unchanged.
+        for (uint u = 0u; u < DPT; u++) {
+            uint dim = t + u * 256u;
+            if (dim >= hd) break;
+            acc[u] *= rescale;
+            uint half_ = dim >> 1;
+            bool lowHalf = (dim & 1u) == 0u;
+            float sum = 0.0;
+            uint c = 0u;
+            for (; c + UNROLL <= got; c += UNROLL) {
+                float v[UNROLL];
+                [[unroll]] for (uint m = 0u; m < UNROLL; m++) {
+                    vec2 pair = unpackHalf2x16(cv[(entry(lo + start + c + m, kv) >> 1) + half_]);
+                    v[m] = lowHalf ? pair.x : pair.y;
+                }
+                [[unroll]] for (uint m = 0u; m < UNROLL; m++) sum += ss[c + m] * v[m];
+            }
+            for (; c < got; c++) {
+                vec2 v = unpackHalf2x16(cv[(entry(lo + start + c, kv) >> 1) + half_]);
+                sum += ss[c] * (lowHalf ? v.x : v.y);
+            }
+            acc[u] += sum;
+        }
+        rowMax = newMax;
+    }
+
+    // The Q8_0 form the output projection reads, a block of thirty-two to
+    // thirty-two threads, exactly as attn_scores.comp writes it.
+    uint blocks = (p.heads * hd) >> 5;
+    float invSum = (rowSum > 0.0) ? (1.0 / rowSum) : 0.0;
+    for (uint u = 0u; u < DPT; u++) {
+        uint dim = t + u * 256u;
+        if (dim >= hd) break;
+        uint slot = ((h * hd) >> 5) + (dim >> 5);
+        float value = acc[u] * invSum;
+
+        float peak = subgroupClusteredMax(abs(value), 32u);
+        float scale = 0.0;
+        int   q = 0;
+        if (peak > 0.0) {
+            scale = unpackHalf2x16(floatToHalf(peak * (1.0 / 127.0))).x;
+            precise float scaled = value * (127.0 / peak);
+            q = clamp(nearestInt(scaled), -128, 127);
+        }
+        int count = subgroupClusteredAdd(q, 32u);
+
+        uint word = subgroupClusteredOr(uint(q & 0xFF) << ((dim & 3u) * 8u), 4u);
+        uint dest = ((base * p.heads * hd + h * hd) >> 2) + (dim >> 2);
+        if ((dim & 3u) == 0u) aq[dest] = word;
+#ifdef FLOATOUT
+        af[base * p.heads * hd + h * hd + dim] = value;
+#endif
+
+        if ((dim & 31u) == 0u) {
+            uint cbase = base * 2u * blocks;
+            as_[cbase + slot]          = scale;
+            as_[cbase + blocks + slot] = 8.0 * scale * float(count);
+        }
+    }
+}

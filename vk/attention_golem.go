@@ -77,6 +77,14 @@ func (a *Attention) AddBlockGolem(k *GolemKernels, shape BlockShape,
 		}
 		a.scoresFloat = p
 	}
+	// And the single-column form of it, which is what a drawn token takes.
+	if a.oneFloat == nil {
+		p, err := a.d.NewPipeline(attnOneFloatSPIRV, 8, uint32(unsafe.Sizeof(scorePush{})))
+		if err != nil {
+			return err
+		}
+		a.oneFloat = p
+	}
 	// The block itself, without its projections: AddBlock does the norms, the
 	// cache and the sets that read them, and skips a projection whose bytes
 	// are nil.
