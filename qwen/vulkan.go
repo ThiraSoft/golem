@@ -30,7 +30,7 @@ import (
 // read it there. It fails, and changes nothing, when there is no device, when
 // the head is not Q4_0, or when the tensor does not fit in device memory.
 func (m *Model) UseVulkanHead() error {
-	if m.head != nil || m.golemHead != nil {
+	if m.head != nil || m.golemHead != nil || m.q6kHead != nil {
 		return nil
 	}
 	if gq := m.W.TokenEmbd.Quant; gq.Golem() {
@@ -58,12 +58,29 @@ func (m *Model) UseVulkanHead() error {
 		}
 		return nil
 	}
-	if m.W.TokenEmbd.Quant != nn.Q4_0 {
-		return fmt.Errorf("qwen: the Vulkan head wants a Q4_0 embedding, this one is %s", m.W.TokenEmbd.Quant)
+	if q := m.W.TokenEmbd.Quant; q != nn.Q4_0 && q != nn.Q6_K {
+		return fmt.Errorf("qwen: the Vulkan head reads a Q4_0 or Q6_K embedding, this one is %s", m.W.TokenEmbd.Quant)
 	}
 	d, err := m.device()
 	if err != nil {
 		return err
+	}
+	// Six bits is what a K-quant mix leaves the embedding at, and it is the
+	// same kernel Gemma's head has taken since it existed — vk/q6k.go, against
+	// a Q8_K activation, which qwen/model.go's Logits already builds for the
+	// processor's own K-quant path.
+	if m.W.TokenEmbd.Quant == nn.Q6_K {
+		h, err := vk.NewQ6KHead(d, m.W.TokenEmbd.Data, m.W.TokenEmbd.Rows, m.W.TokenEmbd.Cols)
+		if err != nil {
+			return err
+		}
+		m.q6kHead = h
+		if m.stack != nil {
+			if err := m.useVulkanEmbedding(); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	h, err := vk.NewQ40Head(d, m.W.TokenEmbd.Data, m.W.TokenEmbd.Rows, m.W.TokenEmbd.Cols)
 	if err != nil {
@@ -87,6 +104,10 @@ func (m *Model) useVulkanEmbedding() error {
 	if m.golemHead != nil {
 		table, steps, cols := m.golemHead.Table()
 		return m.stack.SetEmbeddingGolem(table, steps, cols, m.W.PreHead, m.golemHead.Quant())
+	}
+	if m.q6kHead != nil {
+		table, cols := m.q6kHead.Table()
+		return m.stack.SetEmbedding(table, cols, 1.0)
 	}
 	if m.head == nil {
 		return nil
@@ -199,20 +220,43 @@ func (m *Model) UseVulkanStack() error {
 
 	for i := range cfg.Blocks {
 		bc, bw := cfg.Blocks[i], &m.W.Blocks[i]
-		want := nn.Q4_0
+		// A .golem checkpoint is one format for the whole model by construction;
+		// anything else is asked per matrix. A K-quant mix gives the same role
+		// different formats in different blocks — a Q4_K_M puts Q6_K on half its
+		// ffn_down and a quarter of its attention — so a model-wide answer here
+		// is wrong before it starts.
 		if golem != nil {
-			want = bw.Q.Quant
-		}
-		for _, q := range []nn.Quant{bw.Q.Quant, bw.K.Quant, bw.V.Quant, bw.O.Quant, bw.Gate.Quant, bw.Up.Quant, bw.Down.Quant} {
-			if q != want {
+			for _, q := range []nn.Quant{bw.Q.Quant, bw.K.Quant, bw.V.Quant, bw.O.Quant, bw.Gate.Quant, bw.Up.Quant, bw.Down.Quant} {
+				if q != bw.Q.Quant {
+					stack.Close()
+					return fmt.Errorf("qwen: a %s checkpoint is one format throughout, and block %d has a %s", bw.Q.Quant, i, q)
+				}
+			}
+		} else {
+			for _, spec := range []struct {
+				what string
+				q    nn.Quant
+			}{
+				{"attn_q", bw.Q.Quant}, {"attn_k", bw.K.Quant}, {"attn_v", bw.V.Quant},
+				{"attn_output", bw.O.Quant}, {"ffn_gate", bw.Gate.Quant},
+				{"ffn_up", bw.Up.Quant}, {"ffn_down", bw.Down.Quant},
+			} {
+				if !vk.QuantReadable(spec.q) {
+					stack.Close()
+					return fmt.Errorf("qwen: block %d's %s is %s, which no kernel here reads", i, spec.what, spec.q)
+				}
+			}
+			if bw.Gate.Quant != bw.Up.Quant {
 				stack.Close()
-				return fmt.Errorf("qwen: the kernels read %s, block %d has a %s", want, i, q)
+				return fmt.Errorf("qwen: block %d has ffn_gate in %s and ffn_up in %s, and one kernel reads them joined",
+					i, bw.Gate.Quant, bw.Up.Quant)
 			}
 		}
 		shape := vk.BlockShape{
 			Heads: bc.Heads, KVHeads: bc.KVHeads, HeadDim: bc.HeadDim,
 			RoPEDims: bc.RoPEDims, Capacity: m.SlotContext(), Rotation: index[bc.RoPEBase],
 			OwnsKV: true, Eps: cfg.Eps,
+			Formats: vk.BlockFormats{Q: bw.Q.Quant, K: bw.K.Quant, V: bw.V.Quant, O: bw.O.Quant},
 			// llama.cpp passes this into the softmax rather than scaling the
 			// query; qwen/attention.go is the other copy.
 			Scale: float32(1 / sqrtOf(bc.HeadDim)),
@@ -233,7 +277,8 @@ func (m *Model) UseVulkanStack() error {
 				stack.Close()
 				return err
 			}
-			if err := mix.AddBlock(nil, nil, bw.Gate.Data, bw.Up.Data, bw.Down.Data); err != nil {
+			formats := vk.MixtureFormats{GateUp: bw.Gate.Quant, Down: bw.Down.Quant}
+			if err := mix.AddBlock(formats, nil, nil, bw.Gate.Data, bw.Up.Data, bw.Down.Data); err != nil {
 				stack.Close()
 				return err
 			}
@@ -313,7 +358,7 @@ func (m *Model) NewStackTimeline() (*vk.Timeline, error) {
 func (m *Model) VulkanStack() bool { return m.stack != nil }
 
 // VulkanHead says whether the head is on a device.
-func (m *Model) VulkanHead() bool { return m.head != nil || m.golemHead != nil }
+func (m *Model) VulkanHead() bool { return m.head != nil || m.golemHead != nil || m.q6kHead != nil }
 
 // device opens the Vulkan device the model shares between its parts, or
 // returns the one it already has. The head and the blocks sit on the same card
@@ -335,6 +380,10 @@ func (m *Model) closeVulkan() {
 	if m.stack != nil {
 		m.stack.Close()
 		m.stack = nil
+	}
+	if m.q6kHead != nil {
+		m.q6kHead.Close()
+		m.q6kHead = nil
 	}
 	if m.head != nil {
 		m.head.Close()

@@ -99,6 +99,8 @@ int nearestInt(float f) {
 
 void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
     uint nb  = p.dim >> 5;
+    // Q4_0 and Q4_K put their nibbles at the same offset: two bytes a block of
+    // scales against sixteen a superblock of headers is the same count.
     uint nib = rowBase + 2u * nb;
     uint xw  = p.dim >> 2;   // one column of the input, in uints
 
@@ -106,8 +108,29 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
     [[unroll]] for (uint k = 0u; k < COLUMNS; k++) s[k] = 0.0;
 
     for (uint b = lane; b < nb; b += LANES) {
+#ifdef Q4K
+        // vk/mixture.go's splitQ4_K left the superblock header at the front of
+        // the row; shaders/matvec.comp reads it the same way and says why the
+        // six bits are unpacked here rather than folded on the way over.
+        uint hb = (rowBase + 16u * (b >> 3u)) >> 2u;
+        vec2 dm = unpackHalf2x16(w[hb]);
+        uint k0 = w[hb + 1u], k1 = w[hb + 2u], k2 = w[hb + 3u];
+        uint sub = b & 7u;
+        uint sc6, mn6;
+        if (sub < 4u) {
+            sc6 = bitfieldExtract(k0, int(8u * sub), 6);
+            mn6 = bitfieldExtract(k1, int(8u * sub), 6);
+        } else {
+            uint jj = sub - 4u;
+            sc6 = bitfieldExtract(k2, int(8u * jj), 4) | (bitfieldExtract(k0, int(8u * jj + 6u), 2) << 4u);
+            mn6 = bitfieldExtract(k2, int(8u * jj + 4u), 4) | (bitfieldExtract(k1, int(8u * jj + 6u), 2) << 4u);
+        }
+        float ws = dm.x * float(sc6);
+        float wm = dm.y * float(mn6);
+#else
         vec2  pair = unpackHalf2x16(w[(rowBase + 2u * b) >> 2]);
         float ws   = pair[b & 1u];
+#endif
 
         uint at = (nib + 16u * b) >> 2;
         uint ab = b * 8u;
@@ -125,7 +148,14 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
                 acc = dotPacked4x8AccSatEXT(hi[u], int(xq[xc + u + 4u]), acc);
             }
             uint sc = SRCCOL(k) * 2u * nb;
+#ifdef Q4K
+            // A Q4_K weight is q times a scale less a minimum, with no offset
+            // of eight, so the second term carries the minimum and an eighth of
+            // the stored sum rather than the scale and the whole of it.
+            s[k] += ws * float(acc) * xs[sc + b] - wm * xs[sc + nb + b] * 0.125;
+#else
             s[k] += ws * (float(acc) * xs[sc + b] - xs[sc + nb + b]);
+#endif
         }
     }
     [[unroll]] for (uint k = 0u; k < COLUMNS; k++) answer[k] = s[k];

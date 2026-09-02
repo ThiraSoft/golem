@@ -99,6 +99,26 @@ var moeGateUpWideSPIRV []byte
 //go:embed shaders/moe_gateup16.spv
 var moeGateUpMidSPIRV []byte
 
+// The same fused kernel over Q4_K weights, which is what every K-quant mix
+// stores its gate and up in. shaders/moe_gateup.comp under -DQ4K.
+//
+//go:generate glslc -O -DQ4K --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q4k.spv
+//go:generate glslc -O -DQ4K -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q4k8.spv
+//go:generate glslc -O -DQ4K -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q4k16.spv
+//go:generate glslc -O -DQ4K -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q4k32.spv
+
+//go:embed shaders/moe_gateup_q4k.spv
+var moeGateUpQ4KSPIRV []byte
+
+//go:embed shaders/moe_gateup_q4k8.spv
+var moeGateUpQ4KWideSPIRV []byte
+
+//go:embed shaders/moe_gateup_q4k16.spv
+var moeGateUpQ4KMidSPIRV []byte
+
+//go:embed shaders/moe_gateup_q4k32.spv
+var moeGateUpQ4KWidestSPIRV []byte
+
 //go:embed shaders/moe_gateup32.spv
 var moeGateUpWidestSPIRV []byte
 
@@ -186,6 +206,12 @@ type Mixture struct {
 	byExpertFrom int
 
 	gateUp, down, denseDown *Pipeline
+
+	// The same two products over a K-quant. A mixture holds at most a couple of
+	// formats and each pipeline is several binaries, so they are built when a
+	// block asks and not before — vk/quantproduct.go says the rest.
+	products   *quantProducts
+	gateUpQ4K  *Pipeline
 	// The prompt path of the expert branch, which reads the stack by expert
 	// rather than by column: idProduct serves both gate/up and down projections,
 	// idActivate runs the activation over the first half's output, scatter
@@ -516,6 +542,8 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		}
 	}
 
+	m.products = newQuantProducts(d, coop)
+
 	// One split for every width the down projection is dispatched at, taken
 	// at the widest for the reason vk/attention.go gives.
 	m.splitDown = coopSplit(dim, wideColumns, coop)
@@ -633,36 +661,58 @@ func (m *Mixture) Blocks() int { return len(m.blocks) }
 // reads. The blocks are read back in the order they were added.
 // A dense checkpoint has no expert stacks: gateUpExps and downExps are nil,
 // and the block is the shared branch alone.
-func (m *Mixture) AddBlock(gateUpExps, downExps, gate, up, down []byte) error {
+// MixtureFormats is what a block's feed-forward matrices are stored in.
+//
+// The shared gate and up share a field because they are uploaded joined and
+// read by one kernel, and because no quantizer has ever given them different
+// formats: llama.cpp's mixes promote ffn_down and leave the pair alone. A
+// checkpoint that did would be refused by name rather than half-read.
+type MixtureFormats struct {
+	GateUp     nn.Quant
+	Down       nn.Quant
+	GateUpExps nn.Quant
+	DownExps   nn.Quant
+}
+
+func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, down []byte) error {
+	if f.GateUp != nn.Q4_0 && f.GateUp != nn.Q4_K {
+		return fmt.Errorf("vk: the shared gate and up are %s, and the fused kernel reads Q4_0 and Q4_K", f.GateUp)
+	}
 	shapes := []struct {
 		what       string
 		data       []byte
 		rows, cols int
+		quant      nn.Quant
 	}{
-		{"the shared gate", gate, m.dense, m.dim},
-		{"the shared up", up, m.dense, m.dim},
-		{"the shared down", down, m.dim, m.dense},
+		{"the shared gate", gate, m.dense, m.dim, f.GateUp},
+		{"the shared up", up, m.dense, m.dim, f.GateUp},
+		{"the shared down", down, m.dim, m.dense, f.Down},
 	}
 	if m.experts > 0 {
+		if f.GateUpExps != nn.Q4_0 || f.DownExps != nn.Q4_0 {
+			// The expert kernels stage a Q4_0 block per thread out of a stack
+			// indexed by identifier, and nothing here has written the K-quant
+			// forms of those three. No mixture this reads is quantized that way
+			// — llama.cpp's MoE mixes are what they are — so it is refused by
+			// name rather than half-supported.
+			return fmt.Errorf("vk: the experts are %s and %s, and the routed kernels read Q4_0", f.GateUpExps, f.DownExps)
+		}
 		shapes = append(shapes,
 			struct {
 				what       string
 				data       []byte
 				rows, cols int
-			}{"the gate-and-up stack", gateUpExps, m.experts * 2 * m.ffn, m.dim},
+				quant      nn.Quant
+			}{"the gate-and-up stack", gateUpExps, m.experts * 2 * m.ffn, m.dim, f.GateUpExps},
 			struct {
 				what       string
 				data       []byte
 				rows, cols int
-			}{"the down stack", downExps, m.experts * m.dim, m.ffn},
+				quant      nn.Quant
+			}{"the down stack", downExps, m.experts * m.dim, m.ffn, f.DownExps},
 		)
 	} else if gateUpExps != nil || downExps != nil {
 		return fmt.Errorf("vk: this mixture was opened without experts, and the block brings %d bytes of them", len(gateUpExps)+len(downExps))
-	}
-	for _, spec := range shapes {
-		if want := spec.rows * rowBytesQ4_0(spec.cols); len(spec.data) != want {
-			return fmt.Errorf("vk: %s should be %d bytes, given %d", spec.what, want, len(spec.data))
-		}
 	}
 
 	b := &mixtureBlock{}
@@ -680,14 +730,36 @@ func (m *Mixture) AddBlock(gateUpExps, downExps, gate, up, down []byte) error {
 		}
 	}
 	// The shared branch's gate and up, one after the other, which is the
-	// layout the mixture's own stack already has.
+	// layout the mixture's own stack already has. They are joined before the
+	// packing and not after: every packing here is row by row, so a joined
+	// matrix of twice the rows packs to the same bytes as the two apart.
 	joined := make([]byte, 0, len(gate)+len(up))
 	joined = append(append(joined, gate...), up...)
-	if b.denseGateUp, err = m.d.Upload(splitQ4_0(joined, 2*m.dense, m.dim)); err != nil {
+	gateUpLayout, err := quantLayout(f.GateUp, joined, 2*m.dense, m.dim)
+	if err != nil {
+		return fail(fmt.Errorf("vk: the shared gate and up: %w", err))
+	}
+	if b.denseGateUp, err = m.d.Upload(gateUpLayout); err != nil {
 		return fail(err)
 	}
-	if b.denseDown, err = m.d.Upload(splitQ4_0(down, m.dim, m.dense)); err != nil {
+	downLayout, derr := quantLayout(f.Down, down, m.dim, m.dense)
+	if derr != nil {
+		return fail(fmt.Errorf("vk: the shared down: %w", derr))
+	}
+	if b.denseDown, err = m.d.Upload(downLayout); err != nil {
 		return fail(err)
+	}
+	gateUpPipe, gerr := m.fusedFor(f.GateUp)
+	if gerr != nil {
+		return fail(gerr)
+	}
+	gateUpProd, gperr := m.products.get(f.GateUp)
+	if gperr != nil {
+		return fail(fmt.Errorf("vk: the shared gate and up: %w", gperr))
+	}
+	downProd, dperr := m.products.get(f.Down)
+	if dperr != nil {
+		return fail(fmt.Errorf("vk: the shared down: %w", dperr))
 	}
 
 	type setSpec struct {
@@ -696,15 +768,15 @@ func (m *Mixture) AddBlock(gateUpExps, downExps, gate, up, down []byte) error {
 		bufs []*Buffer
 	}
 	sets := []setSpec{
-		{&b.setDenseUp, m.gateUp, []*Buffer{b.denseGateUp, m.dxq, m.dxs, m.zero, m.gelu, m.daq, m.das}},
+		{&b.setDenseUp, gateUpPipe, []*Buffer{b.denseGateUp, m.dxq, m.dxs, m.zero, m.gelu, m.daq, m.das}},
 		// The same weights through the tiled product, which is the wide
 		// pass's path: same layout on the card, so the matrix is uploaded
 		// once and the two kernels read it the same way.
-		{&b.setDenseProd, m.denseDown, []*Buffer{b.denseGateUp, m.dxq, m.dxs, m.gateOut}},
-		{&b.setDenseDn, m.denseDown, []*Buffer{b.denseDown, m.daq, m.das, m.dout}},
+		{&b.setDenseProd, gateUpProd, []*Buffer{b.denseGateUp, m.dxq, m.dxs, m.gateOut}},
+		{&b.setDenseDn, downProd, []*Buffer{b.denseDown, m.daq, m.das, m.dout}},
 	}
 	if m.splitDown > 1 {
-		sets = append(sets, setSpec{&b.setDenseDnParts, m.denseDown,
+		sets = append(sets, setSpec{&b.setDenseDnParts, downProd,
 			[]*Buffer{b.denseDown, m.daq, m.das, m.doutParts}})
 	}
 	if m.experts > 0 {
@@ -943,6 +1015,14 @@ func (m *Mixture) Routing() (*Buffer, *Buffer) { return m.ids, m.cw }
 func (m *Mixture) Outputs() (shared, experts *Buffer) { return m.dout, m.out }
 
 func (m *Mixture) Close() {
+	if m.products != nil {
+		m.products.Close()
+		m.products = nil
+	}
+	if m.gateUpQ4K != nil {
+		m.gateUpQ4K.Close()
+		m.gateUpQ4K = nil
+	}
 	if m.dxf != nil {
 		m.dxf.Close()
 		m.dxf = nil
@@ -1316,4 +1396,41 @@ func splitQ5_K(src []byte, rows, cols int) []byte {
 		}
 	}
 	return dst
+}
+
+// fusedFor is the gate-and-up kernel for one weight format, built on first ask.
+//
+// It is not vk/quantproduct.go's pipeline: that one is the plain product with
+// four buffers, and this reads seven — the input, the routing identifiers, the
+// activation table, and both halves of what it writes — because the gate, the
+// up and the activation between them are one kernel here.
+func (m *Mixture) fusedFor(q nn.Quant) (*Pipeline, error) {
+	if q == nn.Q4_0 {
+		return m.gateUp, nil
+	}
+	if q != nn.Q4_K {
+		return nil, fmt.Errorf("vk: the fused gate and up reads Q4_0 and Q4_K, not %s", q)
+	}
+	if m.gateUpQ4K != nil {
+		return m.gateUpQ4K, nil
+	}
+	p, err := m.d.NewPipeline(moeGateUpQ4KSPIRV, 7, uint32(unsafe.Sizeof(moePush{})))
+	if err != nil {
+		return nil, err
+	}
+	for _, w := range []struct {
+		columns int
+		spirv   []byte
+	}{
+		{smallColumns, moeGateUpQ4KWideSPIRV},
+		{16, moeGateUpQ4KMidSPIRV},
+		{32, moeGateUpQ4KWidestSPIRV},
+	} {
+		if err := p.Wide(w.columns, w.spirv); err != nil {
+			p.Close()
+			return nil, err
+		}
+	}
+	m.gateUpQ4K = p
+	return p, nil
 }

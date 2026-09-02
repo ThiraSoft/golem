@@ -175,14 +175,40 @@ func (m *Model) UseVulkanStack() error {
 
 	for i := range cfg.Blocks {
 		bc, bw := cfg.Blocks[i], &m.W.Blocks[i]
-		quants := []nn.Quant{bw.Q.Quant, bw.O.Quant, bw.Gate.Quant, bw.Up.Quant, bw.Down.Quant}
-		if bc.MoE {
-			quants = append(quants, bw.GateUpExps.Quant, bw.DownExps.Quant)
-		}
-		for _, q := range quants {
-			if q != nn.Q4_0 {
+		// Asked per matrix rather than per model. A Q4_K_M gives the same role
+		// different formats in different blocks — half of Gemma 4 12B's
+		// ffn_down and its attn_v are Q6_K where the rest is Q4_K — so a check
+		// that wanted one format for the whole file refused every K-quant mix
+		// there is.
+		for _, spec := range []struct {
+			what string
+			q    nn.Quant
+		}{
+			{"attn_q", bw.Q.Quant}, {"attn_output", bw.O.Quant},
+			{"ffn_gate", bw.Gate.Quant}, {"ffn_up", bw.Up.Quant}, {"ffn_down", bw.Down.Quant},
+		} {
+			if !vk.QuantReadable(spec.q) {
 				stack.Close()
-				return fmt.Errorf("gemma: the kernels read Q4_0, block %d has a %s", i, q)
+				return fmt.Errorf("gemma: block %d's %s is %s, which no kernel here reads", i, spec.what, spec.q)
+			}
+		}
+		if bw.Gate.Quant != bw.Up.Quant {
+			stack.Close()
+			return fmt.Errorf("gemma: block %d has ffn_gate in %s and ffn_up in %s, and one kernel reads them joined",
+				i, bw.Gate.Quant, bw.Up.Quant)
+		}
+		if bc.OwnsKV {
+			for _, spec := range []struct {
+				what string
+				q    nn.Quant
+			}{{"attn_k", bw.K.Quant}, {"attn_v", bw.V.Quant}} {
+				if bc.ValueIsKey && spec.what == "attn_v" {
+					continue
+				}
+				if !vk.QuantReadable(spec.q) {
+					stack.Close()
+					return fmt.Errorf("gemma: block %d's %s is %s, which no kernel here reads", i, spec.what, spec.q)
+				}
 			}
 		}
 		if bc.MoE && bw.Router.Quant != nn.F32 {
@@ -206,6 +232,7 @@ func (m *Model) UseVulkanStack() error {
 			RoPEDims: bc.RoPEDims, Capacity: capacity, Rotation: index[bc.RoPEBase],
 			ValueIsKey: bc.ValueIsKey, OwnsKV: bc.OwnsKV, KVSource: bc.KVSource, NormValue: true,
 			Eps: cfg.Eps, Scale: 1, // Gemma 4's query norm holds the scores in range
+			Formats: vk.BlockFormats{Q: bw.Q.Quant, K: bw.K.Quant, V: bw.V.Quant, O: bw.O.Quant},
 		}
 		if err := attn.AddBlock(shape, bw.Q.Data, k, v, bw.O.Data, bw.QNorm, bw.KNorm); err != nil {
 			stack.Close()
@@ -222,7 +249,11 @@ func (m *Model) UseVulkanStack() error {
 			norms.PreFFW2, norms.PostFFW1, norms.PostFFW2 = bw.PreFFWNorm2, bw.PostFFWNorm1, bw.PostFFWNorm2
 			norms.RouterScale, norms.DownScale, norms.Router = bw.RouterScale, bw.DownScale, routerRows(bw.Router)
 		}
-		if err := mix.AddBlock(gateUpExps, downExps, bw.Gate.Data, bw.Up.Data, bw.Down.Data); err != nil {
+		formats := vk.MixtureFormats{GateUp: bw.Gate.Quant, Down: bw.Down.Quant}
+		if bc.MoE {
+			formats.GateUpExps, formats.DownExps = bw.GateUpExps.Quant, bw.DownExps.Quant
+		}
+		if err := mix.AddBlock(formats, gateUpExps, downExps, bw.Gate.Data, bw.Up.Data, bw.Down.Data); err != nil {
 			stack.Close()
 			return err
 		}

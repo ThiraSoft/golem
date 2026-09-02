@@ -40,6 +40,10 @@ type Model struct {
 	dev   *vk.Device
 	stack *vk.Stack
 	head  *vk.Q40Head
+	// q6kHead is the same tensor when the quantizer gave the embedding six
+	// bits, which every K-quant mix does: a Q4_K_M leaves token_embd at Q6_K
+	// whatever it does to the blocks.
+	q6kHead *vk.Q6KHead
 	// golemHead is the same tensor when the file is a .golem, which needs its
 	// own kernel and its own transform. Only one of the two is ever set.
 	golemHead *vk.GolemHead
@@ -287,6 +291,12 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 	// A K-quantized head wants the activation cut in superblocks rather than in
 	// blocks of thirty-two.
 	v.QuantizeK()
+	if m.q6kHead != nil {
+		if err := m.q6kHead.MatVec(v, 0, out); err != nil {
+			panic(fmt.Sprintf("qwen: the device head failed: %v", err))
+		}
+		return
+	}
 	m.W.TokenEmbd.MatVec(v, out)
 }
 
@@ -300,7 +310,7 @@ func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
 			panic(fmt.Sprintf("qwen: logits need %d entries, given %d", m.Cfg.Vocab, len(o)))
 		}
 	}
-	if m.head != nil || m.golemHead != nil {
+	if m.head != nil || m.golemHead != nil || m.q6kHead != nil {
 		for i := range hidden {
 			m.Logits(hidden[i], out[i])
 		}

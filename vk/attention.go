@@ -109,7 +109,19 @@ type BlockShape struct {
 	// and lets its query norm hold them in range; Qwen3 passes 1/sqrt(head_dim)
 	// the way llama.cpp does.
 	Scale float32
+	// Formats says what each of the four projections is stored in. It is asked
+	// and not inferred: eighteen bytes to a block of thirty-two is Q4_0 and it
+	// is also Q4_K, so a length check passes on the wrong format and the answer
+	// is noise rather than an error. A K-quant mix gives the same role
+	// different formats in different blocks, which is why this is per block and
+	// not per model.
+	Formats BlockFormats
 }
+
+// BlockFormats is one block's four weight formats. The zero value is F32, which
+// no projection here is stored in, so a caller that forgets a field is refused
+// by name rather than served a guess.
+type BlockFormats struct{ Q, K, V, O nn.Quant }
 
 // Columns is how many positions one pass may carry, which callers need in
 // order to cut a prompt into batches of it.
@@ -129,7 +141,12 @@ type Attention struct {
 	slotContext int // the positions one conversation holds
 	slots       int // how many conversations the caches are cut into
 
-	matvec, prepare, scores *Pipeline
+	prepare, scores *Pipeline
+
+	// One product pipeline per weight format a block asked for. A K-quant mix
+	// wants two of them and a Q4_0 checkpoint one; vk/quantproduct.go says why
+	// they are the same four buffers whichever it is.
+	products *quantProducts
 	// scoresFloat is the same kernel with a float copy of the mix beside its
 	// Q8_0 one, for the blocks whose output projection reads floats. Built
 	// only when one is added.
@@ -267,7 +284,6 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, slotContext, s
 		push     uintptr
 		wave     uint32
 	}{
-		{&a.matvec, matvecSPIRV, 4, unsafe.Sizeof(moePush{}), 0},
 		{&a.reduce, matmulReduceSPIRV, 2, unsafe.Sizeof(moePush{}), 0},
 		{&a.prepare, attnPrepareSPIRV, 11, unsafe.Sizeof(attnPush{}), 0},
 		{&a.scores, scoresSPIRV(coop), 7, unsafe.Sizeof(scorePush{}), scoresWave},
@@ -279,45 +295,10 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, slotContext, s
 		}
 	}
 	// The four projections read their weights once for a whole batch of
-	// positions when there is one.
-	if coop {
-		if err := a.matvec.Wide(smallColumns, matvecWideSPIRV); err != nil {
-			a.Close()
-			return nil, err
-		}
-		for _, spec := range []struct {
-			columns int
-			spirv   []byte
-		}{
-			{tiledColumns, matmulCoop32SPIRV},
-			{64, matmulCoop64SPIRV},
-			{128, matmulCoop128SPIRV},
-			{256, matmulCoop256SPIRV},
-			{wideColumns, matmulCoop512SPIRV},
-		} {
-			if err := a.matvec.WideWave(spec.columns, spec.spirv, coopmatWave); err != nil {
-				a.Close()
-				return nil, err
-			}
-		}
-	} else {
-		for _, spec := range []struct {
-			columns int
-			spirv   []byte
-		}{
-			{smallColumns, matvecWideSPIRV},
-			{tiledColumns, matmulWide32SPIRV},
-			{64, matmulWide64SPIRV},
-			{128, matmulWidest128SPIRV},
-			{256, matmulWidest256SPIRV},
-			{wideColumns, matmulWide()},
-		} {
-			if err := a.matvec.Wide(spec.columns, spec.spirv); err != nil {
-				a.Close()
-				return nil, err
-			}
-		}
-	}
+	// positions when there is one. Which binaries that means depends on the
+	// format, and the format is a block's business rather than a model's, so
+	// the pipelines are built as the blocks ask for them.
+	a.products = newQuantProducts(d, coop)
 
 	for _, spec := range []struct {
 		into  **Buffer
@@ -505,33 +486,40 @@ func (a *Attention) AddBlock(shape BlockShape, q, k, v, o []byte, qnorm, knorm [
 		data       []byte
 		rows, cols int
 		out        *Buffer
+		quant      nn.Quant
+		name       string
 	}{
-		{&b.q, &b.setQ, q, heads, a.dim, a.q},
-		{&b.k, &b.setK, k, kv, a.dim, a.k},
-		{&b.v, &b.setV, v, kv, a.dim, a.v},
-		{&b.o, &b.setO, o, a.dim, heads, a.out},
+		{&b.q, &b.setQ, q, heads, a.dim, a.q, shape.Formats.Q, "query"},
+		{&b.k, &b.setK, k, kv, a.dim, a.k, shape.Formats.K, "key"},
+		{&b.v, &b.setV, v, kv, a.dim, a.v, shape.Formats.V, "value"},
+		{&b.o, &b.setO, o, a.dim, heads, a.out, shape.Formats.O, "output"},
 	} {
 		if spec.data == nil {
 			continue
 		}
-		if want := spec.rows * rowBytesQ4_0(spec.cols); len(spec.data) != want {
-			return fail(fmt.Errorf("vk: a projection should be %d bytes, given %d", want, len(spec.data)))
+		layout, lerr := quantLayout(spec.quant, spec.data, spec.rows, spec.cols)
+		if lerr != nil {
+			return fail(fmt.Errorf("vk: block %d's %s projection: %w", len(a.blocks), spec.name, lerr))
 		}
-		if *spec.into, err = a.d.Upload(splitQ4_0(spec.data, spec.rows, spec.cols)); err != nil {
+		pipe, perr := a.products.get(spec.quant)
+		if perr != nil {
+			return fail(fmt.Errorf("vk: block %d's %s projection: %w", len(a.blocks), spec.name, perr))
+		}
+		if *spec.into, err = a.d.Upload(layout); err != nil {
 			return fail(err)
 		}
 		in, scales := a.xq, a.xs
 		if spec.out == a.out {
 			in, scales = a.aq, a.as // the output projection reads the mix, not the stream
 		}
-		if *spec.set, err = a.matvec.NewSet([]*Buffer{*spec.into, in, scales, spec.out}); err != nil {
+		if *spec.set, err = pipe.NewSet([]*Buffer{*spec.into, in, scales, spec.out}); err != nil {
 			return fail(err)
 		}
 		// The output projection twice: once writing the answer where the
 		// kernels after it read, and once writing the slices a split product
 		// makes. Which of the two a pass dispatches is its width's business.
 		if spec.out == a.out && a.splitOut > 1 {
-			if b.setOParts, err = a.matvec.NewSet([]*Buffer{*spec.into, in, scales, a.outParts}); err != nil {
+			if b.setOParts, err = pipe.NewSet([]*Buffer{*spec.into, in, scales, a.outParts}); err != nil {
 				return fail(err)
 			}
 		}
@@ -802,7 +790,11 @@ func (a *Attention) Close() {
 		a.reduceSet.Close()
 		a.reduceSet = nil
 	}
-	for _, p := range []**Pipeline{&a.scoresFloat, &a.scores, &a.prepare, &a.matvec, &a.reduce, &a.rope} {
+	if a.products != nil {
+		a.products.Close()
+		a.products = nil
+	}
+	for _, p := range []**Pipeline{&a.scoresFloat, &a.scores, &a.prepare, &a.reduce, &a.rope} {
 		if *p != nil {
 			(*p).Close()
 			*p = nil
