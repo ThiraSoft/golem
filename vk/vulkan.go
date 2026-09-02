@@ -59,6 +59,16 @@ const (
 	structCooperativeMatrixFeatures = 1000506000
 	structSubgroupSizeFeatures      = 1000225002
 	structRequiredSubgroupSize      = 1000225001
+	structProperties2               = 1000059001
+	structExternalMemoryBuffer      = 1000072001
+	structImportMemoryHostPointer   = 1000178000
+	structHostPointerProperties     = 1000178001
+	structExternalMemoryHostProps   = 1000178002
+
+	// handleTypeHostAllocation names memory this side allocated, which is what
+	// VK_EXT_external_memory_host imports: a pointer the process already owns
+	// becomes a VkDeviceMemory the card reads across the bus.
+	handleTypeHostAllocation = 0x80
 
 	apiVersion11              = 1 << 22 // VK_API_VERSION_1_1
 	structQueryPoolCreateInfo = 11
@@ -551,6 +561,46 @@ type bufferCopy struct {
 	size      uint64
 }
 
+// importMemoryHostPointerInfo hands vkAllocateMemory a pointer this side owns
+// instead of asking it for pages of its own.
+type importMemoryHostPointerInfo struct {
+	sType        uint32
+	_            uint32
+	pNext        uintptr
+	handleType   uint32
+	_            uint32
+	pHostPointer unsafe.Pointer
+}
+
+// externalMemoryBufferCreateInfo says a buffer will be bound to imported
+// memory, which the buffer has to be created knowing.
+type externalMemoryBufferCreateInfo struct {
+	sType       uint32
+	_           uint32
+	pNext       uintptr
+	handleTypes uint32
+	_           uint32
+}
+
+// externalMemoryHostProperties carries the one limit that decides whether a
+// pointer can be imported at all.
+type externalMemoryHostProperties struct {
+	sType                           uint32
+	_                               uint32
+	pNext                           uintptr
+	minImportedHostPointerAlignment uint64
+}
+
+// memoryHostPointerProperties is which memory types an imported pointer may be
+// allocated as.
+type memoryHostPointerProperties struct {
+	sType          uint32
+	_              uint32
+	pNext          uintptr
+	memoryTypeBits uint32
+	_              uint32
+}
+
 // The entry points, bound once by load().
 var (
 	vkCreateInstance                     func(*instanceCreateInfo, uintptr, *instance) int32
@@ -603,6 +653,13 @@ var (
 	vkGetQueryPoolResults                func(device, uint64, uint32, uint32, uint64, unsafe.Pointer, uint64, uint32) int32
 	vkQueueSubmit                        func(queue, uint32, *submitInfo, uint64) int32
 	vkQueueWaitIdle                      func(queue) int32
+	vkGetPhysicalDeviceProperties2       func(physicalDevice, unsafe.Pointer)
+	vkGetDeviceProcAddr                  func(device, uintptr) uintptr
+
+	// Resolved per device rather than from the loader: an extension entry point
+	// is not required to be an exported symbol, and this one is not on every
+	// driver.
+	vkGetMemoryHostPointerProperties func(device, uint32, unsafe.Pointer, *memoryHostPointerProperties) int32
 )
 
 var loaded bool
@@ -670,6 +727,8 @@ func load() error {
 	bind(&vkGetQueryPoolResults, "vkGetQueryPoolResults")
 	bind(&vkQueueSubmit, "vkQueueSubmit")
 	bind(&vkQueueWaitIdle, "vkQueueWaitIdle")
+	bind(&vkGetPhysicalDeviceProperties2, "vkGetPhysicalDeviceProperties2")
+	bind(&vkGetDeviceProcAddr, "vkGetDeviceProcAddr")
 	loaded = true
 	return nil
 }

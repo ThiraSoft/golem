@@ -4,7 +4,10 @@ package vk
 
 import (
 	"fmt"
+	"os"
 	"unsafe"
+
+	"github.com/ebitengine/purego"
 )
 
 // A Device is one Vulkan compute queue and the pools that feed it. It is not
@@ -24,6 +27,13 @@ type Device struct {
 	// coopmat says the device took the matrix-core extensions at creation, so
 	// a kernel that declares CooperativeMatrixKHR may be compiled on it.
 	coopmat bool
+
+	// importAlign is what a host pointer has to be aligned to before the card
+	// can be given it directly, or zero on a device that cannot be. See Import.
+	importAlign uint64
+
+	// stage is the staging pair every upload alternates between. See staging.
+	stage [2]*Buffer
 }
 
 // Open finds the first device with a compute queue and takes it.
@@ -105,6 +115,13 @@ func Open() (*Device, error) {
 	}
 	names := [][]byte{append([]byte(dotProductExtension), 0)}
 
+	// Importing host memory, if this device offers it. It is what makes a
+	// streamed weight cost one crossing instead of a crossing and a copy, and a
+	// device without it falls back to the staging path rather than failing.
+	if have[hostImportExtension] {
+		names = append(names, append([]byte(hostImportExtension), 0))
+	}
+
 	// The matrix cores, if this device has them. They are asked for as a group
 	// or not at all — the product needs all four capabilities — and a device
 	// without them keeps the kernel that reaches the same answer with a
@@ -153,6 +170,10 @@ func Open() (*Device, error) {
 	}
 	vkGetDeviceQueue(d.dev, d.family, 0, &d.queue)
 
+	if have[hostImportExtension] {
+		d.findHostImport()
+	}
+
 	cpci := commandPoolCreateInfo{
 		sType:            structCommandPoolCreateInfo,
 		flags:            0x2, // reset individual command buffers
@@ -174,6 +195,17 @@ func Open() (*Device, error) {
 	}
 	return d, nil
 }
+
+// hostImportExtension lets a pointer this process already owns be handed to the
+// card as device memory.
+//
+// It is what the streamed paths want. Staging a weight costs a write into
+// host-visible memory and then a read of it by the copy engine, and the two do
+// not add up to a copy and a crossing: they contend for the same host memory
+// controller. Measured here on a gigabyte, the staged path reaches 2.6 GB/s and
+// double-buffering it 4.8, against 6.9 for the crossing alone. Importing the
+// pointer removes the copy rather than hiding it.
+const hostImportExtension = "VK_EXT_external_memory_host"
 
 // dotProductExtension is what the Q4_0 and Q6_K kernels are written against.
 // A four-byte-at-a-time signed dot product with a 32-bit accumulator is one
@@ -238,6 +270,12 @@ func (d *Device) extensions() (map[string]bool, error) {
 // Close releases the device. Buffers and pipelines built on it must be closed
 // first.
 func (d *Device) Close() {
+	for i, b := range d.stage {
+		if b != nil {
+			b.Close()
+			d.stage[i] = nil
+		}
+	}
 	if d.cmdPool != 0 {
 		vkDestroyCommandPool(d.dev, d.cmdPool, 0)
 		d.cmdPool = 0
@@ -265,6 +303,124 @@ func (d *Device) memoryTypeFor(bits uint32, want uint32) (uint32, error) {
 	}
 	return 0, fmt.Errorf("vk: no memory type with properties %#x", want)
 }
+
+// findHostImport resolves the import entry point and the alignment a pointer
+// must satisfy. Both are asked of the driver: the entry point because an
+// extension function need not be an exported symbol of the loader, and the
+// alignment because the specification allows anything up to sixty-four
+// kibibytes and a constant here would be this driver's number on every other.
+func (d *Device) findHostImport() {
+	name := append([]byte("vkGetMemoryHostPointerPropertiesEXT"), 0)
+	fn := vkGetDeviceProcAddr(d.dev, uintptr(unsafe.Pointer(&name[0])))
+	if fn == 0 {
+		return
+	}
+	purego.RegisterFunc(&vkGetMemoryHostPointerProperties, fn)
+
+	// VkPhysicalDeviceProperties2 carries the whole of VkPhysicalDeviceProperties
+	// inline, which is eight hundred-odd bytes this file has no reason to
+	// describe. It is given room the driver cannot overrun and read through the
+	// pNext chain, which is the only part wanted.
+	ext := externalMemoryHostProperties{sType: structExternalMemoryHostProps}
+	room := make([]byte, 4096)
+	*(*uint32)(unsafe.Pointer(&room[0])) = structProperties2
+	*(*uintptr)(unsafe.Pointer(&room[8])) = uintptr(unsafe.Pointer(&ext))
+	vkGetPhysicalDeviceProperties2(d.phys, unsafe.Pointer(&room[0]))
+	d.importAlign = ext.minImportedHostPointerAlignment
+
+	// The query comes back empty on this machine's driver — vulkaninfo prints
+	// 0x1000 for the same card, and the same chained struct through the same
+	// loader returns zero here — so the answer is probed rather than trusted. A
+	// page is what every driver that offers this asks for; importing one is
+	// cheap, and a device that refuses it keeps the staging path.
+	if d.importAlign == 0 {
+		d.importAlign = uint64(os.Getpagesize())
+		page := make([]byte, 2*d.importAlign)
+		at := (d.importAlign - uint64(uintptr(unsafe.Pointer(&page[0])))%d.importAlign) % d.importAlign
+		b, err := d.Import(unsafe.Pointer(&page[at]), int(d.importAlign), bufferUsageTransferSrc)
+		if err != nil {
+			d.importAlign = 0
+			return
+		}
+		b.Close()
+	}
+}
+
+// Import wraps memory this process owns as a buffer the card reads directly,
+// with no staging buffer and no copy on this side.
+//
+// The pointer and the length must both be multiples of ImportAlignment, which
+// is a page here. That is not a burden for what this is for: a weight streamed
+// from a mapped checkpoint is page-aligned because mmap returns pages, and a
+// pool this side allocates can be asked for the same.
+//
+// The card reads the memory over the bus every time a kernel touches it, so an
+// imported buffer is for a tensor that is read once — a weight on its way to
+// device memory, or an expert used for one token. A tensor read every token
+// belongs in Local.
+//
+// The caller keeps the memory alive: the returned buffer does not own it, and
+// Close releases the card's handle on it and nothing else.
+func (d *Device) Import(p unsafe.Pointer, size int, usage uint32) (*Buffer, error) {
+	if d.importAlign == 0 {
+		return nil, fmt.Errorf("vk: the device cannot import host memory")
+	}
+	if uintptr(p)%uintptr(d.importAlign) != 0 || uint64(size)%d.importAlign != 0 {
+		return nil, fmt.Errorf("vk: an imported pointer and length must be multiples of %d", d.importAlign)
+	}
+	props := memoryHostPointerProperties{sType: structHostPointerProperties}
+	if err := check("vkGetMemoryHostPointerPropertiesEXT",
+		vkGetMemoryHostPointerProperties(d.dev, handleTypeHostAllocation, p, &props)); err != nil {
+		return nil, err
+	}
+
+	b := &Buffer{d: d, size: uint64(size)}
+	ext := externalMemoryBufferCreateInfo{sType: structExternalMemoryBuffer, handleTypes: handleTypeHostAllocation}
+	bci := bufferCreateInfo{
+		sType: structBufferCreateInfo,
+		pNext: uintptr(unsafe.Pointer(&ext)),
+		size:  uint64(size),
+		usage: usage,
+	}
+	if err := check("vkCreateBuffer", vkCreateBuffer(d.dev, &bci, 0, &b.handle)); err != nil {
+		return nil, err
+	}
+	var req memoryRequirements
+	vkGetBufferMemoryRequirements(d.dev, b.handle, &req)
+
+	// The type has to suit both the buffer and the pointer: the driver decides
+	// which types an imported allocation may be, and it is not every type the
+	// buffer would otherwise accept.
+	kind, err := d.memoryTypeFor(req.memoryTypeBits&props.memoryTypeBits, memoryHostVisible)
+	if err != nil {
+		b.Close()
+		return nil, err
+	}
+	imp := importMemoryHostPointerInfo{
+		sType:        structImportMemoryHostPointer,
+		handleType:   handleTypeHostAllocation,
+		pHostPointer: p,
+	}
+	mai := memoryAllocateInfo{
+		sType:           structMemoryAllocateInfo,
+		pNext:           uintptr(unsafe.Pointer(&imp)),
+		allocationSize:  uint64(size),
+		memoryTypeIndex: kind,
+	}
+	if err := check("vkAllocateMemory", vkAllocateMemory(d.dev, &mai, 0, &b.mem)); err != nil {
+		b.Close()
+		return nil, err
+	}
+	if err := check("vkBindBufferMemory", vkBindBufferMemory(d.dev, b.handle, b.mem, 0)); err != nil {
+		b.Close()
+		return nil, err
+	}
+	return b, nil
+}
+
+// ImportAlignment is what Import demands of a pointer and a length, or zero on
+// a device that cannot import at all.
+func (d *Device) ImportAlignment() uint64 { return d.importAlign }
 
 // A Buffer is one allocation and the VkBuffer bound to it.
 type Buffer struct {
@@ -429,28 +585,103 @@ func (d *Device) UploadTail(data []byte, tail int) (*Buffer, error) {
 	if err != nil {
 		return nil, err
 	}
-	// A staging buffer of the whole tensor would need a second copy of it in
-	// pinned memory. Sixty-four mebibytes at a time keeps that bounded.
-	const chunk = 64 << 20
-	stage, err := d.Host(min(chunk, len(data)), bufferUsageTransferSrc)
-	if err != nil {
+	if err := d.CopyInto(dst, 0, data); err != nil {
 		dst.Close()
 		return nil, err
 	}
-	defer stage.Close()
+	return dst, nil
+}
 
-	for off := 0; off < len(data); off += chunk {
-		n := min(chunk, len(data)-off)
-		copy(stage.Bytes(), data[off:off+n])
-		if err := d.run(func(cb commandBuffer) {
-			region := bufferCopy{srcOffset: 0, dstOffset: uint64(off), size: uint64(n)}
-			vkCmdCopyBuffer(cb, stage.handle, dst.handle, 1, &region)
-		}); err != nil {
-			dst.Close()
-			return nil, err
+// stageChunk is how much of a tensor crosses in one submission.
+//
+// It is the width the two stages balance at, measured on a gigabyte: at four
+// mebibytes the submissions cost more than they hide (3.8 GB/s), at sixteen the
+// copy is fully behind the transfer (5.9), and at sixty-four and above the tail
+// of the last chunk is long enough to show in the total and the answer starts
+// moving between runs. The ceiling is what the copy engine alone reaches, 6.7.
+const stageChunk = 16 << 20
+
+// staging is the pair of host buffers every upload passes through, allocated on
+// first use and kept for the life of the device.
+//
+// A pair, and not one: the copy into a staging buffer and the card's read out
+// of it are on opposite sides of the machine and used to run one after the
+// other, which cost more than either. Alternating between two buffers puts the
+// copy of the next chunk beside the transfer of this one. Measured on a
+// gigabyte, 2.6 GB/s becomes 5.9 against a bus that carries 6.7 — this card
+// reaches the processor over eight lanes at 8 GT/s, whatever the card's own
+// port reports, so 6.7 is nearly the whole link and there is nothing else here
+// to win.
+//
+// They are kept rather than made per call because a checkpoint is hundreds of
+// tensors and thirty-two mebibytes of host memory is faulted in once.
+func (d *Device) staging() ([2]*Buffer, error) {
+	if d.stage[0] == nil {
+		for i := range d.stage {
+			b, err := d.Host(stageChunk, bufferUsageTransferSrc)
+			if err != nil {
+				return d.stage, err
+			}
+			d.stage[i] = b
 		}
 	}
-	return dst, nil
+	return d.stage, nil
+}
+
+// CopyInto writes data into an existing device-local buffer at an offset,
+// through the shared staging pair. It is what UploadTail is built on, and what
+// a streamed weight wants directly: the destination outlives the transfer.
+func (d *Device) CopyInto(dst *Buffer, at int, data []byte) error {
+	stage, err := d.staging()
+	if err != nil {
+		return err
+	}
+	// One chunk is one copy and one submission, with nothing to overlap and no
+	// goroutine to pay for. Most tensors are this.
+	if len(data) <= stageChunk {
+		copy(stage[0].Bytes()[:len(data)], data)
+		return d.copyBuffer(stage[0], dst, uint64(at), uint64(len(data)))
+	}
+
+	// free carries the slots this side may write. A slot returns to it only
+	// once the card has finished reading it: without that handshake the copy
+	// runs a buffer ahead into one still in flight and overwrites the bytes
+	// being sent, which is a wrong answer and not a slow one.
+	free := make(chan int, len(stage))
+	for i := range stage {
+		free <- i
+	}
+	type ready struct {
+		slot int
+		off  int
+	}
+	filled := make(chan ready, 1)
+	go func() {
+		for off := 0; off < len(data); off += stageChunk {
+			slot := <-free
+			n := min(stageChunk, len(data)-off)
+			copy(stage[slot].Bytes()[:n], data[off:off+n])
+			filled <- ready{slot, off}
+		}
+		close(filled)
+	}()
+	var failed error
+	for r := range filled {
+		n := min(stageChunk, len(data)-r.off)
+		if failed == nil {
+			failed = d.copyBuffer(stage[r.slot], dst, uint64(at+r.off), uint64(n))
+		}
+		free <- r.slot
+	}
+	return failed
+}
+
+// copyBuffer submits one region copy and waits for it.
+func (d *Device) copyBuffer(src, dst *Buffer, at, n uint64) error {
+	return d.run(func(cb commandBuffer) {
+		region := bufferCopy{srcOffset: 0, dstOffset: at, size: n}
+		vkCmdCopyBuffer(cb, src.handle, dst.handle, 1, &region)
+	})
 }
 
 // run records one command buffer, submits it, and waits. Everything here is
