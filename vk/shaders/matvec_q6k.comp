@@ -1,0 +1,99 @@
+#version 450
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// y = W * x for a Q6_K matrix against float activations, in a projection.
+//
+// shaders/q6k.comp is the other Q6_K product here and it is not this one: it
+// scores a vocabulary against a Q8_K activation, in integers, out of superblocks
+// padded to 212 bytes. A projection has neither the shape nor the activation —
+// nothing on this card produces Q8_K — so what a K-quant mix needs for the
+// quarter of its attn_qkv and the half of its ffn_down that llama.cpp promotes
+// to six bits is this: the same mat-vec every other format here has.
+//
+// It reads vk/mixture.go's splitQ6_K. A block of thirty-two is twenty-four
+// contiguous bytes — two words of high bit pairs, then sixteen bytes of low
+// nibbles in Q4_0's order — and the two group scales and the superblock's
+// magnitude are found in the row's header.
+//
+// The recentring by thirty-two is done on the magnitude and not on the sum: a
+// weight is d * s[g] * (q - 32) where the scale changes at sixteen weights, so
+// the correction cannot be collected across a block the way Q4_0's eight is.
+//
+// Workgroup: 128 threads -> 16 output rows, 8 lanes per row. COLUMNS is
+// matvec_q40.comp's: how many activations one reading of the weights answers.
+
+#ifndef COLUMNS
+#define COLUMNS 1
+#endif
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly  buffer W { uint  w[]; };
+layout(std430, binding = 1) readonly  buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint dim; // outputs
+    uint ffn; // inputs
+    uint col; // the first column of the pass this dispatch answers
+} p;
+
+const uint LANES = 8u;
+const uint OUTS  = 16u;
+
+// sbyte reads one signed byte of the weight buffer, which is what a group scale
+// is: llama.cpp's quantizer writes them as int8 and the sign carries meaning.
+int sbyte(uint at) { return bitfieldExtract(int(w[at >> 2]), int((at & 3u) * 8u), 8); }
+
+void main() {
+    uint row = gl_WorkGroupID.x * OUTS + (gl_LocalInvocationID.x / LANES);
+    uint lane = gl_LocalInvocationID.x % LANES;
+    bool live = row < p.dim;
+    if (!live) row = 0u;
+
+    uint nb  = p.ffn / 32u;
+    uint nsb = p.ffn / 256u;
+    uint rowBase  = row * (((210u * nsb) + 3u) & ~3u);
+    uint magBase  = rowBase + 16u * nsb;
+    uint blockBase = rowBase + ((18u * nsb + 3u) & ~3u);
+
+    float sum[COLUMNS];
+    [[unroll]] for (uint c = 0u; c < COLUMNS; c++) sum[c] = 0.0;
+
+    for (uint b = lane; live && b < nb; b += LANES) {
+        uint sb = b >> 3u;
+        float d = unpackHalf2x16(w[(magBase + 2u * sb) >> 2])[sb & 1u];
+        // Two group scales to a block: the first sixteen weights and the last.
+        float d0 = d * float(sbyte(rowBase + 16u * sb + 2u * (b & 7u)));
+        float d1 = d * float(sbyte(rowBase + 16u * sb + 2u * (b & 7u) + 1u));
+
+        uint at = (blockBase + 24u * b) >> 2;
+        uint hi0 = w[at], hi1 = w[at + 1u];
+        uvec4 words = uvec4(w[at + 2u], w[at + 3u], w[at + 4u], w[at + 5u]);
+        uint xOffset = b * 32u;
+
+        [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+            uint xc = (p.col + c) * p.ffn + xOffset;
+            float lowSum = 0.0;
+            float highSum = 0.0;
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                uint word = words[u];
+                [[unroll]] for (uint k = 0u; k < 4u; k++) {
+                    uint j = u * 4u + k;
+                    uint byteVal = (word >> (k * 8u)) & 0xFFu;
+                    int qL = int(byteVal & 0x0Fu) | int((hi0 >> (2u * j)) & 3u) << 4;
+                    int qH = int(byteVal >> 4u)   | int((hi1 >> (2u * j)) & 3u) << 4;
+                    lowSum  += float(qL - 32) * x[xc + j];
+                    highSum += float(qH - 32) * x[xc + j + 16u];
+                }
+            }
+            sum[c] += lowSum * d0 + highSum * d1;
+        }
+    }
+
+    [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+        float total = subgroupClusteredAdd(sum[c], LANES);
+        if (lane == 0u && live) y[(p.col + c) * p.dim + row] = total;
+    }
+}

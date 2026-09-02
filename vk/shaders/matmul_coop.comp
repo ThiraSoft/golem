@@ -375,7 +375,15 @@ float pws[WPT];
 // is Q4_0's with three instructions added.
 uint  pwh[WPT];
 #endif
-#if defined(Q5K) || defined(Q4K)
+#ifdef Q6K
+// Q6_K carries two of everything a block: two words of high bit pairs, and two
+// group scales, because a scale covers sixteen weights and a block is
+// thirty-two. pws and pwm are those two scales rather than a scale and a
+// minimum — Q6_K has no minimum, its magnitudes are recentred on thirty-two.
+uint  pwh[WPT];
+uint  pwh2[WPT];
+#endif
+#if defined(Q5K) || defined(Q4K) || defined(Q6K)
 // The minimum, which both K-quants carry and Q4_0 does not: their weight is a
 // magnitude times a scale less a minimum, where Q4_0's is a magnitude recentred
 // on eight.
@@ -398,10 +406,13 @@ void prefetch(uint kb) {
         if (idx < uint(BM * KBC)) {
             uint r = idx & (uint(BM) - 1u);
             uint b = kb + idx / uint(BM);
-#ifdef Q5K
+#if defined(Q5K) || defined(Q6K)
             pwh[i] = 0u;
 #endif
-#if defined(Q5K) || defined(Q4K)
+#ifdef Q6K
+            pwh2[i] = 0u;
+#endif
+#if defined(Q5K) || defined(Q4K) || defined(Q6K)
             pwm[i] = 0.0;
 #endif
             if (row0 + r < p.dim && b < nb) {
@@ -413,6 +424,23 @@ void prefetch(uint kb) {
                 vec2 dm = unpackHalf2x16(w[(base + 4u * b) >> 2]);
                 pws[i] = dm.x;
                 pwm[i] = dm.y;
+#elif defined(Q6K)
+                // vk/mixture.go's splitQ6_K: the scales and the magnitudes are
+                // a header at the front of the row, the blocks are twenty-four
+                // bytes each past it, and both regions are on a word whatever
+                // the superblock count is.
+                uint nsb   = nb >> 3;
+                uint magB  = base + 16u * nsb;
+                uint blkB  = base + ((18u * nsb + 3u) & ~3u);
+                uint at4   = (blkB + 24u * b) >> 2;
+                pwh[i]  = w[at4];
+                pwh2[i] = w[at4 + 1u];
+                pw[i]   = uvec4(w[at4 + 2u], w[at4 + 3u], w[at4 + 4u], w[at4 + 5u]);
+                uint sbi = b >> 3u;
+                float dd = unpackHalf2x16(w[(magB + 2u * sbi) >> 2])[sbi & 1u];
+                uint sat = base + 16u * sbi + 2u * (b & 7u);
+                pws[i] = dd * float(bitfieldExtract(int(w[sat >> 2]), int((sat & 3u) * 8u), 8));
+                pwm[i] = dd * float(bitfieldExtract(int(w[(sat + 1u) >> 2]), int(((sat + 1u) & 3u) * 8u), 8));
 #elif defined(Q4K)
                 // vk/mixture.go's splitQ4_K: the nibbles begin where splitQ4_0
                 // puts its own, sixteen contiguous bytes to a block, and the
@@ -488,11 +516,14 @@ void stageTile() {
         uint k  = idx / uint(BM);
         uint at = r * uint(SA_STRIDE) + k * 32u;
         float ws = pws[i];
-#if defined(Q5K) || defined(Q4K)
+#if defined(Q5K) || defined(Q4K) || defined(Q6K)
         float wm = pwm[i];
 #endif
-#ifdef Q5K
+#if defined(Q5K) || defined(Q6K)
         uint  wh = pwh[i];
+#endif
+#ifdef Q6K
+        uint  wh2 = pwh2[i];
 #endif
         [[unroll]] for (uint u = 0u; u < 4u; u++) {
             uint w0 = pw[i][u] & 0x0F0F0F0Fu;
@@ -507,6 +538,22 @@ void stageTile() {
             uint h1 = ((((wh >> (16u + 4u * u))  & 0xFu) * 0x00204081u) & 0x01010101u) * 16u;
             vec4 v0 = unpackUnorm4x8(w0 | h0) * 255.0 * ws - wm;
             vec4 v1 = unpackUnorm4x8(w1 | h1) * 255.0 * ws - wm;
+#elif defined(Q6K)
+            // The two high bits a weight, spread one pair to a byte. Q5_K
+            // spreads its one bit with a multiply and a mask; the same trick
+            // does not survive a second bit. A multiply is a sum of shifted
+            // copies, and with two-bit fields the copies overlap in bits six
+            // and seven — pair three from one term and pair nought from the
+            // next — so the addition carries into bit eight and corrupts the
+            // pair that lands there. Measured, it was wrong on ninety-four per
+            // cent of the answers by about a fifth of each. Four masked shifts
+            // are an or of disjoint bits and cannot carry.
+            uint x0 = (wh  >> (8u * u)) & 0xFFu;
+            uint x1 = (wh2 >> (8u * u)) & 0xFFu;
+            uint h0 = ((x0 & 3u) | ((x0 & 12u) << 6u) | ((x0 & 48u) << 12u) | ((x0 & 192u) << 18u)) * 16u;
+            uint h1 = ((x1 & 3u) | ((x1 & 12u) << 6u) | ((x1 & 48u) << 12u) | ((x1 & 192u) << 18u)) * 16u;
+            vec4 v0 = (unpackUnorm4x8(w0 | h0) * 255.0 - 32.0) * ws;
+            vec4 v1 = (unpackUnorm4x8(w1 | h1) * 255.0 - 32.0) * wm;
 #elif defined(Q4K)
             // Q4_0's staging without the recentring by eight, which Q4_K does
             // not have: a weight is q times this sub-block's scale less its
@@ -591,8 +638,10 @@ void main() {
     uint ir   = (gl_WorkGroupID.x / CGROUPS) % wgs;
     uint ik   = gl_WorkGroupID.x / (wgs * CGROUPS);
     col0      = ic * uint(BN);
-#ifdef Q5K
+#if defined(Q5K)
     rowBytes  = nb * 24u;
+#elif defined(Q6K)
+    rowBytes  = ((nb >> 3) * 210u + 3u) & ~3u;
 #else
     rowBytes  = nb * 18u;
 #endif

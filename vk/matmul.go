@@ -213,6 +213,11 @@ func NewMatMulQuant(d *Device, data []byte, rows, cols, columns int, coop bool, 
 			return nil, fmt.Errorf("vk: a Q4_K row needs a multiple of %d columns, given %d", nn.SuperBlock, cols)
 		}
 		rowBytes, relayout = rowBytesQ4_K, splitQ4_K
+	case nn.Q6_K:
+		if cols%nn.SuperBlock != 0 {
+			return nil, fmt.Errorf("vk: a Q6_K row needs a multiple of %d columns, given %d", nn.SuperBlock, cols)
+		}
+		rowBytes, relayout = rowBytesQ6_K, splitQ6_K
 	default:
 		return nil, fmt.Errorf("vk: the tiled product has no staging for %s", q)
 	}
@@ -237,6 +242,8 @@ func NewMatMulQuant(d *Device, data []byte, rows, cols, columns int, coop bool, 
 		}
 		if q == nn.Q4_K {
 			spirv, err = matmulCoopQ4KSPIRV(columns)
+		} else if q == nn.Q6_K {
+			spirv, err = matmulCoopQ6KSPIRV(columns)
 		} else {
 			spirv, err = matmulCoopSPIRV(columns)
 		}
@@ -483,6 +490,21 @@ func matmulCoopQ4KSPIRV(columns int) ([]byte, error) {
 		return matmulCoopQ4K512SPIRV, nil
 	}
 	return nil, fmt.Errorf("vk: the cooperative Q4_K product is built at 64, 128, 256, 512 columns, not %d", columns)
+}
+
+// matmulCoopQ6KSPIRV is the same kernel under -DQ6K, at the same four widths.
+func matmulCoopQ6KSPIRV(columns int) ([]byte, error) {
+	switch columns {
+	case 64:
+		return matmulCoopQ6K64SPIRV, nil
+	case 128:
+		return matmulCoopQ6K128SPIRV, nil
+	case 256:
+		return matmulCoopQ6K256SPIRV, nil
+	case 512:
+		return matmulCoopQ6K512SPIRV, nil
+	}
+	return nil, fmt.Errorf("vk: the cooperative Q6_K product is built at 64, 128, 256, 512 columns, not %d", columns)
 }
 
 // matmulSPIRV is the binary built for that many columns.

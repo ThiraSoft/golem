@@ -1098,6 +1098,99 @@ func splitQ4_K(src []byte, rows, cols int) []byte {
 	return dst
 }
 
+// rowBytesQ6_K is what one row of that many inputs occupies once splitQ6_K has
+// had it: the format's own two hundred and ten bytes to a superblock, rounded
+// up to a whole number of words.
+//
+// The rounding is at most two bytes a row and it is not optional. Two hundred
+// and ten is not a multiple of four, so on a matrix with an odd number of
+// superblocks to a row — 3840 columns is fifteen of them, which is Gemma 4's
+// attention width — every other row would begin off alignment and a shader
+// indexing a uint array would read across the boundary on every load.
+func rowBytesQ6_K(cols int) int { return (cols/nn.SuperBlock*210 + 3) &^ 3 }
+
+// q6kBlockBase is where a row's blocks begin: past its scales and magnitudes,
+// on a word. The same two bytes rowBytesQ6_K rounds a row up by are spent here
+// when a row has an odd number of superblocks, and none when it does not.
+func q6kBlockBase(nsb int) int { return (18*nsb + 3) &^ 3 }
+
+// splitQ6_K rewrites a Q6_K matrix into blocks of thirty-two a thread can take.
+//
+// Q6_K's own order is the awkward one of the three. A superblock is traversed
+// in halves of a hundred and twenty-eight, and inside a half the four groups of
+// thirty-two draw their low nibbles from two bytes sixty-four apart and their
+// two high bits from two bit positions of a third — so four weights that are
+// consecutive in the matrix are not consecutive anywhere in the file.
+// nn/dequant_q6_k.go is that walk written out, and it is done once here.
+//
+// A row becomes
+//
+//	[0,      16nsb)  the signed group scales, sixteen a superblock, verbatim
+//	[16nsb,  18nsb)  the fp16 magnitudes, one a superblock
+//	[q6kBlockBase, ..)  twenty-four bytes a block of thirty-two: two words of
+//	                  high bit pairs, two bits a weight at bit 2l, then
+//	                  sixteen bytes of low nibbles in Q4_0's order
+//
+// which is 18nsb + 192nsb = 210nsb, the format's own count. The scales come
+// first because sixteen bytes a superblock is aligned whatever nsb is, where
+// two is not; rowBytesQ6_K says what pays for the rest of the alignment.
+//
+// The scales stay a header rather than being folded into the block, for
+// splitQ4_K's reason: a group scale covers sixteen weights, so folding would
+// put two fp16 in every block and take twenty-four bytes to twenty-eight.
+//
+// What the packing buys a reader is the recentring. A Q6_K magnitude is nought
+// to sixty-three and its weight is that less thirty-two — minus thirty-two to
+// thirty-one, which is a signed byte. A reader that subtracts as it unpacks has
+// therefore no correction term at all against a Q8_0 activation, where Q4_0's
+// eight and the other K-quants' minimum both need one.
+func splitQ6_K(src []byte, rows, cols int) []byte {
+	const superBytes = 210
+	nsb := cols / nn.SuperBlock
+	inStride := nsb * superBytes
+	outStride := rowBytesQ6_K(cols)
+	dst := make([]byte, rows*outStride)
+	var q [nn.SuperBlock]uint8
+	for r := 0; r < rows; r++ {
+		in := src[r*inStride : (r+1)*inStride]
+		out := dst[r*outStride : (r+1)*outStride]
+		blocks := out[q6kBlockBase(nsb):]
+		for sb := 0; sb < nsb; sb++ {
+			block := in[sb*superBytes : (sb+1)*superBytes]
+			low, high, scales := block[0:128], block[128:192], block[192:208]
+			copy(out[16*sb:], scales)
+			copy(out[16*nsb+2*sb:], block[208:210])
+
+			for half := 0; half < 2; half++ {
+				l := low[half*64 : half*64+64]
+				h := high[half*32 : half*32+32]
+				d := q[half*128 : half*128+128]
+				for i := 0; i < 32; i++ {
+					d[i] = l[i]&0x0F | (h[i]>>0&3)<<4
+					d[i+32] = l[i+32]&0x0F | (h[i]>>2&3)<<4
+					d[i+64] = l[i]>>4 | (h[i]>>4&3)<<4
+					d[i+96] = l[i+32]>>4 | (h[i]>>6&3)<<4
+				}
+			}
+
+			for i := 0; i < 8; i++ {
+				pack := blocks[(sb*8+i)*24 : (sb*8+i)*24+24]
+				vals := q[i*32 : i*32+32]
+				var hi [2]uint32
+				for j := 0; j < 16; j++ {
+					lo, up := vals[j], vals[j+16]
+					pack[8+j] = lo&0x0F | (up&0x0F)<<4
+					hi[0] |= uint32(lo>>4) << uint(2*j)
+					hi[1] |= uint32(up>>4) << uint(2*j)
+				}
+				binary.LittleEndian.PutUint32(pack[0:], hi[0])
+				binary.LittleEndian.PutUint32(pack[4:], hi[1])
+			}
+		}
+	}
+	return dst
+}
+
 // splitQ4_1 is splitQ4_0 for the format with a minimum beside the scale: the
 // twenty bytes of a block are a scale, a minimum, and sixteen nibble pairs, and
 // the kernels want all the scale-and-minimum pairs of a row before any of its
