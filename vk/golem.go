@@ -162,6 +162,24 @@ var golemDefaultShapes = map[int]GolemShape{
 // -rows and -cols — and set GOLEM_MATVEC_SHAPE to what it prints. Every shape
 // answers the same numbers whatever is fastest, and TestGolemBuildsAgree holds
 // them to it.
+//
+// And read what it prints as a candidate rather than an answer. golemtune times
+// one matrix in a loop, where a model reads sixty of them with everything else
+// a block does between; the two disagree, and they disagree in both directions.
+// Measured on Qwen3.8-27B in t3g, at its own 17408x5120 geometry, against
+// qwen35's TestVulkanWidthCost which times the same shapes inside a pass:
+//
+//	width  golemtune says   in a pass   what a pass measured
+//	    1  256,true,true    prefetch off      27.7 -> 27.1 ms
+//	    2  512,true,true    256,true,false    31.8 -> 30.2 ms
+//
+// The table above is Qwen3-4B's and the 4B still wants what it says — its t4g
+// draws at 75.6 tokens a second with the read-ahead and 76.9 without, which is
+// inside the noise, and the fastest single pass of either belongs to the
+// read-ahead. So the compiled default stays the 4B's and the 27B is a
+// GOLEM_MATVEC_SHAPE away, which is what the setting is for. What is worth
+// carrying away is that an isolated timing is a hypothesis: it has been wrong
+// about the mat-vec's shape, about the K-quant kernel's, and about this.
 
 // GolemShapes is the shape each pass width is built with. It is
 // golemDefaultShapes unless GOLEM_MATVEC_SHAPE says otherwise, in the form

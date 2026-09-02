@@ -121,8 +121,28 @@
 // dot products — which is most of why it is faster than its instruction count
 // says. Eight windows cut before the first read is issued gives the scheduler
 // eight independent reads in flight.
+// PHASED decodes a group of eight weights before any of them is looked up, and
+// reads that group's activations before any of them is multiplied. Both halves
+// are about having more than one thing in flight, and the second is what makes
+// a wide pass worth the name here: a weight of this format is four tenths of a
+// byte and its activations are four each a column, so past one column the
+// activation is the traffic and the loop was asking the memory system to
+// alternate between two streams p.ffn floats apart, one weight at a time.
+//
+// Measured on Qwen3.8-27B in t3g, a pass against a pass of one column:
+//
+//	columns   1      2      4      8     16
+//	off     1.00   1.160  1.826  3.142  6.419
+//	on      1.00   1.159  1.751  2.920  5.825
+//
+// A token is one column and is unmoved either way — 27.4 milliseconds against
+// 27.3, and the 4B's t4g draws at the same rate to a tenth — so this is a
+// prompt's saving and not a generation's. What it does not reach is the second
+// column, which is the one a draft wants: an ablation that removes the
+// activation read entirely takes the two-column pass from 1.160 to 1.034, so
+// what is left there is the traffic itself and not the order it is asked in.
 #ifndef PHASED
-#define PHASED 0
+#define PHASED 1
 #endif
 
 // NARROW holds the table as sixteen-bit integers instead of floats: eight
@@ -408,9 +428,27 @@ void main() {
                 wv[j] = (TABLE != 0 ? ldsValues[copy + vv[j]] : t4gHash(vv[j])) * step;
 #endif
             }
+            // The activations of this group, every column, read before any of
+            // them is multiplied.
+            //
+            // Interleaved with the multiplies — a column's value, then the
+            // next column's, then back — the two streams are p.ffn floats
+            // apart and the loop asks the memory system to alternate between
+            // them a weight at a time. On a three-bit format that is the whole
+            // of what a second column costs: the weight is four tenths of a
+            // byte and its activations are four each, so past one column the
+            // activation is the traffic. Measured on Qwen3.8-27B in t3g, a
+            // pass of two against a pass of one: 1.168 with the reads
+            // interleaved and 1.034 with them ablated away entirely, which is
+            // what said where to look.
+            float xv[COLUMNS][8];
+            [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+                uint xb = (p.col + c) * p.ffn + xOffset + g * 8u;
+                [[unroll]] for (uint j = 0u; j < 8u; j++) xv[c][j] = x[xb + j];
+            }
             [[unroll]] for (uint j = 0u; j < 8u; j++) {
                 [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
-                    sum[c] += wv[j] * x[(p.col + c) * p.ffn + xOffset + g * 8u + j];
+                    sum[c] += wv[j] * xv[c][j];
                 }
             }
         }
