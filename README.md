@@ -24,7 +24,7 @@ A golem is inert matter given a voice. That is what these engines do to a file o
 - **Multimodal**: Text, Vision (images) and Audio (WAV/MP3/FLAC) via Gemma 4; Qwen3.8 sees too, its tower checked against llama.cpp waypoint by waypoint.
 - **Verified, not asserted**: no layer is deemed correct until its intermediate activations match llama.cpp or PyTorch, waypoint by waypoint.
 - **Fast on CPU**: keeps pace with `llama.cpp` on tuned AVX2 kernels — ahead reading prompts, level generating, except on the smallest model, where the weights stop being the cost and it says so.
-- **Vulkan GPU**: bound through `purego` rather than cgo. Measured on AMD against `llama.cpp`'s own Vulkan build: ahead of it reading prompts on all five models, and generating on both Gemma ones. The table below says where it is behind, and by how much.
+- **Vulkan GPU**: bound through `purego` rather than cgo. Measured on AMD against `llama.cpp`'s own Vulkan build: ahead of it reading prompts on four of five models at every width, and level generating on the 12B. The table below says where it is behind, and by how much.
 - **Its own weight format**: `.golem` is 18 % smaller than llama.cpp's Q3_K_M on Qwen3-4B and ahead of it on every measure — a trellis codebook with no lookup table, converted on the card. [What it costs](#-golem--the-engines-own-weight-format).
 - **Serves several clients at once**: `-parallel N` holds N conversations and carries a token for each of them through one read of the weights, on the card as well as on the processor — Qwen3.8 on the card excepted, for a reason [written below](#-several-conversations-one-pass).
 
@@ -54,7 +54,7 @@ go build ./cmd/golem-server
 
 Whatever is waiting at the moment a pass is built goes into that pass. Four clients each wanting a token are four tokens in one read of a gigabyte of weights, rather than four reads — llama.cpp's continuous batching, and it now works on the card as well as on the processor. The context is cut between the slots rather than multiplied, so `-context 4096 -parallel 4` is four conversations of 1024 and the memory is what it was.
 
-Gemma 4 26B A4B on an RX 9070 XT, drawing a token for each conversation from 448 positions of context:
+Gemma 4 26B A4B on an RX 9070 XT, drawing a token for each conversation from 448 positions of context. These are from an earlier sitting than the table below and the two are not comparable — the section there says why:
 
 | conversations | 1 | 2 | 4 | 8 |
 | --- | ---: | ---: | ---: | ---: |
@@ -68,21 +68,47 @@ What made it possible is that a column now says which conversation it belongs to
 
 ## ⚡ Vulkan GPU
 
-`-vulkan` puts the whole model on the card. Measured on an RX 9070 XT, the same evening, against `llama.cpp`'s own Vulkan build on the same files:
+`-vulkan` puts the whole model on the card. Measured on an RX 9070 XT in one
+sitting, against `llama.cpp`'s own Vulkan build on the same Q4_0 files, both
+sides warmed before timing:
 
 | tokens a second | golem gen | llama gen | golem pp64 | llama pp64 | golem pp256 | llama pp256 | golem pp512 | llama pp512 |
 | --------------- | --------: | --------: | ---------: | ---------: | ----------: | ----------: | ----------: | ----------: |
-| Gemma 4 26B A4B | **133.5** |     124.8 |   **2061** |        833 |    **3951** |        2918 |    **4541** |        4038 |
-| Gemma 4 12B     |  **65.4** |      64.6 |   **1499** |        983 |    **2611** |        2471 |        2858 |        2976 |
-| Qwen3 4B        |     167.0 |     169.7 |   **3950** |       2952 |    **5854** |        4545 |        5895 |        6125 |
-| Qwen3 0.6B      |     359.4 |     365.4 |  **13915** |       9966 |   **23787** |       19159 |   **23995** |       22306 |
-| Qwen3.8 27B     |      30.1 |      32.8 |    **799** |      628.7 |    **1134** |      1127.8 |    **1236** |      1234.7 |
+| Gemma 4 26B A4B |     105.4 |     115.6 |   **1858** |       1053 |    **3614** |        2704 |    **4011** |        3483 |
+| Gemma 4 12B     |  **61.5** |      61.2 |   **1463** |       1209 |    **2557** |        2287 |    **2761** |        2683 |
+| Qwen3 4B        |     130.4 |     139.0 |   **3528** |       3231 |    **5780** |        5585 |        5802 |        6686 |
+| Qwen3 0.6B      |     259.6 |     270.3 |       7498 |      10188 |       14665 |       17297 |   **18756** |       18644 |
+| Qwen3.8 27B     |      30.3 |      31.4 |    **798** |        655 |    **1170** |        1105 |    **1285** |        1212 |
 
-**Reading a prompt, golem is ahead on all five models at 64 and 256 positions**, and on the 26B A4B, the 0.6B and Qwen3.8 at 512 as well. On the 26B A4B that is a factor of two and a half at sixty-four positions; on Qwen3.8 the two engines land within a tenth of a per cent of each other at 512, which the [section below](#-reading-a-prompt-on-the-card) takes apart op by op.
+**Reading a prompt, golem is ahead on four of the five models at every width**,
+by a factor of one and three quarters on the 26B A4B at sixty-four positions.
+The exception is the 0.6B, which is behind at sixty-four and two hundred and
+fifty-six and level at five hundred and twelve: a model that small spends a
+prompt in dispatch latency rather than in arithmetic, and there is nothing in a
+kernel to win it back.
 
-**Generating, golem is ahead on both Gemma models** and within two per cent on both Qwen3 ones. Qwen3.8 generates slightly behind due to the heavy per-token state updates of its gated delta net, which cannot be amortised across a batch.
+**Generating, golem is level on the 12B and two to nine per cent behind on the
+other four.** Qwen3.8 is the closest of them because a gated delta net rewrites
+a state matrix a head every token, which is arithmetic neither engine
+amortises; the 26B A4B is the furthest.
 
-The card holds the whole model: 12.8 GiB for the 26B A4B, which is why sixteen is the smallest card that can run it, and about nine seconds of upload. `-vulkan` is all or nothing and says so: a card without `VK_KHR_shader_integer_dot_product`, a machine with no Vulkan loader, a model too large for the card — each is an error at startup rather than a silent half-move. Without the flag, everything runs on the CPU as before.
+These are one machine's numbers on one afternoon and they are not comparable
+with figures taken on another. Earlier revisions of this file carried a table
+from an evening when the same card ran a fifth faster on small models — both
+engines by the same fraction, checked by re-running llama.cpp's side as well —
+so the column to read is the difference between the two engines and not the
+absolute rate.
+
+**A K-quant runs on the card too.** Q4_0, Q4_1, Q4_K, Q5_K and Q6_K each have a
+mat-vec and a tiled product here, and a checkpoint may mix them the way
+llama.cpp's own quantizer does — a `Q4_K_M` gives the same role different
+formats in different blocks, six bits on half its `ffn_down` and four on the
+rest, and every matrix is asked what it is rather than told. A form with no
+kernel is an error naming it, never a guess: eighteen bytes to a block of
+thirty-two is Q4_0 and it is also Q4_K, so a reader that checked a length
+instead of a type would answer fluently out of the wrong bits.
+
+The card holds the whole model: 12.8 GiB for the 26B A4B, which is why sixteen is the smallest card that can run it. `-vulkan` is all or nothing and says so: a card without `VK_KHR_shader_integer_dot_product`, a machine with no Vulkan loader, a model too large for the card — each is an error at startup rather than a silent half-move. Without the flag, everything runs on the CPU as before.
 
 _(See [ARCHITECTURE.md](ARCHITECTURE.md) for the kernel work behind these numbers.)_
 
@@ -94,10 +120,20 @@ Qwen3.8 27B, a seventeen-token prompt, greedy:
 
 | | prompt | a token at a time | drafting | drafts accepted |
 | --- | ---: | ---: | ---: | ---: |
-| RX 9070 XT | 119.6 /s | 31.1 t/s | **46.0 t/s** | 70% |
+| RX 9070 XT | 129.2 /s | 27.6 t/s | **40.1 t/s** | 70% |
 | i7-9700K, 8 threads | 0.7 /s | 0.70 t/s | _refused_ | — |
 
-Seventeen positions is a narrow pass, which is why the card reads this prompt at a hundred and twenty a second and a five-hundred-and-twelve-position one at 1236 — the [section below](#-reading-a-prompt-on-the-card) is that curve.
+**On a card with no room for it, drafting is dropped rather than paid for.** The
+prediction block's weights and a shadow of every delta net's recurrence are
+about four hundred mebibytes, and Qwen3.8-27B in Q4_K_M is 15.65 GiB on a card
+whose heap is 15.92: with them the driver leaves the logit head in system
+memory and the model reads a gigabyte across the bus for every token — 3.5
+tokens a second against 26.5 with the head resident. golem asks the heap before
+it uploads, drops the block when it will not fit, and says so on the standard
+error. Speculation is worth about thirty per cent; a head on the bus costs
+eighty-eight. The Q4_0 build is 14.94 GiB and keeps both.
+
+Seventeen positions is a narrow pass, which is why the card reads this prompt at a hundred and thirty a second and a five-hundred-and-twelve-position one at 1283 — the [section below](#-reading-a-prompt-on-the-card) is that curve.
 
 **Drafting is refused on the processor**, and the reason is one measurement. A speculative step costs a draft plus a pass of two columns, against the one-column pass it hopes to replace:
 
@@ -115,12 +151,12 @@ The same bargain reads a prompt. A pass carries up to five hundred and twelve po
 
 | positions in the pass | 1 | 16 | 32 | 64 | 128 | 256 | 512 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| the pass | 31.2ms | 70.0ms | 63.2ms | 80.1ms | 140.2ms | 225.8ms | 417.8ms |
-| positions a second | 32 | 229 | 506 | 799 | 913 | 1134 | **1236** |
+| the pass | 33.2ms | 57.0ms | 52.4ms | 80.2ms | 137.7ms | 219.4ms | 399.2ms |
+| positions a second | 30 | 281 | 611 | 798 | 929 | 1167 | **1283** |
 
 Thirty-two positions cost *less* than sixteen, and that is not a misprint: sixteen is the widest the mat-vec builds, and thirty-two is where the tiled products take over.
 
-**A prompt reads at 1236 positions a second, against 62 when a pass carried two.** llama.cpp's Vulkan build reads the same file on the same card at 1234.67 ± 2.00 (`llama-bench -p 512 -r 3`). Both benchmarks do the same work — 512 tokens from an empty cache, both warm, both synchronised, load time excluded — with one difference, and it is ours: golem reads every position's hidden state back over the bus where llama.cpp keeps only the last.
+**A prompt reads at 1283 positions a second, against 62 when a pass carried two.** llama.cpp's Vulkan build reads the same file on the same card at 1211.67 ± 1.63 (`llama-bench -p 512 -r 5`). Both benchmarks do the same work — 512 tokens from an empty cache, both warm, both synchronised, load time excluded — with one difference, and it is ours: golem reads every position's hidden state back over the bus where llama.cpp keeps only the last.
 
 ### Where a pass goes
 
@@ -149,7 +185,7 @@ Attention is the one line where the gap is a shape rather than a margin: golem d
 | --- | --- | --- |
 | **Gemma 4** | E2B, 12B, 26B A4B (mixture of 128 experts). Text, Vision, Audio. | Reading a prompt ×1.24 (E2B), ×1.33 (12B), ×1.06 (26B A4B). Generating, a tie: ×1.01, ×1.04, ×1.06 — vs llama.cpp |
 | **Qwen3** | Dense models, from a GGUF. | 4B: ×1.13 reading, ×1.00 generating. 0.6B: ×0.99 reading, ×0.85 generating — vs llama.cpp |
-| **Qwen3.8** | 27B: Dense model featuring forty-eight gated delta nets and sixteen attentions (three to one ratio) — plus the checkpoint's own multi-token-prediction head, which drafts the second token of every pass. Text and Vision. | 0.72 t/s on an i7-9700K: a delta net rewrites a 128×128 state a head every token, and that is arithmetic no kernel makes cheaper. On a card, 30.1 a token at a time, **46.0 drafting** and **1236** reading a prompt, against llama.cpp's Vulkan build at 32.8 and 1234.7 |
+| **Qwen3.8** | 27B: Dense model featuring forty-eight gated delta nets and sixteen attentions (three to one ratio) — plus the checkpoint's own multi-token-prediction head, which drafts the second token of every pass. Text and Vision. | 0.72 t/s on an i7-9700K: a delta net rewrites a 128×128 state a head every token, and that is arithmetic no kernel makes cheaper. On a card, 27.6 a token at a time, **40.1 drafting** and **1283** reading a prompt, against llama.cpp's Vulkan build at 31.4 and 1211.7 |
 | **Pocket TTS** | 12 shipped models across 6 languages, voice cloning included. | ×2.31 and ×1.69 the speed of the PyTorch reference, on the 24- and 6-layer models |
 
 In absolute terms, on an i7-9700K with eight threads and Q4_0 weights: Gemma E2B draws 22.6 tokens a second and reads 204; the 12B, 5.0 and 42; the 26B A4B, 13.1 and 51; Qwen3 4B, 14.6 and 110. Pocket TTS speaks at ×2.94 real time in French, ×6.81 in English.
@@ -206,11 +242,12 @@ generates more slowly than either. Qwen3-4B on an RX 9070 XT, same card, greedy:
 
 | | size | tokens a second |
 | --- | ---: | ---: |
-| llama.cpp Q3_K_M | 1.93 GiB | 135.1 |
+| llama.cpp Q3_K_M | 1.93 GiB | 133.9 |
 | llama.cpp Q4_K_M | 2.32 GiB | 128.7 |
-| golem Q4_0 | 2.11 GiB | 103.2 |
-| **golem `.golem` T4G** | **1.96 GiB** | **69.4** |
-| **golem `.golem` T3G** | **1.57 GiB** | **71.0** |
+| golem Q4_K_M | 2.32 GiB | 118.2 |
+| golem Q4_0 | 2.11 GiB | 130.4 |
+| **golem `.golem` T4G** | **1.97 GiB** | **80.3** |
+| **golem `.golem` T3G** | **1.57 GiB** | **82.5** |
 
 The reason is the codebook and it does not go away with tuning: a trellis weight
 is decoded one at a time out of twelve bits of state, where a nibble format

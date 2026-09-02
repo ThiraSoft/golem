@@ -1,0 +1,294 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_integer_dot_product : require
+
+// The tiled product for Q5_K weights against a Q8_0 activation, and for Q4_1
+// under -DQ41.
+//
+// shaders/matmul.comp is the same shape for Q4_0 and this is written against
+// it; what differs is the weight. A Q5_K superblock is two hundred and fifty-
+// six weights in forty-four words: d and dmin as two halves, twelve bytes of
+// six-bit scales and minima for eight sub-blocks, thirty-two bytes of high
+// bits, and a hundred and twenty-eight bytes of low nibbles.
+//
+// Two sub-blocks share thirty-two of those bytes — the even one takes their
+// low nibbles and the odd one their high nibbles, over the same thirty-two
+// positions — and the fifth bit of a weight is bit i of qh's thirty-two bytes,
+// one byte a position. That is ggml-quants.c's dequantize_row_q5_K and it is
+// the definition; nn's TestQ5_KMatchesGGML holds the processor's copy of it to
+// the same line.
+//
+// A weight is that five-bit number in nought to thirty-one, and its value is
+//
+//     w = d * sc[i] * q - dmin * m[i]
+//
+// so against an activation in Q8_0, where x = xs * xq and golem's blocks carry
+// a correction of 8 * xs * sum(xq),
+//
+//     sum(w * x) = d*sc[i] * xs * dot(q, xq) - dmin*m[i] * corr / 8
+//
+// A sub-block is thirty-two weights and a Q8_0 block is thirty-two values, so
+// the two align one to one and the minimum's term needs no accumulator of its
+// own.
+//
+// The step is a whole superblock rather than a sub-block. A sub-block a step
+// would read the superblock's header — its two halves and its twelve bytes of
+// scales — eight times over, and would put a barrier every thirty-two of the
+// shared dimension: a hundred and ninety-two of them for this projection
+// against twenty-four. Eight sub-blocks of arithmetic sit between one pair of
+// barriers instead.
+
+#ifndef COLUMNS
+#define COLUMNS 32
+#endif
+#ifndef BN
+#define BN 32
+#endif
+#ifndef BM
+#define BM 32
+#endif
+#define THREADS 256
+#ifndef TN
+#define TN 2
+#endif
+#define TM (BM * BN / THREADS / TN)
+#define COLTH (BN / TN)
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer W  { uint  w[];   };
+layout(std430, binding = 1) readonly  buffer AQ { uint  aq[];  };
+layout(std430, binding = 2) readonly  buffer AS { float as_[]; };
+layout(std430, binding = 3) writeonly buffer Y  { float y[];   };
+
+layout(push_constant) uniform Push {
+    uint dim;   // outputs, the rows of the weight
+    uint ffn;   // inputs, the shared dimension
+    uint used;  // one, and only here so every kernel takes the same block
+    uint act;   // not read
+    uint col;   // not read: this kernel answers COLUMNS from zero
+} p;
+
+// A superblock's worth: eight sub-blocks of eight words a row, and the eight
+// pairs of floats their scales and minima come to.
+// The stride is sixty-five words and not sixty-four, which is a bank. Two
+// rows a bank apart put every thread of a wave on the same one, and the reads
+// serialise; one word of padding walks them round.
+#define WSTRIDE 65
+shared uint  sw[BM * WSTRIDE];
+shared float sd[BM * 8];
+shared float sm[BM * 8];
+shared uint  sx[BN * WSTRIDE];
+shared float sxd[BN * 8];
+shared float sxc[BN * 8];
+
+void main() {
+    uint t  = gl_LocalInvocationID.x;
+    uint tr = t / COLTH;
+    uint tc = t % COLTH;
+
+    uint nsub = p.ffn >> 5;      // Q8_0 blocks of the shared dimension
+    uint nsup = p.ffn >> 8;      // eight of those to a staging step
+#ifdef Q41
+    // A Q4_1 row after splitQ4_1 is its scale-and-minimum pairs, one word a
+    // block, and then its nibbles, four words a block.
+    uint rowWords = nsub * 5u;
+#elif defined(Q4K)
+    // A Q4_K row after splitQ4_K is the file's own count — thirty-six words a
+    // superblock — with the header moved to the front of the row.
+    uint rowWords = nsup * 36u;
+#else
+    uint rowWords = nsup * 44u;  // a Q5_K superblock is forty-four
+#endif
+
+    uint groups = (p.dim + uint(BM) - 1u) / uint(BM);
+    uint ir = gl_WorkGroupID.x % groups;
+    uint ic = gl_WorkGroupID.x / groups;
+    uint row0 = ir * uint(BM);
+    uint col0 = ic * uint(BN);
+
+
+    float acc[TM][TN];
+    [[unroll]] for (uint r = 0u; r < TM; r++) {
+        [[unroll]] for (uint c = 0u; c < TN; c++) acc[r][c] = 0.0;
+    }
+
+    for (uint sup = 0u; sup < nsup; sup++) {
+#ifdef Q41
+        // The weights. A thread takes one row and one block: four words of
+        // nibbles become eight of bytes, which is sixteen bytes read for
+        // thirty-two weights and no word read twice. A Q4_1 weight is the
+        // nibble times the scale plus the minimum, with no offset of eight, so
+        // the second term is the activation's own sum rather than its negative.
+        for (uint e = t; e < uint(BM) * 8u; e += uint(THREADS)) {
+            uint sr = e >> 3;
+            uint si = e & 7u;
+            uint srow = row0 + sr;
+            uint blk  = sup * 8u + si;
+            if (srow >= p.dim) {
+                sd[sr * 8u + si] = 0.0;
+                sm[sr * 8u + si] = 0.0;
+                [[unroll]] for (uint u = 0u; u < 8u; u++) sw[sr * uint(WSTRIDE) + si * 8u + u] = 0u;
+                continue;
+            }
+            uint base = srow * rowWords;
+            vec2 dm = unpackHalf2x16(w[base + blk]);
+            sd[sr * 8u + si] = dm.x;
+            sm[sr * 8u + si] = dm.y;
+
+            uint qs = base + nsub + blk * 4u;
+            [[unroll]] for (uint l = 0u; l < 4u; l++) {
+                uint q = w[qs + l];
+                sw[sr * uint(WSTRIDE) + si * 8u + l]      =  q         & 0x0F0F0F0Fu;
+                sw[sr * uint(WSTRIDE) + si * 8u + 4u + l] = (q >> 4u)  & 0x0F0F0F0Fu;
+            }
+        }
+#elif defined(Q4K)
+        // The weights. Layout A of vk/mixture.go's splitQ4_K puts a block's
+        // sixteen bytes of nibbles contiguous, so a thread takes one row and
+        // one whole block as it does for Q4_1. What it does not have is a scale
+        // of its own: the eight threads staging a row of this superblock read
+        // the same four words of header and each unpacks the six bits that
+        // belong to it.
+        for (uint e = t; e < uint(BM) * 8u; e += uint(THREADS)) {
+            uint sr = e >> 3;
+            uint si = e & 7u;
+            uint srow = row0 + sr;
+            uint blk  = sup * 8u + si;
+            if (srow >= p.dim) {
+                sd[sr * 8u + si] = 0.0;
+                sm[sr * 8u + si] = 0.0;
+                [[unroll]] for (uint u = 0u; u < 8u; u++) sw[sr * uint(WSTRIDE) + si * 8u + u] = 0u;
+                continue;
+            }
+            uint base = srow * rowWords;
+            uint hb   = base + 4u * sup;
+            vec2 dd = unpackHalf2x16(w[hb]);
+            uint s0 = w[hb + 1u], s1 = w[hb + 2u], s2 = w[hb + 3u];
+            uint sc, mn;
+            if (si < 4u) {
+                sc = (s0 >> (si * 8u)) & 63u;
+                mn = (s1 >> (si * 8u)) & 63u;
+            } else {
+                uint j  = si - 4u;
+                uint b2 = (s2 >> (j * 8u)) & 0xFFu;
+                sc = (b2 & 0x0Fu) | ((((s0 >> (j * 8u)) & 0xFFu) >> 6u) << 4u);
+                mn = (b2 >> 4u)   | ((((s1 >> (j * 8u)) & 0xFFu) >> 6u) << 4u);
+            }
+            sd[sr * 8u + si] = dd.x * float(sc);
+            sm[sr * 8u + si] = dd.y * float(mn);
+
+            uint qs = base + (nsub >> 1) + blk * 4u;
+            [[unroll]] for (uint l = 0u; l < 4u; l++) {
+                uint q = w[qs + l];
+                sw[sr * uint(WSTRIDE) + si * 8u + l]      =  q        & 0x0F0F0F0Fu;
+                sw[sr * uint(WSTRIDE) + si * 8u + 4u + l] = (q >> 4u) & 0x0F0F0F0Fu;
+            }
+        }
+#else
+        // The weights. A thread takes one row and one word position of a
+        // sub-block, not one row and one whole sub-block, and it is the
+        // difference between reading the superblock once and reading it three
+        // and a half times.
+        //
+        // Two sub-blocks share a word of nibbles and all eight share a word of
+        // high bits, so a thread that stages a whole sub-block re-reads that
+        // word for every one of the eight, and re-reads the header with it.
+        // Forty dwords of the forty-four a superblock holds are read once each
+        // this way, and the four the header is are read by the thread at word
+        // zero, which is where the eight pairs of scales and minima come from.
+        for (uint e = t; e < uint(BM) * 8u; e += uint(THREADS)) {
+            uint sr = e >> 3;    // which row of the tile
+            uint u  = e & 7u;    // which word of a sub-block
+            uint srow = row0 + sr;
+            if (srow >= p.dim) {
+                [[unroll]] for (uint i = 0u; i < 8u; i++) sw[sr * uint(WSTRIDE) + i * 8u + u] = 0u;
+                if (u == 0u) {
+                    [[unroll]] for (uint i = 0u; i < 8u; i++) { sd[sr * 8u + i] = 0.0; sm[sr * 8u + i] = 0.0; }
+                }
+                continue;
+            }
+            uint base = srow * rowWords + sup * 44u;
+
+            // The four pairs' nibbles at this word, and the high bits of all
+            // eight sub-blocks, which is one word.
+            uint qh = w[base + 4u + u];
+            uint high[8];
+            [[unroll]] for (uint i = 0u; i < 8u; i++) high[i] = ((qh >> i) & 0x01010101u) << 4u;
+            [[unroll]] for (uint k = 0u; k < 4u; k++) {
+                uint q = w[base + 12u + k * 8u + u];
+                sw[sr * uint(WSTRIDE) + (2u * k) * 8u + u]      = (q         & 0x0F0F0F0Fu) | high[2u * k];
+                sw[sr * uint(WSTRIDE) + (2u * k + 1u) * 8u + u] = ((q >> 4u) & 0x0F0F0F0Fu) | high[2u * k + 1u];
+            }
+
+            if (u == 0u) {
+                vec2 dd = unpackHalf2x16(w[base]);
+                uint s0 = w[base + 1u], s1 = w[base + 2u], s2 = w[base + 3u];
+                [[unroll]] for (uint i = 0u; i < 8u; i++) {
+                    uint sc, mn;
+                    if (i < 4u) {
+                        sc = (s0 >> (i * 8u)) & 63u;
+                        mn = (s1 >> (i * 8u)) & 63u;
+                    } else {
+                        uint j  = i - 4u;
+                        uint b2 = (s2 >> (j * 8u)) & 0xFFu;
+                        sc = (b2 & 0x0Fu) | ((((s0 >> (j * 8u)) & 0xFFu) >> 6u) << 4u);
+                        mn = (b2 >> 4u)   | ((((s1 >> (j * 8u)) & 0xFFu) >> 6u) << 4u);
+                    }
+                    sd[sr * 8u + i] = dd.x * float(sc);
+                    sm[sr * 8u + i] = dd.y * float(mn);
+                }
+            }
+        }
+
+#endif
+
+        // The activation's eight blocks over the same two hundred and fifty-six
+        // of the shared dimension.
+        for (uint e = t; e < uint(BN) * 8u; e += uint(THREADS)) {
+            uint sc2 = e >> 3;
+            uint si2 = e & 7u;
+            uint scol = col0 + sc2;
+            uint blk  = sup * 8u + si2;
+            uint at   = (scol * p.ffn + blk * 32u) >> 2;
+            [[unroll]] for (uint u = 0u; u < 8u; u++) sx[sc2 * uint(WSTRIDE) + si2 * 8u + u] = aq[at + u];
+            sxd[sc2 * 8u + si2] = as_[scol * 2u * nsub + blk];
+            sxc[sc2 * 8u + si2] = as_[scol * 2u * nsub + nsub + blk];
+        }
+        barrier();
+
+        [[unroll]] for (uint i = 0u; i < 8u; i++) {
+            [[unroll]] for (uint r = 0u; r < TM; r++) {
+                uint rr = tr * uint(TM) + r;
+                float d1 = sd[rr * 8u + i], m1 = sm[rr * 8u + i];
+                uint wr[8];
+                [[unroll]] for (uint u = 0u; u < 8u; u++) wr[u] = sw[rr * uint(WSTRIDE) + i * 8u + u];
+
+                [[unroll]] for (uint c = 0u; c < TN; c++) {
+                    uint cc = tc * uint(TN) + c;
+                    int qsum = 0;
+                    [[unroll]] for (uint u = 0u; u < 8u; u++) {
+                        qsum = dotPacked4x8AccSatEXT(wr[u], int(sx[cc * uint(WSTRIDE) + i * 8u + u]), qsum);
+                    }
+#ifdef Q41
+                    // plus: a Q4_1 nibble carries no offset of eight.
+                    acc[r][c] += d1 * float(qsum) * sxd[cc * 8u + i]
+                               + m1 * sxc[cc * 8u + i] * 0.125;
+#else
+                    acc[r][c] += d1 * float(qsum) * sxd[cc * 8u + i]
+                               - m1 * sxc[cc * 8u + i] * 0.125;
+#endif
+                }
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint r = 0u; r < TM; r++) {
+        uint row = row0 + tr * uint(TM) + r;
+        if (row >= p.dim) continue;
+        [[unroll]] for (uint c = 0u; c < TN; c++) {
+            y[(col0 + tc * uint(TN) + c) * p.dim + row] = acc[r][c];
+        }
+    }
+}

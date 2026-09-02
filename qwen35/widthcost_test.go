@@ -23,7 +23,7 @@ func TestVulkanWidthCost(t *testing.T) {
 	m.W.TokenEmbd.Row(1000, x)
 
 	one := time.Duration(0)
-	for _, w := range []int{1, 2, 4, 8, 16} {
+	for _, w := range []int{1, 16, 32, 64, 128, 256, 512} {
 		if w > m.gpuPipe.Columns() {
 			continue
 		}
