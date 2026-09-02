@@ -35,11 +35,19 @@ import (
 	"github.com/ThiraSoft/golem/vk"
 )
 
-// floatOf widens a matrix to the float32 bytes vk's float path reads. Every
-// quantized form goes through nn.Matrix.Row, which is what every other reader
-// of a checkpoint uses, so there is no second decoder to disagree with it.
-func floatOf(w nn.Matrix) []byte {
-	if w.Quant == nn.F32 {
+// wideOf is a matrix in the form the window's kernels read, which is the
+// checkpoint's own form when the card has a kernel for it and float32
+// otherwise. Every quantized form goes through nn.Matrix.Row, which is what
+// every other reader of a checkpoint uses, so there is no second decoder to
+// disagree with it.
+//
+// **The bfloat16 case returns the checkpoint's bytes and touches nothing.**
+// Widening every matrix used to read the 27B's 54.8 GB and write and send
+// 109.6 — the shift that puts a bfloat's bits in a float's top half, done on
+// this side sixty times a window. shaders/matvec_f32.comp does the same shift
+// now, so the host allocates nothing and the bus carries half.
+func wideOf(w nn.Matrix, form vk.WideForm) []byte {
+	if w.Quant == nn.F32 || (form == vk.WideBF16 && w.Quant == nn.BF16) {
 		return w.Data
 	}
 	out := make([]float32, w.Rows*w.Cols)
@@ -49,6 +57,48 @@ func floatOf(w nn.Matrix) []byte {
 		}
 	})
 	return f32Bytes(out)
+}
+
+// wideForm is the form every projection of the trunk will be uploaded in.
+//
+// It is bfloat16 only when every one of them already is. The kernel is chosen
+// once for the whole pipeline, so a trunk that mixed the two would have to
+// widen the odd matrix out to a kernel that reads pairs of weights to a word —
+// there is no such thing, and the answer is to widen all of them instead. The
+// decay projections are excluded because they are float32 in every checkpoint
+// and vk keeps the float kernel for them whatever the rest is.
+func (m *Model) wideForm() vk.WideForm {
+	if wideF32Only {
+		return vk.WideF32
+	}
+	for i := range m.W.Blocks[:m.trunk()] {
+		bw := &m.W.Blocks[i]
+		for _, w := range []nn.Matrix{bw.Gate, bw.Up, bw.Down, bw.Q, bw.K, bw.V, bw.O,
+			bw.QKV, bw.AttnGate, bw.SSMOut} {
+			if w.Rows*w.Cols > 0 && w.Quant != nn.BF16 {
+				return vk.WideF32
+			}
+		}
+	}
+	return vk.WideBF16
+}
+
+// wideF32Only makes wideForm answer WideF32 whatever the checkpoint holds,
+// which is the path every window took before the card had a bfloat16 kernel:
+// the host widens each matrix and sends twice its size.
+//
+// It is here for one test. The two forms compute the same numbers — widening a
+// bfloat16 to a float is a shift, and the kernel does the shift the host used
+// to — so the only way to hold the newer path to the older one is to run both,
+// and the only way to run the older one is to ask for it.
+var wideF32Only bool
+
+// wideBytes is how many bytes a weight occupies in the given form.
+func wideBytes(form vk.WideForm) int {
+	if form == vk.WideBF16 {
+		return 2
+	}
+	return 4
 }
 
 func spread(n int, fn func(lo, hi int)) {
@@ -99,7 +149,7 @@ func (m *Model) streamShape(ctx int) vk.QwenShape {
 		MaxContext:   ctx,
 		Eps:          cfg.Eps,
 		RoPESections: [4]int(cfg.RoPESections),
-		Float:        true,
+		Float:        m.wideForm(),
 	}
 	for _, bc := range cfg.Blocks[:m.trunk()] {
 		if bc.Type == BlockFullAttn && s.Heads == 0 {
@@ -116,15 +166,25 @@ func (m *Model) streamShape(ctx int) vk.QwenShape {
 	return s
 }
 
-// streamShare is how much of the card's device-local heap a window may occupy.
-// The rest is what nothing here can count: the driver's own allocations, a
-// desktop already on the card, and the fragmentation between one window's
-// buffers and the next's. Three quarters left the heap at its ceiling on this
-// machine and lost the device; two thirds is what holds, and it is a share
-// rather than a size so that it means the same thing on a card of any capacity.
+// streamShare is how much of the card a window may occupy.
+//
+// It is a share of what is *free*, not of the heap's size, wherever the driver
+// will say — vk's DeviceLocalFree, which is VK_EXT_memory_budget. The
+// difference is not academic on this machine: two thirds of the heap is 10.6
+// GiB, and what is actually free moves between 14.9 and 15.6 GiB depending on
+// the desktop and on what the previous window has not finished releasing. The
+// same constant therefore meant seventy-one per cent of the card on one run and
+// sixty-eight on another, which is how a test that holds for an hour loses the
+// device on the next run for no reason it can name.
+//
+// The rest is the margin: the driver's own allocations, and the fragmentation
+// between one window's buffers and the next's. Three quarters of the heap left
+// it at its ceiling and lost the device; two thirds of what is free is a
+// tighter claim and a safer one.
 const streamShare = 2.0 / 3.0
 
-// buildWindow uploads blocks from `from` onward, as floats, and stops when the
+// buildWindow uploads blocks from `from` onward, in the form wideForm chooses,
+// and stops when the
 // next one would put the pipeline past the budget. It answers the pipeline and
 // the block after the last one it took, so the caller walks the trunk by asking
 // rather than by arithmetic.
@@ -139,8 +199,16 @@ func (m *Model) buildWindow(from, ctx, want int) (*vk.QwenPipeline, int, error) 
 		return nil, 0, err
 	}
 	trunk := m.trunk()
-	budget := uint64(float64(d.DeviceLocalBytes()) * streamShare)
+	// What the driver says is left, and the heap's size only when it will not
+	// say. A window is sized against the card it is about to be built on rather
+	// than against the card's specification.
+	room := d.DeviceLocalFree()
+	if room == 0 {
+		room = d.DeviceLocalBytes()
+	}
+	budget := uint64(float64(room) * streamShare)
 	shape := m.streamShape(ctx)
+	form := shape.Float
 	pipe, err := vk.NewQwenPipeline(d, shape)
 	if err != nil {
 		return nil, 0, fmt.Errorf("qwen35: cannot create the window's pipeline: %w", err)
@@ -166,7 +234,7 @@ func (m *Model) buildWindow(from, ctx, want int) (*vk.QwenPipeline, int, error) 
 		isSSM = append(isSSM, bc.Type != BlockFullAttn)
 
 		if err := pipe.AddFFNBlock(vk.QwenFFNData{
-			Gate: floatOf(bw.Gate), Up: floatOf(bw.Up), Down: floatOf(bw.Down),
+			Gate: wideOf(bw.Gate, form), Up: wideOf(bw.Up, form), Down: wideOf(bw.Down, form),
 		}); err != nil {
 			pipe.Close()
 			return nil, 0, fmt.Errorf("qwen35: block %d feed forward: %w", i, err)
@@ -178,16 +246,18 @@ func (m *Model) buildWindow(from, ctx, want int) (*vk.QwenPipeline, int, error) 
 		at := i - from
 		if bc.Type == BlockFullAttn {
 			err = pipe.AddAttnBlock(at, vk.QwenAttnData{
-				WQ: floatOf(bw.Q), WK: floatOf(bw.K), WV: floatOf(bw.V), WO: floatOf(bw.O),
+				WQ: wideOf(bw.Q, form), WK: wideOf(bw.K, form), WV: wideOf(bw.V, form), WO: wideOf(bw.O, form),
 				QNorm: bw.QNorm, KNorm: bw.KNorm,
 			})
 		} else {
 			err = pipe.AddSSMBlock(at, vk.QwenSSMData{
-				WQKV:       floatOf(bw.QKV),
-				WGate:      floatOf(bw.AttnGate),
-				WAlpha:     floatOf(bw.SSMAlpha),
-				WBeta:      floatOf(bw.SSMBeta),
-				WOut:       floatOf(bw.SSMOut),
+				WQKV:  wideOf(bw.QKV, form),
+				WGate: wideOf(bw.AttnGate, form),
+				// The decay's two, always float32 on the card. See the comment
+				// beside setAlpha in vk/qwen_pipeline.go.
+				WAlpha:     wideOf(bw.SSMAlpha, vk.WideF32),
+				WBeta:      wideOf(bw.SSMBeta, vk.WideF32),
+				WOut:       wideOf(bw.SSMOut, form),
 				Out:        nn.F32,
 				ConvWeight: bw.Conv1D,
 				SSMA:       bw.SSMA,
@@ -311,18 +381,23 @@ func (m *Model) CalibrateStreamed(runs [][]int32, window, ctx int) (map[string][
 	return sums, rows, nil
 }
 
-// FloatWeights says the checkpoint keeps its projections as floats, which no
-// kernel on the card reads: vk has no BF16 anywhere, in the Go or the shaders.
-// Such a checkpoint can only reach the card through CalibrateStreamed, which
-// widens each window on the way up.
+// FloatWeights says the checkpoint keeps its projections in the form it was
+// trained in, which is not an inference form: four bytes a weight, or two, on a
+// card that reads a quantized one at half of one. Such a checkpoint reaches the
+// card only through CalibrateStreamed, a window at a time.
+//
+// A bfloat16 one now goes up as it is — shaders/matvec_f32.comp has a -DBF16
+// build and vk.WideBF16 selects it — where it used to be widened to float32 on
+// this side. A float32 one is still sent as it is, and every quantized form
+// still reaches this path widened.
 func (m *Model) FloatWeights() bool {
 	q := m.W.Blocks[0].Down.Quant
 	return q == nn.BF16 || q == nn.F32
 }
 
-// StreamBlockBytes is what one block of this model occupies on the card once
-// widened: four bytes a weight over the projections, which is what decides how
-// many of them a window may hold.
+// StreamBlockBytes is what one block of this model occupies on the card in the
+// form it is uploaded in — two bytes a weight for a bfloat16 checkpoint and four
+// for anything else — which is what decides how many of them a window may hold.
 func (m *Model) StreamBlockBytes() int {
 	bw := &m.W.Blocks[0]
 	n := 0
@@ -341,7 +416,7 @@ func (m *Model) StreamBlockBytes() int {
 		}
 		n = max(n, m2)
 	}
-	return n * 4
+	return n * wideBytes(m.wideForm())
 }
 
 // ForwardStreamed runs every position of every run through the model a window

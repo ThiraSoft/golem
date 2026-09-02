@@ -112,6 +112,9 @@ func taken(ids []int32, e int32) bool {
 func ExpertFFN(cfg *Config, bw *BlockWeights, s *Scratch, in *nn.Batch, out [][]float32) {
 	batch := len(out)
 	Route(cfg, bw, s, s.resid[:batch], s.expIDs[:batch], s.expWeights[:batch])
+	if RouteWatch != nil {
+		RouteWatch(s.expIDs[:batch])
+	}
 
 	// Each position's input, quantized once and read by all eight of its
 	// experts. A column of a wider batch would be strided, and the products

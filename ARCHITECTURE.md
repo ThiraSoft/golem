@@ -42,6 +42,8 @@ Worth knowing before diving into the code:
 
 `-vulkan` moves all four, and then everything between them. On the 26B A4B, **13.4 tokens a second becomes 133.5**, against llama.cpp's Vulkan build at 124.8 on the same card, and **the prompt goes from 40 a second to 4541** — against their 4038. It costs those matrices being resident — 12.8 gibibytes, which is why a card with sixteen is the smallest that can do this — and about nine seconds of upload.
 
+**Resident is a default, not a requirement, and only for a mixture.** Of those 12.8 gibibytes the expert stacks are 12.85 GB, and a token routes to eight matrices of a hundred and twenty-eight — eleven of the twelve sit untouched on any given token. So they need not be on the card at all: `vk.Device.HostResident` leaves a stack in system memory the card addresses, and the kernels read it there, because a compute shader reads a storage buffer the same way wherever it lives. On the 26B A4B that is 7.4 tokens a second against 108, which is the bus and not the card — 6.37 GB/s measured through the model, against a link this machine trains at 7.9 — and the reference test passes with the same tokens and the same tie margins. A cache of the experts a token does keep asking for is what climbs back up from there; it does not exist yet, and `gemma/expert_cache_test.go` prices it. A *dense* model that does not fit has no such answer: one column of a pass is one multiply per weight, so every byte crossing the bus is used once, and making the weights smaller is the only route.
+
 A dense checkpoint goes the same way, because a dense block is a mixture block with one branch: the shared branch of a mixture and an ordinary feed forward are the same three matrices under the same norm, and what differs is the end of the block — one post-norm instead of three, and no routing. On the 12B, **5.0 tokens a second becomes 65.4**, against llama.cpp's 64.6 on the same card.
 
 Qwen3 runs on the same stack. Four things differ and they are all the file being read rather than a second path: an ordinary pre-norm block, where neither half is normed on its way back into the stream; a SiLU on the gate where Gemma looks ggml's GELU up in a table; scores scaled by one over the square root of the head, which Gemma leaves at one because its query norm holds them in range; and a value handed to the attention unnormed, which Gemma norms. On the 4B, **14.6 tokens a second becomes 167.0**, against llama.cpp's 169.7; on the 0.6B, 83.4 becomes 359.4 against 365.4. The head is Q4_0 on those checkpoints rather than Q6_K, and reads through `shaders/matvec.comp` — the kernel the attention's projections already use.
@@ -68,7 +70,9 @@ There is no cgo: `vk/` opens `libvulkan.so.1` through `purego`, and `CGO_ENABLED
 
 ### Generation Speed vs Prompt Speed
 
-On a card, golem is ahead of llama.cpp on both Gemma models, generating and reading, and within two hundredths of it generating on both Qwen3 ones. Qwen3.8 came later and sits apart: level reading a prompt, behind generating, for a reason that is the architecture's rather than a kernel's.
+**These are one card's numbers on one afternoon, and they are kept here for the story that follows rather than as a claim.** The current table is the README's, taken in a later sitting, and it reads differently: level generating on the 12B and two to nine per cent behind on the other four, ahead reading a prompt on four of five at every width. Both sittings say the same thing about the two engines — that they are level on this machine — and neither says anything about another card, another driver or another checkpoint, because nobody has run either there.
+
+What the table below is for is the *shape* it had at the time, which is what found the softcap.
 
 | tokens a second | golem gen | llama gen | golem pp64 | llama pp64 | golem pp256 | llama pp256 | golem pp512 | llama pp512 |
 | --------------- | --------: | --------: | ---------: | ---------: | ----------: | ----------: | ----------: | ----------: |
@@ -78,7 +82,7 @@ On a card, golem is ahead of llama.cpp on both Gemma models, generating and read
 | Qwen3 0.6B      |     359.4 |     365.4 |  **13915** |       9966 |   **23787** |       19159 |   **23995** |       22306 |
 | Qwen3.8 27B     |      30.1 |      32.8 |    **799** |      628.7 |    **1134** |      1127.8 |    **1236** |      1234.7 |
 
-golem reads a prompt faster than llama.cpp does on every model here at 64 and 256 positions, and on the 26B A4B, the 0.6B and Qwen3.8 at 512 as well.
+In that sitting golem was the faster of the two reading a prompt on every model at 64 and 256 positions, and on the 26B A4B, the 0.6B and Qwen3.8 at 512 as well.
 
 Generation was the side that was left, at 0.83 of llama.cpp on the 26B A4B and 0.93 on the 12B against 0.98 on both Qwen3 models, and the shape of that table was the answer: **the models with a gap were exactly the models with a logit softcap.**
 

@@ -14,11 +14,19 @@ package vk
 // submission costs sixty-three microseconds whatever is in it. Two of them a
 // block would be four milliseconds a token spent asking rather than computing.
 //
-// The whole stack is resident — 11.96 gibibytes of experts on this checkpoint
-// and 0.3 more of shared branches, which is why a card with sixteen is the
-// smallest one that can do this. The routing stays on the CPU: it reads the
-// residual, which the CPU already has, and choosing eight of a hundred and
-// twenty-eight is a hundred and twenty-eight comparisons.
+// The stack is resident by default — 11.96 gibibytes of experts on this
+// checkpoint and 0.3 more of shared branches, which is why a card with sixteen
+// is the smallest one that can do this. It does not have to be: see
+// expertsInHost, which leaves the two expert stacks in system memory and lets
+// the kernels read them across the bus, at 7.4 tokens a second against 108 and
+// with the same answers.
+//
+// **The routing is on the card**, and has been since the router became two
+// shaders. It used to be on the processor — the sentence that stood here said
+// so, and said why, long after it stopped being true — which is a thing to know
+// before designing anything around what the host knows and when. shaders/
+// router_logits.comp and shaders/router_pick.comp choose the experts, and the
+// identifiers land in m.ids, which is device memory nothing on this side reads.
 
 import (
 	_ "embed"
@@ -366,6 +374,20 @@ func idPlanMax(experts, columns, bn int) int {
 // path on a six-token fixture: neither is the fallback and both have to be
 // right, so both are run against the same recording.
 const byExpertFrom = 32
+
+// expertsInHost says the expert stacks are to be held in system memory the card
+// reads across the bus, instead of copied into device memory.
+//
+// This is the streamed mixture's first step and its floor. On the 26B A4B the
+// stacks are 12.85 GB against a sixteen-gibibyte card, so they fit and this
+// changes nothing but the speed — which is exactly what makes it the right first
+// measurement: the same model, the same answers, and a number to put against the
+// nought-per-cent row of gemma/expert_cache_test.go's table rather than the
+// arithmetic that row is made of.
+//
+// A cache of hot experts in device memory is what climbs back up that table, and
+// it is not here yet.
+func expertsInHost() bool { return os.Getenv("GOLEM_MOE_EXPERTS_HOST") != "" }
 
 // byExpertWidth is that, with the environment's override if there is one.
 func byExpertWidth() int {
@@ -735,10 +757,17 @@ func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, dow
 	}
 	var err error
 	if m.experts > 0 {
-		if b.gateUp, err = m.d.Upload(splitQ4_0(gateUpExps, m.experts*2*m.ffn, m.dim)); err != nil {
+		// The two stacks are the only tensors here that go anywhere else: they
+		// are what a token reads eight of a hundred and twenty-eight of, which
+		// is what makes them worth not keeping.
+		hold := m.d.Upload
+		if expertsInHost() {
+			hold = m.d.HostResident
+		}
+		if b.gateUp, err = hold(splitQ4_0(gateUpExps, m.experts*2*m.ffn, m.dim)); err != nil {
 			return fail(err)
 		}
-		if b.down, err = m.d.Upload(splitQ4_0(downExps, m.experts*m.dim, m.ffn)); err != nil {
+		if b.down, err = hold(splitQ4_0(downExps, m.experts*m.dim, m.ffn)); err != nil {
 			return fail(err)
 		}
 	}

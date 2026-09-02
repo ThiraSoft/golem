@@ -5,6 +5,14 @@
 // y = W * x for float32 weights. Qwen3.5 keeps the delta net's two 48-wide
 // projections in float32, which is a megabyte a block and forty-eight of them.
 // COLUMNS is matvec_q40.comp's.
+//
+// With BF16 defined the same product reads the weights as bfloat16 instead: a
+// pair of them to a word, widened to float by the shift that puts a bfloat's
+// sixteen bits in a float's top sixteen. That is exactly what the host used to
+// do on the way up, and doing it here rather than there halves what crosses the
+// bus and removes the widened copy on that side altogether. Nothing else in the
+// kernel changes, because nothing else can: a bfloat16 and the float it widens
+// to are the same number.
 
 #ifndef COLUMNS
 #define COLUMNS 1
@@ -12,7 +20,11 @@
 
 layout(local_size_x = 128) in;
 
+#ifdef BF16
+layout(std430, binding = 0) readonly  buffer W { uint w[]; };
+#else
 layout(std430, binding = 0) readonly  buffer W { float w[]; };
+#endif
 layout(std430, binding = 1) readonly  buffer X { float x[]; };
 layout(std430, binding = 2) writeonly buffer Y { float y[]; };
 
@@ -35,7 +47,16 @@ void main() {
     if (row < p.dim) {
         uint rowBase = row * p.ffn;
         for (uint i = lane; i < p.ffn; i += LANES) {
+#ifdef BF16
+            // Two weights to a word, the first in the low half. The widening is
+            // a shift and not a conversion, so it costs one instruction and
+            // rounds nothing.
+            uint at = rowBase + i;
+            uint word = w[at >> 1u];
+            float wi = uintBitsToFloat((at & 1u) == 0u ? word << 16u : word & 0xffff0000u);
+#else
             float wi = w[rowBase + i];
+#endif
             [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
                 sum[c] += wi * x[(p.col + c) * p.ffn + i];
             }

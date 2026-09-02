@@ -2,7 +2,7 @@
   <img src="assets/logo.svg" alt="golem" width="420">
 
 **Gemma, Qwen and Pocket TTS in a single static Go binary.**  
-_No Python. No cgo. No GPU required — but with `-vulkan` it matches or exceeds llama.cpp's Vulkan performance on AMD hardware._
+_No Python. No cgo. No GPU required — and with `-vulkan` it keeps pace with llama.cpp's Vulkan build on the one AMD card it has been measured on._
 
 [![test](https://github.com/ThiraSoft/golem/actions/workflows/test.yml/badge.svg)](https://github.com/ThiraSoft/golem/actions/workflows/test.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/ThiraSoft/golem.svg)](https://pkg.go.dev/github.com/ThiraSoft/golem)
@@ -23,9 +23,10 @@ A golem is inert matter given a voice. That is what these engines do to a file o
 - **OpenAI Compatible**: Drop-in replacement for OpenAI API clients, tool calls included.
 - **Multimodal**: Text, Vision (images) and Audio (WAV/MP3/FLAC) via Gemma 4; Qwen3.8 sees too, its tower checked against llama.cpp waypoint by waypoint.
 - **Verified, not asserted**: no layer is deemed correct until its intermediate activations match llama.cpp or PyTorch, waypoint by waypoint.
-- **Fast on CPU**: keeps pace with `llama.cpp` on tuned AVX2 kernels — ahead reading prompts, level generating, except on the smallest model, where the weights stop being the cost and it says so.
-- **Vulkan GPU**: bound through `purego` rather than cgo. Measured on AMD against `llama.cpp`'s own Vulkan build: ahead of it reading prompts on four of five models at every width, and level generating on the 12B. The table below says where it is behind, and by how much.
+- **Keeps pace on CPU**: tuned AVX2 kernels reach `llama.cpp`'s level on this machine — reading prompts and generating both — except on the smallest model, where the weights stop being the cost and it says so.
+- **Vulkan GPU**: bound through `purego` rather than cgo, and level with `llama.cpp`'s own Vulkan build on the one AMD card this has been measured on. The table below gives every number both ways, including where golem is behind and by how much.
 - **Its own weight format**: `.golem` is 18 % smaller than llama.cpp's Q3_K_M on Qwen3-4B and ahead of it on every measure — a trellis codebook with no lookup table, converted on the card. [What it costs](#-golem--the-engines-own-weight-format).
+- **A mixture's experts need not be on the card**: they can stay in system memory and be read across the bus where they lie, which takes the 26B A4B's footprint on the card from 13.6 GiB to 1.3 — the same answers, at the bus's speed rather than the card's. [What it costs, and what a cache would buy back](#-a-mixtures-experts-need-not-be-on-the-card).
 - **Serves several clients at once**: `-parallel N` holds N conversations and carries a token for each of them through one read of the weights, on the card as well as on the processor — Qwen3.8 on the card excepted, for a reason [written below](#-several-conversations-one-pass).
 
 ## 🚀 Quickstart
@@ -80,24 +81,30 @@ sides warmed before timing:
 | Qwen3 0.6B      |     259.6 |     270.3 |       7498 |      10188 |       14665 |       17297 |   **18756** |       18644 |
 | Qwen3.8 27B     |      30.3 |      31.4 |    **798** |        655 |    **1170** |        1105 |    **1285** |        1212 |
 
-**Reading a prompt, golem is ahead on four of the five models at every width**,
-by a factor of one and three quarters on the 26B A4B at sixty-four positions.
-The exception is the 0.6B, which is behind at sixty-four and two hundred and
-fifty-six and level at five hundred and twelve: a model that small spends a
-prompt in dispatch latency rather than in arithmetic, and there is nothing in a
-kernel to win it back.
+**Read as a whole: golem reaches llama.cpp's level here, and that is the claim.**
+Not more than that, and deliberately — this is one card, one driver, one
+afternoon. A kernel that wins on RDNA 4 at these shapes need not win on another
+architecture, another driver revision, or another checkpoint, and nobody has
+run it there. The table above is what was measured; the conclusion to draw from
+it is parity.
 
-**Generating, golem is level on the 12B and two to nine per cent behind on the
-other four.** Qwen3.8 is the closest of them because a gated delta net rewrites
-a state matrix a head every token, which is arithmetic neither engine
-amortises; the 26B A4B is the furthest.
+Reading a prompt, golem is the faster of the two on four of the five models at
+every width, by a factor of one and three quarters on the 26B A4B at sixty-four
+positions. The exception is the 0.6B, which is behind at sixty-four and two
+hundred and fifty-six and level at five hundred and twelve: a model that small
+spends a prompt in dispatch latency rather than in arithmetic, and there is
+nothing in a kernel to win it back.
 
-These are one machine's numbers on one afternoon and they are not comparable
-with figures taken on another. Earlier revisions of this file carried a table
-from an evening when the same card ran a fifth faster on small models — both
-engines by the same fraction, checked by re-running llama.cpp's side as well —
-so the column to read is the difference between the two engines and not the
-absolute rate.
+Generating, golem is level on the 12B and two to nine per cent behind on the
+other four. Qwen3.8 is the closest of them because a gated delta net rewrites a
+state matrix a head every token, which is arithmetic neither engine amortises;
+the 26B A4B is the furthest.
+
+And the absolute rates do not travel either. Earlier revisions of this file
+carried a table from an evening when the same card ran a fifth faster on small
+models — both engines by the same fraction, checked by re-running llama.cpp's
+side as well — so the column to read is the difference between the two engines
+and not the rate, and even that difference is this machine's.
 
 **A K-quant runs on the card too.** Q4_0, Q4_1, Q4_K, Q5_K and Q6_K each have a
 mat-vec and a tiled product here, and a checkpoint may mix them the way
@@ -108,9 +115,80 @@ kernel is an error naming it, never a guess: eighteen bytes to a block of
 thirty-two is Q4_0 and it is also Q4_K, so a reader that checked a length
 instead of a type would answer fluently out of the wrong bits.
 
-The card holds the whole model: 12.8 GiB for the 26B A4B, which is why sixteen is the smallest card that can run it. `-vulkan` is all or nothing and says so: a card without `VK_KHR_shader_integer_dot_product`, a machine with no Vulkan loader, a model too large for the card — each is an error at startup rather than a silent half-move. Without the flag, everything runs on the CPU as before.
+The card holds the whole model: 12.8 GiB for the 26B A4B, which is why sixteen is the smallest card that can run it at these speeds — though not all of that has to be on it, which is the next section. `-vulkan` is all or nothing and says so: a card without `VK_KHR_shader_integer_dot_product`, a machine with no Vulkan loader, a dense model too large for the card — each is an error at startup rather than a silent half-move. Without the flag, everything runs on the CPU as before.
 
 _(See [ARCHITECTURE.md](ARCHITECTURE.md) for the kernel work behind these numbers.)_
+
+## 🫙 A mixture's experts need not be on the card
+
+**A dense model that does not fit cannot be rescued.** One column of a pass is
+one multiply per weight, so every byte crossing the bus is used once: Qwen3.8
+27B in BF16 is 54.8 GB a token, which is eight seconds a token on this machine's
+link and no amount of engineering moves it. Making the weights smaller is the
+answer there, and that is what [`.golem`](#-golem--the-engines-own-weight-format) is for.
+
+**A mixture is different, and the difference is the whole opportunity.** The
+26B A4B keeps 12.85 GB of experts and reads *eight matrices out of a hundred and
+twenty-eight* per block — 0.8 GB a token. Eleven of its twelve gigabytes are
+resident and untouched on any given token. So the cost of streaming a mixture is
+what a token *activates*, not what the model *has*.
+
+`GOLEM_MOE_EXPERTS_HOST=1` leaves the two expert stacks in system memory the
+card addresses, and the kernels read them where they are. **No shader knows**: a
+compute shader reads a storage buffer the same way wherever it lives, and only
+the rate changes.
+
+| 26B A4B on an RX 9070 XT | on the card | a token | tokens/s |
+| ------------------------ | ----------: | ------: | -------: |
+| experts resident in VRAM  | 13.6 GiB   | 9.2 ms  | **108** |
+| experts in system memory  | **1.3 GiB**| 135 ms  | **7.4** |
+
+**The second row is the point of this section.** What stays on the card is the
+shared branches, the attention and the head; the twelve gigabytes that leave are
+the experts. So what a mixture costs the card no longer scales with how many
+experts it has, and what bounds it becomes host memory instead — sixteen
+gibibytes of addressable system memory here.
+
+**What has not been done is run a mixture that genuinely does not fit.** The 26B
+A4B is the only one on this machine and it fits either way, so what is shown
+above is the mechanism and the footprint, not the consequence. Whether a model
+three times its size loads and answers is the next thing to find out, and it is
+not claimed here.
+
+It is also the floor for speed — every expert read across the bus, nothing
+cached — and the bus is what binds it: this card sits behind a switch and
+reaches the processor over eight lanes at 8 GT/s, 7.9 GB/s of payload. The 126
+milliseconds between the two rows is 802.9 MB of experts at **6.37 GB/s**, which
+is the same figure a mat-vec reads host memory at in isolation and 95 % of what
+the copy engine manages across the same link.
+
+**It answers the same tokens.** The reference test passes unchanged with the
+experts in system memory, down to the three logged tie margins being identical
+to the resident run's. That control is what makes the arrangement worth
+building on: a mixture that answers plausibly and wrongly is this project's
+named failure mode.
+
+**What is not built yet is the cache.** Simulating one against the model's real
+routing — the router is arithmetic, so this costs a map and no card time —
+prices what a slice of VRAM buys back:
+
+| experts kept in VRAM | hit rate | tokens/s *(projected)* |
+| -------------------- | -------: | ---------------------: |
+| 3.9 GB, a third of the pool | 84.1 % | 35 |
+| 5.1 GB, 40 % | 91.9 % | 51 |
+| 7.7 GB, 60 % | 98.0 % | 81 |
+
+Those rates are measured against a real continuation and checked against the
+trap that makes them meaningless — repetitive text routes to a handful of
+experts and reports a hit rate nobody reproduces, so the run is required to
+touch a quarter of the pool and it touches three quarters, with no token routing
+exactly as the one before it. The tokens-a-second column is arithmetic over
+those rates and is marked as such until a cache exists to measure.
+
+The pool has to fit in the memory the card can address, which is sixteen
+gibibytes here against the 26B A4B's 12.85 — so that model fits and a much
+larger one does not. Past that the source is the mapped file and the rate is the
+disk's.
 
 ## 🔮 Qwen3.8 drafts its own next token
 
@@ -355,13 +433,17 @@ We want to make Golem the best pure-Go inference engine available. We especially
 
 ```bash
 go build ./...
-go test ./...
+go test ./... -short -p 1
 ```
 
-Weights are not in this repository, and every test that needs one skips cleanly when it cannot find it.
+Weights are not in this repository, and every test that needs one skips cleanly when it cannot find it — which is why the same command is safe on a machine with no models and no card, and why CI runs it.
+
+**`-p 1` matters if you have a GPU**, and it is not a preference. `go test ./...` runs one test binary per package concurrently, and three of these packages put whole models on the card: two of them at once ask for more than a sixteen-gigabyte card has, and what comes back is `vkQueueSubmit failed (VkResult -4)` — a lost device — in whichever binary happened to be second. It reads like a driver fault, it is reproducible only by accident, and it cost an afternoon of looking in the wrong place here.
+
+**`-short`** skips what streams a fifty-two-gigabyte checkpoint or decodes several hundred tokens on the processor. Without it the suite is hours, and `qwen35` alone wants more than `go test`'s ten-minute default: give it `-timeout 40m`.
 
 ## 📜 License & Credits
 
 Golem is [MIT Licensed](LICENSE).
 
-Standing on the shoulders of giants: [llama.cpp & ggml](https://github.com/ggml-org/llama.cpp), [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts), [Google Gemma](https://ai.google.dev/gemma), [QTIP](https://github.com/Cornell-RelaxML/qtip) — the bitshift trellis `.golem`'s codec is built on.
+Standing on the shoulders of giants: [llama.cpp & ggml](https://github.com/ggml-org/llama.cpp), [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts), [Google Gemma](https://ai.google.dev/gemma), [QTIP](https://github.com/Cornell-RelaxML/qtip) — the bitshift trellis `.golem`'s codec is built on — and [FreeToken](https://arxiv.org/abs/2608.16157), which framed the question the section above answers differently: it hides a miss behind a scheduled upload, where golem's router runs on the card and its blocks are one recorded program, so a miss is read where it lies instead. Its claim that one cache shared by every layer beats a per-layer split by ten to fifteen points does not reproduce on this checkpoint, where the two sit under a point apart.
