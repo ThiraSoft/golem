@@ -2,8 +2,15 @@
 #extension GL_EXT_integer_dot_product : require
 #extension GL_KHR_shader_subgroup_clustered : require
 
-// y = W * x for one Q4_0 matrix against one Q8_0 activation, and for Q4_K
-// under -DQ4K and Q6_K under -DQ6K.
+// y = W * x for one Q4_0 matrix against one Q8_0 activation, and for Q4_1 under
+// -DQ41, Q4_K under -DQ4K, Q5_K under -DQ5K and Q6_K under -DQ6K.
+//
+// Five formats and one kernel, because the difference between them is where a
+// block's scale lives and how many instructions its magnitudes take to unpack —
+// thirty lines out of a hundred and fifty, and nothing outside the staging.
+// What they share is the whole of the arithmetic: a packed integer dot against
+// the activation's eight-bit form, and one correction term for whatever offset
+// the format carries. vk/quantproduct.go is the door.
 //
 // It is shaders/moe_down.comp with the mixture taken out, and it turned out to
 // be the kernel most of the model wants: the down projection of a shared
@@ -51,10 +58,18 @@ int sbyte(uint at) { return bitfieldExtract(int(w[at >> 2]), int((at & 3u) * 8u)
 void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
     uint nb  = p.ffn >> 5;
     uint aw  = p.ffn >> 2;   // one column of the activation, in uints
-#ifdef Q6K
+#if defined(Q6K)
     uint nsb  = p.ffn >> 8;
     uint magB = rowBase + 16u * nsb;
     uint nib  = rowBase + ((18u * nsb + 3u) & ~3u);
+#elif defined(Q5K)
+    // vk/mixture.go's splitQ5_K: an fp16 pair a block, then a word of fifth
+    // bits a block, then the nibbles.
+    uint highB = rowBase + 4u * nb;
+    uint nib   = rowBase + 8u * nb;
+#elif defined(Q41)
+    // splitQ4_1: the scale and the minimum of every block, then the nibbles.
+    uint nib = rowBase + 4u * nb;
 #else
     // Q4_0 and Q4_K put their nibbles at the same offset: the one spends two
     // bytes a block on scales, the other sixteen a superblock on headers, and
@@ -91,6 +106,13 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
         float dd = unpackHalf2x16(w[(magB + 2u * sbi) >> 2])[sbi & 1u];
         float ws = dd * float(sbyte(rowBase + 16u * sbi + 2u * (b & 7u)));
         float wm = dd * float(sbyte(rowBase + 16u * sbi + 2u * (b & 7u) + 1u));
+#elif defined(Q41) || defined(Q5K)
+        // Both carry an fp16 pair a block and are read the same way. Q4_1's is
+        // the file's own; Q5_K's is d*sc and dmin*m already multiplied out,
+        // which splitQ5_K does once on the way to the card.
+        vec2  dm = unpackHalf2x16(w[(rowBase + 4u * b) >> 2]);
+        float ws = dm.x;
+        float wm = dm.y;
 #else
         vec2  pair = unpackHalf2x16(w[(rowBase + 2u * b) >> 2]);
         float ws   = pair[b & 1u];
@@ -118,10 +140,25 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
         uint at = (nib + 16u * b) >> 2;
         uint ab = b * 8u;
         uint lo[4], hi[4];
+#ifdef Q5K
+        // The fifth bits, one to a weight, all thirty-two in a word: bit l for
+        // weight l, which is what splitQ5_K writes so that a reader takes one
+        // load where the format made it take thirty-two. Four of them are
+        // spread one to a byte with three masked shifts, the same way
+        // shaders/matmul_coop.comp spreads Q6_K's pairs and for the same
+        // reason — a multiply carries between the copies.
+        uint hbw = w[(highB + 4u * b) >> 2];
+#endif
         for (uint u = 0u; u < 4u; u++) {
             uint word = w[at + u];
             lo[u] = word & 0x0F0F0F0Fu;
             hi[u] = (word >> 4) & 0x0F0F0F0Fu;
+#ifdef Q5K
+            uint x0 = (hbw >> (4u * u)) & 0xFu;
+            uint x1 = (hbw >> (16u + 4u * u)) & 0xFu;
+            lo[u] |= ((x0 & 1u) | ((x0 & 2u) << 7u) | ((x0 & 4u) << 14u) | ((x0 & 8u) << 21u)) * 16u;
+            hi[u] |= ((x1 & 1u) | ((x1 & 2u) << 7u) | ((x1 & 4u) << 14u) | ((x1 & 8u) << 21u)) * 16u;
+#endif
         }
 #endif
         for (uint c = 0u; c < COLUMNS; c++) {
@@ -154,12 +191,17 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
                 acc = dotPacked4x8AccSatEXT(hi[u], int(aq[ac + u + 4u]), acc);
             }
             sum[c]  += float(acc) * ws * as_[sc + b];
-#ifdef Q4K
-            // A Q4_K weight is q times a scale less a minimum, with no offset
-            // of eight, so the second term is the minimum times the
+#if defined(Q4K) || defined(Q5K)
+            // A Q4_K or Q5_K weight is q times a scale less a minimum, with no
+            // offset of eight, so the second term is the minimum times the
             // activation's own sum. golem stores that sum as eight times it,
             // which is what Q4_0's offset wanted.
             corr[c] += wm * as_[sc + nb + b] * 0.125;
+#elif defined(Q41)
+            // Q4_1 adds its minimum where the two K-quants subtract theirs, and
+            // the answer below is sum less corr, so this one goes the other
+            // way. It is the sign llama.cpp's own dequantiser has: d*q + m.
+            corr[c] -= wm * as_[sc + nb + b] * 0.125;
 #else
             corr[c] += ws * as_[sc + nb + b];
 #endif
@@ -174,8 +216,12 @@ void main() {
     uint lane = t & 7u;
     uint i    = gl_WorkGroupID.x * OUTS + (t >> 3);
 
-#ifdef Q6K
+#if defined(Q6K)
     uint rowBytes = (((p.ffn >> 8) * 210u) + 3u) & ~3u;
+#elif defined(Q5K)
+    uint rowBytes = (p.ffn >> 5) * 24u;
+#elif defined(Q41)
+    uint rowBytes = (p.ffn >> 5) * 20u;
 #else
     uint rowBytes = (p.ffn >> 5) * 18u;
 #endif

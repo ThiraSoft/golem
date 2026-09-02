@@ -210,8 +210,8 @@ type Mixture struct {
 	// The same two products over a K-quant. A mixture holds at most a couple of
 	// formats and each pipeline is several binaries, so they are built when a
 	// block asks and not before — vk/quantproduct.go says the rest.
-	products   *quantProducts
-	gateUpQ4K  *Pipeline
+	products  *quantProducts
+	gateUpQ4K *Pipeline
 	// The prompt path of the expert branch, which reads the stack by expert
 	// rather than by column: idProduct serves both gate/up and down projections,
 	// idActivate runs the activation over the first half's output, scatter
@@ -1099,17 +1099,34 @@ func splitQ4_0(src []byte, rows, cols int) []byte {
 	nb := cols / nn.QuantBlock
 	stride := nb * 18
 	dst := make([]byte, len(src))
-	for r := 0; r < rows; r++ {
-		in := src[r*stride : (r+1)*stride]
-		out := dst[r*stride : (r+1)*stride]
+	splitRows(src, dst, rows, stride, stride, func(in, out []byte) {
 		nibbles := out[2*nb:]
 		for b := 0; b < nb; b++ {
 			block := in[b*18 : (b+1)*18]
 			binary.LittleEndian.PutUint16(out[2*b:], binary.LittleEndian.Uint16(block))
 			copy(nibbles[b*16:], block[2:])
 		}
-	}
+	})
 	return dst
+}
+
+// splitRows is the shape every relayout below has: a matrix is rewritten one
+// row at a time, and the rows do not look at each other.
+//
+// It runs them over the cores, which is not a detail. These functions are what
+// a checkpoint load spends its time in — 55 seconds of one core for a 12B
+// Q4_K_M, 45 for the 27B — because a relayout reads and writes every byte of
+// the model and does it in Go. Nothing about it was ever sequential; it simply
+// had never been asked.
+//
+// nn.InParallel decides whether the work justifies a split, so a small matrix
+// still runs on the caller's goroutine and pays nothing for the question.
+func splitRows(src, dst []byte, rows, inStride, outStride int, row func(in, out []byte)) {
+	nn.InParallel(rows, rows*outStride, func(start, end int) {
+		for r := start; r < end; r++ {
+			row(src[r*inStride:(r+1)*inStride], dst[r*outStride:(r+1)*outStride])
+		}
+	})
 }
 
 // rowBytesQ4_K is what one row of that many inputs occupies once splitQ4_K has
@@ -1154,9 +1171,7 @@ func splitQ4_K(src []byte, rows, cols int) []byte {
 	nsb := cols / nn.SuperBlock
 	stride := nsb * superBytes
 	dst := make([]byte, rows*stride)
-	for r := 0; r < rows; r++ {
-		in := src[r*stride : (r+1)*stride]
-		out := dst[r*stride : (r+1)*stride]
+	splitRows(src, dst, rows, stride, stride, func(in, out []byte) {
 		nibbles := out[2*nb:]
 		for sb := 0; sb < nsb; sb++ {
 			block := in[sb*superBytes : (sb+1)*superBytes]
@@ -1174,7 +1189,7 @@ func splitQ4_K(src []byte, rows, cols int) []byte {
 				}
 			}
 		}
-	}
+	})
 	return dst
 }
 
@@ -1230,10 +1245,11 @@ func splitQ6_K(src []byte, rows, cols int) []byte {
 	inStride := nsb * superBytes
 	outStride := rowBytesQ6_K(cols)
 	dst := make([]byte, rows*outStride)
-	var q [nn.SuperBlock]uint8
-	for r := 0; r < rows; r++ {
-		in := src[r*inStride : (r+1)*inStride]
-		out := dst[r*outStride : (r+1)*outStride]
+	splitRows(src, dst, rows, inStride, outStride, func(in, out []byte) {
+		// The walk's scratch, one to a row and so one to a worker: a superblock
+		// is undone into it in the file's order and read out of it in the
+		// card's.
+		var q [nn.SuperBlock]uint8
 		blocks := out[q6kBlockBase(nsb):]
 		for sb := 0; sb < nsb; sb++ {
 			block := in[sb*superBytes : (sb+1)*superBytes]
@@ -1267,7 +1283,7 @@ func splitQ6_K(src []byte, rows, cols int) []byte {
 				binary.LittleEndian.PutUint32(pack[4:], hi[1])
 			}
 		}
-	}
+	})
 	return dst
 }
 
@@ -1279,16 +1295,14 @@ func splitQ4_1(src []byte, rows, cols int) []byte {
 	nb := cols / nn.QuantBlock
 	stride := nb * 20
 	dst := make([]byte, len(src))
-	for r := 0; r < rows; r++ {
-		in := src[r*stride : (r+1)*stride]
-		out := dst[r*stride : (r+1)*stride]
+	splitRows(src, dst, rows, stride, stride, func(in, out []byte) {
 		nibbles := out[4*nb:]
 		for b := 0; b < nb; b++ {
 			block := in[b*20 : (b+1)*20]
 			copy(out[4*b:], block[:4])
 			copy(nibbles[b*16:], block[4:])
 		}
-	}
+	})
 	return dst
 }
 
@@ -1343,9 +1357,7 @@ func splitQ5_K(src []byte, rows, cols int) []byte {
 	inStride := nsb * superBytes
 	outStride := nb * 24
 	dst := make([]byte, rows*outStride)
-	for r := 0; r < rows; r++ {
-		in := src[r*inStride : (r+1)*inStride]
-		out := dst[r*outStride : (r+1)*outStride]
+	splitRows(src, dst, rows, inStride, outStride, func(in, out []byte) {
 		highs := out[4*nb:]
 		nibbles := out[8*nb:]
 		for sb := 0; sb < nsb; sb++ {
@@ -1394,7 +1406,7 @@ func splitQ5_K(src []byte, rows, cols int) []byte {
 				binary.LittleEndian.PutUint32(highs[4*b:], hi)
 			}
 		}
-	}
+	})
 	return dst
 }
 

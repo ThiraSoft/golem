@@ -204,6 +204,7 @@ func (m *Model) UseVulkanStack() error {
 				WQ: bw.Q.Data, WK: bw.K.Data, WV: bw.V.Data, WO: bw.O.Data,
 				QNorm: bw.QNorm, KNorm: bw.KNorm,
 				PreQKV: bw.Q.Pre, PreO: bw.O.Pre,
+				Formats: vk.BlockFormats{Q: bw.Q.Quant, K: bw.K.Quant, V: bw.V.Quant, O: bw.O.Quant},
 			})
 		} else {
 			err = pipe.AddSSMBlock(i, vk.QwenSSMData{
@@ -215,6 +216,8 @@ func (m *Model) UseVulkanStack() error {
 				WBeta:      bw.SSMBeta.Data,
 				WOut:       bw.SSMOut.Data,
 				Out:        bw.SSMOut.Quant,
+				QKV:        bw.QKV.Quant,
+				Gate:       bw.AttnGate.Quant,
 				ConvWeight: bw.Conv1D,
 				SSMA:       bw.SSMA,
 				SSMDtBias:  bw.SSMDtBias,
@@ -243,18 +246,25 @@ func (m *Model) UseVulkanStack() error {
 		// with a projection of its own in front of it. That projection is the
 		// one matrix in the model no calibration site names, so in a .golem it
 		// carries its own vector rather than a site's — see QwenMTPData.
-		if q := m.W.MTP.EHProj.Quant; q != gq && !(!gq.Golem() && q == nn.Q8_0) {
+		// A .golem carries every matrix in the model's one form, and the check
+		// is that this one is not the exception. Anything of llama.cpp's own
+		// is asked no such question: a K-quant mix files this projection where
+		// it likes — Q8_0 in the builds seen first, Q4_K in a Q4_K_M — and the
+		// pipeline refuses by name a form it has no kernel for.
+		if q := m.W.MTP.EHProj.Quant; gq.Golem() && q != gq {
 			pipe.Close()
 			return fmt.Errorf("qwen35: the prediction block's projection is %s where the model is %s",
 				q, m.W.Blocks[0].Down.Quant)
 		}
 		if err := pipe.AddMTPBlock(vk.QwenMTPData{
 			EHProj: m.W.MTP.EHProj.Data,
+			EHQ:    m.W.MTP.EHProj.Quant,
 			PreEH:  m.W.MTP.EHProj.Pre,
 			Attn: vk.QwenAttnData{
 				WQ: bw.Q.Data, WK: bw.K.Data, WV: bw.V.Data, WO: bw.O.Data,
 				QNorm: bw.QNorm, KNorm: bw.KNorm,
 				PreQKV: bw.Q.Pre, PreO: bw.O.Pre,
+				Formats: vk.BlockFormats{Q: bw.Q.Quant, K: bw.K.Quant, V: bw.V.Quant, O: bw.O.Quant},
 			},
 			FFN: vk.QwenFFNData{
 				Gate: bw.Gate.Data, Up: bw.Up.Data, Down: bw.Down.Data,

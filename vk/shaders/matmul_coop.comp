@@ -383,7 +383,7 @@ uint  pwh[WPT];
 uint  pwh[WPT];
 uint  pwh2[WPT];
 #endif
-#if defined(Q5K) || defined(Q4K) || defined(Q6K)
+#if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41)
 // The minimum, which both K-quants carry and Q4_0 does not: their weight is a
 // magnitude times a scale less a minimum, where Q4_0's is a magnitude recentred
 // on eight.
@@ -412,7 +412,7 @@ void prefetch(uint kb) {
 #ifdef Q6K
             pwh2[i] = 0u;
 #endif
-#if defined(Q5K) || defined(Q4K) || defined(Q6K)
+#if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41)
             pwm[i] = 0.0;
 #endif
             if (row0 + r < p.dim && b < nb) {
@@ -421,6 +421,14 @@ void prefetch(uint kb) {
                 uint at4  = (base + 8u * nb + 16u * b) >> 2;
                 pw[i]  = uvec4(w[at4], w[at4 + 1u], w[at4 + 2u], w[at4 + 3u]);
                 pwh[i] = w[(base + 4u * nb + 4u * b) >> 2];
+                vec2 dm = unpackHalf2x16(w[(base + 4u * b) >> 2]);
+                pws[i] = dm.x;
+                pwm[i] = dm.y;
+#elif defined(Q41)
+                // vk/mixture.go's splitQ4_1: Q5_K's layout without the word of
+                // fifth bits, which is what the two formats differ by.
+                uint at4  = (base + 4u * nb + 16u * b) >> 2;
+                pw[i]  = uvec4(w[at4], w[at4 + 1u], w[at4 + 2u], w[at4 + 3u]);
                 vec2 dm = unpackHalf2x16(w[(base + 4u * b) >> 2]);
                 pws[i] = dm.x;
                 pwm[i] = dm.y;
@@ -516,7 +524,7 @@ void stageTile() {
         uint k  = idx / uint(BM);
         uint at = r * uint(SA_STRIDE) + k * 32u;
         float ws = pws[i];
-#if defined(Q5K) || defined(Q4K) || defined(Q6K)
+#if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41)
         float wm = pwm[i];
 #endif
 #if defined(Q5K) || defined(Q6K)
@@ -561,6 +569,11 @@ void stageTile() {
             // weight of the model, which answers rather than failing.
             vec4 v0 = unpackUnorm4x8(w0) * 255.0 * ws - wm;
             vec4 v1 = unpackUnorm4x8(w1) * 255.0 * ws - wm;
+#elif defined(Q41)
+            // The same, with the sign llama.cpp's dequantiser has for this
+            // format: a Q4_1 weight is q times its scale *plus* its minimum.
+            vec4 v0 = unpackUnorm4x8(w0) * 255.0 * ws + wm;
+            vec4 v1 = unpackUnorm4x8(w1) * 255.0 * ws + wm;
 #else
             vec4 v0 = (unpackUnorm4x8(w0) * 255.0 - 8.0) * ws;
             vec4 v1 = (unpackUnorm4x8(w1) * 255.0 - 8.0) * ws;
@@ -640,6 +653,8 @@ void main() {
     col0      = ic * uint(BN);
 #if defined(Q5K)
     rowBytes  = nb * 24u;
+#elif defined(Q41)
+    rowBytes  = nb * 20u;
 #elif defined(Q6K)
     rowBytes  = ((nb >> 3) * 210u + 3u) & ~3u;
 #else
