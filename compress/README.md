@@ -531,15 +531,38 @@ mat-vec's 1.52 — so the whole of the difference is the product and none of it 
 anywhere else. The transform each site applies to its activation was measured by
 taking it out: four per cent.
 
-What it would take to close the rest is not another pass over this kernel. A
-trellis weight arrives as a float and is spent on a float multiply-add; Q4_0's
-fast path never leaves the integers, spending one instruction on eight weights
-against an activation packed four to a word — eight times fewer activation loads
-and a seventh of the arithmetic. Reaching that would mean the decoded value
-fitting in eight bits, and it is eleven: 1MAD's byte sum runs 0 to 1020. It can
-be split into a high byte and two low bits and summed as two integer dot
-products, which is the shape of an answer; assembling those bytes out of the
-shared table costs more than it saves, which is the shape of the problem.
+**What it would take to close the rest is not a kernel.** The obvious answer is
+to do what Q4_0 does — never leave the integers, one `dotPacked4x8` on eight
+weights against an activation packed four to a word — and 1MAD's byte sum runs 0
+to 1020, eleven bits, so it would have to be split into a high byte and a few
+low bits and summed as two dot products. That was worth measuring before it was
+worth writing, and `vk/golem_bar_test.go` measures it. All five kernels in one
+process, round-robin, fastest of six rounds, 9728 by 2560, one column:
+
+| | microseconds | of the bar |
+|---|---|---|
+| **Q4_0 against Q8_0, integer dot product** | **36.2** | 1.00 |
+| Q4_0 against float activations | 45.0 | 1.24 |
+| **T4G with nothing but the window and the table** | **56.8** | **1.57** |
+| T4G | 61.7 | 1.70 |
+| T3G | 62.7 | 1.73 |
+
+The third row is the answer. It is the kernel with the float multiply, the fused
+add and the activation load all taken out — `ABLATE 6` of
+`vk/shaders/matvec_t4g.comp`, which cuts each weight's window, reads its value
+out of shared memory and adds it to an integer. **Everything an integer
+reformulation could win is the 4.9 microseconds between it and the full kernel,
+eight per cent**, and it would have to pay for packing four values into a word
+to win any of it. What is left below is the window cut and the table read, and
+those are the codebook: a trellis decodes one weight at a time from twelve bits
+of state, and Q4_0 decodes eight from one instruction.
+
+So the trellis costs about 1.7 times a nibble's product on this card, of which
+1.57 is not reachable by any arrangement of the arithmetic that reads the
+weights the same way. That is the price of the bits it saves, and it should be
+argued about as a price rather than as a bug: T3G is 18 % smaller than Q3_K_M
+and ahead of it on every quality column, and it generates at about six tenths of
+Q4_0's rate. Nothing above changes either half of that sentence.
 
 **The third knob is the card's, not ours.** Whether the table is worth its
 sixteen kibibytes depends on the pass width: a pass of one decodes a weight for

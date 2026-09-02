@@ -238,6 +238,7 @@ void main() {
 
     float sum[COLUMNS];
     [[unroll]] for (uint c = 0u; c < COLUMNS; c++) sum[c] = 0.0;
+    uint bare = 0u;  // ABLATE 6
 
     uint raw[SD + 1u];
     if (PREFETCH != 0 && live && lane < nb) readRaw(seqOf(codeBase, lane), raw);
@@ -289,6 +290,9 @@ void main() {
                 ? (s[wi] >> 20u)
                 : (((s[wi] << bi) | (s[wi + 1u] >> (32u - bi))) >> 20u);
 #endif
+#if ABLATE == 6
+            bare += floatBitsToUint(ldsValues[v]);
+#else
 #if ABLATE == 1
             float wv = float(v) * step;
 #else
@@ -301,10 +305,14 @@ void main() {
                 sum[c] += wv * x[(p.col + c) * p.ffn + xOffset + i];
 #endif
             }
+#endif
         }
 #endif
     }
 
+#if ABLATE == 6
+    sum[0] += float(bare);
+#endif
     [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
         float total = subgroupClusteredAdd(sum[c], LANES);
         if (lane == 0u && live) y[(p.col + c) * p.dim + row] = total;

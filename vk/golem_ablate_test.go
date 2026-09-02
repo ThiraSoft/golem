@@ -60,6 +60,7 @@ func BenchmarkGolemAblate(b *testing.B) {
 			{"nowindow", 2}, // the window, gone: the stream word is the state
 			{"nox", 3},      // the activation load, gone: one float for all
 			{"stream", 4},   // nothing but reading the stream and summing it
+			{"intfloor", 6}, // the window, the table, an integer add: the floor
 		} {
 			b.Run(kind.String()+"/"+v.name, func(b *testing.B) {
 				d := open(b)
