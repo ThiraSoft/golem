@@ -175,3 +175,32 @@ func TestVulkan12BPromptProfile(t *testing.T) {
 	}
 	t.Logf("%d columns\n%s", width, report)
 }
+
+// TestVulkan12BTokenProfile is the same instrument on the pass generation
+// runs. The prompt and the token are not the same shape and have never been
+// the same problem: the prompt is bound by the tiled products and the token by
+// everything that is one workgroup.
+func TestVulkan12BTokenProfile(t *testing.T) {
+	_, m := load12BStack(t)
+	tl, err := m.NewStackTimeline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tl.Close()
+
+	m.Reset()
+	for pos := 0; pos < 32; pos++ {
+		m.Forward(int32(pos+100), pos)
+	}
+	m.ProfileStack(tl)
+	start := time.Now()
+	m.Forward(1000, 32)
+	took := time.Since(start)
+	m.ProfileStack(nil)
+
+	report, err := tl.Report(took)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("one token in %v\n%s", took, report)
+}

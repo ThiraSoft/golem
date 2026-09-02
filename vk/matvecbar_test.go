@@ -43,6 +43,11 @@ func TestMatVecAgainstLlamaCpp(t *testing.T) {
 		{4096, 2560, nn.Q4_K, "attn query", 14.56},
 		{2560, 4096, nn.Q4_K, "attn output", 17.17},
 		{1024, 2560, nn.Q4_K, "attn key and value", 7.69},
+		// And gemma-4-12B-it-Q4_K_M, whose feed forward is four times the 4B's
+		// and whose down projection is where the two engines part.
+		{3840, 15360, nn.Q4_K, "12B ffn down", 65.66},
+		{3840, 15360, nn.Q6_K, "12B ffn down, six bits", 86.15},
+		{15360, 3840, nn.Q4_K, "12B ffn gate or up", 71.80},
 	} {
 		t.Run(s.what, func(t *testing.T) {
 			ours := matvecMicroseconds(t, d, s.rows, s.cols, s.q)
