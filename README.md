@@ -26,7 +26,7 @@ A golem is inert matter given a voice. That is what these engines do to a file o
 - **Keeps pace on CPU**: tuned AVX2 kernels reach `llama.cpp`'s level on this machine — reading prompts and generating both — except on the smallest model, where the weights stop being the cost and it says so.
 - **Vulkan GPU**: bound through `purego` rather than cgo, and level with `llama.cpp`'s own Vulkan build on the one AMD card this has been measured on. The table below gives every number both ways, including where golem is behind and by how much.
 - **Its own weight format**: `.golem` is 18 % smaller than llama.cpp's Q3_K_M on Qwen3-4B and ahead of it on every measure — a trellis codebook with no lookup table, converted on the card. [What it costs](#-golem--the-engines-own-weight-format).
-- **A mixture's experts need not be on the card**: they can stay in system memory and be read across the bus where they lie, which takes the 26B A4B's footprint on the card from 13.6 GiB to 1.3 — the same answers, at the bus's speed rather than the card's. [What it costs, and what a cache would buy back](#-a-mixtures-experts-need-not-be-on-the-card).
+- **A mixture's experts need not be on the card**: they can stay in system memory and be read across the bus where they lie, which takes the 26B A4B's footprint on the card from 13.6 GiB to 1.3. A cache of the ones a token keeps asking for buys the speed back — two fifths of the pool is four fifths of the tokens — and the answers do not change. [The measured curve](#-a-mixtures-experts-need-not-be-on-the-card).
 - **Serves several clients at once**: `-parallel N` holds N conversations and carries a token for each of them through one read of the weights, on the card as well as on the processor — Qwen3.8 on the card excepted, for a reason [written below](#-several-conversations-one-pass).
 
 ## 🚀 Quickstart
@@ -138,16 +138,16 @@ card addresses, and the kernels read them where they are. **No shader knows**: a
 compute shader reads a storage buffer the same way wherever it lives, and only
 the rate changes.
 
-| 26B A4B on an RX 9070 XT | on the card | a token | tokens/s |
-| ------------------------ | ----------: | ------: | -------: |
-| experts resident in VRAM  | 13.6 GiB   | 9.2 ms  | **108** |
-| experts in system memory  | **1.3 GiB**| 135 ms  | **7.4** |
+| 26B A4B on an RX 9070 XT | on the card |
+| ------------------------ | ----------: |
+| experts resident in VRAM  | 13.6 GiB   |
+| experts in system memory  | **1.3 GiB**|
 
-**The second row is the point of this section.** What stays on the card is the
-shared branches, the attention and the head; the twelve gigabytes that leave are
-the experts. So what a mixture costs the card no longer scales with how many
-experts it has, and what bounds it becomes host memory instead — sixteen
-gibibytes of addressable system memory here.
+**What stays on the card is the shared branches, the attention and the head**;
+the twelve gigabytes that leave are the experts. So what a mixture costs the card
+no longer scales with how many experts it has, and what bounds it becomes host
+memory instead — sixteen gibibytes of addressable system memory here. The speeds
+are the table further down, which measures all of this on one continuation.
 
 **What has not been done is run a mixture that genuinely does not fit.** The 26B
 A4B is the only one on this machine and it fits either way, so what is shown
@@ -155,35 +155,57 @@ above is the mechanism and the footprint, not the consequence. Whether a model
 three times its size loads and answers is the next thing to find out, and it is
 not claimed here.
 
-It is also the floor for speed — every expert read across the bus, nothing
-cached — and the bus is what binds it: this card sits behind a switch and
-reaches the processor over eight lanes at 8 GT/s, 7.9 GB/s of payload. The 126
-milliseconds between the two rows is 802.9 MB of experts at **6.37 GB/s**, which
-is the same figure a mat-vec reads host memory at in isolation and 95 % of what
-the copy engine manages across the same link.
+That arrangement is the floor for speed — every expert read across the bus,
+nothing cached — and the bus is what binds it: this card sits behind a switch and
+reaches the processor over eight lanes at 8 GT/s, 7.9 GB/s of payload. What
+separates a resident token from a fully absent one is 802.9 MB of experts at
+**6.37 GB/s**, which is the figure a mat-vec reads host memory at in isolation
+and 95 % of what the copy engine manages across the same link.
 
-**It answers the same tokens.** The reference test passes unchanged with the
-experts in system memory, down to the three logged tie margins being identical
-to the resident run's. That control is what makes the arrangement worth
-building on: a mixture that answers plausibly and wrongly is this project's
-named failure mode.
+**It answers the same tokens** — with the experts in system memory, and with any
+size of cache in front of them. The reference test passes unchanged in all
+three, down to the three logged tie margins being identical to the resident
+run's. That control is what makes the arrangement worth building on: a mixture
+that answers plausibly and wrongly is this project's named failure mode.
 
-**What is not built yet is the cache.** Simulating one against the model's real
-routing — the router is arithmetic, so this costs a map and no card time —
-prices what a slice of VRAM buys back:
+**A slice of the card buys most of it back.** `GOLEM_MOE_CACHE_SLOTS=N` keeps a
+copy of N experts per block in device memory and fetches a missing one on the
+way past. Measured on a continuation the model wrote itself — 160 tokens,
+greedy, after a warm-up that is not counted:
 
-| experts kept in VRAM | hit rate | tokens/s *(projected)* |
-| -------------------- | -------: | ---------------------: |
-| 3.9 GB, a third of the pool | 84.1 % | 35 |
-| 5.1 GB, 40 % | 91.9 % | 51 |
-| 7.7 GB, 60 % | 98.0 % | 81 |
+| experts kept in VRAM | that much VRAM | tokens/s |
+| -------------------- | -------------: | -------: |
+| none — all in system memory | 0 | 7.3 |
+| 16 of 128 | 1.6 GB | 15.1 |
+| 32 of 128 | 3.2 GB | 27.3 |
+| 40 of 128 | 4.0 GB | 35.3 |
+| **51 of 128** | **5.1 GB** | **47.4** |
+| 64 of 128 | 6.4 GB | 58.0 |
+| all 128 — the resident path | 12.9 GB | 82.1 |
 
-Those rates are measured against a real continuation and checked against the
-trap that makes them meaningless — repetitive text routes to a handful of
-experts and reports a hit rate nobody reproduces, so the run is required to
-touch a quarter of the pool and it touches three quarters, with no token routing
-exactly as the one before it. The tokens-a-second column is arithmetic over
-those rates and is marked as such until a cache exists to measure.
+**Two fifths of the pool is four fifths of the tokens.** And the shape was known
+before the cache existed: simulating one against the model's own routing — the
+router is arithmetic, so it costs a map and no card time —
+`gemma/expert_cache_test.go` predicted 34.5 tokens a second at 30 % of the pool
+and 50.9 at 40 %, against the 35.3 and 47.4 measured here.
+
+That simulation is also what says which cache to build. FreeToken reports that
+one pool shared by every layer beats a split per layer by ten to fifteen points;
+on this checkpoint the two sit under a point apart, so golem keeps one cache per
+block — simpler to index, and the blocks do not compete.
+
+**Nothing on the host decides any of this.** The experts are picked on the card,
+one block at a time, inside a program recorded once and re-run per token, so a
+host that had to choose would cost a readback between every pair of blocks.
+`shaders/moe_admit.comp` turns each identifier into the slot holding a copy of
+it, `shaders/moe_fill.comp` fetches whatever was missing, and the two product
+kernels read a slot where they read an identifier — the same instruction. A
+fetch costs what reading the expert where it lay would have cost, and buys every
+later token that wants it again.
+
+The prompt is unchanged: a wide pass reads every expert of a block at once, and
+a cache of a few dozen has nothing to offer it, so passes above the cache's width
+go by expert straight out of the pool.
 
 The pool has to fit in the memory the card can address, which is sixteen
 gibibytes here against the 26B A4B's 12.85 — so that model fits and a much
