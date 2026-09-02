@@ -9,8 +9,10 @@ package vk
 // kernel that beats the first and loses to the second still loses the model.
 //
 // Round-robin and fastest-of-n, for the reason vk/golemtune.go gives: measured
-// one after another, these three move together by a third between runs and
-// against each other by nothing that can be believed.
+// one after another, these move together by a third between runs. Twenty rounds
+// and not six, because six was not enough either — the same code came back at
+// 1.53 and at 1.65 of the bar on two runs, and a kernel change worth eight per
+// cent cannot be read off an instrument with eight per cent of slack in it.
 
 import (
 	"math/rand"
@@ -26,7 +28,7 @@ func TestGolemAgainstQ40(t *testing.T) {
 		t.Skip("times four kernels over a 9728x2560 product")
 	}
 	const rows, cols = 9728, 2560
-	const times, rounds = 128, 6
+	const times, rounds = 128, 20
 
 	d := open(t)
 	defer d.Close()
@@ -88,7 +90,10 @@ func TestGolemAgainstQ40(t *testing.T) {
 		})
 	}
 
-	// The trellis tiers, each built the way vk/golem.go builds a pass of one.
+	// The trellis tiers, each built the way vk/golem.go builds a pass of one,
+	// and T4G a second time with the window cut the other way — the only way to
+	// read a difference of a tenth on a card that moves by a sixth between
+	// processes.
 	for _, kind := range []nn.Quant{nn.T3G, nn.T4G} {
 		data := make([]byte, rows*(nn.Matrix{Quant: kind, Cols: cols}).RowBytes())
 		r.Read(data)
@@ -115,6 +120,51 @@ func TestGolemAgainstQ40(t *testing.T) {
 		push := m.Push(0)
 		runs = append(runs, &entry{
 			name: kind.String(), set: m.Set(1), groups: m.Groups(1),
+			push: unsafe.Pointer(&push), bytes: len(data), best: time.Hour,
+		})
+	}
+
+	// T4G with the shift pair instead of the bitfield extract, which is what
+	// the window cut used to be. It is here so that the three per cent between
+	// them stays measured rather than remembered.
+	{
+		data := make([]byte, rows*(nn.Matrix{Quant: nn.T4G, Cols: cols}).RowBytes())
+		r.Read(data)
+		spv := buildGolemSPIRV(t, 4, 0, 0)
+		pipe, err := d.NewPipelineSpec(spv, 4, uint32(unsafe.Sizeof(golemPush{})), GolemShapes()[1].Spec())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pipe.Close()
+		w, err := d.UploadTail(data, golemReadTail)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Close()
+		table, err := d.Upload(golemTable())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer table.Close()
+		act, err := d.Host(cols*4, bufferUsageStorage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer act.Close()
+		out, err := d.Readback(rows*4, bufferUsageStorage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer out.Close()
+		set, err := pipe.NewSet([]*Buffer{w, table, act, out})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer set.Close()
+		push := golemPush{dim: rows, ffn: cols}
+		per := uint32(GolemShapes()[1].Threads / 8)
+		runs = append(runs, &entry{
+			name: "T4G shifts", set: set, groups: (rows + per - 1) / per,
 			push: unsafe.Pointer(&push), bytes: len(data), best: time.Hour,
 		})
 	}
@@ -182,8 +232,16 @@ func TestGolemAgainstQ40(t *testing.T) {
 		push: unsafe.Pointer(&dp), bytes: len(q40), best: time.Hour,
 	})
 
+	// The order rotates. Timed in a fixed order, whichever kernel sits fourth
+	// comes out three to six per cent ahead of whichever sits third — the same
+	// binary, both ways round — and two afternoons went into a conclusion that
+	// was that effect and nothing else.
 	for round := 0; round <= rounds; round++ {
-		for _, e := range runs {
+		order := make([]*entry, len(runs))
+		for i := range runs {
+			order[i] = runs[(i+round)%len(runs)]
+		}
+		for _, e := range order {
 			start := time.Now()
 			if err := e.set.DispatchTimes(e.groups, e.push, times); err != nil {
 				t.Fatal(err)

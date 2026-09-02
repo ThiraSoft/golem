@@ -72,6 +72,31 @@
 #define ABLATE 0
 #endif
 
+// BFE is whether a window that ends inside its own word is cut with the
+// hardware's bitfield extract or with a shift pair. Six windows in eight end
+// inside their own word at four bits — the field runs from bit bi to bit bi+12
+// counting from the top, which is bit 20-bi counting from the bottom, in range
+// whenever bi is at most 20 — and for those v_bfe_u32 is one instruction where
+// the shift pair is two. It is worth three to five per cent.
+//
+// Both shapes stay here, and vk/golem_bar_test.go times them side by side,
+// because getting that number took three wrong readings:
+//
+//   - Measured in separate processes it looked like a gain of eight per cent.
+//     This card moves by a sixth between processes; eight per cent is noise.
+//   - Measured in one process, in a fixed order, it looked like a loss of five
+//     per cent. Whichever kernel sits fourth in that loop comes out ahead of
+//     whichever sits third, the same binary either way.
+//   - Measured in one process with the order rotating, it is a gain of three to
+//     five per cent, three runs agreeing.
+//
+// The rule that falls out: a kernel difference under a tenth cannot be read off
+// this card without interleaving *and* rotating, and two of the three readings
+// above were confident.
+#ifndef BFE
+#define BFE 1
+#endif
+
 // Three specialization constants, because the fastest shape is the card's
 // answer and not this file's. They are given values when the pipeline is made,
 // so one binary a tier and a width becomes every shape of it; vk.GolemShapes
@@ -270,6 +295,7 @@ void main() {
 #if ABLATE == 4
         [[unroll]] for (uint j = 0u; j < SD; j++) sum[0] += float(s[j]) * step;
 #else
+
         [[unroll]] for (uint i = 0u; i < BLOCK; i++) {
             const uint o  = i * KBITS;
             const uint wi = o >> 5u;
@@ -282,13 +308,20 @@ void main() {
             // kept because it bounds the cut from above.
             uint v = s[wi] & 0xFFFu;
 #else
-            // bi is a constant of the unrolled iteration, so this is a shift
-            // and a funnel shift and the branch is not one. Written with the
-            // zero case spelled out because a shift by thirty-two is undefined
-            // and the folded form is what ACO turns into v_alignbit_b32.
-            uint v = bi == 0u
-                ? (s[wi] >> 20u)
-                : (((s[wi] << bi) | (s[wi + 1u] >> (32u - bi))) >> 20u);
+            // bi is a constant of the unrolled iteration, so neither branch
+            // below is one.
+            //
+            // The straddling windows take a shift pair, written with the zero
+            // case spelled out because a shift by thirty-two is undefined and
+            // the folded form is what ACO turns into v_alignbit_b32.
+            uint v;
+            if (BFE != 0 && bi <= 20u) {
+                v = bitfieldExtract(s[wi], int(20u - bi), 12);
+            } else if (bi == 0u) {
+                v = s[wi] >> 20u;
+            } else {
+                v = ((s[wi] << bi) | (s[wi + 1u] >> (32u - bi))) >> 20u;
+            }
 #endif
 #if ABLATE == 6
             bare += floatBitsToUint(ldsValues[v]);

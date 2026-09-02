@@ -27,11 +27,17 @@ import (
 )
 
 func ablateSPIRV(tb testing.TB, kbits, ablate int) []byte {
+	return buildGolemSPIRV(tb, kbits, ablate, 1)
+}
+
+// buildGolemSPIRV compiles the kernel with the switches a probe wants. It is
+// the shader that ships, so a probe cannot drift from it.
+func buildGolemSPIRV(tb testing.TB, kbits, ablate, bfe int) []byte {
 	tb.Helper()
 	dir := tb.TempDir()
 	out := filepath.Join(dir, "a.spv")
 	cmd := exec.Command("glslc", "-O",
-		"-DKBITS="+itoa(kbits), "-DABLATE="+itoa(ablate),
+		"-DKBITS="+itoa(kbits), "-DABLATE="+itoa(ablate), "-DBFE="+itoa(bfe),
 		"--target-env=vulkan1.1", "-fshader-stage=compute",
 		"shaders/matvec_t4g.comp", "-o", out)
 	if b, err := cmd.CombinedOutput(); err != nil {

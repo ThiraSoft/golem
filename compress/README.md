@@ -536,6 +536,92 @@ to do what Q4_0 does — never leave the integers, one `dotPacked4x8` on eight
 weights against an activation packed four to a word — and 1MAD's byte sum runs 0
 to 1020, eleven bits, so it would have to be split into a high byte and a few
 low bits and summed as two dot products. That was worth measuring before it was
+worth writing, and `vk/golem_bar_test.go` measures it: all six kernels in one
+process, the order rotating, fastest of twenty rounds, 9728 by 2560, one column.
+
+| | microseconds | of the bar |
+|---|---|---|
+| **Q4_0 against Q8_0, integer dot product** | **27.2 – 27.4** | 1.00 |
+| Q4_0 against float activations | 34.7 – 34.9 | 1.27 |
+| **T4G with nothing but the window and the table** | **44.6 – 46.4** | 1.67 |
+| T4G | 48.4 – 49.1 | 1.78 |
+| T3G | 48.1 – 49.2 | 1.78 |
+
+The third row is the answer. It is the kernel with the float multiply, the fused
+add and the activation load all taken out — `ABLATE 6` of
+`vk/shaders/matvec_t4g.comp`, which cuts each weight's window, reads its value
+out of shared memory and adds it to an integer. **Everything an integer
+reformulation could win is the four to nine per cent between it and the full
+kernel**, and it would have to pay for packing four decoded values into a word
+to win any of it. What is left below is the window cut and the table read, and
+those are the codebook: a trellis decodes one weight at a time from twelve bits
+of state, and Q4_0 decodes eight from one instruction.
+
+So the trellis costs somewhere between 1.5 and 1.8 times a nibble's product on
+this card — the ratio itself moves with the card's clock state, because Q4_0's
+kernel is bandwidth-bound and this one is not — and almost none of that is
+reachable by rearranging the arithmetic. That is the price of the bits it saves,
+and it should be argued about as a price rather than as a bug: T3G is 18 %
+smaller than Q3_K_M and ahead of it on every quality column, and it generates at
+about six tenths of Q4_0's rate. Nothing above changes either half of that
+sentence.
+
+### Interleave, and rotate
+
+`vk/golem_bar_test.go` and `cmd/golemtune` both time their cases round-robin
+*and* rotate the order between rounds, and the second half of that was learned
+the hard way. Reading the same change three ways gave three answers:
+
+| how it was measured | what it said about one three-per-cent change |
+|---|---|
+| two runs, one binary each | a gain of eight per cent |
+| one run, fixed order | a loss of five per cent |
+| one run, order rotating, three times | a gain of three to five per cent |
+
+The card moves by a sixth between processes, which buries anything smaller. And
+inside one process, whichever kernel sits fourth in a fixed loop comes out ahead
+of whichever sits third — the same binary, both ways round. Two of those three
+readings were confident and wrong. **Below a tenth, nothing measured any other
+way should be believed, including by whoever measured it.**
+
+**And a warning about the tuning.** The first shapes shipped here were measured
+on the 4B's feed forward alone, 9728 by 2560. On the 27B's, 17408 by 5120, the
+workgroup that won for the 4B at two columns costs **28 %** — which was most of
+why drafting looked worse than it is. The defaults are now the consensus of both
+geometries, and `cmd/golemtune` takes `-rows` and `-cols` so that a model with a
+shape unlike either can be measured on its own.
+
+Two things follow for anyone reading this next.
+
+**The standing lesson survives, sharpened.** T4G is still not bandwidth-bound —
+it now moves about 190 GB/s of 640 — so a change argued for on bytes read still
+has to clear that bar. What has changed is that "it is not bandwidth-bound" is
+no longer where the analysis stops.
+
+**And the bar to beat is not the one this file was measuring against.** Q4_0 has
+two mat-vecs here: `matvec_q40.comp`, which reads float activations, and
+`matvec.comp`, which reads them quantized to Q8_0 and spends one
+`dotPacked4x8AccSatEXT` on eight weights. The second is the path most of a
+model's projections actually take, and it is much the faster of the two. On the
+same 9728x2560 shape, one column:
+
+| | microseconds |
+|---|---|
+| T4G, after everything above | 67.9 |
+| Q4_0 against float activations | 52.4 |
+| **Q4_0 against Q8_0, integer dot product** | **44.7** |
+
+End to end on Qwen3-4B, same engine, same card, warm: Q4_0 generates at 103.6
+tokens a second where T4G does 67.5 and T3G 68.4. **1.53 times**, against the
+mat-vec's 1.52 — so the whole of the difference is the product and none of it is
+anywhere else. The transform each site applies to its activation was measured by
+taking it out: four per cent.
+
+**What it would take to close the rest is not a kernel.** The obvious answer is
+to do what Q4_0 does — never leave the integers, one `dotPacked4x8` on eight
+weights against an activation packed four to a word — and 1MAD's byte sum runs 0
+to 1020, eleven bits, so it would have to be split into a high byte and a few
+low bits and summed as two dot products. That was worth measuring before it was
 worth writing, and `vk/golem_bar_test.go` measures it. All five kernels in one
 process, round-robin, fastest of six rounds, 9728 by 2560, one column:
 
