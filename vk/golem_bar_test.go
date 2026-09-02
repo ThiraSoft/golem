@@ -124,9 +124,61 @@ func TestGolemAgainstQ40(t *testing.T) {
 		})
 	}
 
-	// T4G with the shift pair instead of the bitfield extract, which is what
-	// the window cut used to be. It is here so that the three per cent between
-	// them stays measured rather than remembered.
+	// T4G hashing every weight instead of reading the shared table, and T4G
+	// with the shift pair instead of the bitfield extract. Both are shapes this
+	// kernel has had, kept side by side so that the few per cent between them
+	// stays measured rather than remembered.
+	for _, alt := range []struct {
+		name   string
+		shape  GolemShape
+		lanes  int
+		phased int
+	}{
+		{"T4G hash", GolemShape{Threads: 256, Table: false, Prefetch: true}, 8, 0},
+		{"T4G lanes16", GolemShape{Threads: 256, Table: true, Prefetch: true}, 16, 0},
+		{"T4G phased", GolemShape{Threads: 256, Table: true, Prefetch: true}, 8, 1},
+		{"T4G phased/128", GolemShape{Threads: 128, Table: true, Prefetch: true}, 8, 1},
+	} {
+		data := make([]byte, rows*(nn.Matrix{Quant: nn.T4G, Cols: cols}).RowBytes())
+		r.Read(data)
+		pipe, err := d.NewPipelineSpec(buildGolemPhased(t, 4, 0, 1, alt.lanes, alt.phased), 4,
+			uint32(unsafe.Sizeof(golemPush{})), alt.shape.Spec())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pipe.Close()
+		w, err := d.UploadTail(data, golemReadTail)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Close()
+		table, err := d.Upload(golemTable())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer table.Close()
+		act, err := d.Host(cols*4, bufferUsageStorage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer act.Close()
+		out, err := d.Readback(rows*4, bufferUsageStorage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer out.Close()
+		set, err := pipe.NewSet([]*Buffer{w, table, act, out})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer set.Close()
+		push := golemPush{dim: rows, ffn: cols}
+		per := uint32(alt.shape.Threads / alt.lanes)
+		runs = append(runs, &entry{
+			name: alt.name, set: set, groups: (rows + per - 1) / per,
+			push: unsafe.Pointer(&push), bytes: len(data), best: time.Hour,
+		})
+	}
 	{
 		data := make([]byte, rows*(nn.Matrix{Quant: nn.T4G, Cols: cols}).RowBytes())
 		r.Read(data)

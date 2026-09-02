@@ -8,11 +8,14 @@ package vk
 // GOLEM_MATVEC_SHAPE to. cmd/golemtune is the command around it, and
 // TestGolemSweep runs it here.
 //
-// Interleaved, and reduced by the fastest round, on purpose. A sweep that runs
-// its cases one after another cannot compare them: this card's clock drifts far
-// enough over a few minutes that the same two shapes came out 16% apart one way
-// and 3% apart the other. Round-robin, the same two are separated by the same
-// number every run.
+// Interleaved, rotating, and reduced by the fastest round, and all three are
+// load-bearing. A sweep that runs its cases one after another cannot compare
+// them: this card's clock drifts far enough over a few minutes that the same
+// two shapes came out 16% apart one way and 3% apart the other. And a sweep
+// that interleaves them in a fixed order cannot either: whichever shape sits
+// fourth in the loop comes out three to six per cent ahead of whichever sits
+// third, the same binary both ways round. Rotating the order between rounds is
+// what makes a difference of a few per cent readable at all.
 
 import (
 	"fmt"
@@ -36,6 +39,8 @@ var GolemTuneShapes = []GolemShape{
 	{Threads: 256, Table: true, Prefetch: false},
 	{Threads: 128, Table: true, Prefetch: true},
 	{Threads: 256, Table: true, Prefetch: true},
+	{Threads: 512, Table: true, Prefetch: false},
+	{Threads: 512, Table: true, Prefetch: true},
 }
 
 // A GolemTuneRow is one shape of one pass width, and the fastest dispatch of it.
@@ -118,10 +123,14 @@ func TuneGolem(d *Device, rows, cols, rounds int) ([]GolemTuneRow, error) {
 	// Enough dispatches in one submission that the card raises its clocks: a
 	// kernel handed a few microseconds of work and then left alone runs at half
 	// its frequency, and that is not the number anyone wants.
-	const times = 128
+	const times = 128 // enough that the card raises its clocks
 	push := golemPush{dim: uint32(rows), ffn: uint32(cols), col: 0}
 	for round := 0; round <= rounds; round++ {
-		for _, t := range runs {
+		order := make([]*timed, len(runs))
+		for i := range runs {
+			order[i] = runs[(i+round)%len(runs)]
+		}
+		for _, t := range order {
 			start := time.Now()
 			if err := t.set.DispatchTimes(t.groups, unsafe.Pointer(&push), times); err != nil {
 				return nil, err

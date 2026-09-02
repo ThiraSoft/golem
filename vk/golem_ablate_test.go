@@ -33,11 +33,24 @@ func ablateSPIRV(tb testing.TB, kbits, ablate int) []byte {
 // buildGolemSPIRV compiles the kernel with the switches a probe wants. It is
 // the shader that ships, so a probe cannot drift from it.
 func buildGolemSPIRV(tb testing.TB, kbits, ablate, bfe int) []byte {
+	return buildGolemLanes(tb, kbits, ablate, bfe, 8)
+}
+
+// buildGolemLanes is buildGolemSPIRV with the lanes a row is shared by, which
+// is a define rather than a specialization constant because the clustered
+// reduction wants its width when the module is built.
+func buildGolemLanes(tb testing.TB, kbits, ablate, bfe, lanes int) []byte {
+	return buildGolemPhased(tb, kbits, ablate, bfe, lanes, 0)
+}
+
+// buildGolemPhased is buildGolemLanes with the decode split into phases.
+func buildGolemPhased(tb testing.TB, kbits, ablate, bfe, lanes, phased int) []byte {
 	tb.Helper()
 	dir := tb.TempDir()
 	out := filepath.Join(dir, "a.spv")
 	cmd := exec.Command("glslc", "-O",
 		"-DKBITS="+itoa(kbits), "-DABLATE="+itoa(ablate), "-DBFE="+itoa(bfe),
+		"-DLANES_PER_ROW="+itoa(lanes), "-DPHASED="+itoa(phased),
 		"--target-env=vulkan1.1", "-fshader-stage=compute",
 		"shaders/matvec_t4g.comp", "-o", out)
 	if b, err := cmd.CombinedOutput(); err != nil {

@@ -557,6 +557,30 @@ to win any of it. What is left below is the window cut and the table read, and
 those are the codebook: a trellis decodes one weight at a time from twelve bits
 of state, and Q4_0 decodes eight from one instruction.
 
+### What else was tried
+
+Everything below was measured on the same instrument and none of it is in the
+kernel, which is worth more than the sentence it takes: a list of the ideas that
+do not work is the part of an optimization nobody writes down and everybody
+repeats.
+
+| | |
+|---|---|
+| the table in a buffer on the card instead of shared memory | **+54 %**, a wave's lanes want sixty-four addresses |
+| two copies of the table, one per group of lanes, against bank conflicts | **+15 %**; four copies, +80 %. Occupancy costs more than the conflicts |
+| hashing every weight instead of reading the table | **+32 %** |
+| four, sixteen or thirty-two lanes to a row instead of eight | **+11 %, +14 %, +34 %** |
+| decoding in phases — eight windows, then eight table reads, then eight adds | **+10 %**; ACO was already scheduling it better |
+| the step scaled once a block instead of once a weight | nothing at one column, worse at eight |
+| splitting the 1MAD multiply into two 24-bit ones | nothing; ACO folds the shift back |
+
+The phased row is the one to read twice. The ISA puts 2.4 `s_delay_alu` slots
+beside the five instructions a weight costs, which says the kernel waits on a
+chain — stream word, window, shared read, multiply, add — rather than on
+throughput. Doing eight of each in turn is the obvious answer and it is ten per
+cent slower, because the eight live values cost more in registers than the chain
+costs in stalls.
+
 So the trellis costs somewhere between 1.5 and 1.8 times a nibble's product on
 this card — the ratio itself moves with the card's clock state, because Q4_0's
 kernel is bandwidth-bound and this one is not — and almost none of that is
@@ -577,6 +601,10 @@ the hard way. Reading the same change three ways gave three answers:
 | two runs, one binary each | a gain of eight per cent |
 | one run, fixed order | a loss of five per cent |
 | one run, order rotating, three times | a gain of three to five per cent |
+
+`cmd/golemtune` rotates for the same reason, and it did not at first: re-running
+it after the fix moved the two-column shape by ten per cent, from 256 threads
+with a read-ahead to 512 without.
 
 The card moves by a sixth between processes, which buries anything smaller. And
 inside one process, whichever kernel sits fourth in a fixed loop comes out ahead

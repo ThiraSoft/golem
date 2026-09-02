@@ -97,6 +97,40 @@
 #define BFE 1
 #endif
 
+// LANES is how many threads share an output row, and it is eight because every
+// other matvec in this directory says eight — which is a reason to check rather
+// than a reason. Fewer lanes give a row more blocks to walk and a workgroup
+// more rows; more lanes shorten the walk and widen the reduction. It is a
+// define and not a specialization constant because subgroupClusteredAdd wants
+// its width at compile time.
+#ifndef LANES_PER_ROW
+#define LANES_PER_ROW 8
+#endif
+
+// PHASED decodes eight weights a phase at a time — every window cut, then every
+// table read, then every accumulation — instead of carrying one weight all the
+// way through before starting the next.
+//
+// The reason is in the ISA. A weight costs about five instructions and the
+// compiler puts 2.4 s_delay_alu slots beside them: the chain from the stream
+// word to the window to the shared-memory read to the multiply to the add is
+// five latencies deep and there is nothing else to run while it waits. Q4_0's
+// kernel has no such chain — it loads four words and issues eight independent
+// dot products — which is most of why it is faster than its instruction count
+// says. Eight windows cut before the first read is issued gives the scheduler
+// eight independent reads in flight.
+#ifndef PHASED
+#define PHASED 0
+#endif
+
+// COPIES is how many copies of the table shared memory holds, one per bank
+// group. A weight's index into it is twelve pseudo-random bits, so the lanes of
+// a wave want scattered banks and the read serializes on whichever bank two of
+// them collide in. Giving half the lanes their own copy halves the collisions
+// and doubles the shared memory. It is a specialization constant so that
+// vk/golem_bar_test.go can price the trade rather than assume it.
+layout(constant_id = 3) const int COPIES = 1;
+
 // Three specialization constants, because the fastest shape is the card's
 // answer and not this file's. They are given values when the pipeline is made,
 // so one binary a tier and a width becomes every shape of it; vk.GolemShapes
@@ -127,7 +161,7 @@ layout(constant_id = 2) const int PREFETCH = 1;
 
 // LDS_SIZE is the table's, and it is a constant expression of TABLE so that a
 // build without the table does not reserve sixteen kibibytes to never read.
-const uint LDS_SIZE = TABLE != 0 ? (1u << 12) : 1u;
+const uint LDS_SIZE = TABLE != 0 ? (1u << 12) * uint(COPIES) : 1u;
 
 layout(std430, binding = 0) readonly  buffer W { uint  w[]; };
 // Binding 1 is the step grid: 256 floats, one per code, a kibibyte uploaded
@@ -150,8 +184,8 @@ layout(push_constant) uniform Push {
     uint col; // the first column of the pass this dispatch answers
 } p;
 
-const uint LANES = 8u;
-const uint OUTS  = gl_WorkGroupSize.x / 8u;
+const uint LANES = uint(LANES_PER_ROW);
+const uint OUTS  = gl_WorkGroupSize.x / LANES;
 const uint SEQ   = 128u; // weights in one path
 const uint BLOCK = 64u;  // weights sharing one step
 #if KBITS == 5
@@ -246,13 +280,17 @@ void readRaw(uint seqAt, out uint raw[SD + 1u]) {
 void main() {
     if (TABLE != 0) {
         for (uint i = gl_LocalInvocationID.x; i < LDS_SIZE; i += gl_WorkGroupSize.x) {
-            ldsValues[i] = t4gHash(i);
+            ldsValues[i] = t4gHash(i & 0xFFFu);
         }
     }
     barrier();
 
     uint row = gl_WorkGroupID.x * OUTS + (gl_LocalInvocationID.x / LANES);
     uint lane = gl_LocalInvocationID.x % LANES;
+    // This thread's copy of the table, which is its lane's when there is more
+    // than one: the eight lanes of a row walk different blocks and so want
+    // different values at the same moment.
+    uint copy = (gl_LocalInvocationID.x % uint(COPIES)) << 12;
     bool live = row < p.dim;
     if (!live) row = 0u;
 
@@ -263,7 +301,7 @@ void main() {
 
     float sum[COLUMNS];
     [[unroll]] for (uint c = 0u; c < COLUMNS; c++) sum[c] = 0.0;
-    uint bare = 0u;  // ABLATE 6
+    float bare[4] = float[4](0.0, 0.0, 0.0, 0.0);  // ABLATE 6
 
     uint raw[SD + 1u];
     if (PREFETCH != 0 && live && lane < nb) readRaw(seqOf(codeBase, lane), raw);
@@ -296,6 +334,34 @@ void main() {
         [[unroll]] for (uint j = 0u; j < SD; j++) sum[0] += float(s[j]) * step;
 #else
 
+#if PHASED
+        [[unroll]] for (uint g = 0u; g < BLOCK / 8u; g++) {
+            // Every window of the group, before any of them is looked up.
+            uint vv[8];
+            [[unroll]] for (uint j = 0u; j < 8u; j++) {
+                const uint o  = (g * 8u + j) * KBITS;
+                const uint wi = o >> 5u;
+                const uint bi = o & 31u;
+                if (BFE != 0 && bi <= 20u) {
+                    vv[j] = bitfieldExtract(s[wi], int(20u - bi), 12);
+                } else if (bi == 0u) {
+                    vv[j] = s[wi] >> 20u;
+                } else {
+                    vv[j] = ((s[wi] << bi) | (s[wi + 1u] >> (32u - bi))) >> 20u;
+                }
+            }
+            // Then every value, so that eight reads are in flight at once.
+            float wv[8];
+            [[unroll]] for (uint j = 0u; j < 8u; j++) {
+                wv[j] = (TABLE != 0 ? ldsValues[copy + vv[j]] : t4gHash(vv[j])) * step;
+            }
+            [[unroll]] for (uint j = 0u; j < 8u; j++) {
+                [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+                    sum[c] += wv[j] * x[(p.col + c) * p.ffn + xOffset + g * 8u + j];
+                }
+            }
+        }
+#else
         [[unroll]] for (uint i = 0u; i < BLOCK; i++) {
             const uint o  = i * KBITS;
             const uint wi = o >> 5u;
@@ -324,12 +390,16 @@ void main() {
             }
 #endif
 #if ABLATE == 6
-            bare += floatBitsToUint(ldsValues[v]);
+            // Four accumulators and not one: a single chain of sixty-four
+            // dependent adds is a longer critical path than the multiply-add
+            // it is meant to be cheaper than, and a floor that measures slower
+            // than the kernel above it is not a floor.
+            bare[i & 3u] += ldsValues[copy + v];
 #else
 #if ABLATE == 1
             float wv = float(v) * step;
 #else
-            float wv = (TABLE != 0 ? ldsValues[v] : t4gHash(v)) * step;
+            float wv = (TABLE != 0 ? ldsValues[copy + v] : t4gHash(v)) * step;
 #endif
             [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
 #if ABLATE == 3
@@ -341,10 +411,11 @@ void main() {
 #endif
         }
 #endif
+#endif
     }
 
 #if ABLATE == 6
-    sum[0] += float(bare);
+    sum[0] += (bare[0] + bare[1]) + (bare[2] + bare[3]);
 #endif
     [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
         float total = subgroupClusteredAdd(sum[c], LANES);
