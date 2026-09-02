@@ -70,7 +70,9 @@ There is no cgo: `vk/` opens `libvulkan.so.1` through `purego`, and `CGO_ENABLED
 
 ### Generation Speed vs Prompt Speed
 
-On a card, golem is ahead of llama.cpp on both Gemma models, generating and reading, and within two hundredths of it generating on both Qwen3 ones. Qwen3.8 came later and sits apart: level reading a prompt, behind generating, for a reason that is the architecture's rather than a kernel's.
+**These are one card's numbers on one afternoon, and they are kept here for the story that follows rather than as a claim.** The current table is the README's, taken in a later sitting, and it reads differently: level generating on the 12B and two to nine per cent behind on the other four, ahead reading a prompt on four of five at every width. Both sittings say the same thing about the two engines — that they are level on this machine — and neither says anything about another card, another driver or another checkpoint, because nobody has run either there.
+
+What the table below is for is the *shape* it had at the time, which is what found the softcap.
 
 | tokens a second | golem gen | llama gen | golem pp64 | llama pp64 | golem pp256 | llama pp256 | golem pp512 | llama pp512 |
 | --------------- | --------: | --------: | ---------: | ---------: | ----------: | ----------: | ----------: | ----------: |
@@ -80,7 +82,7 @@ On a card, golem is ahead of llama.cpp on both Gemma models, generating and read
 | Qwen3 0.6B      |     359.4 |     365.4 |  **13915** |       9966 |   **23787** |       19159 |   **23995** |       22306 |
 | Qwen3.8 27B     |      30.1 |      32.8 |    **799** |      628.7 |    **1134** |      1127.8 |    **1236** |      1234.7 |
 
-golem reads a prompt faster than llama.cpp does on every model here at 64 and 256 positions, and on the 26B A4B, the 0.6B and Qwen3.8 at 512 as well.
+In that sitting golem was the faster of the two reading a prompt on every model at 64 and 256 positions, and on the 26B A4B, the 0.6B and Qwen3.8 at 512 as well.
 
 Generation was the side that was left, at 0.83 of llama.cpp on the 26B A4B and 0.93 on the 12B against 0.98 on both Qwen3 models, and the shape of that table was the answer: **the models with a gap were exactly the models with a logit softcap.**
 
