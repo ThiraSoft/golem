@@ -187,8 +187,21 @@ const expertsUsed = 8
 const downOuts = 8
 
 // matvecOuts is shaders/matvec.comp's, which serves the shared branch's down
-// projection and every projection of an attention.
-const matvecOuts = 16
+// projection and every projection of an attention. It has to be that shader's
+// OUTS: a workgroup writes that many rows starting at its own index, so a
+// count computed from a different number leaves rows unwritten or written
+// twice, and neither fails.
+//
+// Eight rows to a workgroup and sixteen threads to a row, where it was sixteen
+// rows and eight threads. The pair is the kernel's shape rather than a law and
+// it had been inherited from the mixture kernel this one was cut out of;
+// vk/matvecshape_test.go sweeps it. Out of cache the shapes are within seven
+// per cent of each other and the best of them reads at 619 GB/s on a card whose
+// bus is 640, which is the finding that matters more than the shape: this
+// kernel is not what a token is waiting for. End to end it is worth 9.66 ms a
+// token against 9.41 on Qwen3-4B-Q4_K_M — two and a half per cent, measured,
+// and the reason it is taken is that it costs two constants.
+const matvecOuts = 8
 
 // A Mixture is every feed-forward matrix of a model, resident, plus the
 // kernels that read them and the small buffers a token passes through.

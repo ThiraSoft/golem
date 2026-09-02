@@ -217,7 +217,7 @@ func quantProductOnCard(tb testing.TB, d *Device, m nn.Matrix, q []uint32, scale
 	}
 	push := moePush{dim: uint32(m.Rows), ffn: uint32(m.Cols), used: 1, split: 1}
 	if err := d.Submit(func(r *Recorder) {
-		r.Dispatch(set, matvecGroups(m.Rows), unsafe.Pointer(&push))
+		r.Dispatch(set, groupsOf(m.Rows, matvecOuts), unsafe.Pointer(&push))
 	}); err != nil {
 		tb.Fatal(err)
 	}

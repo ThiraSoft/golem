@@ -230,12 +230,23 @@ var normWideSPIRV []byte
 // pipeline at all, and says so rather than answering out of a shorter array.
 const qwenMaxContext = 8192
 
-// matvecRows is how many outputs one workgroup of the mat-vec kernels answers.
+// matvecRows is how many outputs one workgroup of the *float-activation*
+// mat-vecs answers — matvec_f32.comp, matvec_q4k.comp and matvec_q6k.comp,
+// which is what a float input and the prediction block's front projection
+// take. shaders/matvec.comp, which everything else reads, has its own and it
+// is vk/mixture.go's matvecOuts.
 // All five of them — Q4_0 against Q8_0, and Q4_0, Q4_1, Q5_K and F32 against
 // floats — put 128 threads on sixteen rows with eight lanes to a row.
 const matvecRows = 16
 
-func matvecGroups(rows int) uint32 { return uint32((rows + matvecRows - 1) / matvecRows) }
+func matvecGroups(rows int) uint32 { return groupsOf(rows, matvecRows) }
+
+// groupsOf is that count for a kernel that writes `outs` rows to a workgroup.
+// Which number a dispatch takes is the *binary's* business and not the
+// caller's: shaders/matvec.comp writes vk/mixture.go's matvecOuts and the
+// float-activation mat-vecs beside it write matvecRows, and a count taken from
+// the wrong one leaves rows unwritten or written twice. Neither fails.
+func groupsOf(rows, outs int) uint32 { return uint32((rows + outs - 1) / outs) }
 
 type swigluPush struct {
 	N       uint32
@@ -1434,7 +1445,7 @@ func (p *QwenPipeline) product(r *Recorder, set *Set, rows, columns int, push mo
 			w = 1
 		}
 		push.col = uint32(at)
-		p.dispatchAt(r, set, rows, w, true, unsafe.Pointer(&push))
+		p.dispatchAt(r, set, rows, w, true, matvecOuts, unsafe.Pointer(&push))
 		at += w
 	}
 }
@@ -1449,7 +1460,7 @@ func (p *QwenPipeline) productK(r *Recorder, set *Set, rows, columns int, push m
 			w = 1
 		}
 		push.Col = uint32(at)
-		p.dispatchAt(r, set, rows, w, false, unsafe.Pointer(&push))
+		p.dispatchAt(r, set, rows, w, false, matvecRows, unsafe.Pointer(&push))
 		at += w
 	}
 }
@@ -1466,12 +1477,12 @@ func (p *QwenPipeline) productK(r *Recorder, set *Set, rows, columns int, push m
 // sixty-fourth of the workgroups it needed. It covered a fraction of the rows,
 // left the rest untouched, and measured a third faster for it — which is how a
 // wrong kernel looks like a fast one.
-func (p *QwenPipeline) dispatchAt(r *Recorder, set *Set, rows, columns int, tiled bool, push unsafe.Pointer) {
+func (p *QwenPipeline) dispatchAt(r *Recorder, set *Set, rows, columns int, tiled bool, outs int, push unsafe.Pointer) {
 	if tiled && columns >= tiledColumns {
 		r.DispatchWide(set, columns, coopProductGroups(p.coop, columns, rows), push)
 		return
 	}
-	groups := matvecGroups(rows)
+	groups := groupsOf(rows, outs)
 	if columns == 1 {
 		r.Dispatch(set, groups, push)
 		return

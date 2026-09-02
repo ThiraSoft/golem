@@ -30,7 +30,20 @@
 #define COLUMNS 1
 #endif
 
-layout(local_size_x = 128) in;   // sixteen outputs, eight lanes each
+// LANES is how many threads share one output row and OUTS how many rows a
+// workgroup answers. The two multiply to the workgroup, and the pair is a
+// shape rather than a law: a lane reads LANES*16 contiguous bytes with its
+// neighbours and carries COLUMNS accumulators in registers, so raising LANES
+// buys coalescing and costs a wider reduction, and raising OUTS buys rows in
+// flight and costs occupancy. vk/matvecshape_test.go sweeps them.
+#ifndef LANES
+#define LANES 8u
+#endif
+#ifndef OUTS
+#define OUTS 16u
+#endif
+
+layout(local_size_x = LANES * OUTS) in;
 
 layout(std430, binding = 0) readonly  buffer W  { uint  w[];   };
 layout(std430, binding = 1) readonly  buffer AQ { uint  aq[];  };  // the activation, Q8_0
@@ -45,8 +58,6 @@ layout(push_constant) uniform Push {
     uint col;   // the first column of the pass this dispatch answers
 } p;
 
-const uint LANES = 8u;
-const uint OUTS  = 16u;   // outputs to a workgroup, which is 128 / LANES
 
 #ifdef Q6K
 // sbyte reads one signed byte of the weights, which is what a Q6_K group scale
@@ -213,8 +224,8 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
 
 void main() {
     uint t    = gl_LocalInvocationID.x;
-    uint lane = t & 7u;
-    uint i    = gl_WorkGroupID.x * OUTS + (t >> 3);
+    uint lane = t % LANES;
+    uint i    = gl_WorkGroupID.x * OUTS + t / LANES;
 
 #if defined(Q6K)
     uint rowBytes = (((p.ffn >> 8) * 210u) + 3u) & ~3u;
