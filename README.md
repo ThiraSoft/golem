@@ -149,11 +149,14 @@ no longer scales with how many experts it has, and what bounds it becomes host
 memory instead — sixteen gibibytes of addressable system memory here. The speeds
 are the table further down, which measures all of this on one continuation.
 
-**What has not been done is run a mixture that genuinely does not fit.** The 26B
-A4B is the only one on this machine and it fits either way, so what is shown
-above is the mechanism and the footprint, not the consequence. Whether a model
-three times its size loads and answers is the next thing to find out, and it is
-not claimed here.
+**What has not been done is run a mixture whose pool does not fit either.** The
+26B A4B is the only mixture on this machine, and the ceiling it would have to
+cross is the sixteen gibibytes of system memory the card can address, against
+its own 12.85 GB of experts — so a mixture a fifth larger already fails, and past
+that the source is the mapped file and the rate is the disk's. None of that has
+been run, and none of it is claimed. What *is* shown is that the card stops
+being the limit: the cache sizes below hold as little as 1.6 GB of a 12.85 GB
+pool and answer the same tokens.
 
 That arrangement is the floor for speed — every expert read across the bus,
 nothing cached — and the bus is what binds it: this card sits behind a switch and
