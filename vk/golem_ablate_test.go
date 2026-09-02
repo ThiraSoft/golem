@@ -45,12 +45,23 @@ func buildGolemLanes(tb testing.TB, kbits, ablate, bfe, lanes int) []byte {
 
 // buildGolemPhased is buildGolemLanes with the decode split into phases.
 func buildGolemPhased(tb testing.TB, kbits, ablate, bfe, lanes, phased int) []byte {
+	return buildGolemNarrow(tb, kbits, ablate, bfe, lanes, phased, 0)
+}
+
+// buildGolemNarrow is buildGolemPhased with the table held sixteen bits wide.
+func buildGolemNarrow(tb testing.TB, kbits, ablate, bfe, lanes, phased, narrow int) []byte {
+	return buildGolemAll(tb, kbits, ablate, bfe, lanes, phased, narrow, 0)
+}
+
+// buildGolemAll is every switch the kernel has, for the probes that price them.
+func buildGolemAll(tb testing.TB, kbits, ablate, bfe, lanes, phased, narrow, perm int) []byte {
 	tb.Helper()
 	dir := tb.TempDir()
 	out := filepath.Join(dir, "a.spv")
 	cmd := exec.Command("glslc", "-O",
 		"-DKBITS="+itoa(kbits), "-DABLATE="+itoa(ablate), "-DBFE="+itoa(bfe),
 		"-DLANES_PER_ROW="+itoa(lanes), "-DPHASED="+itoa(phased),
+		"-DNARROW="+itoa(narrow), "-DPERM="+itoa(perm),
 		"--target-env=vulkan1.1", "-fshader-stage=compute",
 		"shaders/matvec_t4g.comp", "-o", out)
 	if b, err := cmd.CombinedOutput(); err != nil {

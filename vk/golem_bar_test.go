@@ -133,15 +133,16 @@ func TestGolemAgainstQ40(t *testing.T) {
 		shape  GolemShape
 		lanes  int
 		phased int
+		narrow int
 	}{
-		{"T4G hash", GolemShape{Threads: 256, Table: false, Prefetch: true}, 8, 0},
-		{"T4G lanes16", GolemShape{Threads: 256, Table: true, Prefetch: true}, 16, 0},
-		{"T4G phased", GolemShape{Threads: 256, Table: true, Prefetch: true}, 8, 1},
-		{"T4G phased/128", GolemShape{Threads: 128, Table: true, Prefetch: true}, 8, 1},
+		{"T4G hash", GolemShape{Threads: 256, Table: false, Prefetch: true}, 8, 0, 0},
+		{"T4G phased", GolemShape{Threads: 256, Table: true, Prefetch: true}, 8, 1, 0},
+		{"T4G narrow", GolemShape{Threads: 256, Table: true, Prefetch: true}, 8, 0, 1},
+		{"T4G perm", GolemShape{Threads: 256, Table: true, Prefetch: true}, 8, 0, 0},
 	} {
 		data := make([]byte, rows*(nn.Matrix{Quant: nn.T4G, Cols: cols}).RowBytes())
 		r.Read(data)
-		pipe, err := d.NewPipelineSpec(buildGolemPhased(t, 4, 0, 1, alt.lanes, alt.phased), 4,
+		pipe, err := d.NewPipelineSpec(buildGolemAll(t, 4, 0, 1, alt.lanes, alt.phased, alt.narrow, map[string]int{"T4G perm": 1}[alt.name]), 4,
 			uint32(unsafe.Sizeof(golemPush{})), alt.shape.Spec())
 		if err != nil {
 			t.Fatal(err)

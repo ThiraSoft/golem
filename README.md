@@ -200,6 +200,28 @@ head, which is worth more bits than the layers before it. A three-bit file carri
 a four-bit head by default, so the 1.57 GiB above is 3.35 bits a weight overall,
 not 3.25.
 
+**What it costs is speed, and it is not a small cost.** A `.golem` file is
+smaller and closer to the original than a K-quant of the same size, and it
+generates more slowly than either. Qwen3-4B on an RX 9070 XT, same card, greedy:
+
+| | size | tokens a second |
+| --- | ---: | ---: |
+| llama.cpp Q3_K_M | 1.93 GiB | 135.1 |
+| llama.cpp Q4_K_M | 2.32 GiB | 128.7 |
+| golem Q4_0 | 2.11 GiB | 103.2 |
+| **golem `.golem` T4G** | **1.96 GiB** | **69.4** |
+| **golem `.golem` T3G** | **1.57 GiB** | **71.0** |
+
+The reason is the codebook and it does not go away with tuning: a trellis weight
+is decoded one at a time out of twelve bits of state, where a nibble format
+decodes eight per instruction. About half of the trellis mat-vec is that decode.
+[`compress/README.md`](compress/README.md) has the measurements, the thirteen
+things that were tried to close it and the eleven that made it worse.
+
+So the trade is memory for speed, and it is worth taking when memory is what is
+short — a model that fits the card at T3G and does not at Q4_K_M generates
+infinitely faster than one that does not fit — and not otherwise.
+
 ```bash
 go build ./cmd/golemquant
 ./golemquant -model Qwen3-4B-BF16.gguf -out Qwen3-4B.golem -bits 3 -calib wiki.txt

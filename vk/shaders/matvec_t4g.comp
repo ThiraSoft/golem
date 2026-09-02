@@ -1,6 +1,8 @@
 #version 450
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_control_flow_attributes : enable
 
 // y = W * x for a T4G matrix against float activations.
@@ -123,6 +125,28 @@
 #define PHASED 0
 #endif
 
+// NARROW holds the table as sixteen-bit integers instead of floats: eight
+// kibibytes instead of sixteen, at the cost of a convert and a multiply a
+// weight. It is exact and not an approximation — the value is (sum - 510)
+// scaled, and sum runs 0 to 1020, so the integer is [-510, 510] and float32
+// represents it and the subtraction exactly either way.
+//
+// The point is the shared memory and not the bytes: a workgroup's sixteen
+// kibibytes is what decides how many workgroups a WGP holds, so halving it may
+// buy occupancy worth more than the two instructions it costs. May: measure it
+// with vk/golem_bar_test.go before believing it.
+#ifndef NARROW
+#define NARROW 0
+#endif
+
+// PERM reaches for the card's byte permutation to reverse a stream word,
+// through the only spelling GLSL has for it. The swap runs SD+1 times a block
+// and costs about seven instructions each way it is written here, so it is
+// worth a per cent or two at most — measure it, do not assume it.
+#ifndef PERM
+#define PERM 0
+#endif
+
 // COPIES is how many copies of the table shared memory holds, one per bank
 // group. A weight's index into it is twelve pseudo-random bits, so the lanes of
 // a wave want scattered banks and the read serializes on whichever bank two of
@@ -214,7 +238,15 @@ const uint SD = ((BLOCK - 1u) * KBITS + 12u + 31u) / 32u;
 // the alternative is cutting the windows out of little-endian words, where the
 // offsets stop being constants of the unrolled loop.
 uint bswap(uint v) {
+#if PERM
+    // The byte permutation the card has, reached the only way GLSL reaches it.
+    // unpackUnorm4x8 divides each byte by 255 and packUnorm4x8 rounds it back,
+    // so the round trip is the identity on every byte — and the exactness tests
+    // are what says so rather than this comment.
+    return packUnorm4x8(unpackUnorm4x8(v).wzyx);
+#else
     return (v >> 24u) | ((v >> 8u) & 0xFF00u) | ((v << 8u) & 0xFF0000u) | (v << 24u);
+#endif
 }
 
 // The 1MAD code of nn/t4g.go. It has to be these constants and this arithmetic:
@@ -228,6 +260,13 @@ uint bswap(uint v) {
 // v_dot4_u32_u8 in place of three shifts, three masks and three adds.
 //
 // It runs 4096 times a workgroup and not once a weight: see ldsValues below.
+// t4gSum is the byte sum the value is scaled from, which NARROW stores instead
+// of the value.
+uint t4gSum(uint s) {
+    uint v = (((519u * s) & 0xFFFFu) << 16u) + (25297u * s + 76625530u);
+    return uint(dotPacked4x8EXT(v, 0x01010101u));
+}
+
 float t4gHash(uint s) {
     // 34038481 = 519·65536 + 25297, and both halves fit the twenty-four bits a
     // v_mul_u32_u24 takes — where the constant itself needs twenty-six and
@@ -261,7 +300,11 @@ float t4gHash(uint s) {
 // The format still has no codebook. Nothing in a file points into this, nothing
 // in it depends on the model, and it is built by the same arithmetic
 // nn.T4GValue uses rather than by a second copy of it.
+#if NARROW
+shared int16_t ldsValues[LDS_SIZE];
+#else
 shared float ldsValues[LDS_SIZE];
+#endif
 
 // seqOf is the byte a block's stream starts at. A half is a whole number of
 // bytes in every tier, which is why the block is 64 and not something the step
@@ -280,7 +323,11 @@ void readRaw(uint seqAt, out uint raw[SD + 1u]) {
 void main() {
     if (TABLE != 0) {
         for (uint i = gl_LocalInvocationID.x; i < LDS_SIZE; i += gl_WorkGroupSize.x) {
+#if NARROW
+            ldsValues[i] = int16_t(t4gSum(i & 0xFFFu)) - int16_t(510);
+#else
             ldsValues[i] = t4gHash(i & 0xFFFu);
+#endif
         }
     }
     barrier();
@@ -353,7 +400,13 @@ void main() {
             // Then every value, so that eight reads are in flight at once.
             float wv[8];
             [[unroll]] for (uint j = 0u; j < 8u; j++) {
+#if NARROW
+                wv[j] = TABLE != 0
+                    ? float(int(ldsValues[copy + vv[j]])) * 0.00676589971 * step
+                    : t4gHash(vv[j]) * step;
+#else
                 wv[j] = (TABLE != 0 ? ldsValues[copy + vv[j]] : t4gHash(vv[j])) * step;
+#endif
             }
             [[unroll]] for (uint j = 0u; j < 8u; j++) {
                 [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
@@ -394,12 +447,22 @@ void main() {
             // dependent adds is a longer critical path than the multiply-add
             // it is meant to be cheaper than, and a floor that measures slower
             // than the kernel above it is not a floor.
+#if NARROW
+            bare[i & 3u] += float(int(ldsValues[copy + v]));
+#else
             bare[i & 3u] += ldsValues[copy + v];
+#endif
 #else
 #if ABLATE == 1
             float wv = float(v) * step;
 #else
+#if NARROW
+            float wv = TABLE != 0
+                ? float(int(ldsValues[copy + v])) * 0.00676589971 * step
+                : t4gHash(v) * step;
+#else
             float wv = (TABLE != 0 ? ldsValues[copy + v] : t4gHash(v)) * step;
+#endif
 #endif
             [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
 #if ABLATE == 3

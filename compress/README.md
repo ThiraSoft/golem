@@ -541,7 +541,7 @@ process, the order rotating, fastest of twenty rounds, 9728 by 2560, one column.
 
 | | microseconds | of the bar |
 |---|---|---|
-| **Q4_0 against Q8_0, integer dot product** | **27.2 – 27.4** | 1.00 |
+| **Q4_0 against Q8_0, integer dot product** | **27.2 – 36.6** | 1.00 |
 | Q4_0 against float activations | 34.7 – 34.9 | 1.27 |
 | **T4G with nothing but the window and the table** | **44.6 – 46.4** | 1.67 |
 | T4G | 48.4 – 49.1 | 1.78 |
@@ -568,11 +568,18 @@ repeats.
 |---|---|
 | the table in a buffer on the card instead of shared memory | **+54 %**, a wave's lanes want sixty-four addresses |
 | two copies of the table, one per group of lanes, against bank conflicts | **+15 %**; four copies, +80 %. Occupancy costs more than the conflicts |
+| the table sixteen bits wide, eight kibibytes instead of sixteen | **+16 %**, so shared memory is not what caps the occupancy either |
 | hashing every weight instead of reading the table | **+32 %** |
 | four, sixteen or thirty-two lanes to a row instead of eight | **+11 %, +14 %, +34 %** |
 | decoding in phases — eight windows, then eight table reads, then eight adds | **+10 %**; ACO was already scheduling it better |
+| the byte swap through `packUnorm4x8(unpackUnorm4x8(v).wzyx)`, to reach the card's own byte permutation | **+28 %**; the round trip goes through float conversions |
 | the step scaled once a block instead of once a weight | nothing at one column, worse at eight |
 | splitting the 1MAD multiply into two 24-bit ones | nothing; ACO folds the shift back |
+
+Three of those were somebody's confident hypothesis about what the kernel was
+short of — bank conflicts, shared memory, the dependency chain — and all three
+were wrong. The kernel is short of none of them: it is short of the fact that
+one weight comes out of twelve bits of state, one at a time.
 
 The phased row is the one to read twice. The ISA puts 2.4 `s_delay_alu` slots
 beside the five instructions a weight costs, which says the kernel waits on a
@@ -580,6 +587,27 @@ chain — stream word, window, shared read, multiply, add — rather than on
 throughput. Doing eight of each in turn is the obvious answer and it is ten per
 cent slower, because the eight live values cost more in registers than the chain
 costs in stalls.
+
+### And the bar outside this repository
+
+Everything above compares golem's trellis kernel against golem's own Q4_0 one.
+The question the format has to answer is against llama.cpp, which is what a
+reader would run instead. Same card, `llama-bench -n 128 -r 3`, Qwen3-4B:
+
+| | tokens a second |
+|---|---|
+| llama.cpp Q3_K_M | 135.1 |
+| llama.cpp Q4_0 | 134.9 |
+| llama.cpp Q4_K_M | 128.7 |
+| golem Q4_0 | 103.2 |
+| **golem `.golem` T3G** | **71.0** |
+| **golem `.golem` T4G** | **69.4** |
+
+Two gaps and they are different gaps. golem's own Q4_0 path is 0.76 of
+llama.cpp's, which is this engine against that one and is measured elsewhere in
+the top-level README. The trellis is 0.69 of golem's Q4_0, which is this
+document's subject, and the section above says why: about half the kernel is
+decode that a nibble does not pay.
 
 So the trellis costs somewhere between 1.5 and 1.8 times a nibble's product on
 this card — the ratio itself moves with the card's clock state, because Q4_0's
