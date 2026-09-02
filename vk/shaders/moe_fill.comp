@@ -1,0 +1,42 @@
+#version 450
+
+// One expert out of the pool and into the slot the admission gave it.
+//
+// The pool is system memory the card addresses and the cache is device memory,
+// so this is the bus, and it is the only thing in a token that crosses it. It
+// costs nothing over reading the pool where it lies — the same bytes cross
+// either way — and it buys every later token that wants the same expert, which
+// then reads device memory instead.
+//
+// The dispatch is sized for every fetch the list could hold, because a program
+// recorded once cannot ask how many there turned out to be. `groups` workgroups
+// share one expert; the ones past the count leave without reading anything.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer SRC { uint src[];   };  // the pool, by expert
+layout(std430, binding = 1) buffer          DST { uint dst[];   };  // the cache, by slot
+layout(std430, binding = 2) readonly buffer FL  { int  fills[]; };  // a count, then pairs
+
+layout(push_constant) uniform Push {
+    uint words;   // thirty-two-bit words in one expert
+    uint groups;  // workgroups sharing one of them
+} p;
+
+void main() {
+    uint fetch = gl_WorkGroupID.x / p.groups;
+    if (fetch >= uint(fills[0])) return;
+
+    uint expert = uint(fills[1 + 2 * fetch]);
+    uint slot    = uint(fills[2 + 2 * fetch]);
+    uint from = expert * p.words;
+    uint into = slot * p.words;
+
+    // The workgroup's share of the expert, strided so that the lanes of one
+    // step read consecutive words.
+    uint lanes = gl_WorkGroupSize.x * p.groups;
+    uint first = (gl_WorkGroupID.x % p.groups) * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    for (uint w = first; w < p.words; w += lanes) {
+        dst[into + w] = src[from + w];
+    }
+}

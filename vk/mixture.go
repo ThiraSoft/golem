@@ -241,9 +241,13 @@ type Mixture struct {
 	// idProduct is shaders/matmul.comp (or matmul_coop.comp) built with BYID.
 	idProduct          *Pipeline
 	scatter, idCombine *Pipeline
-	scatterSet         *Set
-	combineSet         *Set
-	counts, pairs      *Buffer
+	// admit and fill are the cache's two kernels, built only when there is a
+	// cache. slots is how many experts of one block the card keeps.
+	admit, fill   *Pipeline
+	slots         int
+	scatterSet    *Set
+	combineSet    *Set
+	counts, pairs *Buffer
 	// plan is the grid the by-expert product is dispatched against: one entry
 	// per expert and stretch of idProductBN that has work, written by the
 	// scatter beside the counts because only the card knows how many there
@@ -299,7 +303,22 @@ type mixtureBlock struct {
 	setDenseProd           *Set // the gate and up through the tiled product, for a wide pass
 	setDenseDnParts        *Set // the same, writing the slices of a split product
 	setIDProd, setIDDown   *Set // the expert branch read by expert, for a prompt
+
+	// The cache, when the experts live in host memory and a slice of the card
+	// is kept for the ones a token keeps asking for. cacheGateUp and cacheDown
+	// hold `slots` experts each; table is where they are and when each was last
+	// wanted; fills is what the admission decided has to be fetched. All nil
+	// when the experts are resident, which is every model that fits.
+	cacheGateUp, cacheDown *Buffer
+	table, fills           *Buffer
+	setAdmit               *Set
+	setFillUp, setFillDown *Set
 }
+
+// fillGroups is how many workgroups share one expert in a fetch. One expert of
+// the 26B A4B is 3.3 MB — eight hundred thousand words — and a workgroup of two
+// hundred and fifty-six lanes would walk it in three thousand steps on its own.
+const fillGroups = 32
 
 // moePush is what all three kernels take. matvec.comp reads the first three
 // fields and ignores the activation, which is spent before it runs.
@@ -387,7 +406,22 @@ const byExpertFrom = 32
 //
 // A cache of hot experts in device memory is what climbs back up that table, and
 // it is not here yet.
-func expertsInHost() bool { return os.Getenv("GOLEM_MOE_EXPERTS_HOST") != "" }
+func expertsInHost() bool { return os.Getenv("GOLEM_MOE_EXPERTS_HOST") != "" || cacheSlots() > 0 }
+
+// cacheSlots is how many of a block's experts the card keeps a copy of, from
+// GOLEM_MOE_CACHE_SLOTS, or zero for no cache at all.
+//
+// It implies the pool is in host memory, because a cache of a stack that is
+// already resident is a copy of it. On the 26B A4B one expert is 3.35 MB and a
+// block has a hundred and twenty-eight, so forty slots a block is 5.1 GB over
+// thirty blocks — the share gemma/expert_cache_test.go measures at 91.9 %.
+func cacheSlots() int {
+	n, err := strconv.Atoi(os.Getenv("GOLEM_MOE_CACHE_SLOTS"))
+	if err != nil || n < 1 {
+		return 0
+	}
+	return n
+}
 
 // byExpertWidth is that, with the environment's override if there is one.
 func byExpertWidth() int {
@@ -479,7 +513,29 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 	}
 	coop := d.Coopmat()
 	m := &Mixture{d: d, dim: dim, ffn: ffn, dense: dense, experts: experts, act: act, coop: coop,
-		byExpertFrom: byExpertWidth()}
+		byExpertFrom: byExpertWidth(), slots: cacheSlots()}
+	if m.slots > experts {
+		// A cache larger than the pool is the pool, and the eviction has
+		// nothing to choose between.
+		m.slots = experts
+	}
+	if m.slots > 0 && expertsUsed > 0 {
+		// **A pass may not want more experts than the cache holds.** The
+		// admission runs once for the whole pass and the products then run a
+		// column at a time, so a later column that evicted an earlier column's
+		// slot would leave that column reading somebody else's weights — a
+		// wrong answer, not a slow one. Below this width every column's experts
+		// are still there when its product runs; at or above it the pass goes
+		// by expert instead, out of the pool, which is what a prompt wanted
+		// anyway.
+		if w := m.slots / expertsUsed; w < m.byExpertFrom {
+			m.byExpertFrom = w
+		}
+		if m.byExpertFrom < 1 {
+			m.Close()
+			return nil, fmt.Errorf("vk: a cache of %d slots cannot hold the %d experts one column routes to", m.slots, expertsUsed)
+		}
+	}
 
 	push := uint32(unsafe.Sizeof(moePush{}))
 	var err error
@@ -534,6 +590,18 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		{&m.gateUp, 32, moeGateUpWidestSPIRV},
 	} {
 		if err := (*spec.pipe).Wide(spec.columns, spec.spirv); err != nil {
+			m.Close()
+			return nil, err
+		}
+	}
+	// The cache's two kernels, when there is a cache. They take their own push
+	// constants, which is why they are not in the table above.
+	if m.slots > 0 && experts > 0 {
+		if m.admit, err = d.NewPipeline(moeAdmitSPIRV, 3, uint32(unsafe.Sizeof(admitPush{}))); err != nil {
+			m.Close()
+			return nil, err
+		}
+		if m.fill, err = d.NewPipeline(moeFillSPIRV, 3, uint32(unsafe.Sizeof(fillPush{}))); err != nil {
 			m.Close()
 			return nil, err
 		}
@@ -770,6 +838,32 @@ func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, dow
 		if b.down, err = hold(splitQ4_0(downExps, m.experts*m.dim, m.ffn)); err != nil {
 			return fail(err)
 		}
+		if m.slots > 0 {
+			// The slice of the card this block keeps. One expert's size is the
+			// pool's divided by the experts in it — the split layout is by
+			// expert and contiguous, which is what lets a fetch be one range.
+			for _, spec := range []struct {
+				into **Buffer
+				pool *Buffer
+			}{{&b.cacheGateUp, b.gateUp}, {&b.cacheDown, b.down}} {
+				if *spec.into, err = m.d.Local(spec.pool.Size()/m.experts*m.slots, bufferUsageStorage); err != nil {
+					return fail(err)
+				}
+			}
+			// Where every expert is (nowhere, to start), what every slot holds
+			// (nothing), when each was last wanted, and the clock. See
+			// shaders/moe_admit.comp for the layout.
+			table := make([]int32, m.experts+2*m.slots+1)
+			for i := 0; i < m.experts+m.slots; i++ {
+				table[i] = -1
+			}
+			if b.table, err = m.d.Upload(asBytesInt32(table)); err != nil {
+				return fail(err)
+			}
+			if b.fills, err = m.d.Upload(make([]byte, (1+2*expertsUsed*maxColumns)*4)); err != nil {
+				return fail(err)
+			}
+		}
 	}
 	// The shared branch's gate and up, one after the other, which is the
 	// layout the mixture's own stack already has. They are joined before the
@@ -822,14 +916,30 @@ func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, dow
 			[]*Buffer{b.denseDown, m.daq, m.das, m.doutParts}})
 	}
 	if m.experts > 0 {
+		// The by-column path reads the cache when there is one and the pool
+		// when there is not; the by-expert path always reads the pool, because
+		// a prompt wants every expert of a block and a cache of a few dozen has
+		// nothing to offer it. The two paths already had their own sets, so
+		// this is a binding and not a branch.
+		up, down := b.gateUp, b.down
+		if b.cacheGateUp != nil {
+			up, down = b.cacheGateUp, b.cacheDown
+		}
 		sets = append(sets,
-			setSpec{&b.setGateUp, m.gateUp, []*Buffer{b.gateUp, m.xq, m.xs, m.ids, m.gelu, m.aq, m.as}},
-			setSpec{&b.setDown, m.down, []*Buffer{b.down, m.aq, m.as, m.ids, m.cw, m.out}},
+			setSpec{&b.setGateUp, m.gateUp, []*Buffer{up, m.xq, m.xs, m.ids, m.gelu, m.aq, m.as}},
+			setSpec{&b.setDown, m.down, []*Buffer{down, m.aq, m.as, m.ids, m.cw, m.out}},
 			setSpec{&b.setIDProd, m.idProduct,
 				[]*Buffer{b.gateUp, m.xq, m.xs, m.gateOut, m.counts, m.pairs, m.plan}},
 			setSpec{&b.setIDDown, m.idProduct,
 				[]*Buffer{b.down, m.aq, m.as, m.dpart, m.counts, m.pairs, m.plan}},
 		)
+		if b.cacheGateUp != nil {
+			sets = append(sets,
+				setSpec{&b.setAdmit, m.admit, []*Buffer{m.ids, b.table, b.fills}},
+				setSpec{&b.setFillUp, m.fill, []*Buffer{b.gateUp, b.cacheGateUp, b.fills}},
+				setSpec{&b.setFillDown, m.fill, []*Buffer{b.down, b.cacheDown, b.fills}},
+			)
+		}
 	}
 	for _, spec := range sets {
 		if *spec.into, err = spec.pipe.NewSet(spec.bufs); err != nil {
@@ -962,6 +1072,29 @@ func (m *Mixture) Record(r *Recorder, block, columns int, sharedUp, sharedDown b
 		r.DispatchColumns(m.idActSet, uint32((m.ffn+255)/256), uint32(columns*expertsUsed), unsafe.Pointer(&act))
 		m.mark(r, "moe expert act")
 	} else if m.experts > 0 {
+		// The cache, when there is one: the identifiers the pick wrote become
+		// slots, and whatever is missing is fetched from the pool before either
+		// product reads it. Both kernels are inside the same recording as
+		// everything else — the routing is on the card and nothing here asks
+		// the host anything.
+		if b.setAdmit != nil {
+			ad := admitPush{Experts: uint32(m.experts), Slots: uint32(m.slots),
+				Used: expertsUsed, Columns: uint32(columns)}
+			r.Dispatch(b.setAdmit, 1, unsafe.Pointer(&ad))
+			r.Barrier()
+			for _, spec := range []struct {
+				set   *Set
+				words uint32
+			}{
+				{b.setFillUp, uint32(b.cacheGateUp.Size()/m.slots) / 4},
+				{b.setFillDown, uint32(b.cacheDown.Size()/m.slots) / 4},
+			} {
+				fp := fillPush{Words: spec.words, Groups: fillGroups}
+				r.Dispatch(spec.set, uint32(expertsUsed*columns)*fillGroups, unsafe.Pointer(&fp))
+			}
+			r.Barrier()
+			m.tl.Stamp(r, "moe fetch")
+		}
 		// A dispatch a column, each reading that column's own eight matrices.
 		// The columns write disjoint rows of the intermediate, so nothing
 		// between them has to wait.
@@ -1098,7 +1231,7 @@ func (m *Mixture) Close() {
 	}
 	for _, p := range []**Pipeline{
 		&m.denseDown, &m.down, &m.gateUp, &m.activate, &m.idActivate, &m.reduce,
-		&m.idProduct, &m.scatter, &m.idCombine,
+		&m.idProduct, &m.scatter, &m.idCombine, &m.admit, &m.fill,
 	} {
 		if *p != nil {
 			(*p).Close()
@@ -1111,13 +1244,15 @@ func (b *mixtureBlock) close() {
 	for _, s := range []**Set{
 		&b.setDenseDn, &b.setDenseDnParts, &b.setDenseUp, &b.setDenseProd,
 		&b.setDown, &b.setGateUp, &b.setIDProd, &b.setIDDown,
+		&b.setAdmit, &b.setFillUp, &b.setFillDown,
 	} {
 		if *s != nil {
 			(*s).Close()
 			*s = nil
 		}
 	}
-	for _, x := range []**Buffer{&b.denseDown, &b.denseGateUp, &b.down, &b.gateUp} {
+	for _, x := range []**Buffer{&b.cacheGateUp, &b.cacheDown, &b.table, &b.fills,
+		&b.denseDown, &b.denseGateUp, &b.down, &b.gateUp} {
 		if *x != nil {
 			(*x).Close()
 			*x = nil
@@ -1349,6 +1484,14 @@ func splitQ4_1(src []byte, rows, cols int) []byte {
 }
 
 // asBytes views a float slice as the bytes behind it, for an upload.
+// asBytesInt32 is a slice of signed words as the bytes behind them.
+func asBytesInt32(v []int32) []byte {
+	if len(v) == 0 {
+		return nil
+	}
+	return unsafe.Slice((*byte)(unsafe.Pointer(&v[0])), len(v)*4)
+}
+
 func asBytes(f []float32) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(&f[0])), len(f)*4)
 }

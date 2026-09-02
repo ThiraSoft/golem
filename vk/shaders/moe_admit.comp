@@ -1,0 +1,80 @@
+#version 450
+
+// An expert's identifier in, the place a copy of it lives out.
+//
+// A cache means the two expert kernels can no longer read `id * stride`:
+// expert one hundred and fourteen is in whichever slot it was given. Teaching
+// them about residency would put a branch in the hottest kernel in the engine
+// and a second weight buffer beside it, for a question that has one answer per
+// expert and not one per weight. So the identifiers are rewritten here instead,
+// in place, between the pick and the product — and moe_gateup.comp and
+// moe_down.comp read a slot where they used to read an identifier, which is the
+// same instruction.
+//
+// It also says what has to be fetched. A miss takes the slot whose expert went
+// longest unwanted and goes on a list shaders/moe_fill.comp reads.
+//
+// One workgroup, one lane. There are eight identifiers in a token and a few
+// dozen slots to search for a victim: a few hundred comparisons, against a
+// block whose two products are forty-seven million. Spreading it would cost
+// more in barriers than it saves, and the order matters — an expert admitted by
+// the first identifier has to be a hit for the third.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer ID { int ids[];   };
+layout(std430, binding = 1) buffer TB { int table[]; };
+layout(std430, binding = 2) buffer FL { int fills[]; };
+
+layout(push_constant) uniform Push {
+    uint experts;
+    uint slots;
+    uint used;
+    uint columns;
+} p;
+
+// The table is one allocation and four things, because a descriptor is a scarce
+// thing and these are read together:
+//
+//   [0, experts)                    where each expert is, or -1
+//   [experts, experts+slots)        what each slot holds, or -1
+//   [experts+slots, experts+2slots) when each slot was last wanted
+//   [experts+2slots]                the clock those answers are in
+#define WHERE(e)  table[uint(e)]
+#define HOLDS(s)  table[p.experts + uint(s)]
+#define WANTED(s) table[p.experts + p.slots + uint(s)]
+#define CLOCK     table[p.experts + 2u * p.slots]
+
+void main() {
+    if (gl_LocalInvocationID.x != 0u) return;
+
+    uint n = p.used * p.columns;
+    int fetches = 0;
+    for (uint i = 0u; i < n; i++) {
+        int e = ids[i];
+        int s = WHERE(e);
+        if (s < 0) {
+            // The slot wanted longest ago. An empty slot is wanted at nought
+            // and so is taken before any occupied one, and a tie goes to the
+            // lower slot, which makes a cold cache fill in order.
+            int victim = 0;
+            int oldest = WANTED(0);
+            for (uint k = 1u; k < p.slots; k++) {
+                int when = WANTED(k);
+                if (when < oldest) { oldest = when; victim = int(k); }
+            }
+            int had = HOLDS(victim);
+            if (had >= 0) WHERE(had) = -1;
+            HOLDS(victim) = e;
+            WHERE(e) = victim;
+            fills[1 + 2 * fetches] = e;
+            fills[2 + 2 * fetches] = victim;
+            fetches++;
+            s = victim;
+        }
+        CLOCK = CLOCK + 1;
+        WANTED(s) = CLOCK;
+        ids[i] = s;
+    }
+    fills[0] = fetches;
+}
