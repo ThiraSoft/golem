@@ -93,6 +93,10 @@ void main() {
     // A Q4_1 row after splitQ4_1 is its scale-and-minimum pairs, one word a
     // block, and then its nibbles, four words a block.
     uint rowWords = nsub * 5u;
+#elif defined(Q4K)
+    // A Q4_K row after splitQ4_K is the file's own count — thirty-six words a
+    // superblock — with the header moved to the front of the row.
+    uint rowWords = nsup * 36u;
 #else
     uint rowWords = nsup * 44u;  // a Q5_K superblock is forty-four
 #endif
@@ -137,6 +141,48 @@ void main() {
                 uint q = w[qs + l];
                 sw[sr * uint(WSTRIDE) + si * 8u + l]      =  q         & 0x0F0F0F0Fu;
                 sw[sr * uint(WSTRIDE) + si * 8u + 4u + l] = (q >> 4u)  & 0x0F0F0F0Fu;
+            }
+        }
+#elif defined(Q4K)
+        // The weights. Layout A of vk/mixture.go's splitQ4_K puts a block's
+        // sixteen bytes of nibbles contiguous, so a thread takes one row and
+        // one whole block as it does for Q4_1. What it does not have is a scale
+        // of its own: the eight threads staging a row of this superblock read
+        // the same four words of header and each unpacks the six bits that
+        // belong to it.
+        for (uint e = t; e < uint(BM) * 8u; e += uint(THREADS)) {
+            uint sr = e >> 3;
+            uint si = e & 7u;
+            uint srow = row0 + sr;
+            uint blk  = sup * 8u + si;
+            if (srow >= p.dim) {
+                sd[sr * 8u + si] = 0.0;
+                sm[sr * 8u + si] = 0.0;
+                [[unroll]] for (uint u = 0u; u < 8u; u++) sw[sr * uint(WSTRIDE) + si * 8u + u] = 0u;
+                continue;
+            }
+            uint base = srow * rowWords;
+            uint hb   = base + 4u * sup;
+            vec2 dd = unpackHalf2x16(w[hb]);
+            uint s0 = w[hb + 1u], s1 = w[hb + 2u], s2 = w[hb + 3u];
+            uint sc, mn;
+            if (si < 4u) {
+                sc = (s0 >> (si * 8u)) & 63u;
+                mn = (s1 >> (si * 8u)) & 63u;
+            } else {
+                uint j  = si - 4u;
+                uint b2 = (s2 >> (j * 8u)) & 0xFFu;
+                sc = (b2 & 0x0Fu) | ((((s0 >> (j * 8u)) & 0xFFu) >> 6u) << 4u);
+                mn = (b2 >> 4u)   | ((((s1 >> (j * 8u)) & 0xFFu) >> 6u) << 4u);
+            }
+            sd[sr * 8u + si] = dd.x * float(sc);
+            sm[sr * 8u + si] = dd.y * float(mn);
+
+            uint qs = base + (nsub >> 1) + blk * 4u;
+            [[unroll]] for (uint l = 0u; l < 4u; l++) {
+                uint q = w[qs + l];
+                sw[sr * uint(WSTRIDE) + si * 8u + l]      =  q        & 0x0F0F0F0Fu;
+                sw[sr * uint(WSTRIDE) + si * 8u + 4u + l] = (q >> 4u) & 0x0F0F0F0Fu;
             }
         }
 #else

@@ -40,11 +40,10 @@ type ssmGatePush struct {
 	Eps   float32
 }
 
-//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q4k.comp -o shaders/matvec_q4k.spv
-
-//go:embed shaders/matvec_q4k.spv
-var matvecQ4KSPIRV []byte
-
+// The two K-quant mat-vecs the delta net's output projection may need. Both
+// are declared with the rest of the mat-vecs in vk/qwen_pipeline.go, which is
+// where they are built and dispatched; this file only reaches for them.
+//
 //go:embed shaders/matvec_q5k.spv
 var matvecQ5KSPIRV []byte
 
@@ -172,7 +171,16 @@ func NewSSMBlock(
 		return nil, err
 	}
 
-	if b.wOut, err = d.Upload(wOutData); err != nil {
+	// Both K-quant mat-vecs read a packing and not the file: splitQ5_K makes a
+	// block stand alone, splitQ4_K moves the superblock's header to the front
+	// of the row. Uploading the file's bytes gives a kernel that reads a scale
+	// where a nibble is.
+	if outIsQ5K {
+		b.wOut, err = d.Upload(splitQ5_K(wOutData, 5120, 6144))
+	} else {
+		b.wOut, err = d.Upload(splitQ4_K(wOutData, 5120, 6144))
+	}
+	if err != nil {
 		return nil, err
 	}
 

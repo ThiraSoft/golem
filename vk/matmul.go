@@ -191,15 +191,43 @@ type MatMul struct {
 // NewMatMul uploads a Q4_0 matrix in the file's own layout and binds the tiled
 // product to it, for passes of the given width.
 func NewMatMul(d *Device, data []byte, rows, cols, columns int, coop bool) (*MatMul, error) {
+	return NewMatMulQuant(d, data, rows, cols, columns, coop, nn.Q4_0)
+}
+
+// NewMatMulQuant is NewMatMul for a weight format other than Q4_0.
+//
+// It exists so that the K-quant tiled products have a caller outside a whole
+// pipeline: the packing, the geometry and the dispatch are the same three
+// things whichever format the weights are in, and the one that is not — the
+// staging — is exactly what a correctness test has to reach. Q4_K is built for
+// the cooperative product alone here, which is what the qwen pipeline binds.
+func NewMatMulQuant(d *Device, data []byte, rows, cols, columns int, coop bool, q nn.Quant) (*MatMul, error) {
 	if cols%nn.QuantBlock != 0 {
-		return nil, fmt.Errorf("vk: a Q4_0 row needs a multiple of %d columns, given %d", nn.QuantBlock, cols)
+		return nil, fmt.Errorf("vk: a quantized row needs a multiple of %d columns, given %d", nn.QuantBlock, cols)
 	}
-	if want := rows * rowBytesQ4_0(cols); len(data) != want {
+	rowBytes, relayout := rowBytesQ4_0, splitQ4_0
+	switch q {
+	case nn.Q4_0:
+	case nn.Q4_K:
+		if cols%nn.SuperBlock != 0 {
+			return nil, fmt.Errorf("vk: a Q4_K row needs a multiple of %d columns, given %d", nn.SuperBlock, cols)
+		}
+		rowBytes, relayout = rowBytesQ4_K, splitQ4_K
+	default:
+		return nil, fmt.Errorf("vk: the tiled product has no staging for %s", q)
+	}
+	if want := rows * rowBytes(cols); len(data) != want {
 		return nil, fmt.Errorf("vk: %d rows of %d columns need %d bytes, given %d", rows, cols, want, len(data))
 	}
-	spirv, err := matmulSPIRV(columns)
-	if err != nil && !coop {
-		return nil, err
+	var spirv []byte
+	var err error
+	if q == nn.Q4_0 {
+		spirv, err = matmulSPIRV(columns)
+		if err != nil && !coop {
+			return nil, err
+		}
+	} else if !coop || !d.Coopmat() {
+		return nil, fmt.Errorf("vk: the %s tiled product is built for the cooperative kernel alone", q)
 	}
 	perGroup, wave := matmulRows, uint32(0)
 	if coop && d.Coopmat() {
@@ -207,7 +235,12 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int, coop bool) (*Mat
 		if rows%coopTile != 0 {
 			return nil, fmt.Errorf("vk: the cooperative product writes %d rows at a time, and %d is not a multiple of it", coopTile, rows)
 		}
-		if spirv, err = matmulCoopSPIRV(columns); err != nil {
+		if q == nn.Q4_K {
+			spirv, err = matmulCoopQ4KSPIRV(columns)
+		} else {
+			spirv, err = matmulCoopSPIRV(columns)
+		}
+		if err != nil {
 			return nil, err
 		}
 		perGroup = matmulCoopRows(columns)
@@ -219,7 +252,7 @@ func NewMatMul(d *Device, data []byte, rows, cols, columns int, coop bool) (*Mat
 	// blocking together are what first put it ahead of the dot products.
 	split := coopSplit(rows, columns, coop)
 	m := &MatMul{d: d, rows: rows, cols: cols, columns: columns, perGroup: perGroup, split: split, coop: coop && d.Coopmat()}
-	layout := splitQ4_0(data, rows, cols)
+	layout := relayout(data, rows, cols)
 	if m.weights, err = d.Upload(layout); err != nil {
 		return nil, err
 	}
@@ -433,6 +466,23 @@ func matmulCoopSPIRV(columns int) ([]byte, error) {
 		return matmulCoop512SPIRV, nil
 	}
 	return nil, fmt.Errorf("vk: the cooperative product is built at 32, 64, 128, 256, 512 columns, not %d", columns)
+}
+
+// matmulCoopQ4KSPIRV is the same kernel under -DQ4K. It starts at sixty-four:
+// thirty-two columns is below where a K-quant prompt pass goes, and the qwen
+// pipeline binds these four widths and no others.
+func matmulCoopQ4KSPIRV(columns int) ([]byte, error) {
+	switch columns {
+	case 64:
+		return matmulCoopQ4K64SPIRV, nil
+	case 128:
+		return matmulCoopQ4K128SPIRV, nil
+	case 256:
+		return matmulCoopQ4K256SPIRV, nil
+	case 512:
+		return matmulCoopQ4K512SPIRV, nil
+	}
+	return nil, fmt.Errorf("vk: the cooperative Q4_K product is built at 64, 128, 256, 512 columns, not %d", columns)
 }
 
 // matmulSPIRV is the binary built for that many columns.

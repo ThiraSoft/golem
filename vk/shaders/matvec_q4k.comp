@@ -2,119 +2,116 @@
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_control_flow_attributes : enable
 
-// MatVec for Q4_K weights (256 weights in 144 bytes = 36 uints) against float32 activation.
-// Workgroup: 128 threads -> 16 output rows, 8 lanes per row.
+// y = W * x for a Q4_K matrix against float activations. Q4_K is most of what
+// a K-quant mix is made of: in the 27B's Q4_K_M it is 11.42 of 15.65 GiB, and
+// every projection of every block except the ones llama.cpp promoted to Q6_K.
+//
+// It reads vk/mixture.go's splitQ4_K and not the file's own superblocks. That
+// packing leaves the sixteen-byte header where the file wrote it — d, dmin and
+// twelve bytes of six-bit scales and minima — and only moves it to the front of
+// the row, then lays the nibbles out sixteen contiguous bytes to a block of
+// thirty-two in Q4_0's order. So this is matvec_q41.comp with the scale and the
+// minimum found rather than read: one indexed load into a header region that a
+// row of four thousand columns keeps under a kilobyte, and five instructions of
+// unpacking.
+//
+// The header is not folded into an fp16 pair a block, which is what splitQ5_K
+// does and what would make this kernel shorter. That costs two bytes a block —
+// eleven percent on a format that is most of the model — and the header of
+// vk/mixture.go's splitQ4_K says why there was nothing to trade.
+//
+// Workgroup: 128 threads -> 16 output rows, 8 lanes per row. COLUMNS is
+// matvec_q40.comp's: how many activations one reading of the weights answers.
+
+#ifndef COLUMNS
+#define COLUMNS 1
+#endif
 
 layout(local_size_x = 128) in;
 
-layout(std430, binding = 0) readonly  buffer W { uint  w[]; }; // Q4_K raw bytes
-layout(std430, binding = 1) readonly  buffer X { float x[]; }; // Float32 activation [inputs]
-layout(std430, binding = 2) writeonly buffer Y { float y[]; }; // Float32 output [outputs]
+layout(std430, binding = 0) readonly  buffer W { uint  w[]; };
+layout(std430, binding = 1) readonly  buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
 
 layout(push_constant) uniform Push {
     uint dim; // outputs
     uint ffn; // inputs
+    uint col; // the first column of the pass this dispatch answers
 } p;
 
 const uint LANES = 8u;
 const uint OUTS  = 16u;
 
+// byteOf is one byte of a word, which is how the six-bit scales are addressed.
+uint byteOf(uint word, uint i) { return (word >> (i * 8u)) & 0xFFu; }
+
 void main() {
     uint row = gl_WorkGroupID.x * OUTS + (gl_LocalInvocationID.x / LANES);
     uint lane = gl_LocalInvocationID.x % LANES;
-    if (row >= p.dim) return;
+    bool live = row < p.dim;
+    if (!live) row = 0u;
 
-    // Superblock count along the row
-    uint nSuper = p.ffn / 256u;
-    // 144 bytes = 36 uints per superblock
-    uint rowBase = row * nSuper * 36u;
+    uint nb = p.ffn / 32u;
+    uint rowBase = row * nb * 18u;
+    uint nibBase = rowBase + nb * 2u;
 
-    float sum = 0.0;
+    float sum[COLUMNS];
+    [[unroll]] for (uint c = 0u; c < COLUMNS; c++) sum[c] = 0.0;
 
-    for (uint sb = lane; sb < nSuper; sb += LANES) {
-        uint sbOffset = rowBase + sb * 36u;
-        uint xOffset = sb * 256u;
+    for (uint b = lane; live && b < nb; b += LANES) {
+        // The superblock this block belongs to, and its rank in it. Eight
+        // blocks share a header, so a lane striding by eight reads the same one
+        // every time and the load is a cache hit after the first.
+        uint hb = (rowBase + 16u * (b >> 3u)) >> 2u;
+        vec2 dm = unpackHalf2x16(w[hb]);
+        uint s0 = w[hb + 1u];
+        uint s1 = w[hb + 2u];
+        uint s2 = w[hb + 3u];
 
-        // d, dmin
-        uint dPair = w[sbOffset];
-        vec2 dFloats = unpackHalf2x16(dPair);
-        float d = dFloats.x;
-        float dmin = dFloats.y;
+        // ggml-quants.c's unpacking, which nn/dequant_q4_k.go carries in Go and
+        // TestQ4_KMatchesGGML holds to the reference: the first four sub-blocks
+        // take six whole bits, and the last four take four bits from the third
+        // word and their top two from the first two.
+        uint i = b & 7u;
+        uint sc, mn;
+        if (i < 4u) {
+            sc = byteOf(s0, i) & 63u;
+            mn = byteOf(s1, i) & 63u;
+        } else {
+            uint j = i - 4u;
+            sc = (byteOf(s2, j) & 0xFu) | ((byteOf(s0, j) >> 6u) << 4u);
+            mn = (byteOf(s2, j) >> 4u) | ((byteOf(s1, j) >> 6u) << 4u);
+        }
+        float d1 = dm.x * float(sc);
+        float m1 = dm.y * float(mn);
 
-        // Scales raw: 12 bytes = 3 uints
-        uint s0 = w[sbOffset + 1u];
-        uint s1 = w[sbOffset + 2u];
-        uint s2 = w[sbOffset + 3u];
+        uint at = (nibBase + 16u * b) >> 2;
+        uvec4 words = uvec4(w[at], w[at + 1u], w[at + 2u], w[at + 3u]);
+        uint xOffset = b * 32u;
 
-        uint sc[8], m[8];
-        sc[0] = s0 & 63u;
-        sc[1] = (s0 >> 8u) & 63u;
-        sc[2] = (s0 >> 16u) & 63u;
-        sc[3] = (s0 >> 24u) & 63u;
-
-        m[0] = s1 & 63u;
-        m[1] = (s1 >> 8u) & 63u;
-        m[2] = (s1 >> 16u) & 63u;
-        m[3] = (s1 >> 24u) & 63u;
-
-        uint s2_0 = s2 & 0xFFu;
-        uint s2_1 = (s2 >> 8u) & 0xFFu;
-        uint s2_2 = (s2 >> 16u) & 0xFFu;
-        uint s2_3 = (s2 >> 24u) & 0xFFu;
-
-        uint s0_0 = s0 & 0xFFu;
-        uint s0_1 = (s0 >> 8u) & 0xFFu;
-        uint s0_2 = (s0 >> 16u) & 0xFFu;
-        uint s0_3 = (s0 >> 24u) & 0xFFu;
-
-        uint s1_0 = s1 & 0xFFu;
-        uint s1_1 = (s1 >> 8u) & 0xFFu;
-        uint s1_2 = (s1 >> 16u) & 0xFFu;
-        uint s1_3 = (s1 >> 24u) & 0xFFu;
-
-        sc[4] = (s2_0 & 0x0Fu) | ((s0_0 >> 6u) << 4u);
-        m[4]  = (s2_0 >> 4u)   | ((s1_0 >> 6u) << 4u);
-
-        sc[5] = (s2_1 & 0x0Fu) | ((s0_1 >> 6u) << 4u);
-        m[5]  = (s2_1 >> 4u)   | ((s1_1 >> 6u) << 4u);
-
-        sc[6] = (s2_2 & 0x0Fu) | ((s0_2 >> 6u) << 4u);
-        m[6]  = (s2_2 >> 4u)   | ((s1_2 >> 6u) << 4u);
-
-        sc[7] = (s2_3 & 0x0Fu) | ((s0_3 >> 6u) << 4u);
-        m[7]  = (s2_3 >> 4u)   | ((s1_3 >> 6u) << 4u);
-
-        // qs: 128 bytes = 32 uints (offsets +4 .. +35)
-        uint qsOffset = sbOffset + 4u;
-
-        // Two sub-blocks share thirty-two bytes — eight words — of qs: the
-        // even one takes their low nibbles and the odd one their high
-        // nibbles, each with its own scale and minimum. Reading sixteen bytes
-        // a sub-block and giving both nibbles of a byte to the same scale, as
-        // this did, is a different sixteen weights and the wrong scale for
-        // half of them. nn/dequant_q4_k.go is the same format read the same
-        // way, and TestQ4_KMatchesGGML holds that one to ggml's own.
-        for (uint i = 0u; i < 8u; i++) {
-            float d1 = d * float(sc[i]);
-            float m1 = dmin * float(m[i]);
-            uint chunkBase = qsOffset + (i / 2u) * 8u;
-            uint shift = (i & 1u) * 4u;
-            uint chunkX = xOffset + i * 32u;
-
-            for (uint l = 0u; l < 8u; l++) {
-                uint word = w[chunkBase + l];
-                for (uint b = 0u; b < 4u; b++) {
-                    uint byteVal = (word >> (b * 8u)) & 0xFFu;
-                    float q = float((byteVal >> shift) & 0x0Fu) * d1 - m1;
-                    sum += q * x[chunkX + (l * 4u + b)];
+        [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+            uint xc = (p.col + c) * p.ffn + xOffset;
+            float nibX = 0.0;
+            float plainX = 0.0;
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                uint word = words[u];
+                [[unroll]] for (uint k = 0u; k < 4u; k++) {
+                    uint j = u * 4u + k;
+                    uint byteVal = (word >> (k * 8u)) & 0xFFu;
+                    float xL = x[xc + j];
+                    float xH = x[xc + j + 16u];
+                    nibX += float(byteVal & 0x0Fu) * xL + float(byteVal >> 4u) * xH;
+                    plainX += xL + xH;
                 }
             }
+            // A Q4_K weight has no recentring by eight: it is q times a scale
+            // less a minimum, both of which belong to this sub-block alone.
+            sum[c] += nibX * d1 - plainX * m1;
         }
     }
 
-    // Cluster reduction across the 8 lanes of this row
-    sum = subgroupClusteredAdd(sum, LANES);
-    if (lane == 0u) {
-        y[row] = sum;
+    [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+        float total = subgroupClusteredAdd(sum[c], LANES);
+        if (lane == 0u && live) y[(p.col + c) * p.dim + row] = total;
     }
 }

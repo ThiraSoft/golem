@@ -374,6 +374,11 @@ float pws[WPT];
 // minimum beside the scale. Two more registers a block, and the staging below
 // is Q4_0's with three instructions added.
 uint  pwh[WPT];
+#endif
+#if defined(Q5K) || defined(Q4K)
+// The minimum, which both K-quants carry and Q4_0 does not: their weight is a
+// magnitude times a scale less a minimum, where Q4_0's is a magnitude recentred
+// on eight.
 float pwm[WPT];
 #endif
 uvec4 plo[APT], phi[APT];
@@ -395,17 +400,42 @@ void prefetch(uint kb) {
             uint b = kb + idx / uint(BM);
 #ifdef Q5K
             pwh[i] = 0u;
+#endif
+#if defined(Q5K) || defined(Q4K)
             pwm[i] = 0.0;
 #endif
             if (row0 + r < p.dim && b < nb) {
                 uint base = wbase + (row0 + r) * rowBytes;
-#ifdef Q5K
+#if defined(Q5K)
                 uint at4  = (base + 8u * nb + 16u * b) >> 2;
                 pw[i]  = uvec4(w[at4], w[at4 + 1u], w[at4 + 2u], w[at4 + 3u]);
                 pwh[i] = w[(base + 4u * nb + 4u * b) >> 2];
                 vec2 dm = unpackHalf2x16(w[(base + 4u * b) >> 2]);
                 pws[i] = dm.x;
                 pwm[i] = dm.y;
+#elif defined(Q4K)
+                // vk/mixture.go's splitQ4_K: the nibbles begin where splitQ4_0
+                // puts its own, sixteen contiguous bytes to a block, and the
+                // scale is found in the superblock header rather than read.
+                // Eight blocks share a header, so the threads of a step that
+                // stage the same row read one line between them.
+                uint at4  = (base + 2u * nb + 16u * b) >> 2;
+                pw[i]  = uvec4(w[at4], w[at4 + 1u], w[at4 + 2u], w[at4 + 3u]);
+                uint hb = (base + 16u * (b >> 3u)) >> 2;
+                vec2 dm = unpackHalf2x16(w[hb]);
+                uint s0 = w[hb + 1u], s1 = w[hb + 2u], s2 = w[hb + 3u];
+                uint sub = b & 7u;
+                uint sc, mn;
+                if (sub < 4u) {
+                    sc = bitfieldExtract(s0, int(8u * sub), 6);
+                    mn = bitfieldExtract(s1, int(8u * sub), 6);
+                } else {
+                    uint j = sub - 4u;
+                    sc = bitfieldExtract(s2, int(8u * j), 4) | (bitfieldExtract(s0, int(8u * j + 6u), 2) << 4u);
+                    mn = bitfieldExtract(s2, int(8u * j + 4u), 4) | (bitfieldExtract(s1, int(8u * j + 6u), 2) << 4u);
+                }
+                pws[i] = dm.x * float(sc);
+                pwm[i] = dm.y * float(mn);
 #else
                 uint at4  = (base + 2u * nb + 16u * b) >> 2;
                 pw[i]  = uvec4(w[at4], w[at4 + 1u], w[at4 + 2u], w[at4 + 3u]);
@@ -458,8 +488,10 @@ void stageTile() {
         uint k  = idx / uint(BM);
         uint at = r * uint(SA_STRIDE) + k * 32u;
         float ws = pws[i];
-#ifdef Q5K
+#if defined(Q5K) || defined(Q4K)
         float wm = pwm[i];
+#endif
+#ifdef Q5K
         uint  wh = pwh[i];
 #endif
         [[unroll]] for (uint u = 0u; u < 4u; u++) {
@@ -475,6 +507,13 @@ void stageTile() {
             uint h1 = ((((wh >> (16u + 4u * u))  & 0xFu) * 0x00204081u) & 0x01010101u) * 16u;
             vec4 v0 = unpackUnorm4x8(w0 | h0) * 255.0 * ws - wm;
             vec4 v1 = unpackUnorm4x8(w1 | h1) * 255.0 * ws - wm;
+#elif defined(Q4K)
+            // Q4_0's staging without the recentring by eight, which Q4_K does
+            // not have: a weight is q times this sub-block's scale less its
+            // minimum. Leaving the eight in place subtracts 8*d*sc from every
+            // weight of the model, which answers rather than failing.
+            vec4 v0 = unpackUnorm4x8(w0) * 255.0 * ws - wm;
+            vec4 v1 = unpackUnorm4x8(w1) * 255.0 * ws - wm;
 #else
             vec4 v0 = (unpackUnorm4x8(w0) * 255.0 - 8.0) * ws;
             vec4 v1 = (unpackUnorm4x8(w1) * 255.0 - 8.0) * ws;

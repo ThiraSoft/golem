@@ -1032,6 +1032,72 @@ func splitQ4_0(src []byte, rows, cols int) []byte {
 	return dst
 }
 
+// rowBytesQ4_K is what one row of that many inputs occupies once splitQ4_K has
+// had it: eighteen bytes to a block of thirty-two, which is the format's own.
+// The split moves bytes and adds none.
+func rowBytesQ4_K(cols int) int { return cols / nn.QuantBlock * 18 }
+
+// splitQ4_K rewrites a Q4_K matrix so that a shader can reach a block of
+// thirty-two, without spending a byte more than the file does.
+//
+// Q5_K got a block that stands wholly alone — splitQ5_K folds d*sc and dmin*m
+// into an fp16 pair a block — and that costs two bytes a block, twenty-two to
+// twenty-four. The same treatment here would take Q4_K's eighteen to twenty,
+// which is Q4_1's rate: eleven percent, or 1.26 GiB on the 27B's Q4_K tensors,
+// on a card that the same model's Q4_0 build already overflows. Q4_K is most of
+// a K-quant mix, so the rate is the format and there is nothing to trade.
+//
+// So the superblock's header stays a header and only moves. A row becomes
+//
+//	[0,    16nsb)  the superblocks' own sixteen-byte headers, verbatim:
+//	               d and dmin as an fp16 pair, then the twelve bytes of
+//	               six-bit scales and minima
+//	[2nb,    18nb)  the nibbles, sixteen bytes a block, in Q4_0's own order —
+//	               low nibble of byte j is weight j, high nibble is weight j+16
+//
+// and 16nsb is 2nb, so the nibbles begin exactly where splitQ4_0 puts its own:
+// a Q4_K block is read with Q4_0's offset arithmetic and one indexed load into
+// a header region of sixteen bytes per two hundred and fifty-six weights, which
+// is a quarter of a kilobyte for a row of four thousand and stays in cache for
+// as long as a tile is on those rows.
+//
+// What the reader pays for that is the six-bit unpacking, which the file does
+// not spare anybody: llama.cpp's Vulkan backend uploads a Q4_K tensor
+// untouched and unpacks the same twelve bytes in every one of its kernels.
+// What it saves is the nibble order: the sub-blocks of a superblock interleave
+// two at a time over the same thirty-two bytes, so a reader of the file's order
+// cannot take sixteen contiguous bytes and call them a block. Here it can, and
+// the staging is splitQ4_0's with the minimum subtracted instead of eight.
+func splitQ4_K(src []byte, rows, cols int) []byte {
+	const superBytes = 144
+	nb := cols / nn.QuantBlock // blocks of thirty-two
+	nsb := cols / nn.SuperBlock
+	stride := nsb * superBytes
+	dst := make([]byte, rows*stride)
+	for r := 0; r < rows; r++ {
+		in := src[r*stride : (r+1)*stride]
+		out := dst[r*stride : (r+1)*stride]
+		nibbles := out[2*nb:]
+		for sb := 0; sb < nsb; sb++ {
+			block := in[sb*superBytes : (sb+1)*superBytes]
+			copy(out[16*sb:], block[:16])
+			qs := block[16:]
+			for i := 0; i < 8; i++ {
+				b := sb*8 + i
+				qSub := qs[(i/2)*32:]
+				shift := uint(4 * (i & 1))
+				pack := nibbles[b*16 : b*16+16]
+				for j := 0; j < 16; j++ {
+					lo := (qSub[j] >> shift) & 0xF
+					up := (qSub[j+16] >> shift) & 0xF
+					pack[j] = lo | up<<4
+				}
+			}
+		}
+	}
+	return dst
+}
+
 // splitQ4_1 is splitQ4_0 for the format with a minimum beside the scale: the
 // twenty bytes of a block are a scale, a minimum, and sixteen nibble pairs, and
 // the kernels want all the scale-and-minimum pairs of a row before any of its

@@ -26,10 +26,12 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q41.comp -o shaders/matvec_q41.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q5k.comp -o shaders/matvec_q5k.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q4k.comp -o shaders/matvec_q4k.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/swiglu_act.comp -o shaders/swiglu_act.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/quant_q80.comp -o shaders/quant_q80.spv
 //go:generate glslc -O -DBM=64 -DBN=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_q5k.comp -o shaders/matmul_q5k.spv
 //go:generate glslc -O -DQ41 -DBM=64 -DBN=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_q5k.comp -o shaders/matmul_q41t.spv
+//go:generate glslc -O -DQ4K -DBM=64 -DBN=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_q5k.comp -o shaders/matmul_q4kt.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/qwen_attn_prep.comp -o shaders/qwen_attn_prep.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/qwen_attn_gqa.comp -o shaders/qwen_attn_gqa.spv
 
@@ -38,6 +40,13 @@ var matvecQ40SPIRV []byte
 
 //go:embed shaders/matvec_q41.spv
 var matvecQ41SPIRV []byte
+
+// The Q4_K mat-vec. It was compiled and embedded next to the delta net's
+// kernels for a year and bound to nothing, against a layout the split now
+// replaces; vk/shaders/matvec_q4k.comp says what it reads.
+//
+//go:embed shaders/matvec_q4k.spv
+var matvecQ4KSPIRV []byte
 
 //go:embed shaders/matvec_f32.spv
 var matvecF32SPIRV []byte
@@ -60,20 +69,24 @@ var matvecQ80SPIRV []byte
 //go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q40.comp -o shaders/matvec_q40_2.spv
 //go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q41.comp -o shaders/matvec_q41_2.spv
 //go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q5k.comp -o shaders/matvec_q5k_2.spv
+//go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q4k.comp -o shaders/matvec_q4k_2.spv
 //go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32_2.spv
 //go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec4.spv
 //go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q40.comp -o shaders/matvec_q40_4.spv
 //go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q41.comp -o shaders/matvec_q41_4.spv
 //go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q5k.comp -o shaders/matvec_q5k_4.spv
+//go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q4k.comp -o shaders/matvec_q4k_4.spv
 //go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32_4.spv
 //go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q40.comp -o shaders/matvec_q40_8.spv
 //go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q41.comp -o shaders/matvec_q41_8.spv
 //go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q5k.comp -o shaders/matvec_q5k_8.spv
+//go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q4k.comp -o shaders/matvec_q4k_8.spv
 //go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32_8.spv
 //go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_qwen16.spv
 //go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q40.comp -o shaders/matvec_q40_16.spv
 //go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q41.comp -o shaders/matvec_q41_16.spv
 //go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q5k.comp -o shaders/matvec_q5k_16.spv
+//go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q4k.comp -o shaders/matvec_q4k_16.spv
 //go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32_16.spv
 
 // The tiled product again, for the Q4_1 weights a Q4_0 checkpoint still keeps:
@@ -94,6 +107,9 @@ var matvecQ41_2SPIRV []byte
 
 //go:embed shaders/matvec_q5k_2.spv
 var matvecQ5K_2SPIRV []byte
+
+//go:embed shaders/matvec_q4k_2.spv
+var matvecQ4K_2SPIRV []byte
 
 //go:embed shaders/matvec_f32_2.spv
 var matvecF32_2SPIRV []byte
@@ -117,6 +133,9 @@ var matvecQ41_4SPIRV []byte
 //go:embed shaders/matvec_q5k_4.spv
 var matvecQ5K_4SPIRV []byte
 
+//go:embed shaders/matvec_q4k_4.spv
+var matvecQ4K_4SPIRV []byte
+
 //go:embed shaders/matvec_f32_4.spv
 var matvecF32_4SPIRV []byte
 
@@ -128,6 +147,9 @@ var matvecQ41_8SPIRV []byte
 
 //go:embed shaders/matvec_q5k_8.spv
 var matvecQ5K_8SPIRV []byte
+
+//go:embed shaders/matvec_q4k_8.spv
+var matvecQ4K_8SPIRV []byte
 
 //go:embed shaders/matvec_f32_8.spv
 var matvecF32_8SPIRV []byte
@@ -143,6 +165,9 @@ var matvecQ41_16SPIRV []byte
 
 //go:embed shaders/matvec_q5k_16.spv
 var matvecQ5K_16SPIRV []byte
+
+//go:embed shaders/matvec_q4k_16.spv
+var matvecQ4K_16SPIRV []byte
 
 //go:embed shaders/matvec_f32_16.spv
 var matvecF32_16SPIRV []byte
@@ -197,6 +222,21 @@ var matmulQ5KSPIRV []byte
 // no reason but the format's packing — which vk/mixture.go's splitQ5_K now
 // undoes on the way to the card.
 //
+//go:embed shaders/matmul_q4kt.spv
+var matmulQ4KTSPIRV []byte
+
+//go:embed shaders/matmul_coop_q4k64.spv
+var matmulCoopQ4K64SPIRV []byte
+
+//go:embed shaders/matmul_coop_q4k128.spv
+var matmulCoopQ4K128SPIRV []byte
+
+//go:embed shaders/matmul_coop_q4k256.spv
+var matmulCoopQ4K256SPIRV []byte
+
+//go:embed shaders/matmul_coop_q4k512.spv
+var matmulCoopQ4K512SPIRV []byte
+
 //go:embed shaders/matmul_coop_q5k64.spv
 var matmulCoopQ5K64SPIRV []byte
 
@@ -500,6 +540,7 @@ type QwenPipeline struct {
 	pipeMatQ40   *Pipeline // Q4_0 against floats
 	pipeMatQ41   *Pipeline
 	pipeMatQ5K   *Pipeline
+	pipeMatQ4K   *Pipeline
 	pipeMatF32   *Pipeline
 	pipeSwiglu   *Pipeline
 	pipeConv     *Pipeline
@@ -511,6 +552,7 @@ type QwenPipeline struct {
 	pipeMatQ80   *Pipeline // the prediction block's front projection
 	pipeQuant    *Pipeline // floats to their Q8_0 form
 	pipeMatT5K   *Pipeline // the tiled Q5_K product, which only a wide pass reaches
+	pipeMatT4K   *Pipeline // and the tiled Q4_K one, which is most of a K-quant mix
 	pipeMatT41   *Pipeline // the same tile over Q4_1 weights
 
 	// The lattice and the transform, for a .golem checkpoint. Both belong to
@@ -642,10 +684,12 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		{&p.pipeMatQ40, matvecQ40SPIRV, 3, unsafe.Sizeof(matvecKPush{})},
 		{&p.pipeMatQ41, matvecQ41SPIRV, 3, unsafe.Sizeof(matvecKPush{})},
 		{&p.pipeMatQ5K, matvecQ5KSPIRV, 3, unsafe.Sizeof(matvecKPush{})},
+		{&p.pipeMatQ4K, matvecQ4KSPIRV, 3, unsafe.Sizeof(matvecKPush{})},
 		{&p.pipeMatF32, matvecF32SPIRV, 3, unsafe.Sizeof(matvecKPush{})},
 		{&p.pipeSwiglu, swigluActSPIRV, 5, unsafe.Sizeof(swigluPush{})},
 		{&p.pipeQuant, quantQ80SPIRV, 3, unsafe.Sizeof(swigluPush{})},
 		{&p.pipeMatT5K, matmulQ5KSPIRV, 4, unsafe.Sizeof(moePush{})},
+		{&p.pipeMatT4K, matmulQ4KTSPIRV, 4, unsafe.Sizeof(moePush{})},
 		{&p.pipeMatT41, matmulQ41TSPIRV, 4, unsafe.Sizeof(moePush{})},
 		{&p.pipeConv, ssmConv1dSPIRV, 5, unsafe.Sizeof(ssmConvPush{})},
 		{&p.pipeScan, ssmScanSPIRV, 9, unsafe.Sizeof(ssmScanPush{})},
@@ -671,6 +715,7 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		{p.pipeMatQ40, 2, matvecQ40_2SPIRV}, {p.pipeMatQ40, 4, matvecQ40_4SPIRV}, {p.pipeMatQ40, 8, matvecQ40_8SPIRV}, {p.pipeMatQ40, 16, matvecQ40_16SPIRV},
 		{p.pipeMatQ41, 2, matvecQ41_2SPIRV}, {p.pipeMatQ41, 4, matvecQ41_4SPIRV}, {p.pipeMatQ41, 8, matvecQ41_8SPIRV}, {p.pipeMatQ41, 16, matvecQ41_16SPIRV},
 		{p.pipeMatQ5K, 2, matvecQ5K_2SPIRV}, {p.pipeMatQ5K, 4, matvecQ5K_4SPIRV}, {p.pipeMatQ5K, 8, matvecQ5K_8SPIRV}, {p.pipeMatQ5K, 16, matvecQ5K_16SPIRV},
+		{p.pipeMatQ4K, 2, matvecQ4K_2SPIRV}, {p.pipeMatQ4K, 4, matvecQ4K_4SPIRV}, {p.pipeMatQ4K, 8, matvecQ4K_8SPIRV}, {p.pipeMatQ4K, 16, matvecQ4K_16SPIRV},
 		{p.pipeMatF32, 2, matvecF32_2SPIRV}, {p.pipeMatF32, 4, matvecF32_4SPIRV}, {p.pipeMatF32, 8, matvecF32_8SPIRV}, {p.pipeMatF32, 16, matvecF32_16SPIRV},
 	} {
 		if err := w.pipe.Wide(w.columns, w.spirv); err != nil {
@@ -723,15 +768,20 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 	// same packing.
 	if p.coop {
 		for _, w := range []struct {
+			pipe    *Pipeline
 			columns int
 			spirv   []byte
 		}{
-			{64, matmulCoopQ5K64SPIRV},
-			{128, matmulCoopQ5K128SPIRV},
-			{256, matmulCoopQ5K256SPIRV},
-			{wideColumns, matmulCoopQ5K512SPIRV},
+			{p.pipeMatT5K, 64, matmulCoopQ5K64SPIRV},
+			{p.pipeMatT5K, 128, matmulCoopQ5K128SPIRV},
+			{p.pipeMatT5K, 256, matmulCoopQ5K256SPIRV},
+			{p.pipeMatT5K, wideColumns, matmulCoopQ5K512SPIRV},
+			{p.pipeMatT4K, 64, matmulCoopQ4K64SPIRV},
+			{p.pipeMatT4K, 128, matmulCoopQ4K128SPIRV},
+			{p.pipeMatT4K, 256, matmulCoopQ4K256SPIRV},
+			{p.pipeMatT4K, wideColumns, matmulCoopQ4K512SPIRV},
 		} {
-			if err := p.pipeMatT5K.WideWave(w.columns, w.spirv, coopmatWave); err != nil {
+			if err := w.pipe.WideWave(w.columns, w.spirv, coopmatWave); err != nil {
 				return nil, err
 			}
 		}
