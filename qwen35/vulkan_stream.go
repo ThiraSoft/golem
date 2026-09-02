@@ -68,6 +68,9 @@ func wideOf(w nn.Matrix, form vk.WideForm) []byte {
 // decay projections are excluded because they are float32 in every checkpoint
 // and vk keeps the float kernel for them whatever the rest is.
 func (m *Model) wideForm() vk.WideForm {
+	if wideF32Only {
+		return vk.WideF32
+	}
 	for i := range m.W.Blocks[:m.trunk()] {
 		bw := &m.W.Blocks[i]
 		for _, w := range []nn.Matrix{bw.Gate, bw.Up, bw.Down, bw.Q, bw.K, bw.V, bw.O,
@@ -79,6 +82,16 @@ func (m *Model) wideForm() vk.WideForm {
 	}
 	return vk.WideBF16
 }
+
+// wideF32Only makes wideForm answer WideF32 whatever the checkpoint holds,
+// which is the path every window took before the card had a bfloat16 kernel:
+// the host widens each matrix and sends twice its size.
+//
+// It is here for one test. The two forms compute the same numbers — widening a
+// bfloat16 to a float is a shift, and the kernel does the shift the host used
+// to — so the only way to hold the newer path to the older one is to run both,
+// and the only way to run the older one is to ask for it.
+var wideF32Only bool
 
 // wideBytes is how many bytes a weight occupies in the given form.
 func wideBytes(form vk.WideForm) int {

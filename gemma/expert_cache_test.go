@@ -139,6 +139,38 @@ func TestExpertCacheHitRate(t *testing.T) {
 		float64(expertBytes)/1e6, float64(pool)*float64(expertBytes)/1e9,
 		float64(perToken)*float64(expertBytes)/1e6)
 
+	// Whether the continuation is varied enough for the figures below to mean
+	// anything. **This is the check that decides whether to believe the rest of
+	// this test.** Greedy decoding on a small prompt can fall into a loop, and a
+	// loop routes to the same eight experts every token: the sweep would then
+	// report a hit rate near one that no conversation reproduces.
+	//
+	// Two numbers say it. How much of the pool the run ever touches — a routing
+	// that used a tenth of the experts is not exercising a cache of half of
+	// them — and how often a token routes exactly as the one before it, which is
+	// what a loop looks like from here.
+	seen := map[lruKey]bool{}
+	same := 0
+	for tok, one := range log {
+		identical := tok > 0
+		for b, ids := range one {
+			for k, e := range ids {
+				seen[lruKey{int32(b), e}] = true
+				if identical && log[tok-1][b][k] != e {
+					identical = false
+				}
+			}
+		}
+		if identical {
+			same++
+		}
+	}
+	t.Logf("the run touched %d of %d pairs (%.1f%% of the pool), and %d of %d tokens routed exactly as the one before",
+		len(seen), pool, 100*float64(len(seen))/float64(pool), same, len(log))
+	if len(seen)*4 < pool {
+		t.Errorf("the continuation touched under a quarter of the pool: the hit rates below are about this text, not about this model")
+	}
+
 	// The first tokens of decoding fill an empty cache and would be counted as
 	// misses that a warm cache never pays.
 	const warm = 64
