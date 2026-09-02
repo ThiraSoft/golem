@@ -432,7 +432,20 @@ func TestVulkanBatchMatchesTokenPath(t *testing.T) {
 // any of those wrong gives a pass where every column answers the first one's
 // question, which is exactly what the kernels did before they took a column.
 //
-// Bit for bit: same kernel, same order, only the column offset differs.
+// Not bit for bit any more, and the reason is worth naming. It was, and the
+// guarantee was real: one kernel answered both widths and a row's arithmetic
+// did not depend on how many other rows shared its tile. Since
+// shaders/attn_one.comp a pass of one column takes an attention of its own —
+// the tiled one spent a workgroup's whole shape on thirty-one columns that
+// were not there, and that cost a fifth of every token — so the two paths now
+// fold the same dot in two orders. Measured, that is two parts in a thousand.
+//
+// What the test is for survives it. A column-indexing fault — the wrong
+// column's routing, the wrong row of the intermediate, the wrong slice of the
+// output — makes a column answer another column's question, which is a
+// difference of order one and not of order a thousandth. The tolerance is ten
+// times tighter than the batch test's beside it and a hundred times looser
+// than the fault it hunts.
 func TestVulkanColumnsMatchTokenPath(t *testing.T) {
 	f, m := load26BStack(t)
 	if len(f.Tokens) < 2 {
@@ -452,10 +465,6 @@ func TestVulkanColumnsMatchTokenPath(t *testing.T) {
 		m.Forward(tok, pos)
 	}
 	for _, il := range moeBlocks {
-		got := m.BlockOutput(il)
-		if !same(wide[il], got) {
-			compareRelative(t, "l_out-"+itoa(il)+" columns against token", wide[il], got, 0)
-			t.Errorf("block %d answered differently in a pass of %d columns", il, len(f.Tokens))
-		}
+		compareRelative(t, "l_out-"+itoa(il)+" columns against token", wide[il], m.BlockOutput(il), 1e-2)
 	}
 }

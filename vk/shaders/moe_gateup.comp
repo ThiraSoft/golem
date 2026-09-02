@@ -32,7 +32,20 @@
 #define COLUMNS 1
 #endif
 
-layout(local_size_x = 512) in;   // sixty-four rows, eight lanes each
+// LANES threads share an output row; sixty-four rows go to a workgroup, which
+// is a block of thirty-two outputs of the gate and the same of the up. The two
+// multiply to the workgroup. vk/matvecshape_test.go is the same question asked
+// of the plain mat-vec.
+// Sixteen, where every other kernel here says eight. Sixty-four rows and
+// sixteen lanes is a workgroup of a thousand and twenty-four, which is the
+// most a workgroup may be, and it measured 8.65 milliseconds a token against
+// 8.49 on Qwen3-4B-Q4_K_M — this is the hottest kernel in the engine, a third
+// of what a token spends, so two per cent of it is worth the line.
+#ifndef LANES
+#define LANES 16u
+#endif
+
+layout(local_size_x = 64 * LANES) in;
 
 layout(std430, binding = 0) readonly  buffer W  { uint  w[];    };  // Q4_0, every expert
 layout(std430, binding = 1) readonly  buffer XQ { uint  xq[];   };  // the input, Q8_0
@@ -56,7 +69,6 @@ layout(push_constant) uniform Push {
 #define OUTSLOT(k) e
 #define ACTIVE(k)  true
 
-const uint LANES = 8u;
 
 shared float half_[64 * COLUMNS];
 shared int   q32[32 * COLUMNS];
@@ -194,7 +206,7 @@ void main() {
         }
         barrier();
 
-        for (uint i = t; i < 32u * COLUMNS; i += 512u) {
+        for (uint i = t; i < 32u * COLUMNS; i += 64u * LANES) {
             uint k = i / 32u, j2 = i % 32u;
             float g = half_[k * 64u + j2];
             float a;
@@ -211,7 +223,7 @@ void main() {
         }
         barrier();
 
-        for (uint k = t; k < COLUMNS; k += 512u) {
+        for (uint k = t; k < COLUMNS; k += 64u * LANES) {
             uint hb = k * 64u;
             uint qb = k * 32u;
             float peak = 0.0;
