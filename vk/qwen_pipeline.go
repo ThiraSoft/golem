@@ -50,6 +50,30 @@ var matvecQ6KSPIRV []byte
 //go:embed shaders/matvec_f32.spv
 var matvecF32SPIRV []byte
 
+// The same product against bfloat16 weights, which is what a checkpoint read as
+// it was trained actually holds. It is one -DBF16 away from the float kernel and
+// shares its source; QwenShape.Float says when it is built.
+//
+//go:generate glslc -O -DBF16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_bf16.spv
+//go:generate glslc -O -DBF16 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_bf16_2.spv
+//go:generate glslc -O -DBF16 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_bf16_4.spv
+//go:generate glslc -O -DBF16 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_bf16_8.spv
+//go:generate glslc -O -DBF16 -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_bf16_16.spv
+//go:embed shaders/matvec_bf16.spv
+var matvecBF16SPIRV []byte
+
+//go:embed shaders/matvec_bf16_2.spv
+var matvecBF16_2SPIRV []byte
+
+//go:embed shaders/matvec_bf16_4.spv
+var matvecBF16_4SPIRV []byte
+
+//go:embed shaders/matvec_bf16_8.spv
+var matvecBF16_8SPIRV []byte
+
+//go:embed shaders/matvec_bf16_16.spv
+var matvecBF16_16SPIRV []byte
+
 //go:embed shaders/matvec_q80.spv
 var matvecQ80SPIRV []byte
 
@@ -346,23 +370,47 @@ type QwenShape struct {
 	// code, so the question is which format and not how wide.
 	Golem nn.Quant
 
-	// Float says every projection arrives as float32 and is read by
-	// shaders/matvec_f32.comp, which is the same y = W·x the delta net's two
-	// 48-wide projections have always run — only over the whole model.
+	// Float says every projection arrives in the form the model was trained in
+	// and is read by shaders/matvec_f32.comp, which is the same y = W·x the
+	// delta net's two 48-wide projections have always run — only over the whole
+	// model.
 	//
-	// This is not an inference form. Nobody would run a model at four bytes a
-	// weight on a card that reads it at half of one. It exists because a
-	// conversion has to calibrate the checkpoint it is converting, and a BF16
+	// This is not an inference form. Nobody would run a model at two or four
+	// bytes a weight on a card that reads it at half of one. It exists because
+	// a conversion has to calibrate the checkpoint it is converting, and a BF16
 	// checkpoint is exactly what a conversion reads: the alternative was to
-	// measure a quantized twin and hope the salience did not notice, which is
-	// a claim nobody here has measured. A BF16 matrix is widened to float on
-	// the way up — the shift the host already does everywhere else — so no
-	// shader knows this format exists.
+	// measure a quantized twin and hope the salience did not notice, which is a
+	// claim nobody here has measured.
 	//
-	// It costs four bytes a weight in device memory, which is why it only ever
-	// makes sense beside a window: see AddBlockWindow.
-	Float bool
+	// It is a form and not a flag because the widening has moved. A BF16 matrix
+	// used to be widened to float32 on the host on its way up, which read the
+	// checkpoint once and wrote and sent twice its size; the kernel does the
+	// same shift now, so WideBF16 sends the checkpoint's own bytes. It costs
+	// two or four bytes a weight in device memory either way, which is why it
+	// only ever makes sense beside a window: see AddBlockWindow.
+	Float WideForm
 }
+
+// A WideForm is the form a projection arrives in on the float path, or NotWide
+// when the model does not take that path at all.
+//
+// It is an enumeration rather than an nn.Quant because nn.F32 is the zero Quant
+// and a zero field has to mean "not this path": a model read as Q4_K would
+// otherwise be indistinguishable from one read as float32.
+type WideForm uint8
+
+const (
+	// NotWide is a model whose projections arrive quantized, which is every
+	// model that is being run rather than measured.
+	NotWide WideForm = iota
+	// WideF32 is four bytes a weight, read as a float.
+	WideF32
+	// WideBF16 is two, read as the top half of one.
+	WideBF16
+)
+
+// wide says the model takes the float path in either of its forms.
+func (s QwenShape) wide() bool { return s.Float != NotWide }
 
 func (s QwenShape) qDim() int     { return s.Heads * s.HeadDim }
 func (s QwenShape) qFullDim() int { return s.qDim() * 2 }
@@ -535,9 +583,14 @@ type QwenPipeline struct {
 	// The two K-quant mat-vecs against *float* activations, which the
 	// prediction block's front projection is the last reader of: it reads two
 	// hidden states joined, and nothing quantizes those.
-	pipeMatQ4K   *Pipeline
-	pipeMatQ6K   *Pipeline
-	pipeMatF32   *Pipeline
+	pipeMatQ4K *Pipeline
+	pipeMatQ6K *Pipeline
+	pipeMatF32 *Pipeline
+	// pipeMatBF16 is the same product against half-width weights, built only
+	// for a WideBF16 model. It does not replace pipeMatF32: the delta net's
+	// decay projections are float32 in every checkpoint whatever the rest is,
+	// so both live here and wideProduct chooses between them.
+	pipeMatBF16  *Pipeline
 	pipeSwiglu   *Pipeline
 	pipeConv     *Pipeline
 	pipeScan     *Pipeline
@@ -658,6 +711,17 @@ type QwenPipeline struct {
 	owned []*Buffer
 }
 
+// wideProduct is the pipeline that reads a projection arriving in the model's
+// own form. It is not pipeMatF32 unconditionally: a bfloat16 model's
+// projections are half as wide, while the delta net's decay projections beside
+// them are float32 in every checkpoint and keep the float kernel.
+func (p *QwenPipeline) wideProduct() *Pipeline {
+	if p.pipeMatBF16 != nil {
+		return p.pipeMatBF16
+	}
+	return p.pipeMatF32
+}
+
 func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 	if shape.MaxContext > qwenMaxContext {
 		return nil, fmt.Errorf("vk: qwen pipeline holds %d positions of scores, not %d", qwenMaxContext, shape.MaxContext)
@@ -711,6 +775,23 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 	} {
 		if err := w.pipe.Wide(w.columns, w.spirv); err != nil {
 			return nil, err
+		}
+	}
+
+	// The bfloat16 product, for a model read in the form it was trained in. It
+	// is built only then: it is five more binaries, and every other model would
+	// carry them for nothing.
+	if shape.Float == WideBF16 {
+		if p.pipeMatBF16, err = d.NewPipeline(matvecBF16SPIRV, 3, uint32(unsafe.Sizeof(matvecKPush{}))); err != nil {
+			return nil, err
+		}
+		for _, w := range []struct {
+			columns int
+			spirv   []byte
+		}{{2, matvecBF16_2SPIRV}, {4, matvecBF16_4SPIRV}, {8, matvecBF16_8SPIRV}, {16, matvecBF16_16SPIRV}} {
+			if err := p.pipeMatBF16.Wide(w.columns, w.spirv); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -951,7 +1032,7 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 func (p *QwenPipeline) uploadSSMProjections(b *qwenSSMBlock, d QwenSSMData) error {
 	s := p.shape
 	var err error
-	if s.Float {
+	if s.wide() {
 		b.f32 = true
 	}
 	if b.f32 {
@@ -964,13 +1045,13 @@ func (p *QwenPipeline) uploadSSMProjections(b *qwenSSMBlock, d QwenSSMData) erro
 		if b.wOut, err = p.upload(d.WOut); err != nil {
 			return err
 		}
-		if b.setQKV, err = p.pipeMatF32.NewSet([]*Buffer{b.wQKV, p.normed, p.qkvBuf}); err != nil {
+		if b.setQKV, err = p.wideProduct().NewSet([]*Buffer{b.wQKV, p.normed, p.qkvBuf}); err != nil {
 			return err
 		}
-		if b.setGate, err = p.pipeMatF32.NewSet([]*Buffer{b.wGate, p.normed, p.gateZBuf}); err != nil {
+		if b.setGate, err = p.wideProduct().NewSet([]*Buffer{b.wGate, p.normed, p.gateZBuf}); err != nil {
 			return err
 		}
-		if b.setOut, err = p.pipeMatF32.NewSet([]*Buffer{b.wOut, p.ySSM, p.mixOut}); err != nil {
+		if b.setOut, err = p.wideProduct().NewSet([]*Buffer{b.wOut, p.ySSM, p.mixOut}); err != nil {
 			return err
 		}
 	} else {
@@ -1011,6 +1092,9 @@ func (p *QwenPipeline) uploadSSMProjections(b *qwenSSMBlock, d QwenSSMData) erro
 			return err
 		}
 	}
+	// The decay's two projections keep the float kernel whatever the rest of the
+	// model is: they are float32 in every checkpoint, which is why they were
+	// uploaded above the branch that chose a form.
 	if b.setAlpha, err = p.pipeMatF32.NewSet([]*Buffer{b.wAlpha, p.normed, p.alphaBuf}); err != nil {
 		return err
 	}
@@ -1039,7 +1123,7 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 		if b.golem, err = p.newGolemAttn(d); err != nil {
 			return nil, err
 		}
-	} else if s.Float {
+	} else if s.wide() {
 		b.f32 = true
 		for _, u := range []struct {
 			into **Buffer
@@ -1095,7 +1179,7 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 			into **Set
 			w, y *Buffer
 		}{{&b.setQ, b.wQ, p.qIn}, {&b.setK, b.wK, p.kIn}, {&b.setV, b.wV, p.vIn}} {
-			if *u.into, err = p.pipeMatF32.NewSet([]*Buffer{u.w, p.normed, u.y}); err != nil {
+			if *u.into, err = p.wideProduct().NewSet([]*Buffer{u.w, p.normed, u.y}); err != nil {
 				return nil, err
 			}
 		}
@@ -1109,7 +1193,7 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 	if b.f32 {
 		// The mix arrives in floats and stays there: nothing quantizes it on
 		// the float path, so this projection reads what the attention wrote.
-		if b.setO, err = p.pipeMatF32.NewSet([]*Buffer{b.wO, p.attnOut, p.mixOut}); err != nil {
+		if b.setO, err = p.wideProduct().NewSet([]*Buffer{b.wO, p.attnOut, p.mixOut}); err != nil {
 			return nil, err
 		}
 	}
@@ -1137,7 +1221,7 @@ func (p *QwenPipeline) newFFNBlock(d QwenFFNData) (*qwenFFNBlock, error) {
 		}
 		return b, nil
 	}
-	if s.Float {
+	if s.wide() {
 		b.f32 = true
 		for _, u := range []struct {
 			into **Buffer
@@ -1158,7 +1242,7 @@ func (p *QwenPipeline) newFFNBlock(d QwenFFNData) (*qwenFFNBlock, error) {
 			{&b.setUp, b.wUp, p.ffnNorm, p.upBuf},
 			{&b.setDown, b.wDown, p.actBuf, p.ffnOut},
 		} {
-			if *u.into, err = p.pipeMatF32.NewSet([]*Buffer{u.w, u.x, u.y}); err != nil {
+			if *u.into, err = p.wideProduct().NewSet([]*Buffer{u.w, u.x, u.y}); err != nil {
 				return nil, err
 			}
 		}
@@ -2156,7 +2240,7 @@ func (p *QwenPipeline) Close() {
 	}
 	for _, pl := range []*Pipeline{
 		p.pipeNorm, p.pipeMatQ4K, p.pipeMatQ6K,
-		p.pipeMatF32, p.pipeSwiglu, p.pipeConv, p.pipeScan, p.pipeAttnPrep, p.pipeAttnGQA,
+		p.pipeMatF32, p.pipeMatBF16, p.pipeSwiglu, p.pipeConv, p.pipeScan, p.pipeAttnPrep, p.pipeAttnGQA,
 		p.pipeMatQ80,
 	} {
 		if pl != nil {

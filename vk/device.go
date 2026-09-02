@@ -34,6 +34,11 @@ type Device struct {
 
 	// stage is the staging pair every upload alternates between. See staging.
 	stage [2]*Buffer
+
+	// budget says the driver will answer DeviceLocalFree with something real.
+	// See that function for what it is for and why it is asked rather than
+	// computed.
+	budget bool
 }
 
 // Open finds the first device with a compute queue and takes it.
@@ -121,6 +126,13 @@ func Open() (*Device, error) {
 	if have[hostImportExtension] {
 		names = append(names, append([]byte(hostImportExtension), 0))
 	}
+	// What is free on the card, rather than how large it is. A caller sizing a
+	// working set has been dividing the heap by a constant found by trial; this
+	// is the driver's own answer, and it moves with what else is resident.
+	if have[budgetExtension] {
+		names = append(names, append([]byte(budgetExtension), 0))
+		d.budget = true
+	}
 
 	// The matrix cores, if this device has them. They are asked for as a group
 	// or not at all — the product needs all four capabilities — and a device
@@ -206,6 +218,16 @@ func Open() (*Device, error) {
 // double-buffering it 4.8, against 6.9 for the crossing alone. Importing the
 // pointer removes the copy rather than hiding it.
 const hostImportExtension = "VK_EXT_external_memory_host"
+
+// budgetExtension reports what each heap has left.
+//
+// It matters where a working set is sized against the card rather than chosen:
+// qwen35's streamed window takes two thirds of the heap's *size*, a fraction
+// arrived at by losing the device at three quarters. Two thirds of the size is
+// seventy-one per cent of what was actually free the moment this was written,
+// and that figure moves with the desktop, with the driver's own allocations,
+// and with whatever the previous window has not finished releasing.
+const budgetExtension = "VK_EXT_memory_budget"
 
 // dotProductExtension is what the Q4_0 and Q6_K kernels are written against.
 // A four-byte-at-a-time signed dot product with a 32-bit accumulator is one
@@ -328,11 +350,13 @@ func (d *Device) findHostImport() {
 	vkGetPhysicalDeviceProperties2(d.phys, unsafe.Pointer(&room[0]))
 	d.importAlign = ext.minImportedHostPointerAlignment
 
-	// The query comes back empty on this machine's driver — vulkaninfo prints
-	// 0x1000 for the same card, and the same chained struct through the same
-	// loader returns zero here — so the answer is probed rather than trusted. A
-	// page is what every driver that offers this asks for; importing one is
-	// cheap, and a device that refuses it keeps the staging path.
+	// A driver that answers zero is not saying the alignment is zero, it is
+	// saying nothing — which is what this one did until the instance stopped
+	// asking for Vulkan 1.0 under the name of 1.1 (see apiVersion11). The
+	// fallback is kept because it costs one page and it is the difference
+	// between a wrong answer and no import: a page is what every driver that
+	// offers this asks for, and a device that refuses the trial keeps the
+	// staging path.
 	if d.importAlign == 0 {
 		d.importAlign = uint64(os.Getpagesize())
 		page := make([]byte, 2*d.importAlign)
@@ -616,14 +640,24 @@ const stageChunk = 16 << 20
 // They are kept rather than made per call because a checkpoint is hundreds of
 // tensors and thirty-two mebibytes of host memory is faulted in once.
 func (d *Device) staging() ([2]*Buffer, error) {
+	// Both or neither. A first buffer kept after the second failed would leave
+	// the next call finding d.stage[0] set, returning a pair whose second half
+	// is nil, and saying nothing was wrong — which CopyInto dereferences.
 	if d.stage[0] == nil {
-		for i := range d.stage {
+		var made [2]*Buffer
+		for i := range made {
 			b, err := d.Host(stageChunk, bufferUsageTransferSrc)
 			if err != nil {
-				return d.stage, err
+				for _, m := range made {
+					if m != nil {
+						m.Close()
+					}
+				}
+				return [2]*Buffer{}, err
 			}
-			d.stage[i] = b
+			made[i] = b
 		}
+		d.stage = made
 	}
 	return d.stage, nil
 }
@@ -707,6 +741,45 @@ func (d *Device) run(record func(commandBuffer)) error {
 		return err
 	}
 	return check("vkQueueWaitIdle", vkQueueWaitIdle(d.queue))
+}
+
+// DeviceLocalFree is what the largest device-local heap has left, or zero when
+// the driver will not say.
+//
+// It is the answer DeviceLocalBytes cannot give. A caller that has just
+// released a window of ten gigabytes and is about to ask for another has no way
+// to know from the heap's size whether the first one is actually gone: the
+// driver frees asynchronously, and an allocation that succeeds against a heap
+// the kernel has not finished reclaiming is where a hard recovery comes from.
+// This is asked again each time rather than cached for exactly that reason.
+func (d *Device) DeviceLocalFree() uint64 {
+	if !d.budget {
+		return 0
+	}
+	// VkPhysicalDeviceMemoryProperties2 carries the whole of
+	// VkPhysicalDeviceMemoryProperties inline. It is given room the driver
+	// cannot overrun and read through the pNext chain, which is the only part
+	// wanted — the same arrangement as findHostImport, and for the same reason.
+	ext := memoryBudgetProperties{sType: structMemoryBudget}
+	room := make([]byte, 4096)
+	*(*uint32)(unsafe.Pointer(&room[0])) = structMemoryProperties2
+	*(*uintptr)(unsafe.Pointer(&room[8])) = uintptr(unsafe.Pointer(&ext))
+	vkGetPhysicalDeviceMemoryProps2(d.phys, unsafe.Pointer(&room[0]))
+
+	// The same heap DeviceLocalBytes names, so that the free figure and the
+	// size are about the same memory.
+	var at uint32
+	var most uint64
+	for i := uint32(0); i < d.memory.memoryHeapCount && i < 16; i++ {
+		h := d.memory.memoryHeaps[i]
+		if h.flags&memoryDeviceLocal != 0 && h.size > most {
+			most, at = h.size, i
+		}
+	}
+	if most == 0 || ext.budget[at] <= ext.usage[at] {
+		return 0
+	}
+	return ext.budget[at] - ext.usage[at]
 }
 
 // DeviceLocalBytes is the largest device-local heap the card reports. It is

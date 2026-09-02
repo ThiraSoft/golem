@@ -64,13 +64,28 @@ const (
 	structImportMemoryHostPointer   = 1000178000
 	structHostPointerProperties     = 1000178001
 	structExternalMemoryHostProps   = 1000178002
+	structMemoryProperties2         = 1000059006
+	structMemoryBudget              = 1000237000
 
 	// handleTypeHostAllocation names memory this side allocated, which is what
 	// VK_EXT_external_memory_host imports: a pointer the process already owns
 	// becomes a VkDeviceMemory the card reads across the bus.
 	handleTypeHostAllocation = 0x80
 
-	apiVersion11              = 1 << 22 // VK_API_VERSION_1_1
+	// VK_MAKE_API_VERSION(0, 1, 1, 0). The minor is the second term and it was
+	// missing: 1<<22 alone is 1.0, and this constant has been asking for 1.0
+	// under the name of 1.1 for the life of the backend.
+	//
+	// It was silent because a 1.0 instance still gets everything the kernels
+	// need — the extensions are asked for by name. What it does not get is the
+	// pNext chain of a promoted query: the loader emulates
+	// vkGetPhysicalDevice*Properties2 for a 1.0 instance by calling the 1.0
+	// entry point, which fills the base structure and drops everything chained
+	// behind it. Two queries were written against that and read zeros —
+	// VK_EXT_memory_budget's heaps, and the alignment
+	// VK_EXT_external_memory_host wants — while the same call in C answered
+	// both.
+	apiVersion11              = 1<<22 | 1<<12 // VK_API_VERSION_1_1
 	structQueryPoolCreateInfo = 11
 
 	queryTypeTimestamp = 2
@@ -582,6 +597,17 @@ type externalMemoryBufferCreateInfo struct {
 	_           uint32
 }
 
+// memoryBudgetProperties is what the driver says is available and in use on
+// each heap, which is not the same as each heap's size. VK_MAX_MEMORY_HEAPS is
+// sixteen.
+type memoryBudgetProperties struct {
+	sType  uint32
+	_      uint32
+	pNext  uintptr
+	budget [16]uint64
+	usage  [16]uint64
+}
+
 // externalMemoryHostProperties carries the one limit that decides whether a
 // pointer can be imported at all.
 type externalMemoryHostProperties struct {
@@ -655,6 +681,7 @@ var (
 	vkQueueWaitIdle                      func(queue) int32
 	vkGetPhysicalDeviceProperties2       func(physicalDevice, unsafe.Pointer)
 	vkGetDeviceProcAddr                  func(device, uintptr) uintptr
+	vkGetPhysicalDeviceMemoryProps2      func(physicalDevice, unsafe.Pointer)
 
 	// Resolved per device rather than from the loader: an extension entry point
 	// is not required to be an exported symbol, and this one is not on every
@@ -729,6 +756,7 @@ func load() error {
 	bind(&vkQueueWaitIdle, "vkQueueWaitIdle")
 	bind(&vkGetPhysicalDeviceProperties2, "vkGetPhysicalDeviceProperties2")
 	bind(&vkGetDeviceProcAddr, "vkGetDeviceProcAddr")
+	bind(&vkGetPhysicalDeviceMemoryProps2, "vkGetPhysicalDeviceMemoryProperties2")
 	loaded = true
 	return nil
 }
