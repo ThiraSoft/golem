@@ -5,6 +5,7 @@ package vk
 import (
 	"fmt"
 	"os"
+	"sync"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -662,6 +663,44 @@ func (d *Device) staging() ([2]*Buffer, error) {
 	return d.stage, nil
 }
 
+// copyWide is a memcpy spread over several goroutines.
+//
+// A memcpy of a slice this process has already touched does not need this — one
+// core reaches fifteen gigabytes a second here and the bus carries seven. A
+// memcpy *out of a mapped file* is a different thing: every page it has not read
+// before is a fault, and faults taken one at a time on one thread are what a
+// streamed checkpoint spends its wall clock on.
+//
+// It was found the way these things are found. qwen35's streamed pass sends half
+// as many bytes in bfloat16 as widened to float32, over a kernel measured at
+// twice the rate, and finished twenty-five per cent *slower* — in both orders,
+// so not the page cache. What the widened path had and the bfloat16 path did not
+// was qwen35's own spread() over the widening, which faulted the mapping in on
+// four threads by accident.
+//
+// The degree is small on purpose. These threads and the copy engine read the
+// same host memory controller, and vk/upload_test.go measures what that
+// contention costs: a staged upload overlapped with one memcpy reaches 5.85 GB/s
+// against the 6.68 the transfer alone reaches.
+func copyWide(dst, src []byte) {
+	const threads = 4
+	// Below this the goroutines cost more than the faults they overlap.
+	const least = 1 << 20
+	n := min(len(dst), len(src))
+	if n < least*threads {
+		copy(dst, src)
+		return
+	}
+	var wg sync.WaitGroup
+	part := (n + threads - 1) / threads
+	for at := 0; at < n; at += part {
+		hi := min(at+part, n)
+		wg.Add(1)
+		go func(lo, hi int) { defer wg.Done(); copy(dst[lo:hi], src[lo:hi]) }(at, hi)
+	}
+	wg.Wait()
+}
+
 // CopyInto writes data into an existing device-local buffer at an offset,
 // through the shared staging pair. It is what UploadTail is built on, and what
 // a streamed weight wants directly: the destination outlives the transfer.
@@ -673,7 +712,7 @@ func (d *Device) CopyInto(dst *Buffer, at int, data []byte) error {
 	// One chunk is one copy and one submission, with nothing to overlap and no
 	// goroutine to pay for. Most tensors are this.
 	if len(data) <= stageChunk {
-		copy(stage[0].Bytes()[:len(data)], data)
+		copyWide(stage[0].Bytes()[:len(data)], data)
 		return d.copyBuffer(stage[0], dst, uint64(at), uint64(len(data)))
 	}
 
@@ -694,7 +733,7 @@ func (d *Device) CopyInto(dst *Buffer, at int, data []byte) error {
 		for off := 0; off < len(data); off += stageChunk {
 			slot := <-free
 			n := min(stageChunk, len(data)-off)
-			copy(stage[slot].Bytes()[:n], data[off:off+n])
+			copyWide(stage[slot].Bytes()[:n], data[off:off+n])
 			filled <- ready{slot, off}
 		}
 		close(filled)

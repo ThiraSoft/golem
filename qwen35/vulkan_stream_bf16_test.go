@@ -22,6 +22,7 @@ package qwen35
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -40,6 +41,23 @@ func TestStreamedBF16MatchesWidened(t *testing.T) {
 	// projection reading the wrong half of a word could not agree by accident.
 	ids := calibTokens(8)
 
+	// The window is fixed rather than left to the budget, for two reasons and
+	// the second is the important one.
+	//
+	// Memory: the widened pass allocates a float32 copy of every matrix it
+	// uploads, about a gigabyte a block on this model, and a window chosen from
+	// the card's free memory is seven blocks of that on top of a mapped
+	// fifty-two gigabyte file. This machine's session manager kills a process
+	// that asks for too much, and it has.
+	//
+	// Correctness: the two forms weigh two and four bytes a weight, so a window
+	// sized by the budget holds a different number of blocks in each pass, and
+	// the state crosses to the host as float32 at every window boundary. Fixing
+	// the window puts the boundaries in the same places, which turns "within a
+	// rounding of a state" into "the same answer" — and an exact assertion is
+	// the one worth making, because the widening is exact.
+	const window = 3
+
 	run := func(widened bool) ([][][]float32, time.Duration) {
 		t.Helper()
 		wideF32Only = widened
@@ -55,7 +73,7 @@ func TestStreamedBF16MatchesWidened(t *testing.T) {
 		}
 		form := m.wideForm()
 		start := time.Now()
-		out, err := m.ForwardStreamed([][]int32{ids}, 0, 256)
+		out, err := m.ForwardStreamed([][]int32{ids}, window, 256)
 		if err != nil {
 			t.Fatalf("streamed (%v): %v", form, err)
 		}
@@ -66,9 +84,27 @@ func TestStreamedBF16MatchesWidened(t *testing.T) {
 	}
 
 	// The widened pass first, so that the bfloat16 one is not the pass that
-	// warms the page cache for the other.
-	want, slow := run(true)
-	got, fast := run(false)
+	// warms the page cache for the other. And the host's copy of the first pass
+	// is given back before the second asks for its own.
+	//
+	// GOLEM_BF16_FIRST swaps them, which is the control for the timings this
+	// prints: the checkpoint is fifty-two gigabytes against this machine's
+	// thirty-one, so neither pass runs against a warm cache, but the second one
+	// runs against a cache the first has just churned. A difference that
+	// survives the swap is a difference between the two paths; one that follows
+	// the order is not.
+	first := os.Getenv("GOLEM_BF16_FIRST") != ""
+	var want, got [][][]float32
+	var slow, fast time.Duration
+	if first {
+		got, fast = run(false)
+		runtime.GC()
+		want, slow = run(true)
+	} else {
+		want, slow = run(true)
+		runtime.GC()
+		got, fast = run(false)
+	}
 	fmt.Printf("bfloat16 against widened: %v against %v\n",
 		fast.Round(time.Millisecond), slow.Round(time.Millisecond))
 
@@ -83,12 +119,12 @@ func TestStreamedBF16MatchesWidened(t *testing.T) {
 		}
 	}
 	fmt.Printf("worst position %d at %.3e\n", at, worst)
-	// Not zero, and it should not be asked to be: the two passes size their
-	// windows differently — two bytes a weight against four — so a block does
-	// not always fall in the same window, and a window boundary is where the
-	// state crosses to the host and back as float32. What that costs is the
-	// rounding of a state, not of a weight.
-	if worst > 1e-5 {
+	// Exactly zero. Same weights, same order of summation, same window
+	// boundaries, and a widening that is a shift on both sides — there is
+	// nothing left that could differ. A tolerance here would pass a kernel
+	// reading the wrong half of every word on a matrix whose columns happen to
+	// be small.
+	if worst != 0 {
 		t.Fatalf("position %d differs by %.3e between the bfloat16 window and the widened one", at, worst)
 	}
 }
