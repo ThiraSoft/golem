@@ -148,6 +148,26 @@ var moeGateUpQ3KMidSPIRV []byte
 //go:embed shaders/moe_gateup_q3k32.spv
 var moeGateUpQ3KWidestSPIRV []byte
 
+// And over Q2_K, which is where llama.cpp's two-bit mix puts the gate and the
+// up — so a Q2_K checkpoint is this kernel for its whole feed-forward.
+//
+//go:generate glslc -O -DQ2K --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q2k.spv
+//go:generate glslc -O -DQ2K -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q2k8.spv
+//go:generate glslc -O -DQ2K -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q2k16.spv
+//go:generate glslc -O -DQ2K -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q2k32.spv
+
+//go:embed shaders/moe_gateup_q2k.spv
+var moeGateUpQ2KSPIRV []byte
+
+//go:embed shaders/moe_gateup_q2k8.spv
+var moeGateUpQ2KWideSPIRV []byte
+
+//go:embed shaders/moe_gateup_q2k16.spv
+var moeGateUpQ2KMidSPIRV []byte
+
+//go:embed shaders/moe_gateup_q2k32.spv
+var moeGateUpQ2KWidestSPIRV []byte
+
 // The expert kernels against Q8_0 weights. A mixture in that form is four
 // bytes a weight where Q4_0 is two and a quarter, so it is the smallest form
 // this engine reads whose expert pool does not fit in the memory a card can
@@ -277,8 +297,8 @@ type Mixture struct {
 	// The same two products over a K-quant. A mixture holds at most a couple of
 	// formats and each pipeline is several binaries, so they are built when a
 	// block asks and not before — vk/quantproduct.go says the rest.
-	products             *quantProducts
-	gateUpQ4K, gateUpQ3K *Pipeline
+	products                        *quantProducts
+	gateUpQ4K, gateUpQ3K, gateUpQ2K *Pipeline
 	// The expert kernels against Q8_0 weights, built on the first block that
 	// brings them. expertQuant is the form the experts arrived in, which every
 	// block of a model shares.
@@ -811,9 +831,9 @@ type MixtureFormats struct {
 
 func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, down []byte) error {
 	switch f.GateUp {
-	case nn.Q4_0, nn.Q3_K, nn.Q4_K, nn.Q8_0:
+	case nn.Q4_0, nn.Q2_K, nn.Q3_K, nn.Q4_K, nn.Q8_0:
 	default:
-		return fmt.Errorf("vk: the shared gate and up are %s, and the fused kernel reads Q4_0, Q3_K, Q4_K and Q8_0", f.GateUp)
+		return fmt.Errorf("vk: the shared gate and up are %s, and the fused kernel reads Q4_0, Q2_K, Q3_K, Q4_K and Q8_0", f.GateUp)
 	}
 	shapes := []struct {
 		what       string
@@ -1278,6 +1298,10 @@ func (m *Mixture) Close() {
 	if m.gateUpQ3K != nil {
 		m.gateUpQ3K.Close()
 		m.gateUpQ3K = nil
+	}
+	if m.gateUpQ2K != nil {
+		m.gateUpQ2K.Close()
+		m.gateUpQ2K = nil
 	}
 	if m.dxf != nil {
 		m.dxf.Close()
@@ -1884,6 +1908,18 @@ func (m *Mixture) fusedFor(q nn.Quant) (*Pipeline, error) {
 		}
 		return m.gateUpQ80, nil
 	}
+	if q == nn.Q2_K {
+		if m.gateUpQ2K != nil {
+			return m.gateUpQ2K, nil
+		}
+		p, err := m.fusedPipeline(moeGateUpQ2KSPIRV,
+			moeGateUpQ2KWideSPIRV, moeGateUpQ2KMidSPIRV, moeGateUpQ2KWidestSPIRV)
+		if err != nil {
+			return nil, err
+		}
+		m.gateUpQ2K = p
+		return p, nil
+	}
 	if q == nn.Q3_K {
 		if m.gateUpQ3K != nil {
 			return m.gateUpQ3K, nil
@@ -1897,7 +1933,7 @@ func (m *Mixture) fusedFor(q nn.Quant) (*Pipeline, error) {
 		return p, nil
 	}
 	if q != nn.Q4_K {
-		return nil, fmt.Errorf("vk: the fused gate and up reads Q4_0, Q3_K, Q4_K and Q8_0, not %s", q)
+		return nil, fmt.Errorf("vk: the fused gate and up reads Q4_0, Q2_K, Q3_K, Q4_K and Q8_0, not %s", q)
 	}
 	if m.gateUpQ4K != nil {
 		return m.gateUpQ4K, nil

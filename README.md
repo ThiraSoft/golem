@@ -106,16 +106,25 @@ models — both engines by the same fraction, checked by re-running llama.cpp's
 side as well — so the column to read is the difference between the two engines
 and not the rate, and even that difference is this machine's.
 
-**A K-quant runs on the card too.** Q4_0, Q4_1, Q3_K, Q4_K, Q5_K and Q6_K each
-have a mat-vec and a tiled product here, and a checkpoint may mix them the way
-llama.cpp's own quantizer does — a `Q4_K_M` gives the same role different
+**A K-quant runs on the card too.** Q4_0, Q4_1, Q2_K, Q3_K, Q4_K, Q5_K and Q6_K
+each have a mat-vec and a tiled product here, and a checkpoint may mix them the
+way llama.cpp's own quantizer does — a `Q4_K_M` gives the same role different
 formats in different blocks, six bits on half its `ffn_down` and four on the
-rest, and every matrix is asked what it is rather than told. Q3_K is here even
-though golem's own `.golem` beats it at the same three bits: a client who will
-not compress a checkpoint, or cannot, downloads a `Q3_K_M`, and refusing it
-would refuse the model over a packing. A `Q3_K_S` runs entirely on the card at
-**97.7 tokens a second** on Qwen3-4B, against **16.1** on this machine's eight
-cores. A form with no
+rest, and every matrix is asked what it is rather than told. The two-bit and
+three-bit tiers are here even though golem's own `.golem` beats them at the same
+rate: a client who will not compress a checkpoint, or cannot, downloads a
+`Q3_K_M`, and refusing it would refuse the model over a packing. With those two
+added, every K-quant llama.cpp writes now runs — a `Q2_K` file is itself a mix
+of Q2_K, Q3_K, Q4_K and Q6_K, so the last format added is what opened the whole
+family.
+
+| on Qwen3-4B | card | eight cores |
+|---|---|---|
+| `Q2_K` | **121.6** t/s | **13.8** t/s |
+| `Q3_K_S` | **97.7** t/s | **16.1** t/s |
+
+Q3_K on the processor was 0.69 tokens a second before it had an integer product,
+because a `Q3_K_S` is that one format for 252 of its tensors. A form with no
 kernel is an error naming it, never a guess: eighteen bytes to a block of
 thirty-two is Q4_0 and it is also Q4_K, so a reader that checked a length
 instead of a type would answer fluently out of the wrong bits.

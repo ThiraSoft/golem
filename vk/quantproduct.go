@@ -65,6 +65,20 @@ import (
 //go:generate glslc -O -DQ3K -DCOLUMNS=256 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q3k256.spv
 //go:generate glslc -O -DQ3K -DCOLUMNS=512 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q3k512.spv
 
+// And Q2_K, the tier below it, which llama.cpp's two-bit mix puts on the
+// query, the key, the gate and the up. vk/split_q2k.go is its layout.
+//
+//go:generate glslc -O -DQ2K -DLANES=16 -DOUTS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q2kq8.spv
+//go:generate glslc -O -DQ2K -DLANES=16 -DOUTS=8 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q2kq8_2.spv
+//go:generate glslc -O -DQ2K -DLANES=16 -DOUTS=8 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q2kq8_4.spv
+//go:generate glslc -O -DQ2K -DLANES=16 -DOUTS=8 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q2kq8_8.spv
+//go:generate glslc -O -DQ2K -DLANES=16 -DOUTS=8 -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q2kq8_16.spv
+//go:generate glslc -O -DQ2K -DCOLUMNS=32 -DBN=32 -DBM=64 -DBK=128 -DWAVE_M=4 -DWAVE_N=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q2k32.spv
+//go:generate glslc -O -DQ2K -DCOLUMNS=64 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q2k64.spv
+//go:generate glslc -O -DQ2K -DCOLUMNS=128 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q2k128.spv
+//go:generate glslc -O -DQ2K -DCOLUMNS=256 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q2k256.spv
+//go:generate glslc -O -DQ2K -DCOLUMNS=512 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q2k512.spv
+
 //go:generate glslc -O -DQ4K -DCOLUMNS=32 -DBN=32 -DBM=64 -DBK=128 -DWAVE_M=4 -DWAVE_N=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q4k32.spv
 //go:generate glslc -O -DQ6K -DCOLUMNS=32 -DBN=32 -DBM=64 -DBK=128 -DWAVE_M=4 -DWAVE_N=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q6k32.spv
 //go:generate glslc -O -DQ6K -DCOLUMNS=64 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q6k64.spv
@@ -239,6 +253,36 @@ var matmulCoopQ3K256SPIRV []byte
 //go:embed shaders/matmul_coop_q3k512.spv
 var matmulCoopQ3K512SPIRV []byte
 
+//go:embed shaders/matvec_q2kq8.spv
+var matvecQ2KQ8SPIRV []byte
+
+//go:embed shaders/matvec_q2kq8_2.spv
+var matvecQ2KQ8_2SPIRV []byte
+
+//go:embed shaders/matvec_q2kq8_4.spv
+var matvecQ2KQ8_4SPIRV []byte
+
+//go:embed shaders/matvec_q2kq8_8.spv
+var matvecQ2KQ8_8SPIRV []byte
+
+//go:embed shaders/matvec_q2kq8_16.spv
+var matvecQ2KQ8_16SPIRV []byte
+
+//go:embed shaders/matmul_coop_q2k32.spv
+var matmulCoopQ2K32SPIRV []byte
+
+//go:embed shaders/matmul_coop_q2k64.spv
+var matmulCoopQ2K64SPIRV []byte
+
+//go:embed shaders/matmul_coop_q2k128.spv
+var matmulCoopQ2K128SPIRV []byte
+
+//go:embed shaders/matmul_coop_q2k256.spv
+var matmulCoopQ2K256SPIRV []byte
+
+//go:embed shaders/matmul_coop_q2k512.spv
+var matmulCoopQ2K512SPIRV []byte
+
 // QuantReadable says whether a projection stored this way has a kernel here.
 //
 // It is asked before a matrix is uploaded rather than inferred from its length,
@@ -249,7 +293,7 @@ var matmulCoopQ3K512SPIRV []byte
 // tensor instead.
 func QuantReadable(q nn.Quant) bool {
 	switch q {
-	case nn.Q4_0, nn.Q4_1, nn.Q3_K, nn.Q4_K, nn.Q5_K, nn.Q6_K, nn.Q8_0:
+	case nn.Q4_0, nn.Q4_1, nn.Q2_K, nn.Q3_K, nn.Q4_K, nn.Q5_K, nn.Q6_K, nn.Q8_0:
 		return true
 	}
 	return false
@@ -263,6 +307,8 @@ func quantRowBytes(q nn.Quant, cols int) (int, error) {
 		return rowBytesQ4_0(cols), nil
 	case nn.Q4_1:
 		return cols / nn.QuantBlock * 20, nil
+	case nn.Q2_K:
+		return rowBytesQ2_K(cols), nil
 	case nn.Q3_K:
 		return rowBytesQ3_K(cols), nil
 	case nn.Q4_K:
@@ -280,7 +326,7 @@ func quantRowBytes(q nn.Quant, cols int) (int, error) {
 // quantLayout is a matrix in the layout its kernels read, checked against the
 // length the format says it should have.
 func quantLayout(q nn.Quant, data []byte, rows, cols int) ([]byte, error) {
-	if (q == nn.Q3_K || q == nn.Q4_K || q == nn.Q5_K || q == nn.Q6_K) && cols%nn.SuperBlock != 0 {
+	if (q == nn.Q2_K || q == nn.Q3_K || q == nn.Q4_K || q == nn.Q5_K || q == nn.Q6_K) && cols%nn.SuperBlock != 0 {
 		return nil, fmt.Errorf("vk: a %s row needs a multiple of %d columns, given %d", q, nn.SuperBlock, cols)
 	}
 	if cols%nn.QuantBlock != 0 {
@@ -298,6 +344,8 @@ func quantLayout(q nn.Quant, data []byte, rows, cols int) ([]byte, error) {
 		return splitQ4_0(data, rows, cols), nil
 	case nn.Q4_1:
 		return splitQ4_1(data, rows, cols), nil
+	case nn.Q2_K:
+		return splitQ2_K(data, rows, cols), nil
 	case nn.Q3_K:
 		return splitQ3_K(data, rows, cols), nil
 	case nn.Q4_K:
@@ -332,6 +380,10 @@ func quantFileRow(q nn.Quant, cols int) (int, error) {
 		return rowBytesQ4_0(cols), nil
 	case nn.Q4_1:
 		return cols / nn.QuantBlock * 20, nil
+	case nn.Q2_K:
+		// Eighty-four bytes a superblock, which the packing keeps: Q2_K is the
+		// one format here the card holds at exactly the file's size.
+		return cols / nn.SuperBlock * 84, nil
 	case nn.Q3_K:
 		// A hundred and ten bytes a superblock, which the packing takes to a
 		// hundred and fourteen; vk/split_q3k.go says what the four buy.
@@ -376,6 +428,14 @@ func newQuantProduct(d *Device, q nn.Quant, coop bool) (*Pipeline, error) {
 			columns int
 			spirv   []byte
 		}{{2, matvec2SPIRV}, {4, matvec4SPIRV}, {smallColumns, matvecWideSPIRV}, {16, matvecQwen16SPIRV}} {
+			narrow = append(narrow, w)
+		}
+	case nn.Q2_K:
+		base = matvecQ2KQ8SPIRV
+		for _, w := range []struct {
+			columns int
+			spirv   []byte
+		}{{2, matvecQ2KQ8_2SPIRV}, {4, matvecQ2KQ8_4SPIRV}, {smallColumns, matvecQ2KQ8_8SPIRV}, {16, matvecQ2KQ8_16SPIRV}} {
 			narrow = append(narrow, w)
 		}
 	case nn.Q3_K:
@@ -439,6 +499,14 @@ func newQuantProduct(d *Device, q nn.Quant, coop bool) (*Pipeline, error) {
 			}{
 				{tiledColumns, matmulCoop32SPIRV}, {64, matmulCoop64SPIRV},
 				{128, matmulCoop128SPIRV}, {256, matmulCoop256SPIRV}, {wideColumns, matmulCoop512SPIRV},
+			}
+		case nn.Q2_K:
+			tiled = []struct {
+				columns int
+				spirv   []byte
+			}{
+				{tiledColumns, matmulCoopQ2K32SPIRV}, {64, matmulCoopQ2K64SPIRV},
+				{128, matmulCoopQ2K128SPIRV}, {256, matmulCoopQ2K256SPIRV}, {wideColumns, matmulCoopQ2K512SPIRV},
 			}
 		case nn.Q3_K:
 			tiled = []struct {

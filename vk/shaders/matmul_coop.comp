@@ -383,7 +383,7 @@ uint  pwh[WPT];
 uint  pwh[WPT];
 uint  pwh2[WPT];
 #endif
-#if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41) || defined(Q3K)
+#if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41) || defined(Q3K) || defined(Q2K)
 // The minimum, which both K-quants carry and Q4_0 does not: their weight is a
 // magnitude times a scale less a minimum, where Q4_0's is a magnitude recentred
 // on eight.
@@ -412,7 +412,7 @@ void prefetch(uint kb) {
 #ifdef Q6K
             pwh2[i] = 0u;
 #endif
-#if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41) || defined(Q3K)
+#if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41) || defined(Q3K) || defined(Q2K)
             pwm[i] = 0.0;
 #endif
             if (row0 + r < p.dim && b < nb) {
@@ -449,6 +449,26 @@ void prefetch(uint kb) {
                 uint sat = base + 16u * sbi + 2u * (b & 7u);
                 pws[i] = dd * float(bitfieldExtract(int(w[sat >> 2]), int((sat & 3u) * 8u), 8));
                 pwm[i] = dd * float(bitfieldExtract(int(w[(sat + 1u) >> 2]), int(((sat + 1u) & 3u) * 8u), 8));
+#elif defined(Q2K)
+                // vk/split_q2k.go. Q2_K wants four numbers a block where every
+                // other format here wants two — a scale and a minimum for each
+                // half — and it has two spare registers to put them in, because
+                // two bits a weight is two words of magnitudes and pw is four.
+                // So pws and pwm carry the superblock's d and dmin, pw.z
+                // carries the two scale bytes, and the staging splits the
+                // nibbles. No register beyond the ones already declared.
+                uint nsb   = nb >> 3;
+                uint magB  = base + 16u * nsb;
+                uint blkB  = base + 20u * nsb;
+                uint at4   = (blkB + 8u * b) >> 2;
+                uint sbi   = b >> 3u;
+                uint sat   = base + 16u * sbi + 2u * (b & 7u);
+                uint scLo  = bitfieldExtract(w[sat >> 2], int((sat & 3u) * 8u), 8);
+                uint scHi  = bitfieldExtract(w[(sat + 1u) >> 2], int(((sat + 1u) & 3u) * 8u), 8);
+                pw[i]      = uvec4(w[at4], w[at4 + 1u], scLo | (scHi << 8u), 0u);
+                vec2 dm    = unpackHalf2x16(w[(magB + 4u * sbi) >> 2]);
+                pws[i]     = dm.x;
+                pwm[i]     = dm.y;
 #elif defined(Q3K)
                 // vk/split_q3k.go: the same header Q6_K has and half the
                 // magnitudes — three words a block against Q6_K's six, which
@@ -540,7 +560,7 @@ void stageTile() {
         uint k  = idx / uint(BM);
         uint at = r * uint(SA_STRIDE) + k * 32u;
         float ws = pws[i];
-#if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41) || defined(Q3K)
+#if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41) || defined(Q3K) || defined(Q2K)
         float wm = pwm[i];
 #endif
 #if defined(Q5K) || defined(Q6K)
@@ -550,11 +570,26 @@ void stageTile() {
         uint  wh2 = pwh2[i];
 #endif
         [[unroll]] for (uint u = 0u; u < 4u; u++) {
-#ifndef Q3K
+#if !defined(Q3K) && !defined(Q2K)
             uint w0 = pw[i][u] & 0x0F0F0F0Fu;
             uint w1 = (pw[i][u] >> 4u) & 0x0F0F0F0Fu;
 #endif
-#if defined(Q3K)
+#if defined(Q2K)
+            // Two bits a weight, spread one to a byte with four masked shifts,
+            // and the block's four numbers taken out of the nibbles prefetch
+            // left packed. ws is d and wm is dmin here, not a scale and a
+            // minimum — the scale and the minimum are what they multiply.
+            uint x0 = (pw[i].x >> (8u * u)) & 0xFFu;
+            uint x1 = (pw[i].y >> (8u * u)) & 0xFFu;
+            uint w0 = (x0 & 3u) | ((x0 & 12u) << 6u) | ((x0 & 48u) << 12u) | ((x0 & 192u) << 18u);
+            uint w1 = (x1 & 3u) | ((x1 & 12u) << 6u) | ((x1 & 48u) << 12u) | ((x1 & 192u) << 18u);
+            float dsLo = ws * float(pw[i].z & 15u);
+            float dsHi = ws * float((pw[i].z >> 8u) & 15u);
+            float mnLo = wm * float((pw[i].z >> 4u) & 15u);
+            float mnHi = wm * float((pw[i].z >> 12u) & 15u);
+            vec4 v0 = unpackUnorm4x8(w0) * 255.0 * dsLo - mnLo;
+            vec4 v1 = unpackUnorm4x8(w1) * 255.0 * dsHi - mnHi;
+#elif defined(Q3K)
             // Three bits a weight, and the two halves of the block are two
             // words rather than the two nibbles of one — so this is the only
             // format here whose staging does not start from a nibble pair.
@@ -696,6 +731,8 @@ void main() {
     rowBytes  = ((nb >> 3) * 210u + 3u) & ~3u;
 #elif defined(Q3K)
     rowBytes  = ((nb >> 3) * 114u + 3u) & ~3u;
+#elif defined(Q2K)
+    rowBytes  = (nb >> 3) * 84u;
 #else
     rowBytes  = nb * 18u;
 #endif

@@ -215,6 +215,8 @@ func NewMatMulQuant(d *Device, data []byte, rows, cols, columns int, coop bool, 
 		relayout = splitQ6_K
 	case nn.Q3_K:
 		relayout = splitQ3_K
+	case nn.Q2_K:
+		relayout = splitQ2_K
 	default:
 		return nil, fmt.Errorf("vk: the tiled product has no staging for %s", q)
 	}
@@ -253,6 +255,8 @@ func NewMatMulQuant(d *Device, data []byte, rows, cols, columns int, coop bool, 
 			spirv, err = matmulCoopQ6KSPIRV(columns)
 		} else if q == nn.Q3_K {
 			spirv, err = matmulCoopQ3KSPIRV(columns)
+		} else if q == nn.Q2_K {
+			spirv, err = matmulCoopQ2KSPIRV(columns)
 		} else {
 			spirv, err = matmulCoopSPIRV(columns)
 		}
@@ -533,6 +537,23 @@ func matmulCoopQ3KSPIRV(columns int) ([]byte, error) {
 		return matmulCoopQ3K512SPIRV, nil
 	}
 	return nil, fmt.Errorf("vk: the cooperative Q3_K product is built at 32, 64, 128, 256, 512 columns, not %d", columns)
+}
+
+// matmulCoopQ2KSPIRV is the cooperative Q2_K product at that width.
+func matmulCoopQ2KSPIRV(columns int) ([]byte, error) {
+	switch columns {
+	case 32:
+		return matmulCoopQ2K32SPIRV, nil
+	case 64:
+		return matmulCoopQ2K64SPIRV, nil
+	case 128:
+		return matmulCoopQ2K128SPIRV, nil
+	case 256:
+		return matmulCoopQ2K256SPIRV, nil
+	case 512:
+		return matmulCoopQ2K512SPIRV, nil
+	}
+	return nil, fmt.Errorf("vk: the cooperative Q2_K product is built at 32, 64, 128, 256, 512 columns, not %d", columns)
 }
 
 // matmulSPIRV is the binary built for that many columns.

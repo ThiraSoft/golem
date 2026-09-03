@@ -109,6 +109,12 @@ int nearestInt(float f) {
     return int(f + sign * 0.5);
 }
 
+#ifdef Q2K
+// ubyte reads one unsigned byte of the weights, which is what a Q2_K scale
+// byte is: a four-bit scale low and a four-bit minimum high, neither biased.
+uint ubyte(uint at) { return bitfieldExtract(w[at >> 2], int((at & 3u) * 8u), 8); }
+#endif
+
 #ifdef Q3K
 // sbyte reads one signed byte of the weights, which is what a Q3_K group scale
 // is once vk/split_q3k.go has unpacked it from six bits and taken thirty-two
@@ -118,7 +124,14 @@ int sbyte(uint at) { return bitfieldExtract(int(w[at >> 2]), int((at & 3u) * 8u)
 
 void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
     uint nb  = p.dim >> 5;
-#ifdef Q3K
+#ifdef Q2K
+    // Sixteen scale-and-minimum bytes and an fp16 pair a superblock, then eight
+    // bytes a block of thirty-two. vk/split_q2k.go writes it, and nothing here
+    // is rounded: both regions are already a whole number of words.
+    uint nsb  = p.dim >> 8;
+    uint magB = rowBase + 16u * nsb;
+    uint nib  = rowBase + 20u * nsb;
+#elif defined(Q3K)
     // Q3_K is the one format here whose header is not two bytes a block:
     // sixteen signed scales and one fp16 to a superblock, then twelve bytes a
     // block of magnitudes on a word. vk/split_q3k.go writes it.
@@ -155,6 +168,16 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
         }
         float ws = dm.x * float(sc6);
         float wm = dm.y * float(mn6);
+#elif defined(Q2K)
+        // Four numbers a block: a scale and a minimum for each half of it.
+        uint sbi = b >> 3u;
+        vec2 dm = unpackHalf2x16(w[(magB + 4u * sbi) >> 2]);
+        uint scLo = ubyte(rowBase + 16u * sbi + 2u * (b & 7u));
+        uint scHi = ubyte(rowBase + 16u * sbi + 2u * (b & 7u) + 1u);
+        float wsLo = dm.x * float(scLo & 15u);
+        float wsHi = dm.x * float(scHi & 15u);
+        float wmLo = dm.y * float(scLo >> 4u);
+        float wmHi = dm.y * float(scHi >> 4u);
 #elif defined(Q3K)
         // Two scales a block of thirty-two, sixteen weights each, and neither
         // is a minimum: Q3_K is symmetric and its weights are recentred on
@@ -182,6 +205,35 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
                 acc = dotPacked4x8AccSatEXT(int(w[at + u]), int(xq[xc + u]), acc);
             }
             s[k] += ws * float(acc) * xs[SRCCOL(k) * 2u * nb + b];
+        }
+#elif defined(Q2K)
+        // Two loads a block, spread one weight to a byte the way Q3_K's are.
+        uint at = (nib + 8u * b) >> 2;
+        uint q0w = w[at], q1w = w[at + 1u];
+        uint ab = b * 8u;
+        uint lo[4], hi[4];
+        for (uint u = 0u; u < 4u; u++) {
+            uint x0 = (q0w >> (8u * u)) & 0xFFu;
+            uint x1 = (q1w >> (8u * u)) & 0xFFu;
+            lo[u] = (x0 & 3u) | ((x0 & 12u) << 6u) | ((x0 & 48u) << 12u) | ((x0 & 192u) << 18u);
+            hi[u] = (x1 & 3u) | ((x1 & 12u) << 6u) | ((x1 & 48u) << 12u) | ((x1 & 192u) << 18u);
+        }
+        [[unroll]] for (uint k = 0u; k < COLUMNS; k++) {
+            uint xc = SRCCOL(k) * xw + ab;
+            // The minima are a group's and the block's stored activation sum
+            // covers two groups, so the sums are taken here — one more packed
+            // dot against a vector of ones, per half.
+            int accLo = 0, accHi = 0, sumLo = 0, sumHi = 0;
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                int alo = int(xq[xc + u]), ahi = int(xq[xc + u + 4u]);
+                accLo = dotPacked4x8AccSatEXT(lo[u], alo, accLo);
+                accHi = dotPacked4x8AccSatEXT(hi[u], ahi, accHi);
+                sumLo = dotPacked4x8AccSatEXT(0x01010101, alo, sumLo);
+                sumHi = dotPacked4x8AccSatEXT(0x01010101, ahi, sumHi);
+            }
+            uint sc = SRCCOL(k) * 2u * nb;
+            s[k] += (float(accLo) * wsLo + float(accHi) * wsHi
+                   - float(sumLo) * wmLo - float(sumHi) * wmHi) * xs[sc + b];
         }
 #elif defined(Q3K)
         // Three loads a block: the low bit pairs of the first sixteen weights,
@@ -265,6 +317,8 @@ void main() {
     uint rowBytes = nb * 34u;
 #elif defined(Q3K)
     uint rowBytes = (((p.dim >> 8) * 114u) + 3u) & ~3u;
+#elif defined(Q2K)
+    uint rowBytes = (p.dim >> 8) * 84u;
 #else
     uint rowBytes = nb * 18u;
 #endif

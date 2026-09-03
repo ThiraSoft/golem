@@ -39,9 +39,14 @@ func aQ3_K(tb testing.TB) (*tensors.GGUF, nn.Matrix) {
 	return aKQuant(tb, "Q3_K", nn.Q3_K)
 }
 
+// aQ2_K is the two-bit tier, which lives in a Q2_K checkpoint and nowhere else.
+func aQ2_K(tb testing.TB) (*tensors.GGUF, nn.Matrix) {
+	return aKQuant(tb, "Q2_K", nn.Q2_K)
+}
+
 func aKQuant(tb testing.TB, dtype string, q nn.Quant) (*tensors.GGUF, nn.Matrix) {
 	tb.Helper()
-	for _, env := range []string{"GOLEM_MODEL_Q3KM", "GOLEM_MODEL_Q4KM", "GOLEM_MODEL_QWEN_Q4KM", "GOLEM_MODEL_12B_Q4KM"} {
+	for _, env := range []string{"GOLEM_MODEL_Q2K", "GOLEM_MODEL_Q3KM", "GOLEM_MODEL_Q4KM", "GOLEM_MODEL_QWEN_Q4KM", "GOLEM_MODEL_12B_Q4KM"} {
 		path := os.Getenv(env)
 		if path == "" {
 			continue
@@ -64,7 +69,7 @@ func aKQuant(tb testing.TB, dtype string, q nn.Quant) (*tensors.GGUF, nn.Matrix)
 		}
 		g.Close()
 	}
-	tb.Skipf("set GOLEM_MODEL_Q3KM or GOLEM_MODEL_Q4KM to a checkpoint holding a %s tensor", dtype)
+	tb.Skipf("set GOLEM_MODEL_Q2K, GOLEM_MODEL_Q3KM or GOLEM_MODEL_Q4KM to a checkpoint holding a %s tensor", dtype)
 	return nil, nn.Matrix{}
 }
 
@@ -213,6 +218,8 @@ func kQuantAgainstQ8_0(m nn.Matrix, batch *nn.Batch, columns int) [][]float32 {
 		stride, dequant = m.Cols/nn.SuperBlock*210, nn.DequantizeQ6_K
 	case nn.Q3_K:
 		stride, dequant = m.Cols/nn.SuperBlock*110, nn.DequantizeQ3_K
+	case nn.Q2_K:
+		stride, dequant = m.Cols/nn.SuperBlock*84, nn.DequantizeQ2_K
 	}
 	for i := 0; i < m.Rows; i++ {
 		dequant(m.Data[i*stride:(i+1)*stride], m.Cols, row)
@@ -241,6 +248,8 @@ func kQuantAgainstFloats(m nn.Matrix, batch *nn.Batch, columns int) [][]float32 
 		stride, dequant = m.Cols/nn.SuperBlock*210, nn.DequantizeQ6_K
 	case nn.Q3_K:
 		stride, dequant = m.Cols/nn.SuperBlock*110, nn.DequantizeQ3_K
+	case nn.Q2_K:
+		stride, dequant = m.Cols/nn.SuperBlock*84, nn.DequantizeQ2_K
 	}
 	for i := 0; i < m.Rows; i++ {
 		dequant(m.Data[i*stride:(i+1)*stride], m.Cols, row)

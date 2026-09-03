@@ -32,6 +32,10 @@ func TestFusedWidthsAreTheirOwnBinaries(t *testing.T) {
 			"1": moeGateUpQ4KSPIRV, "8": moeGateUpQ4KWideSPIRV,
 			"16": moeGateUpQ4KMidSPIRV, "32": moeGateUpQ4KWidestSPIRV,
 		}},
+		{"Q2_K", map[string][]byte{
+			"1": moeGateUpQ2KSPIRV, "8": moeGateUpQ2KWideSPIRV,
+			"16": moeGateUpQ2KMidSPIRV, "32": moeGateUpQ2KWidestSPIRV,
+		}},
 		{"Q3_K", map[string][]byte{
 			"1": moeGateUpQ3KSPIRV, "8": moeGateUpQ3KWideSPIRV,
 			"16": moeGateUpQ3KMidSPIRV, "32": moeGateUpQ3KWidestSPIRV,
