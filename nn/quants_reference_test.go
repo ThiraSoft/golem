@@ -54,6 +54,11 @@ func quantRoot(t *testing.T) string {
 var quantDirs = []string{
 	filepath.Join("testdata", "gemma", "quants"),
 	filepath.Join("testdata", "qwen", "quants"),
+	// Qwen3-4B-Q2_K, which is where the two-bit tier lives — and the three-bit
+	// one beside it, because llama.cpp's two-bit mix puts the output
+	// projection in Q3_K. Neither format is in any checkpoint the two
+	// recordings above were taken from.
+	filepath.Join("testdata", "qwen2k", "quants"),
 }
 
 func loadQuantFixture(t *testing.T, name string) quantFixture {

@@ -77,6 +77,11 @@ int main(int argc, char ** argv) {
         {"q4_0", "blk.0.attn_q.weight"},
         {"q4_1", "blk.0.ffn_down.weight"},
         {"q6_k", "token_embd.weight"},
+        // A Q2_K checkpoint carries both of these: llama.cpp's two-bit mix puts
+        // the query in Q2_K and the output projection in Q3_K. A Q3_K_S gives
+        // the second one alone, and the type check below sorts that out.
+        {"q2_k", "blk.0.attn_q.weight"},
+        {"q3_k", "blk.0.attn_output.weight"},
     };
 
     std::string entries;

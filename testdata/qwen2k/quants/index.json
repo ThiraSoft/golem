@@ -1,0 +1,14 @@
+{
+  "q6_k_matvec":  {"tensor": "token_embd.weight", "type": "Q6_K", "rows": 64, "cols": 2560,
+                     "weights": "q6_k_matvec.w.bin", "x": "q6_k_matvec.x.bin", "y": "q6_k_matvec.y.bin"},
+  "q6_k_dequant": {"tensor": "token_embd.weight", "type": "Q6_K", "rows": 4, "cols": 2560,
+                     "weights": "q6_k_dequant.w.bin", "y": "q6_k_dequant.y.bin"},
+  "q2_k_matvec":  {"tensor": "blk.0.attn_q.weight", "type": "Q2_K", "rows": 64, "cols": 2560,
+                     "weights": "q2_k_matvec.w.bin", "x": "q2_k_matvec.x.bin", "y": "q2_k_matvec.y.bin"},
+  "q2_k_dequant": {"tensor": "blk.0.attn_q.weight", "type": "Q2_K", "rows": 4, "cols": 2560,
+                     "weights": "q2_k_dequant.w.bin", "y": "q2_k_dequant.y.bin"},
+  "q3_k_matvec":  {"tensor": "blk.0.attn_output.weight", "type": "Q3_K", "rows": 64, "cols": 4096,
+                     "weights": "q3_k_matvec.w.bin", "x": "q3_k_matvec.x.bin", "y": "q3_k_matvec.y.bin"},
+  "q3_k_dequant": {"tensor": "blk.0.attn_output.weight", "type": "Q3_K", "rows": 4, "cols": 4096,
+                     "weights": "q3_k_dequant.w.bin", "y": "q3_k_dequant.y.bin"}
+}
