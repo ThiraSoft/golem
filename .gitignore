@@ -43,6 +43,7 @@
 
 # The Mimi encoder fixtures, same rule as the others.
 /testdata/encoder/
+/testdata/stt/
 
 # Python bytecode from the reference scripts.
 __pycache__/

@@ -219,6 +219,18 @@ mkdir -p testdata/qwen35/interp
 build/ref/dump_interpolate testdata/qwen35/interp
 ```
 
+## dump_stt — recording the STT waypoints
+
+`ref/dump_stt.py` runs Kyutai STT under `moshi` and PyTorch on eight frames of a
+deterministic waveform, and writes out the intermediate activations: the Mimi
+encoder output, the downsampled latents, the quantized codes, the summed trunk
+embeddings, block 0, the post-norm trunk output, and the text logits.
+
+```bash
+python -m venv /tmp/sttvenv && /tmp/sttvenv/bin/pip install moshi torch
+/tmp/sttvenv/bin/python ref/dump_stt.py kyutai/stt-1b-en_fr testdata/stt
+```
+
 ## The rule
 
 The recordings are not committed — they are the models' output, and this
