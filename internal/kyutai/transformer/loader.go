@@ -30,15 +30,26 @@ func (c Loader) Vector(name string) ([]float32, error) {
 func (c Loader) Linear(name string, inputs, outputs int) (nn.Linear, error) {
 	t, err := c.M.Get(c.Prefix + name + ".weight")
 	if err != nil {
-		return nn.Linear{}, err
+		t, err = c.M.Get(c.Prefix + name + "_weight")
+		if err != nil {
+			return nn.Linear{}, err
+		}
 	}
 	if len(t.Shape) != 2 || t.Shape[0] != outputs || t.Shape[1] != inputs {
 		return nn.Linear{}, fmt.Errorf("%s: shape %v, want [%d %d]", name, t.Shape, outputs, inputs)
 	}
-	if t.DType != "BF16" {
+	raw := t.Raw
+	if t.DType == "F32" {
+		bf16 := make([]byte, t.Elems()*2)
+		for i := 0; i < t.Elems(); i++ {
+			bf16[i*2] = t.Raw[i*4+2]
+			bf16[i*2+1] = t.Raw[i*4+3]
+		}
+		raw = bf16
+	} else if t.DType != "BF16" {
 		return nn.Linear{}, fmt.Errorf("%s: dtype %s", name, t.DType)
 	}
-	l := nn.Linear{Weights: t.Raw, Inputs: inputs, Outputs: outputs}
+	l := nn.Linear{Weights: raw, Inputs: inputs, Outputs: outputs}
 	if b, err := c.M.Get(c.Prefix + name + ".bias"); err == nil {
 		if l.Bias, err = b.F32(); err != nil {
 			return nn.Linear{}, err

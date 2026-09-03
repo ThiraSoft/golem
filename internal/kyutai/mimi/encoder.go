@@ -102,6 +102,7 @@ func (e *Encoder) transformerSteps(x []float32, steps int) {
 // LoadEncoder reads the encoder's weights.
 func LoadEncoder(m *tensors.Model, cfg Config) (*Encoder, error) {
 	e := &Encoder{Config: cfg}
+	p := cfg.Prefix
 
 	// The SEANet encoder is an indexed list, like the decoder, and the gaps in
 	// the numbering are the activations, which carry no weights: 0 the input
@@ -109,7 +110,7 @@ func LoadEncoder(m *tensors.Model, cfg Config) (*Encoder, error) {
 	// convolution, then the output convolution.
 	const numFilters = 64
 	var err error
-	if e.input, err = loadConv(m, "mimi.encoder.model.0.conv", 1, numFilters, 7, 1, 1); err != nil {
+	if e.input, err = loadConv(m, p+"encoder.model.0.conv", 1, numFilters, 7, 1, 1); err != nil {
 		return nil, err
 	}
 
@@ -119,7 +120,7 @@ func LoadEncoder(m *tensors.Model, cfg Config) (*Encoder, error) {
 	for i := len(cfg.Ratios) - 1; i >= 0; i-- {
 		ratio := cfg.Ratios[i]
 		var st encoderStage
-		block := fmt.Sprintf("mimi.encoder.model.%d.block.", index)
+		block := fmt.Sprintf("%sencoder.model.%d.block.", p, index)
 		if st.block.conv1, err = loadConv(m, block+"1.conv", width, width/2, 3, 1, 1); err != nil {
 			return nil, err
 		}
@@ -128,7 +129,7 @@ func LoadEncoder(m *tensors.Model, cfg Config) (*Encoder, error) {
 		}
 		// The stride divides the rate; the kernel is twice it, as in the
 		// transposed convolution this mirrors.
-		if st.shrink, err = loadConv(m, fmt.Sprintf("mimi.encoder.model.%d.conv", index+2),
+		if st.shrink, err = loadConv(m, fmt.Sprintf("%sencoder.model.%d.conv", p, index+2),
 			width, 2*width, 2*ratio, ratio, 1); err != nil {
 			return nil, err
 		}
@@ -136,13 +137,13 @@ func LoadEncoder(m *tensors.Model, cfg Config) (*Encoder, error) {
 		width *= 2
 		index += 3
 	}
-	if e.output, err = loadConv(m, fmt.Sprintf("mimi.encoder.model.%d.conv", index+1),
+	if e.output, err = loadConv(m, fmt.Sprintf("%sencoder.model.%d.conv", p, index+1),
 		width, width, 3, 1, 1); err != nil {
 		return nil, err
 	}
 
 	for i := 0; i < cfg.Geometry.NumLayers; i++ {
-		c, err := transformer.LoadLayer(m, "mimi.encoder_transformer.transformer.", i, cfg.Geometry)
+		c, err := transformer.LoadLayer(m, p+"encoder_transformer.transformer.", i, cfg.Geometry)
 		if err != nil {
 			return nil, fmt.Errorf("audio layer %d: %w", i, err)
 		}
@@ -151,7 +152,7 @@ func LoadEncoder(m *tensors.Model, cfg Config) (*Encoder, error) {
 
 	// The mirror of the decoder's grouped upsampling, except that it is not
 	// grouped: it folds the 512 channels of sixteen steps into 32 numbers.
-	if e.down, err = loadConv(m, "mimi.downsample.conv.conv",
+	if e.down, err = loadConv(m, p+"downsample.conv.conv",
 		cfg.Channels, cfg.LatentDim, 2*StepsPerFrame, StepsPerFrame, 1); err != nil {
 		return nil, err
 	}

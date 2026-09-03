@@ -36,6 +36,14 @@ type Config struct {
 	Channels  int // 512, the width of the decoder
 	Geometry  transformer.Geometry
 	Ratios    []int // 6, 5, 4: the successive expansion factors
+
+	// Downsample is the stride of the convolution that halves the rate after
+	// the transformer, or 0 when the codec has none. pocket-tts's Mimi folds
+	// its frames inside the encoder; the STT's does it here, in its own layer.
+	Downsample int
+	// Prefix is what the checkpoint's tensor names start with — "mimi." when
+	// the codec is embedded in a larger file, empty when it ships alone.
+	Prefix string
 }
 
 // DefaultConfig is the geometry of the decoder. It carries no language name
@@ -49,6 +57,7 @@ var DefaultConfig = Config{
 		Context: 250, LayerScale: true, MaxPeriod: 10000,
 	},
 	Ratios: []int{6, 5, 4},
+	Prefix: "mimi.",
 }
 
 // residualBlock is a SEANet block: two convolutions around an activation, added
@@ -215,13 +224,14 @@ func (d *Decoder) transformerSteps(x []float32, steps int, state *State) {
 func Load(m *tensors.Model, cfg Config) (*Decoder, error) {
 	ld := transformer.Loader{M: m}
 	d := &Decoder{Config: cfg}
+	p := cfg.Prefix
 
 	var err error
-	if d.projection, err = loadConv(m, "mimi.quantizer.output_proj", cfg.LatentDim, cfg.Channels, 1, 1, 1); err != nil {
+	if d.projection, err = loadConv(m, p+"quantizer.output_proj", cfg.LatentDim, cfg.Channels, 1, 1, 1); err != nil {
 		return nil, err
 	}
 	// Grouped upsampling: each channel is expanded independently.
-	if d.upsample, err = loadConvT(m, "mimi.upsample.convtr.convtr", cfg.Channels, cfg.Channels, 2*StepsPerFrame, StepsPerFrame, cfg.Channels); err != nil {
+	if d.upsample, err = loadConvT(m, p+"upsample.convtr.convtr", cfg.Channels, cfg.Channels, 2*StepsPerFrame, StepsPerFrame, cfg.Channels); err != nil {
 		return nil, err
 	}
 	// One latent at a time reaches the upsampling; StepsPerFrame reach the
@@ -229,7 +239,7 @@ func Load(m *tensors.Model, cfg Config) (*Decoder, error) {
 	d.upsample.Prepare(1)
 
 	for i := 0; i < cfg.Geometry.NumLayers; i++ {
-		c, err := transformer.LoadLayer(m, "mimi.decoder_transformer.transformer.", i, cfg.Geometry)
+		c, err := transformer.LoadLayer(m, p+"decoder_transformer.transformer.", i, cfg.Geometry)
 		if err != nil {
 			return nil, fmt.Errorf("audio layer %d: %w", i, err)
 		}
@@ -240,7 +250,7 @@ func Load(m *tensors.Model, cfg Config) (*Decoder, error) {
 	// transposed convolution and a residual block, then the output convolution.
 	const numFilters = 64
 	channels := cfg.Channels
-	if d.input, err = loadConv(m, "mimi.decoder.model.0.conv", channels, channels, 7, 1, 1); err != nil {
+	if d.input, err = loadConv(m, p+"decoder.model.0.conv", channels, channels, 7, 1, 1); err != nil {
 		return nil, err
 	}
 	index := 2
@@ -248,14 +258,14 @@ func Load(m *tensors.Model, cfg Config) (*Decoder, error) {
 	steps := StepsPerFrame                       // what reaches the first expansion
 	for _, ratio := range cfg.Ratios {
 		var st stage
-		if st.expand, err = loadConvT(m, fmt.Sprintf("mimi.decoder.model.%d.convtr", index),
+		if st.expand, err = loadConvT(m, fmt.Sprintf("%sdecoder.model.%d.convtr", p, index),
 			width, width/2, 2*ratio, ratio, 1); err != nil {
 			return nil, err
 		}
 		st.expand.Prepare(steps)
 		steps *= ratio
 		width /= 2
-		block := fmt.Sprintf("mimi.decoder.model.%d.block.", index+1)
+		block := fmt.Sprintf("%sdecoder.model.%d.block.", p, index+1)
 		if st.block.conv1, err = loadConv(m, block+"1.conv", width, width/2, 3, 1, 1); err != nil {
 			return nil, err
 		}
@@ -265,7 +275,7 @@ func Load(m *tensors.Model, cfg Config) (*Decoder, error) {
 		d.stages = append(d.stages, st)
 		index += 3
 	}
-	if d.output, err = loadConv(m, fmt.Sprintf("mimi.decoder.model.%d.conv", index), numFilters, 1, 3, 1, 1); err != nil {
+	if d.output, err = loadConv(m, fmt.Sprintf("%sdecoder.model.%d.conv", p, index), numFilters, 1, 3, 1, 1); err != nil {
 		return nil, err
 	}
 
