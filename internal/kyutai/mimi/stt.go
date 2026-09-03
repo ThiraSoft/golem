@@ -123,3 +123,72 @@ func (e *STTEncoder) transformerSteps(x []float32, steps int) {
 		}
 	}
 }
+
+// STTState is the encoder's memory between chunks: one causal state per
+// convolution, the block scratch, and the transformer's cache with the position
+// it has reached. Everything the whole-recording path allocates and throws away.
+type STTState struct {
+	input  *nn.ConvState
+	blocks []*blockState
+	shrink []*nn.ConvState
+	output *nn.ConvState
+	caches []*transformer.Cache
+	down   *nn.ConvState
+}
+
+func (e *STTEncoder) NewState() *STTState {
+	g := e.Config.Geometry
+	capacity := 16384
+	if g.Context > capacity {
+		capacity = g.Context
+	}
+	s := &STTState{
+		input:  e.input.NewState(),
+		output: e.output.NewState(),
+		down:   e.down.NewState(),
+		caches: make([]*transformer.Cache, len(e.layers)),
+	}
+	for i := range e.layers {
+		s.caches[i] = transformer.NewCache(capacity, g.NumHeads, g.DModel/g.NumHeads)
+	}
+	for _, st := range e.stages {
+		s.blocks = append(s.blocks, &blockState{s1: st.block.conv1.NewState(), s2: st.block.conv2.NewState()})
+		s.shrink = append(s.shrink, st.shrink.NewState())
+	}
+	return s
+}
+
+// Push encodes one chunk. len(samples) must be a multiple of SamplesPerFrame.
+// It returns the latents for the frames that chunk completed — possibly none —
+// laid out channel by channel, and their count.
+func (e *STTEncoder) Push(samples []float32, s *STTState) ([]float32, int) {
+	if len(samples)%SamplesPerFrame != 0 {
+		return nil, 0
+	}
+	x, steps := e.input.Apply(samples, len(samples), s.input)
+	for i, st := range e.stages {
+		x = st.block.apply(x, steps, s.blocks[i])
+		nn.ELU(x)
+		x, steps = st.shrink.Apply(x, steps, s.shrink[i])
+	}
+	nn.ELU(x)
+	x, steps = e.output.Apply(x, steps, s.output)
+	if steps > 0 {
+		g := e.Config.Geometry
+		block := make([]float32, steps*g.DModel)
+		for t := 0; t < steps; t++ {
+			for c := 0; c < g.DModel; c++ {
+				block[t*g.DModel+c] = x[c*steps+t]
+			}
+		}
+		for i, layer := range e.layers {
+			layer.Block(block, steps, s.caches[i])
+		}
+		for t := 0; t < steps; t++ {
+			for c := 0; c < g.DModel; c++ {
+				x[c*steps+t] = block[t*g.DModel+c]
+			}
+		}
+	}
+	return e.down.Apply(x, steps, s.down)
+}

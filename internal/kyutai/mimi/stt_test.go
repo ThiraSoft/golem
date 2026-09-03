@@ -61,3 +61,47 @@ func TestSTTEncoderLoadAndRun(t *testing.T) {
 		t.Fatalf("latents length = %d, want %d", len(latents), 8*STTConfig.LatentDim)
 	}
 }
+
+// TestStreamingMatchesWhole is the invariant the whole live path rests on: a
+// recording pushed frame by frame must give the same latents as the same
+// recording handed over at once. A convolution whose causal state remembers one
+// sample too few does not crash — it degrades a transcript in a way that reads
+// as the model being mediocre. This is what catches it.
+func TestStreamingMatchesWhole(t *testing.T) {
+	m := sttMimi(t)
+	e, err := LoadSTTEncoder(m, STTConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	framesCount := 8
+	audio := make([]float32, framesCount*SamplesPerFrame)
+	for i := range audio {
+		audio[i] = float32(i%100) / 100.0 * 0.1
+	}
+	whole, frames, err := e.Latents(audio)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	state := e.NewState()
+	var got []float32
+	for i := 0; i < len(audio); i += SamplesPerFrame {
+		out, n := e.Push(audio[i:i+SamplesPerFrame], state)
+		for f := 0; f < n; f++ {
+			for c := 0; c < STTConfig.LatentDim; c++ {
+				got = append(got, out[c*n+f])
+			}
+		}
+	}
+	if len(got) != frames*STTConfig.LatentDim {
+		t.Fatalf("streamed %d values, whole gave %d", len(got), frames*STTConfig.LatentDim)
+	}
+	for f := 0; f < frames; f++ {
+		for c := 0; c < STTConfig.LatentDim; c++ {
+			a, b := got[f*STTConfig.LatentDim+c], whole[c*frames+f]
+			if diff := a - b; diff > 1e-5 || diff < -1e-5 {
+				t.Fatalf("frame %d channel %d: streamed %g, whole %g", f, c, a, b)
+			}
+		}
+	}
+}
