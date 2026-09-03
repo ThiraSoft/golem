@@ -155,11 +155,11 @@ func BenchmarkQuantizedToken(b *testing.B) { benchToken(b, openQuantizedBench(b)
 
 func BenchmarkQuantizedTokenVulkan(b *testing.B) {
 	m := openQuantizedBench(b)
-	if err := m.UseVulkanStack(); err != nil {
-		b.Skipf("no Vulkan stack: %v", err)
-	}
 	if err := m.UseVulkanHead(); err != nil {
 		b.Skipf("no Vulkan head: %v", err)
+	}
+	if err := m.UseVulkanStack(); err != nil {
+		b.Skipf("no Vulkan stack: %v", err)
 	}
 	benchToken(b, m)
 }
@@ -172,11 +172,11 @@ func BenchmarkQuantizedPrefillVulkan(b *testing.B) {
 	for _, n := range []int{64, 128, 256, 512} {
 		b.Run(itoa(n), func(b *testing.B) {
 			m := openQuantizedBench(b)
-			if err := m.UseVulkanStack(); err != nil {
-				b.Skipf("no Vulkan stack: %v", err)
-			}
 			if err := m.UseVulkanHead(); err != nil {
 				b.Skipf("no Vulkan head: %v", err)
+			}
+			if err := m.UseVulkanStack(); err != nil {
+				b.Skipf("no Vulkan stack: %v", err)
 			}
 			tokens := make([]int32, n)
 			for i := range tokens {

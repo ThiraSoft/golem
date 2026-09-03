@@ -101,11 +101,11 @@ func Benchmark12BToken(b *testing.B) { benchToken(b, open12BEngineBench(b)) }
 
 func Benchmark12BTokenVulkan(b *testing.B) {
 	m := open12BEngineBench(b)
-	if err := m.UseVulkanStack(); err != nil {
-		b.Skipf("no Vulkan stack: %v", err)
-	}
 	if err := m.UseVulkanHead(); err != nil {
 		b.Skipf("no Vulkan head: %v", err)
+	}
+	if err := m.UseVulkanStack(); err != nil {
+		b.Skipf("no Vulkan stack: %v", err)
 	}
 	benchToken(b, m)
 }
@@ -114,11 +114,11 @@ func Benchmark12BTokenVulkan(b *testing.B) {
 // device path reads one column at a time.
 func Benchmark12BPrefillVulkan(b *testing.B) {
 	m := open12BEngineBench(b)
-	if err := m.UseVulkanStack(); err != nil {
-		b.Skipf("no Vulkan stack: %v", err)
-	}
 	if err := m.UseVulkanHead(); err != nil {
 		b.Skipf("no Vulkan head: %v", err)
+	}
+	if err := m.UseVulkanStack(); err != nil {
+		b.Skipf("no Vulkan stack: %v", err)
 	}
 	for _, n := range []int{64, 128, 256, 512} {
 		b.Run(itoa(n), func(b *testing.B) {

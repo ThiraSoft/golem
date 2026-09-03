@@ -114,14 +114,14 @@ func TestMixedBatchCostVulkan(t *testing.T) {
 	if err := m.SetSlots(slots); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UseVulkanStack(); err != nil {
-		t.Skipf("no Vulkan stack: %v", err)
-	}
 	// The head as well, because a token costs both and a server puts both
 	// there: leaving the largest matrix in the model on the processor is 17ms
 	// a pass against 6, and it would be the whole of what this measures.
 	if err := m.UseVulkanHead(); err != nil {
 		t.Skipf("no Vulkan head: %v", err)
+	}
+	if err := m.UseVulkanStack(); err != nil {
+		t.Skipf("no Vulkan stack: %v", err)
 	}
 	for i := 0; i < slots; i++ {
 		m.UseSlot(i)

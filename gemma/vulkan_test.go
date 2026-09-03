@@ -207,11 +207,11 @@ func TestVulkanGreedyMatchesTheReference(t *testing.T) {
 // the card, against BenchmarkMoEToken on the CPU alone.
 func BenchmarkMoETokenVulkan(b *testing.B) {
 	m := open26BEngine(b)
-	if err := m.UseVulkanStack(); err != nil {
-		b.Skipf("no Vulkan stack: %v", err)
-	}
 	if err := m.UseVulkanHead(); err != nil {
 		b.Skipf("no Vulkan head: %v", err)
+	}
+	if err := m.UseVulkanStack(); err != nil {
+		b.Skipf("no Vulkan stack: %v", err)
 	}
 	benchToken(b, m)
 }
@@ -318,11 +318,11 @@ func BenchmarkMoEPrefillVulkan(b *testing.B) {
 	for _, n := range []int{64, 128, 256, 512, 1024} {
 		b.Run(itoa(n), func(b *testing.B) {
 			m := open26BEngine(b)
-			if err := m.UseVulkanStack(); err != nil {
-				b.Skipf("no Vulkan stack: %v", err)
-			}
 			if err := m.UseVulkanHead(); err != nil {
 				b.Skipf("no Vulkan head: %v", err)
+			}
+			if err := m.UseVulkanStack(); err != nil {
+				b.Skipf("no Vulkan stack: %v", err)
 			}
 			tokens := make([]int32, n)
 			for i := range tokens {

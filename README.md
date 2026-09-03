@@ -69,17 +69,17 @@ What made it possible is that a column now says which conversation it belongs to
 
 ## ⚡ Vulkan GPU
 
-`-vulkan` puts the whole model on the card. Measured on an RX 9070 XT in one
-sitting, against `llama.cpp`'s own Vulkan build on the same Q4_0 files, both
-sides warmed before timing:
+`-vulkan` puts the whole model on the card. Measured on an RX 9070 XT on
+2026-09-03 in one sitting, against `llama.cpp`'s own Vulkan build (`ba1df050f`,
+b9603) on the same Q4_0 files, both sides warmed before timing, the desktop
+holding 1.0 GiB of the card throughout:
 
 | tokens a second | golem gen | llama gen | golem pp64 | llama pp64 | golem pp256 | llama pp256 | golem pp512 | llama pp512 |
 | --------------- | --------: | --------: | ---------: | ---------: | ----------: | ----------: | ----------: | ----------: |
-| Gemma 4 26B A4B |     105.4 |     115.6 |   **1858** |       1053 |    **3614** |        2704 |    **4011** |        3483 |
-| Gemma 4 12B     |  **61.5** |      61.2 |   **1463** |       1209 |    **2557** |        2287 |    **2761** |        2683 |
-| Qwen3 4B        |     130.4 |     139.0 |   **3528** |       3231 |    **5780** |        5585 |        5802 |        6686 |
-| Qwen3 0.6B      |     259.6 |     270.3 |       7498 |      10188 |       14665 |       17297 |   **18756** |       18644 |
-| Qwen3.8 27B     |      30.3 |      31.4 |    **798** |        655 |    **1170** |        1105 |    **1285** |        1212 |
+| Gemma 4 26B A4B | **153.4** |     125.1 |   **2051** |       1050 |    **3940** |        2867 |    **4434** |        4059 |
+| Gemma 4 12B     |  **72.3** |      64.6 |   **1555** |       1204 |    **2674** |        2561 |        2901 |        2978 |
+| Qwen3 4B        | **180.5** |     172.0 |   **4015** |       3164 |    **6252** |        5702 |        5977 |        7117 |
+| Qwen3 0.6B      |     368.2 | **407.9** |  **13230** |      10064 |   **22711** |       19440 |       23445 |       23677 |
 
 **Read as a whole: golem reaches llama.cpp's level here, and that is the claim.**
 Not more than that, and deliberately — this is one card, one driver, one
@@ -88,23 +88,48 @@ architecture, another driver revision, or another checkpoint, and nobody has
 run it there. The table above is what was measured; the conclusion to draw from
 it is parity.
 
-Reading a prompt, golem is the faster of the two on four of the five models at
-every width, by a factor of one and three quarters on the 26B A4B at sixty-four
-positions. The exception is the 0.6B, which is behind at sixty-four and two
-hundred and fifty-six and level at five hundred and twelve: a model that small
-spends a prompt in dispatch latency rather than in arithmetic, and there is
-nothing in a kernel to win it back.
+Reading a prompt, golem is the faster of the two on every model at sixty-four
+and two hundred and fifty-six positions, by a factor of one and nine tenths on
+the 26B A4B at sixty-four. At five hundred and twelve it is ahead on the 26B
+A4B and behind on the other three — a wide pass is where llama.cpp's tiled
+kernels have the most to amortise.
 
-Generating, golem is level on the 12B and two to nine per cent behind on the
-other four. Qwen3.8 is the closest of them because a gated delta net rewrites a
-state matrix a head every token, which is arithmetic neither engine amortises;
-the 26B A4B is the furthest.
+Generating, golem is ahead on three of the four — by 23 % on the 26B A4B, 12 %
+on the 12B and 5 % on the 4B — and 11 % behind on the 0.6B, which spends a
+token in dispatch latency rather than in arithmetic. **That is a change of
+direction from the table this file carried on 2026-08-31**, which had golem two
+to nine per cent behind on generation across the board. Both columns were
+remeasured here; llama.cpp's own generation figures agree with themselves to
+half a per cent across two passes, so the movement is golem's. What moved it is
+not one thing — the two-bit and three-bit kernels, the split residency, a
+double-buffered upload path, and a logit head that now claims its device memory
+before the blocks take all of it — and no attempt is made here to divide the
+credit between them.
+
+Generation is the median of three runs; the prompt columns are one run each.
+
+**Qwen3.8 27B is not in the table**, and its absence is a measurement and not
+an oversight: the checkpoint is 15.65 GiB on a heap of 15.92, so on a card that
+is also driving a desktop neither engine has room. llama.cpp reads 476
+positions a second at sixty-four and then 79 at two hundred and fifty-six —
+a collapse, not a rate — and golem's own speculative decoding turns *negative*,
+21.1 tokens a second against 27.6 without it, because the draft block's weights
+push the logit head out of device memory. Both are the same fault seen twice,
+and the honest thing to publish is that the model wants a card to itself.
 
 And the absolute rates do not travel either. Earlier revisions of this file
 carried a table from an evening when the same card ran a fifth faster on small
 models — both engines by the same fraction, checked by re-running llama.cpp's
 side as well — so the column to read is the difference between the two engines
 and not the rate, and even that difference is this machine's.
+
+**And this machine's bus is narrow.** The card is a PCIe 5.0 x16 part reaching
+the processor over PCIe 3.0 x8 — 7.88 GB/s, because the CPU is a Coffee Lake
+whose sixteen lanes are split eight and eight, and the second port holds a
+wireless card. Nothing above depends on it, since a model resident on the card
+does not touch the bus. Everything in the streaming section below does, and on
+a board that gives the card its sixteen lanes at PCIe 4.0 those figures are
+what changes, upward, by up to four.
 
 **A K-quant runs on the card too.** Q4_0, Q4_1, Q2_K, Q3_K, Q4_K, Q5_K and Q6_K
 each have a mat-vec and a tiled product here, and a checkpoint may mix them the
@@ -155,7 +180,14 @@ the rate changes.
 | 26B A4B on an RX 9070 XT | on the card |
 | ------------------------ | ----------: |
 | experts resident in VRAM  | 13.6 GiB   |
-| experts in system memory  | **1.3 GiB**|
+| experts in system memory, no cache | **1.3 GiB**|
+
+That second row is the floor and no longer the default: left to itself the
+planner spends whatever device memory is going on a cache of the experts a
+token keeps asking for, so `GOLEM_MOE_EXPERTS_HOST=1` alone fills the card
+again and answers at nearly the resident rate. `GOLEM_MOE_CACHE_SLOTS=N` is
+what names a footprint between the two, and the table further down is that
+whole curve.
 
 **What stays on the card is the shared branches, the attention and the head**;
 the twelve gigabytes that leave are the experts. So what a mixture costs the card
@@ -217,19 +249,25 @@ greedy, after a warm-up that is not counted:
 
 | experts kept in VRAM | that much VRAM | tokens/s |
 | -------------------- | -------------: | -------: |
-| none — all in system memory | 0 | 7.3 |
-| 16 of 128 | 1.6 GB | 15.1 |
-| 32 of 128 | 3.2 GB | 27.3 |
-| 40 of 128 | 4.0 GB | 35.3 |
-| **51 of 128** | **5.1 GB** | **47.4** |
-| 64 of 128 | 6.4 GB | 58.0 |
-| all 128 — the resident path | 12.9 GB | 82.1 |
+| 2 of 128 — the floor | 0.2 GB | 7.8 |
+| 16 of 128 | 1.6 GB | 16.0 |
+| 32 of 128 | 3.2 GB | 30.2 |
+| 40 of 128 | 4.0 GB | 39.9 |
+| **51 of 128** | **5.1 GB** | **56.2** |
+| 64 of 128 | 6.4 GB | 73.8 |
+| all 128 — the resident path | 12.9 GB | 131.6 |
 
 **Two fifths of the pool is four fifths of the tokens.** And the shape was known
 before the cache existed: simulating one against the model's own routing — the
 router is arithmetic, so it costs a map and no card time —
-`gemma/expert_cache_test.go` predicted 34.5 tokens a second at 30 % of the pool
-and 50.9 at 40 %, against the 35.3 and 47.4 measured here.
+`gemma/expert_cache_test.go` predicted the curve's shape, and the shape is what
+held; the rates below it have since moved as the rest of the engine did.
+
+These are the 2026-09-03 sitting. An earlier one, before the logit head claimed
+its device memory ahead of the blocks, read 7.3 / 15.1 / 27.3 / 35.3 / 47.4 /
+58.0 / 82.1 down the same column — the resident path sixty per cent slower than
+it is here, because a 577 MiB head on a card this full was being read across the
+bus for every token and nothing said so.
 
 That simulation is also what says which cache to build. FreeToken reports that
 one pool shared by every layer beats a split per layer by ten to fifteen points;

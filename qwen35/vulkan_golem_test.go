@@ -59,11 +59,11 @@ func TestVulkanGolemMatchesCPU(t *testing.T) {
 	}
 
 	t0 := time.Now()
-	if err := m.UseVulkanStack(); err != nil {
-		t.Fatalf("vulkan stack: %v", err)
-	}
 	if err := m.UseVulkanHead(); err != nil {
 		t.Fatalf("vulkan head: %v", err)
+	}
+	if err := m.UseVulkanStack(); err != nil {
+		t.Fatalf("vulkan stack: %v", err)
 	}
 	fmt.Printf("uploaded in %v\n", time.Since(t0).Round(time.Millisecond))
 	m.Reset()

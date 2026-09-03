@@ -32,14 +32,15 @@ func TestExpertCacheSpeed(t *testing.T) {
 		t.Skipf("open: %v", err)
 	}
 	defer m.Close()
+	// The head first, and before the stack: the blocks take the card greedily
+	// and a head that arrives after them is put in host memory by the driver
+	// without a word, where it crosses the bus once per token. gemma/vulkan.go
+	// says what that costs. Every format the door reads is taken, so the only
+	// checkpoint this skips is one quantized in a way no kernel here knows.
+	onCard := m.UseVulkanHead() == nil
 	if err := m.UseVulkanStack(); err != nil {
 		t.Skipf("no Vulkan stack: %v", err)
 	}
-	// The head is not the subject and not every checkpoint has one this engine
-	// can take — the 26B A4B's is Q4_0 where the shader wants Q6_K — so it is
-	// taken when it is offered and the measurement stands without it. It is the
-	// same on both sides of the comparison either way.
-	onCard := m.UseVulkanHead() == nil
 	vocab, err := bpe.Load(m.File())
 	if err != nil {
 		t.Skipf("no tokenizer: %v", err)
