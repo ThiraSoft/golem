@@ -20,6 +20,25 @@ package nn
 
 import "encoding/binary"
 
+// q3_kScales unpacks a superblock's sixteen six-bit group scales out of the
+// twelve bytes ggml packs them into, and takes the thirty-two off. Group i
+// covers weights 16i to 16i+15.
+//
+// The packing is ggml's and it is not the obvious one: four bits come from the
+// low or the high nibble of scales[i%8] and two more from a byte of
+// scales[8:12], chosen by which quarter of the sixteen the scale is in. The
+// fixture behind DequantizeQ3_K is what confirms the traversal order.
+func q3_kScales(sc []byte) [16]int8 {
+	var scales [16]int8
+	for i := 0; i < 4; i++ {
+		scales[i] = int8((sc[i]&0x0F)|((sc[8+i]>>0)&3)<<4) - 32
+		scales[4+i] = int8((sc[4+i]&0x0F)|((sc[8+i]>>2)&3)<<4) - 32
+		scales[8+i] = int8((sc[i]>>4)|((sc[8+i]>>4)&3)<<4) - 32
+		scales[12+i] = int8((sc[4+i]>>4)|((sc[8+i]>>6)&3)<<4) - 32
+	}
+	return scales
+}
+
 // DequantizeQ3_K expands one row of n weights. out must hold n floats.
 func DequantizeQ3_K(w []byte, n int, out []float32) {
 	if n%SuperBlock != 0 {
@@ -33,13 +52,7 @@ func DequantizeQ3_K(w []byte, n int, out []float32) {
 		d := halfToFloat(binary.LittleEndian.Uint16(block[108:]))
 		dst := out[b*SuperBlock : (b+1)*SuperBlock]
 
-		var scales [16]int8
-		for i := 0; i < 4; i++ {
-			scales[i] = int8((sc[i]&0x0F)|((sc[8+i]>>0)&3)<<4) - 32
-			scales[4+i] = int8((sc[4+i]&0x0F)|((sc[8+i]>>2)&3)<<4) - 32
-			scales[8+i] = int8((sc[i]>>4)|((sc[8+i]>>4)&3)<<4) - 32
-			scales[12+i] = int8((sc[4+i]>>4)|((sc[8+i]>>6)&3)<<4) - 32
-		}
+		scales := q3_kScales(sc)
 
 		// w in 0..255. j2 is which of the eight sixteen-weight groups (four
 		// per 128-weight half); half picks the low or high sixteen bytes of
@@ -59,21 +72,6 @@ func DequantizeQ3_K(w []byte, n int, out []float32) {
 			hbit := int32((hmByte >> uint(j2)) & 1)
 			q := q2 | hbit<<2
 			dst[w] = d * float32(scales[2*j2+half]) * float32(q-4)
-		}
-	}
-}
-
-// matVecQ3_KRows dequantizes each row and dots it against the batch, same as
-// Q5_K's kernel: Q3_K has no packed dot product here, only the format golem
-// has to read in order to know what it is being measured against.
-func matVecQ3_KRows(w []byte, b *Batch, cols int, ys [][]float32, start, end int) {
-	stride := cols / SuperBlock * q3_kBlockBytes
-	rowBuf := make([]float32, cols)
-	for r := start; r < end; r++ {
-		rowBytes := w[r*stride : (r+1)*stride]
-		DequantizeQ3_K(rowBytes, cols, rowBuf)
-		for c := 0; c < b.Size; c++ {
-			ys[c][r] = DotF32(rowBuf, b.F[c])
 		}
 	}
 }
