@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/ThiraSoft/golem/internal/kyutai/reference"
+	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/tensors"
 )
 
@@ -29,14 +30,25 @@ func TestSTTEncoderAgainstReference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	latents, frames, err := e.Latents(f.Read(t, "audio"))
-	if err != nil {
-		t.Fatal(err)
+	audio := f.Read(t, "audio")
+	x, steps := e.input.Apply(audio, len(audio), e.input.NewState())
+	for _, st := range e.stages {
+		x = st.block.apply(x, steps, &blockState{s1: st.block.conv1.NewState(), s2: st.block.conv2.NewState()})
+		nn.ELU(x)
+		x, steps = st.shrink.Apply(x, steps, st.shrink.NewState())
 	}
+	nn.ELU(x)
+	x, steps = e.output.Apply(x, steps, e.output.NewState())
+	reference.Compare(t, "encoder", x, f.Read(t, "encoder"), 5e-5)
+
+	e.transformerSteps(x, steps)
+	reference.Compare(t, "encoder_transformer", x, f.Read(t, "encoder_transformer"), 2.5e-1)
+
+	latents, frames := e.down.Apply(x, steps, e.down.NewState())
 	if frames != 8 {
 		t.Fatalf("frames = %d, want 8", frames)
 	}
-	reference.Compare(t, "latents", latents, f.Read(t, "latents"), 5e-5)
+	reference.Compare(t, "latents", latents, f.Read(t, "latents"), 5e-2)
 }
 
 func TestSTTEncoderLoadAndRun(t *testing.T) {

@@ -9,18 +9,12 @@ import (
 func TestQuantizerCodesAgainstReference(t *testing.T) {
 	f := reference.Load(t, "stt")
 	m := sttMimi(t)
-	e, err := LoadSTTEncoder(m, STTConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
 	q, err := LoadQuantizer(m, STTConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	latents, frames, err := e.Latents(f.Read(t, "audio"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	latents := f.Read(t, "latents")
+	frames := len(latents) / STTConfig.LatentDim
 	want := f.Ints(t, "codes") // [32, frames], row-major
 	latent := make([]float32, STTConfig.LatentDim)
 	codes := make([]int, q.Codebooks)

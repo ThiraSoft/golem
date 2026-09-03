@@ -80,6 +80,7 @@ func LoadSTTEncoder(m *tensors.Model, cfg Config) (*STTEncoder, error) {
 	if e.down, err = loadConv(m, p+"downsample.conv.conv.conv", cfg.Channels, cfg.LatentDim, 2*cfg.Downsample, cfg.Downsample, 1); err != nil {
 		return nil, err
 	}
+	e.down.Replicate = true
 	return e, nil
 }
 

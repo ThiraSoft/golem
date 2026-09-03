@@ -30,7 +30,17 @@ def main() -> None:
     repo, out_dir = sys.argv[1], Path(sys.argv[2])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    info = loaders.CheckpointInfo.from_hf_repo(repo)
+    repo_path = Path(repo)
+    if repo_path.is_dir() and (repo_path / "model.safetensors").exists():
+        info = loaders.CheckpointInfo.from_hf_repo(
+            "kyutai/stt-1b-en_fr",
+            moshi_weights=repo_path / "model.safetensors",
+            mimi_weights=repo_path / "mimi-pytorch-e351c8d8@125.safetensors",
+            tokenizer=repo_path / "tokenizer_en_fr_audio_8000.model",
+            config_path=repo_path / "config.json",
+        )
+    else:
+        info = loaders.CheckpointInfo.from_hf_repo(repo)
     mimi = info.get_mimi(device="cpu")
     lm = info.get_moshi(device="cpu")
     mimi.eval()
@@ -65,20 +75,23 @@ def main() -> None:
         # The trunk, stepped by hand so that every waypoint is reachable.
         text = torch.full((1, 1), lm.text_emb.num_embeddings - 1, dtype=torch.long)
         embs, block0s, trunks, logits = [], [], [], []
-        for t in range(codes.shape[-1]):
-            x = lm.text_emb(text)
-            for q in range(codes.shape[1]):
-                x = x + lm.emb[q](codes[:, q, t : t + 1])
-            embs.append(x)
-            h = lm.transformer.layers[0](x)
-            block0s.append(h if not isinstance(h, tuple) else h[0])
-            y = lm.transformer(x)
-            y = y if not isinstance(y, tuple) else y[0]
-            y = lm.out_norm(y)
-            trunks.append(y)
-            l = lm.text_linear(y)
-            logits.append(l)
-            text = l.argmax(dim=-1)
+        with lm.streaming(batch_size=1):
+            for t in range(codes.shape[-1]):
+                x = lm.text_emb(text)
+                for q in range(codes.shape[1]):
+                    x = x + lm.emb[q](codes[:, q, t : t + 1])
+                embs.append(x)
+                h = lm.transformer.layers[0](x)
+                h = h if not isinstance(h, tuple) else h[0]
+                block0s.append(h)
+                for layer in lm.transformer.layers[1:]:
+                    h = layer(h)
+                    h = h if not isinstance(h, tuple) else h[0]
+                y = lm.out_norm(h)
+                trunks.append(y)
+                l = lm.text_linear(y)
+                logits.append(l)
+                text = l.argmax(dim=-1)
         dump("emb", torch.cat(embs, dim=1))
         dump("block0", torch.cat(block0s, dim=1))
         dump("trunk", torch.cat(trunks, dim=1))

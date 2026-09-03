@@ -23,6 +23,7 @@ const codebookEpsilon = 1e-5
 
 type residualVQ struct {
 	in        nn.Conv1d   // LatentDim -> 256, kernel 1
+	out       nn.Conv1d   // 256 -> LatentDim, kernel 1
 	codebooks [][]float32 // one per layer: 2048 x 256
 }
 
@@ -50,6 +51,9 @@ func loadRVQ(m *tensors.Model, prefix string, latent, dim, layers int) (residual
 	var r residualVQ
 	var err error
 	if r.in, err = loadConv(m, prefix+".input_proj", latent, dim, 1, 1, 1); err != nil {
+		return r, err
+	}
+	if r.out, err = loadConv(m, prefix+".output_proj", dim, latent, 1, 1, 1); err != nil {
 		return r, err
 	}
 	for i := 0; i < layers; i++ {
