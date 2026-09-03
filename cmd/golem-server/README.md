@@ -15,12 +15,13 @@ One model per server, and the request's `model` field routes nothing: there is
 one set of weights, so there is nothing to route to. `-model`
 names the file; `/v1/models` reports it.
 
-Two endpoints:
+Three endpoints:
 
 | | |
 |---|---|
 | `POST /v1/chat/completions` | a conversation, streamed or not, tool declarations included |
-| `GET /v1/models` | the one model, named after the file, for clients that probe at startup |
+| `POST /v1/audio/transcriptions` | audio transcription (WAV, MP3, FLAC), streamed or not, using Kyutai STT (requires `-stt`) |
+| `GET /v1/models` | the loaded models, for clients that probe at startup |
 
 ## Tools
 
@@ -278,11 +279,29 @@ and an `input_audio` carrying bare base64 or such a path. An `http` URL is
 refused on purpose — a server that fetches what a prompt names is a server that
 can be aimed.
 
+## Speech to text
+
+When started with `-stt <dir>` (or `GOLEM_STT`), `golem-server` serves `POST /v1/audio/transcriptions` using the Kyutai STT model:
+
+```bash
+# Standard transcription:
+curl -s http://localhost:8080/v1/audio/transcriptions \
+  -F "file=@clip.wav" \
+  -F "model=stt"
+
+# Streaming transcription:
+curl -s http://localhost:8080/v1/audio/transcriptions \
+  -F "file=@clip.wav" \
+  -F "model=stt" \
+  -F "stream=true"
+```
+
 ## Flags
 
 | | |
 |---|---|
 | `-model` | the GGUF, or `GOLEM_MODEL` |
+| `-stt` | directory holding the Kyutai STT model, or `GOLEM_STT` |
 | `-mmproj` | the projector GGUF, which is what lets a model see and hear, or `GOLEM_MMPROJ` |
 | `-vulkan` | put the blocks and the logit head on a Vulkan device; it fails rather than falling back |
 | `-addr` | what to listen on; `127.0.0.1:8080` by default |

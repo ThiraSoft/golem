@@ -19,6 +19,7 @@ import (
 	"github.com/ThiraSoft/golem/chat"
 	"github.com/ThiraSoft/golem/engine"
 	"github.com/ThiraSoft/golem/sample"
+	"github.com/ThiraSoft/golem/stt"
 )
 
 type Server struct {
@@ -33,6 +34,7 @@ type Server struct {
 	// tower has already made of the pictures it was sent.
 	vision engine.Media
 	images *imageCache
+	stt    *stt.Model
 }
 
 func NewServer(pool *Pool, v Vocabulary, name string, tpl chat.Template, defaults sample.Params) *Server {
@@ -42,6 +44,9 @@ func NewServer(pool *Pool, v Vocabulary, name string, tpl chat.Template, default
 
 // SetVision lets this server answer about pictures.
 func (s *Server) SetVision(v engine.Media) { s.vision = v }
+
+// SetSTT lets this server answer speech-to-text transcriptions.
+func (s *Server) SetSTT(m *stt.Model) { s.stt = m }
 
 // look runs the tower over every picture the conversation carries, in the
 // order the turns carry them, which is the order the markers appear in the
@@ -100,6 +105,9 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/models", s.models)
 	mux.HandleFunc("POST /v1/chat/completions", s.completions)
+	if s.stt != nil {
+		mux.HandleFunc("POST /v1/audio/transcriptions", s.transcriptions)
+	}
 	return mux
 }
 

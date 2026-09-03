@@ -25,10 +25,12 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/engine"
+	"github.com/ThiraSoft/golem/stt"
 )
 
 func main() {
 	model := flag.String("model", os.Getenv("GOLEM_MODEL"), "GGUF file, gemma4, qwen3 or qwen35 (or GOLEM_MODEL)")
+	sttDir := flag.String("stt", os.Getenv("GOLEM_STT"), "directory holding a Kyutai STT checkpoint (or GOLEM_STT)")
 	mmproj := flag.String("mmproj", os.Getenv("GOLEM_MMPROJ"), "projector GGUF, which is what lets a model see (or GOLEM_MMPROJ)")
 	addr := flag.String("addr", "127.0.0.1:8080", "address to listen on")
 	context := flag.Int("context", 4096, "positions to keep; the files declare far more than any machine here would survive")
@@ -109,6 +111,18 @@ func main() {
 	server := NewServer(pool, m.Vocab, name, m.Template, params)
 	if v, ok := m.Media(); ok {
 		server.SetVision(v)
+	}
+	if *sttDir != "" {
+		opts, err := stt.Locate(*sttDir)
+		if err != nil {
+			fail(err)
+		}
+		sttModel, err := stt.Open(opts)
+		if err != nil {
+			fail(err)
+		}
+		defer sttModel.Close()
+		server.SetSTT(sttModel)
 	}
 
 	head := vulkanLine(m.Vulkan())
