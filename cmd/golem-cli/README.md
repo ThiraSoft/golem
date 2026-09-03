@@ -41,3 +41,19 @@ anyway, and the prefix comparison puts it in at the right position.
 vocabulary, the template — so it is tested against a scripted model, a
 vocabulary of whole words and a template of whole words, with no weights on the
 machine and no engine named.
+
+## Speech to text
+
+`golem-cli` can transcribe audio files or live microphone input using the Kyutai STT model:
+
+```bash
+# Transcribe a file (WAV, MP3, FLAC):
+./golem-cli -stt /path/to/stt-1b-en_fr -transcribe clip.wav
+
+# Transcribe live speech from the microphone:
+./golem-cli -stt /path/to/stt-1b-en_fr -listen
+```
+
+If `-stt` is omitted, the `GOLEM_STT` environment variable is used.
+
+For live input (`-listen`), audio is captured using `pw-record`, `arecord`, or `ffmpeg` (searched in that order) at 24 kHz mono signed 16-bit LE, streamed continuously, and transcribed with low latency.

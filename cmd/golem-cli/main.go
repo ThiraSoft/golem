@@ -68,11 +68,36 @@ func main() {
 	prompt := flag.String("p", "", "answer this and exit, instead of reading turns")
 	stats := flag.Bool("stats", false, "report tokens and speed after each answer")
 	vulkan := flag.Bool("vulkan", false, "put the logit head and the expert stacks on a Vulkan device")
+	sttDir := flag.String("stt", os.Getenv("GOLEM_STT"), "directory holding a Kyutai STT checkpoint (or GOLEM_STT)")
+	transcribe := flag.String("transcribe", "", "sound file to transcribe; prints the text and exits")
+	listen := flag.Bool("listen", false, "transcribe the microphone until interrupted")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [options]\n", filepath.Base(os.Args[0]))
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *transcribe != "" && *listen {
+		fail(fmt.Errorf("cannot use both -transcribe and -listen"))
+	}
+	if *transcribe != "" {
+		if *sttDir == "" {
+			fail(fmt.Errorf("no STT checkpoint: pass -stt, or set GOLEM_STT"))
+		}
+		if err := runTranscribe(*sttDir, *transcribe); err != nil {
+			fail(err)
+		}
+		return
+	}
+	if *listen {
+		if *sttDir == "" {
+			fail(fmt.Errorf("no STT checkpoint: pass -stt, or set GOLEM_STT"))
+		}
+		if err := runListen(*sttDir); err != nil {
+			fail(err)
+		}
+		return
+	}
 
 	if *model == "" {
 		fail(fmt.Errorf("no model: pass -model, or set GOLEM_MODEL"))
