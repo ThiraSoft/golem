@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ThiraSoft/golem/pockettts/internal/reference"
+	"github.com/ThiraSoft/golem/internal/kyutai/reference"
 )
 
 // One sentence per language, each long enough to leave the startup behind and

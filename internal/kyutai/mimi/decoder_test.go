@@ -9,7 +9,7 @@ package mimi
 import (
 	"testing"
 
-	"github.com/ThiraSoft/golem/pockettts/internal/reference"
+	"github.com/ThiraSoft/golem/internal/kyutai/reference"
 	"github.com/ThiraSoft/golem/tensors"
 )
 

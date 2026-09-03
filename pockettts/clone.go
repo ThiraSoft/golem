@@ -14,7 +14,7 @@ import (
 	"os"
 
 	"github.com/ThiraSoft/golem/audio/wav"
-	"github.com/ThiraSoft/golem/pockettts/internal/mimi"
+	"github.com/ThiraSoft/golem/internal/kyutai/mimi"
 )
 
 // MaxCloneSeconds is the longest recording worth listening to.

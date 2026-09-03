@@ -17,8 +17,8 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/ThiraSoft/golem/internal/kyutai/transformer"
 	"github.com/ThiraSoft/golem/nn"
-	"github.com/ThiraSoft/golem/pockettts/internal/transformer"
 	"github.com/ThiraSoft/golem/tensors"
 )
 

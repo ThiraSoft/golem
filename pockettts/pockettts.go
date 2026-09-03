@@ -22,8 +22,8 @@ import (
 	"math"
 	"math/rand/v2"
 
+	"github.com/ThiraSoft/golem/internal/kyutai/mimi"
 	"github.com/ThiraSoft/golem/pockettts/internal/flowlm"
-	"github.com/ThiraSoft/golem/pockettts/internal/mimi"
 	"github.com/ThiraSoft/golem/pockettts/internal/text"
 	"github.com/ThiraSoft/golem/tensors"
 	"github.com/ThiraSoft/golem/token/sentencepiece"

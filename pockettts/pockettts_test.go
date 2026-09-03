@@ -15,8 +15,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ThiraSoft/golem/pockettts/internal/mimi"
-	"github.com/ThiraSoft/golem/pockettts/internal/reference"
+	"github.com/ThiraSoft/golem/internal/kyutai/mimi"
+	"github.com/ThiraSoft/golem/internal/kyutai/reference"
 	"github.com/ThiraSoft/golem/pockettts/internal/text"
 )
 
