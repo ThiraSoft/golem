@@ -138,6 +138,11 @@ func (h *Q6KHead) Softcap(limit float32) { h.softcap = limit }
 // do it twice.
 func (h *Q6KHead) Capped() bool { return h.softcap != 0 }
 
+// Prepare puts the activation in the Q8_K form this kernel reads: cut in
+// superblocks rather than in blocks of thirty-two, with the group sums a
+// Q6_K row's per-sixteen scales need.
+func (h *Q6KHead) Prepare(b *nn.Batch) { b.QuantizeK() }
+
 // MatVec computes y = W*x for one column of a batch that already carries its
 // Q8_K form, and leaves the result in out.
 func (h *Q6KHead) MatVec(b *nn.Batch, column int, out []float32) error {

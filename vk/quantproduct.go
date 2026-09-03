@@ -299,6 +299,21 @@ func QuantReadable(q nn.Quant) bool {
 	return false
 }
 
+// quantOuts is how many output rows one workgroup of that format's mat-vec
+// answers, which is the OUTS the binary was compiled at. It is not the same
+// number for every format and a caller that assumes one gets a short answer
+// with no error: the K-quant and Q4_0 kernels are built at the measured shape
+// of sixteen lanes to a row and eight rows to a workgroup, and the Q8_0 family
+// carries no flag and so sits at the shader's own default of eight and
+// sixteen. The go:generate directives above are the authority; this mirrors
+// them, and vk/quanthead_test.go checks the mirror against a real matrix.
+func quantOuts(q nn.Quant) int {
+	if q == nn.Q8_0 {
+		return 16
+	}
+	return matvecOuts
+}
+
 // quantRowBytes is what one row of that many inputs occupies once the packing
 // for its format has had it.
 func quantRowBytes(q nn.Quant, cols int) (int, error) {

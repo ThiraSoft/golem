@@ -298,10 +298,14 @@ func (m *Model) UseVulkanStack() error {
 }
 
 func (m *Model) UseVulkan() error {
-	if err := m.UseVulkanStack(); err != nil {
+	// The head first: it is the largest tensor here and the blocks take the
+	// card greedily, so a head uploaded after them is the allocation the
+	// driver quietly puts in host memory — where it crosses the bus once per
+	// token. engine/engine.go's UseVulkan carries the measurement.
+	if err := m.UseVulkanHead(); err != nil {
 		return err
 	}
-	if err := m.UseVulkanHead(); err != nil {
+	if err := m.UseVulkanStack(); err != nil {
 		return err
 	}
 	// The image tower too, when a projector has been opened. It is last

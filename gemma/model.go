@@ -39,7 +39,7 @@ type Model struct {
 
 	// The logit head on a Vulkan device, when UseVulkanHead put it there.
 	// gemma/vulkan.go says what that buys and what it leaves alone.
-	head      *vk.Q6KHead
+	head      vk.Head
 	stack     *vk.Stack
 	rotations []rotation
 	headDev   *vk.Device
@@ -364,10 +364,11 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 	}
 	v := m.scratch.Batch(m.Cfg.Dim, 1)
 	copy(v.F[0], hidden)
-	// The head is the only K-quantized product in the engine, and it wants the
-	// activation cut in superblocks rather than in blocks of 32.
-	v.QuantizeK()
 	if m.head != nil {
+		// Each head reads a form of its own — the Q6_K one the Q8_K cut in
+		// superblocks, everything behind the format door the Q8_0 cut in
+		// blocks of thirty-two — and only the head knows which.
+		m.head.Prepare(v)
 		// A device that fails here has failed for good — the weights are on it
 		// and there is nothing to fall back to that would still be the same
 		// model. The engine's other impossible states panic; so does this one.
@@ -381,6 +382,11 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 			return
 		}
 	} else {
+		// The Q8_K form is built here rather than inside the kernel because
+		// QuantizeK writes three slices into the batch, and a worker that
+		// started it while another read it would hand out one allocated and
+		// two not. nn's WantsQ8K says the same from the other side.
+		v.QuantizeK()
 		m.W.TokenEmbd.MatVec(v, out)
 	}
 	nn.Softcap(out, m.Cfg.LogitSoftcap)
