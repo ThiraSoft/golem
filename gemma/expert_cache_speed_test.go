@@ -39,7 +39,7 @@ func TestExpertCacheSpeed(t *testing.T) {
 	// can take — the 26B A4B's is Q4_0 where the shader wants Q6_K — so it is
 	// taken when it is offered and the measurement stands without it. It is the
 	// same on both sides of the comparison either way.
-	head := m.UseVulkanHead() == nil
+	onCard := m.UseVulkanHead() == nil
 	vocab, err := bpe.Load(m.File())
 	if err != nil {
 		t.Skipf("no tokenizer: %v", err)
@@ -66,16 +66,29 @@ func TestExpertCacheSpeed(t *testing.T) {
 		hidden = m.Forward(Argmax(logits), pos)
 		pos++
 	}
+	// The two halves are timed apart, because they are not the same question.
+	// Forward is the blocks, and it is what the expert cache changes; Logits is
+	// one matrix of the vocabulary, and on a checkpoint whose head this engine
+	// cannot take it is a read of the whole embedding on the processor. A
+	// single rate hides which of the two a run is waiting on.
+	var head, blocks time.Duration
 	start := time.Now()
 	for i := 0; i < count; i++ {
+		t0 := time.Now()
 		m.Logits(hidden, logits)
+		t1 := time.Now()
 		hidden = m.Forward(Argmax(logits), pos)
+		head += t1.Sub(t0)
+		blocks += time.Since(t1)
 		pos++
 	}
 	took := time.Since(start)
 	fmt.Printf("slots=%-26s %d tokens in %v, %6.2f t/s (%6.2f ms a token, head on the card: %v)\n",
 		envOrDash("GOLEM_MOE_CACHE_SLOTS"), count, took.Round(time.Millisecond),
-		float64(count)/took.Seconds(), took.Seconds()*1000/float64(count), head)
+		float64(count)/took.Seconds(), took.Seconds()*1000/float64(count), onCard)
+	fmt.Printf("    of which the head %6.2f ms a token (%4.1f %%) and the blocks %6.2f ms (%4.1f %%)\n",
+		head.Seconds()*1000/float64(count), 100*head.Seconds()/took.Seconds(),
+		blocks.Seconds()*1000/float64(count), 100*blocks.Seconds()/took.Seconds())
 }
 
 func envOrDash(name string) string {

@@ -1761,6 +1761,16 @@ func (m *Mixture) planResidency(pool int) {
 	// 26B A4B at 1348 MiB — the difference between what the card holds with the
 	// experts resident and with them beside it — and a quarter of that again
 	// for the driver's own.
+	//
+	// It is a constant measured on one checkpoint, and it covers the head only
+	// for a head that is already on the card when this runs. The plan happens
+	// when the first pool arrives, so a caller that uploads its head afterwards
+	// gets an allowance that was sized for a different tensor: on the Q8_0
+	// build of the same model the head is 784 MiB against the Q4_0 build's, and
+	// what does not fit goes to host memory without a word and is re-read over
+	// the bus once per token. engine/engine.go's UseVulkan puts the head first
+	// for that reason. Making this a number the caller computes rather than one
+	// measured here is the open half of it.
 	const fixed = 1700 << 20
 	// The easy case, and the one every model that fits takes: the whole pool
 	// goes on the card and none of this happens. A cache of a stack that is

@@ -132,10 +132,25 @@ func (m *Model) UseVulkan() error {
 	if !ok {
 		return fmt.Errorf("engine: %s has nothing that can move to a device", m.Name)
 	}
-	if err := h.UseVulkanStack(); err != nil {
+	// The head first, and the order is not a preference.
+	//
+	// It is the largest single tensor in a model and the blocks take the card
+	// greedily: a mixture's residency planner asks the driver what is free
+	// when its first pool arrives and reserves a fixed allowance for
+	// everything else, so a head uploaded afterwards is what does not fit. A
+	// driver does not refuse it — it puts the allocation in host memory and
+	// says nothing, and the tensor then crosses the bus once per token drawn.
+	//
+	// Measured on gemma-4-26B-A4B-it-Q8_0, whose head is 784 megabytes: after
+	// the stack it costs 145.28 ms of a 204.99 ms token, and before it 2.65 ms
+	// of a 70.07 ms one. 4.88 tokens a second against 14.27, from the order of
+	// two calls. qwen has had it this way round for another reason — its stack
+	// asks the head for the embedding table — and that is why qwen never saw
+	// this.
+	if err := h.UseVulkanHead(); err != nil {
 		return err
 	}
-	if err := h.UseVulkanHead(); err != nil {
+	if err := h.UseVulkanStack(); err != nil {
 		return err
 	}
 	return m.useVisionVulkan()

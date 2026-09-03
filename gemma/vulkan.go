@@ -25,7 +25,21 @@ import (
 
 // UseVulkanHead uploads the logit head to a Vulkan device and makes Logits
 // read it there. It fails, and changes nothing, when there is no device, when
-// the head is not Q6_K, or when the tensor does not fit in device memory.
+// the embedding is in a format no kernel here reads, or when the tensor does
+// not fit in device memory.
+//
+// Every format the file might carry it in is taken, not only Q6_K. That was
+// the whole of what stood between the 26B A4B's Q8_0 build and its head: the
+// tensor is 784 megabytes and it crossed a PCIe 3.0 x8 link for every token
+// drawn, which measured at 92.02 ms of a 152.90 ms token — sixty per cent of
+// the model's time in one matrix that the card could read in a fraction of it.
+//
+// Call it before UseVulkanStack. The blocks take the card greedily and the
+// mixture's residency planner reserves a fixed allowance for everything else,
+// so a head asked for afterwards is the allocation that does not fit — and a
+// driver answers that by putting it in host memory silently, which costs the
+// whole tensor over the bus for every token. On the 26B A4B's Q8_0 build that
+// is 145.28 ms of a token against 2.65 ms the other way round.
 //
 // LogitsBatch keeps the CPU path whatever else is on the card: the shader
 // scores one activation at a time, and a batch reads the head once for all of
@@ -34,22 +48,36 @@ func (m *Model) UseVulkanHead() error {
 	if m.head != nil {
 		return nil
 	}
-	if m.W.TokenEmbd.Quant != nn.Q6_K {
-		return fmt.Errorf("gemma: the Vulkan head wants a Q6_K embedding, this one is %s", m.W.TokenEmbd.Quant)
+	e := m.W.TokenEmbd
+	if e.Quant != nn.Q6_K && !vk.QuantReadable(e.Quant) {
+		return fmt.Errorf("gemma: there is no Vulkan head kernel for a %s embedding", e.Quant)
 	}
 	d, err := m.device()
 	if err != nil {
 		return err
 	}
-	h, err := vk.NewQ6KHead(d, m.W.TokenEmbd.Data, m.W.TokenEmbd.Rows, m.W.TokenEmbd.Cols)
-	if err != nil {
-		return err
+	if e.Quant == nn.Q6_K {
+		// Q6_K keeps a kernel of its own. It reads the activation in its Q8_K
+		// form, which is the cut a Q6_K row's per-sixteen scales want, where
+		// the door's kernels read every format against a Q8_0 one — and it
+		// caps its own logits, which the door's do not.
+		h, herr := vk.NewQ6KHead(d, e.Data, e.Rows, e.Cols)
+		if herr != nil {
+			return herr
+		}
+		// The cap goes with the product rather than after it: the shader
+		// writes a logit that is already capped, and Logits does not walk the
+		// vocabulary again to do it. gemma/model.go's Logits asks the head
+		// whether it did.
+		h.Softcap(m.Cfg.LogitSoftcap)
+		m.head = h
+	} else {
+		h, herr := vk.NewQuantHead(d, e.Quant, e.Data, e.Rows, e.Cols)
+		if herr != nil {
+			return herr
+		}
+		m.head = h
 	}
-	// The cap goes with the product rather than after it: the shader writes a
-	// logit that is already capped, and Logits does not walk the vocabulary
-	// again to do it. gemma/model.go's Logits asks the head whether it did.
-	h.Softcap(m.Cfg.LogitSoftcap)
-	m.head = h
 	// The head is the embedding read the other way round, so a stack built
 	// before it can now read its rows too rather than being handed them.
 	if m.stack != nil {
@@ -64,8 +92,17 @@ func (m *Model) UseVulkanHead() error {
 // serving both directions: nothing more is uploaded, and what it saves is not
 // the microseconds but the last step of a pass that was still this side of the
 // bus. vk/shaders/embed_q6k.comp says the rest.
+//
+// Only for a Q6_K table, because that shader is the only lookup written. A
+// table of another format handed to it would be unpacked as Q6_K and would
+// answer — fluently and wrongly, which is the fault vk/quantproduct.go exists
+// to make impossible. The head itself is on the card either way; this is the
+// smaller half, and a Q8_0 lookup is a shader nobody has written yet.
 func (m *Model) useVulkanEmbedding() error {
 	if m.head == nil || m.stack == nil || m.stack.Embedding() {
+		return nil
+	}
+	if m.W.TokenEmbd.Quant != nn.Q6_K {
 		return nil
 	}
 	if m.Cfg.PLEDim > 0 {
