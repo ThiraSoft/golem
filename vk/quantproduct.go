@@ -73,6 +73,36 @@ import (
 //go:generate glslc -O -DQ41 -DCOLUMNS=256 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q41_256.spv
 //go:generate glslc -O -DQ41 -DCOLUMNS=512 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q41_512.spv
 
+// The projection kernels against Q8_0 weights. They exist for a mixture whose
+// experts are Q8_0, because such a checkpoint is Q8_0 throughout: its dense
+// branch and its attention come through this door as well, and refusing them
+// would refuse the model the routed kernels were widened for.
+//
+// No tiled form. A card without matrix cores answers a wide pass sixteen
+// columns at a time for every format but Q4_0 already, and that is the path
+// this takes on every card — a Q8_0 checkpoint is read for its size, not for
+// its prompt speed.
+//
+//go:generate glslc -O -DQ80 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q80w.spv
+//go:generate glslc -O -DQ80 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q80w2.spv
+//go:generate glslc -O -DQ80 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q80w4.spv
+//go:generate glslc -O -DQ80 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q80w8.spv
+//go:generate glslc -O -DQ80 -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q80w16.spv
+//go:embed shaders/matvec_q80w.spv
+var matvecQ80WSPIRV []byte
+
+//go:embed shaders/matvec_q80w2.spv
+var matvecQ80W2SPIRV []byte
+
+//go:embed shaders/matvec_q80w4.spv
+var matvecQ80W4SPIRV []byte
+
+//go:embed shaders/matvec_q80w8.spv
+var matvecQ80W8SPIRV []byte
+
+//go:embed shaders/matvec_q80w16.spv
+var matvecQ80W16SPIRV []byte
+
 //go:embed shaders/matvec_q41q8.spv
 var matvecQ41Q8SPIRV []byte
 
@@ -167,7 +197,7 @@ var matmulCoopQ6K32SPIRV []byte
 // tensor instead.
 func QuantReadable(q nn.Quant) bool {
 	switch q {
-	case nn.Q4_0, nn.Q4_1, nn.Q4_K, nn.Q5_K, nn.Q6_K:
+	case nn.Q4_0, nn.Q4_1, nn.Q4_K, nn.Q5_K, nn.Q6_K, nn.Q8_0:
 		return true
 	}
 	return false
@@ -187,6 +217,8 @@ func quantRowBytes(q nn.Quant, cols int) (int, error) {
 		return rowBytesQ5_K(cols), nil
 	case nn.Q6_K:
 		return rowBytesQ6_K(cols), nil
+	case nn.Q8_0:
+		return cols / nn.QuantBlock * 34, nil
 	}
 	return 0, fmt.Errorf("vk: there is no projection kernel for %s", q)
 }
@@ -216,6 +248,8 @@ func quantLayout(q nn.Quant, data []byte, rows, cols int) ([]byte, error) {
 		fileRow = cols / nn.SuperBlock * 176
 	case nn.Q6_K:
 		fileRow = cols / nn.SuperBlock * 210
+	case nn.Q8_0:
+		fileRow = cols / nn.QuantBlock * 34
 	default:
 		return nil, fmt.Errorf("vk: there is no projection kernel for %s", q)
 	}
@@ -231,6 +265,8 @@ func quantLayout(q nn.Quant, data []byte, rows, cols int) ([]byte, error) {
 		return splitQ4_K(data, rows, cols), nil
 	case nn.Q5_K:
 		return splitQ5_K(data, rows, cols), nil
+	case nn.Q8_0:
+		return splitQ8_0(data, rows, cols), nil
 	default:
 		return splitQ6_K(data, rows, cols), nil
 	}
@@ -294,6 +330,14 @@ func newQuantProduct(d *Device, q nn.Quant, coop bool) (*Pipeline, error) {
 			columns int
 			spirv   []byte
 		}{{2, matvecQ5KQ8_2SPIRV}, {4, matvecQ5KQ8_4SPIRV}, {smallColumns, matvecQ5KQ8_8SPIRV}, {16, matvecQ5KQ8_16SPIRV}} {
+			narrow = append(narrow, w)
+		}
+	case nn.Q8_0:
+		base = matvecQ80WSPIRV
+		for _, w := range []struct {
+			columns int
+			spirv   []byte
+		}{{2, matvecQ80W2SPIRV}, {4, matvecQ80W4SPIRV}, {smallColumns, matvecQ80W8SPIRV}, {16, matvecQ80W16SPIRV}} {
 			narrow = append(narrow, w)
 		}
 	default:

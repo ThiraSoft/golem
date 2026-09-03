@@ -808,8 +808,10 @@ type MixtureFormats struct {
 }
 
 func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, down []byte) error {
-	if f.GateUp != nn.Q4_0 && f.GateUp != nn.Q4_K {
-		return fmt.Errorf("vk: the shared gate and up are %s, and the fused kernel reads Q4_0 and Q4_K", f.GateUp)
+	switch f.GateUp {
+	case nn.Q4_0, nn.Q4_K, nn.Q8_0:
+	default:
+		return fmt.Errorf("vk: the shared gate and up are %s, and the fused kernel reads Q4_0, Q4_K and Q8_0", f.GateUp)
 	}
 	shapes := []struct {
 		what       string
@@ -1713,8 +1715,19 @@ func (m *Mixture) fusedFor(q nn.Quant) (*Pipeline, error) {
 	if q == nn.Q4_0 {
 		return m.gateUp, nil
 	}
+	if q == nn.Q8_0 {
+		// The routed kernel with one expert is the shared branch's, which is
+		// what it has always been for Q4_0: the same three matrices under the
+		// same norm, read by the same code with used at one.
+		if m.gateUpQ80 == nil {
+			if err := m.buildQ80Experts(); err != nil {
+				return nil, err
+			}
+		}
+		return m.gateUpQ80, nil
+	}
 	if q != nn.Q4_K {
-		return nil, fmt.Errorf("vk: the fused gate and up reads Q4_0 and Q4_K, not %s", q)
+		return nil, fmt.Errorf("vk: the fused gate and up reads Q4_0, Q4_K and Q8_0, not %s", q)
 	}
 	if m.gateUpQ4K != nil {
 		return m.gateUpQ4K, nil

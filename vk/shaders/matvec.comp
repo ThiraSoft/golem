@@ -129,7 +129,23 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
         float ws   = pair[b & 1u];
 #endif
 
-#ifdef Q6K
+#ifdef Q80
+        // Thirty-two signed bytes to a block against the activation's thirty-two,
+        // which is what the packed dot takes without unpacking anything. A Q8_0
+        // weight carries no offset, so there is no correction term — see
+        // splitQ6_K's note in vk/mixture.go, which is the same observation from
+        // the other side of a K-quant.
+        uint at = (nib + 32u * b) >> 2;
+        uint ab = b * 8u;
+        for (uint c = 0u; c < COLUMNS; c++) {
+            uint ac = (p.col + c) * aw + ab;
+            int acc = 0;
+            for (uint u = 0u; u < 8u; u++) {
+                acc = dotPacked4x8AccSatEXT(int(w[at + u]), int(aq[ac + u]), acc);
+            }
+            sum[c] += ws * float(acc) * as_[(p.col + c) * 2u * nb + b];
+        }
+#elif defined(Q6K)
         uint at = (nib + 24u * b) >> 2;
         uint h0 = w[at], h1 = w[at + 1u];
         uint ab = b * 8u;
@@ -172,6 +188,7 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
 #endif
         }
 #endif
+#ifndef Q80
         for (uint c = 0u; c < COLUMNS; c++) {
             uint ac = (p.col + c) * aw + ab;
             uint sc = (p.col + c) * 2u * nb;
@@ -218,6 +235,7 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
 #endif
 #endif
         }
+#endif
     }
     for (uint c = 0u; c < COLUMNS; c++) answer[c] = sum[c] - corr[c];
 }

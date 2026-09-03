@@ -149,14 +149,20 @@ no longer scales with how many experts it has, and what bounds it becomes host
 memory instead — sixteen gibibytes of addressable system memory here. The speeds
 are the table further down, which measures all of this on one continuation.
 
-**What has not been done is run a mixture whose pool does not fit either.** The
-26B A4B is the only mixture on this machine, and the ceiling it would have to
-cross is the sixteen gibibytes of system memory the card can address, against
-its own 12.85 GB of experts — so a mixture a fifth larger already fails, and past
-that the source is the mapped file and the rate is the disk's. None of that has
-been run, and none of it is claimed. What *is* shown is that the card stops
-being the limit: the cache sizes below hold as little as 1.6 GB of a 12.85 GB
-pool and answer the same tokens.
+**The card stops being the limit, and the next one is measured.** The cache
+sizes below hold as little as 1.6 GB of a 12.85 GB pool and answer the same
+tokens, so what a mixture costs the card is now whatever you give it. What the
+pool costs is a different ceiling: every submission of a token reaches every
+block's share of it, and `vk/residency_test.go` walks that up a gibibyte at a
+time — **fifteen submit and sixteen do not**, which is the heap's own size and
+amdgpu's `gttsize` behind it. Allocating is not submitting: thirty gibibytes
+allocate here without complaint, because the driver allocates lazily.
+
+So the 26B A4B in Q4_0 fits beside the card and runs. The same model in Q8_0 —
+`Q4_0` and `Q8_0` are both read by the routed kernels since v0.22.2 — puts 24 GB
+of experts against that fifteen and is refused at the first submission. Running
+*that* wants either a boot with a larger `gttsize` or a pool read from the mapped
+file, and neither has been done here.
 
 That arrangement is the floor for speed — every expert read across the bus,
 nothing cached — and the bus is what binds it: this card sits behind a switch and
@@ -209,6 +215,14 @@ later token that wants it again.
 The prompt is unchanged: a wide pass reads every expert of a block at once, and
 a cache of a few dozen has nothing to offer it, so passes above the cache's width
 go by expert straight out of the pool.
+
+**Q4_0 and Q8_0 both go through this.** A Q8_0 mixture is eight and a half bits a
+weight against four and a half, which is the smallest form that puts a pool past
+what a card can address — the reason to read it at all. A Q8_0 weight is a signed
+byte against an activation that is already signed bytes, so the packed dot takes
+both as they are, with no nibbles to unpack and no correction term. The two
+routed kernels and `vk/quantproduct.go`'s door read it; the Q4_0 binaries they
+share a source with are unchanged, instruction for instruction.
 
 The pool has to fit in the memory the card can address, which is sixteen
 gibibytes here against the 26B A4B's 12.85 — so that model fits and a much
