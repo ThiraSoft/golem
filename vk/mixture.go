@@ -42,7 +42,7 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_act.comp -o shaders/moe_act.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_down.comp -o shaders/moe_down.spv
-//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec.spv
 
 // The prompt path of the expert branch, which reads the stack by expert
 // rather than by column. shaders/moe_scatter.comp says why.
@@ -93,7 +93,7 @@ var matvecSPIRV []byte
 // The same two kernels built for a batch of columns. shaders/matvec.comp says
 // why the count is compiled in rather than pushed.
 //
-//go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec8.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec8.spv
 //go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup8.spv
 //go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup16.spv
 //go:generate glslc -O -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup32.spv

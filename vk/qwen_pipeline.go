@@ -88,11 +88,11 @@ var matvecQ80SPIRV []byte
 // product rather than a wider mat-vec. vk/matmul.go's smallColumns says the
 // same number for the same reason.
 //
-//go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec2.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec2.spv
 //go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q4k.comp -o shaders/matvec_q4k_2.spv
 //go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q6k.comp -o shaders/matvec_q6k_2.spv
 //go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32_2.spv
-//go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec4.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec4.spv
 //go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q4k.comp -o shaders/matvec_q4k_4.spv
 //go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q6k.comp -o shaders/matvec_q6k_4.spv
 //go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32_4.spv
@@ -100,7 +100,7 @@ var matvecQ80SPIRV []byte
 //go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q4k.comp -o shaders/matvec_q4k_8.spv
 //go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q6k.comp -o shaders/matvec_q6k_8.spv
 //go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32_8.spv
-//go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_qwen16.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_qwen16.spv
 //go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q4k.comp -o shaders/matvec_q4k_16.spv
 //go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q6k.comp -o shaders/matvec_q6k_16.spv
 //go:generate glslc -O -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32_16.spv

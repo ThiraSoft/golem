@@ -205,35 +205,34 @@ func NewMatMulQuant(d *Device, data []byte, rows, cols, columns int, coop bool, 
 	if cols%nn.QuantBlock != 0 {
 		return nil, fmt.Errorf("vk: a quantized row needs a multiple of %d columns, given %d", nn.QuantBlock, cols)
 	}
-	rowBytes, relayout := rowBytesQ4_0, splitQ4_0
+	var relayout func([]byte, int, int) []byte
 	switch q {
 	case nn.Q4_0:
+		relayout = splitQ4_0
 	case nn.Q4_K:
-		if cols%nn.SuperBlock != 0 {
-			return nil, fmt.Errorf("vk: a Q4_K row needs a multiple of %d columns, given %d", nn.SuperBlock, cols)
-		}
-		rowBytes, relayout = rowBytesQ4_K, splitQ4_K
+		relayout = splitQ4_K
 	case nn.Q6_K:
-		if cols%nn.SuperBlock != 0 {
-			return nil, fmt.Errorf("vk: a Q6_K row needs a multiple of %d columns, given %d", nn.SuperBlock, cols)
-		}
-		rowBytes, relayout = rowBytesQ6_K, splitQ6_K
+		relayout = splitQ6_K
 	case nn.Q3_K:
-		if cols%nn.SuperBlock != 0 {
-			return nil, fmt.Errorf("vk: a Q3_K row needs a multiple of %d columns, given %d", nn.SuperBlock, cols)
-		}
-		// The file's own row and not the packed one: rowBytesQ3_K is what the
-		// card holds, a hundred and fourteen bytes a superblock, and what is
-		// being length-checked here is the tensor as the file gives it.
-		rowBytes, relayout = func(c int) int { return c / nn.SuperBlock * 110 }, splitQ3_K
+		relayout = splitQ3_K
 	default:
 		return nil, fmt.Errorf("vk: the tiled product has no staging for %s", q)
 	}
-	if want := rows * rowBytes(cols); len(data) != want {
+	if q != nn.Q4_0 && cols%nn.SuperBlock != 0 {
+		return nil, fmt.Errorf("vk: a %s row needs a multiple of %d columns, given %d", q, nn.SuperBlock, cols)
+	}
+	// The file's own row and not the packed one. data is the tensor as the file
+	// gives it, and the packings do not all hold it at that size —
+	// quantFileRow is the one place that arithmetic lives, and this asking it
+	// rather than keeping its own copy is the fix for the fault it describes.
+	fileRow, err := quantFileRow(q, cols)
+	if err != nil {
+		return nil, err
+	}
+	if want := rows * fileRow; len(data) != want {
 		return nil, fmt.Errorf("vk: %d rows of %d columns need %d bytes, given %d", rows, cols, want, len(data))
 	}
 	var spirv []byte
-	var err error
 	if q == nn.Q4_0 {
 		spirv, err = matmulSPIRV(columns)
 		if err != nil && !coop {

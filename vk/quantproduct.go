@@ -33,25 +33,26 @@ import (
 // The mat-vec over a Q4_K matrix and a Q8_0 activation, at the widths a token
 // and a short pass take. shaders/matvec.comp under -DQ4K.
 //
-//go:generate glslc -O -DQ4K --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q4kq8.spv
-//go:generate glslc -O -DQ4K -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q4kq8_2.spv
-//go:generate glslc -O -DQ4K -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q4kq8_4.spv
-//go:generate glslc -O -DQ4K -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q4kq8_8.spv
-//go:generate glslc -O -DQ4K -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q4kq8_16.spv
-//go:generate glslc -O -DQ6K --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q6kq8.spv
-//go:generate glslc -O -DQ6K -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q6kq8_2.spv
-//go:generate glslc -O -DQ6K -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q6kq8_4.spv
-//go:generate glslc -O -DQ6K -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q6kq8_8.spv
-//go:generate glslc -O -DQ6K -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q6kq8_16.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ4K --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q4kq8.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ4K -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q4kq8_2.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ4K -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q4kq8_4.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ4K -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q4kq8_8.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ4K -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q4kq8_16.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ6K --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q6kq8.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ6K -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q6kq8_2.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ6K -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q6kq8_4.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ6K -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q6kq8_8.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ6K -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q6kq8_16.spv
 // And Q3_K, which nothing here writes and which is read because a client who
 // will not compress a checkpoint downloads one. vk/split_q3k.go is its layout.
 //
-// These lines carry -DLANES=16 -DOUTS=8 and the ones above do not, which is a
-// difference in the directives and not in the binaries: every matvec binary in
-// shaders/ is built at that shape, and the lines above have simply drifted from
-// what produced them. Regenerating them at the defaults would change every
-// mat-vec in the repository, so the shape is written out here rather than
-// inherited from a comment.
+// The workgroup shape is written out here, as it now is on every mat-vec
+// directive that is not Q8_0's. It was written on none of them: shaders/ held
+// binaries built at sixteen lanes to a row while the directives asked for the
+// source's default of eight, so `go generate` rewrote thirty shaders at a
+// geometry nobody had measured, and it did it silently — a mat-vec at the wrong
+// lane count answers, more slowly. The Q8_0 family really is at the default and
+// says so by carrying no flag.
 //
 //go:generate glslc -O -DQ3K -DLANES=16 -DOUTS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q3kq8.spv
 //go:generate glslc -O -DQ3K -DLANES=16 -DOUTS=8 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q3kq8_2.spv
@@ -77,16 +78,16 @@ import (
 // output projection. Both were read against *float* activations by kernels
 // that predate the packed dot, which is a slower product for the same answer.
 //
-//go:generate glslc -O -DQ41 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q41q8.spv
-//go:generate glslc -O -DQ41 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q41q8_2.spv
-//go:generate glslc -O -DQ41 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q41q8_4.spv
-//go:generate glslc -O -DQ41 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q41q8_8.spv
-//go:generate glslc -O -DQ41 -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q41q8_16.spv
-//go:generate glslc -O -DQ5K --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q5kq8.spv
-//go:generate glslc -O -DQ5K -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q5kq8_2.spv
-//go:generate glslc -O -DQ5K -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q5kq8_4.spv
-//go:generate glslc -O -DQ5K -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q5kq8_8.spv
-//go:generate glslc -O -DQ5K -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q5kq8_16.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ41 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q41q8.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ41 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q41q8_2.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ41 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q41q8_4.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ41 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q41q8_8.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ41 -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q41q8_16.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ5K --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q5kq8.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ5K -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q5kq8_2.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ5K -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q5kq8_4.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ5K -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q5kq8_8.spv
+//go:generate glslc -O -DLANES=16 -DOUTS=8 -DQ5K -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q5kq8_16.spv
 //go:generate glslc -O -DQ5K -DCOLUMNS=32 -DBN=32 -DBM=64 -DBK=128 -DWAVE_M=4 -DWAVE_N=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q5k32.spv
 //go:generate glslc -O -DQ41 -DCOLUMNS=32 -DBN=32 -DBM=64 -DBK=128 -DWAVE_M=4 -DWAVE_N=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q41_32.spv
 //go:generate glslc -O -DQ41 -DCOLUMNS=64 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q41_64.spv
@@ -285,30 +286,9 @@ func quantLayout(q nn.Quant, data []byte, rows, cols int) ([]byte, error) {
 	if cols%nn.QuantBlock != 0 {
 		return nil, fmt.Errorf("vk: a quantized row needs a multiple of %d columns, given %d", nn.QuantBlock, cols)
 	}
-	// The file's own count, not the packing's: Q6_K's rows are rounded up to a
-	// word on the way to the card and the file does not round them.
-	fileRow := 0
-	switch q {
-	case nn.Q4_0:
-		fileRow = rowBytesQ4_0(cols)
-	case nn.Q4_1:
-		fileRow = cols / nn.QuantBlock * 20
-	case nn.Q3_K:
-		// A hundred and ten bytes a superblock, which the packing takes to a
-		// hundred and fourteen; vk/split_q3k.go says what the four buy.
-		fileRow = cols / nn.SuperBlock * 110
-	case nn.Q4_K:
-		fileRow = rowBytesQ4_K(cols)
-	case nn.Q5_K:
-		// A hundred and seventy-six bytes a superblock, which the packing takes
-		// to a hundred and ninety-two; splitQ5_K says what the sixth bit buys.
-		fileRow = cols / nn.SuperBlock * 176
-	case nn.Q6_K:
-		fileRow = cols / nn.SuperBlock * 210
-	case nn.Q8_0:
-		fileRow = cols / nn.QuantBlock * 34
-	default:
-		return nil, fmt.Errorf("vk: there is no projection kernel for %s", q)
+	fileRow, err := quantFileRow(q, cols)
+	if err != nil {
+		return nil, err
 	}
 	if want := rows * fileRow; len(data) != want {
 		return nil, fmt.Errorf("vk: %d rows of %d columns in %s need %d bytes, given %d", rows, cols, q, want, len(data))
@@ -329,6 +309,45 @@ func quantLayout(q nn.Quant, data []byte, rows, cols int) ([]byte, error) {
 	default:
 		return splitQ6_K(data, rows, cols), nil
 	}
+}
+
+// quantFileRow is what one row of that many inputs occupies in the *file*,
+// which is not always what it occupies once a packing has had it.
+//
+// Three of these formats differ between the two, and the difference is what
+// this function exists to keep in one place. Q5_K's superblock grows from a
+// hundred and seventy-six bytes to a hundred and ninety-two, Q3_K's from a
+// hundred and ten to a hundred and fourteen, and Q6_K's two hundred and ten
+// stay two hundred and ten but are rounded up to a word — so a Q6_K row of
+// fifteen superblocks is 3150 bytes in the file and 3152 on the card.
+//
+// A second copy of this arithmetic in vk/matmul.go length-checked callers'
+// tensors against the *packed* count, and so refused every Q6_K matrix with an
+// odd number of superblocks to a row. 3840 columns is fifteen of them, which
+// is Gemma 4 12B's attention width. The formats whose rows are a whole number
+// of words either way — Q4_0, Q4_K, Q8_0 — hid it.
+func quantFileRow(q nn.Quant, cols int) (int, error) {
+	switch q {
+	case nn.Q4_0:
+		return rowBytesQ4_0(cols), nil
+	case nn.Q4_1:
+		return cols / nn.QuantBlock * 20, nil
+	case nn.Q3_K:
+		// A hundred and ten bytes a superblock, which the packing takes to a
+		// hundred and fourteen; vk/split_q3k.go says what the four buy.
+		return cols / nn.SuperBlock * 110, nil
+	case nn.Q4_K:
+		return rowBytesQ4_K(cols), nil
+	case nn.Q5_K:
+		// A hundred and seventy-six bytes a superblock, which the packing takes
+		// to a hundred and ninety-two; splitQ5_K says what the sixth bit buys.
+		return cols / nn.SuperBlock * 176, nil
+	case nn.Q6_K:
+		return cols / nn.SuperBlock * 210, nil
+	case nn.Q8_0:
+		return cols / nn.QuantBlock * 34, nil
+	}
+	return 0, fmt.Errorf("vk: there is no projection kernel for %s", q)
 }
 
 // newQuantProduct builds the pipeline that reads one weight format: the mat-vec
