@@ -85,6 +85,11 @@ func TestQuantProductMatchesReference(t *testing.T) {
 		// the format's own cost rather than the kernel's.
 		{nn.Q5_K, cols / nn.SuperBlock * 176, 1e-3},
 		{nn.Q6_K, cols / nn.SuperBlock * 210, 1e-3},
+		// Q8_0 is here for a mixture whose pool is larger than the memory a
+		// card can address; vk/mixture.go says why that is the reason to read
+		// it. A signed byte against a signed byte and no offset in either, so
+		// this is the one format in the table with no correction term.
+		{nn.Q8_0, cols / nn.QuantBlock * 34, 1e-3},
 	} {
 		t.Run(f.q.String(), func(t *testing.T) {
 			rng := rand.New(rand.NewSource(int64(f.q)))
@@ -150,6 +155,10 @@ func sane(tb testing.TB, m nn.Matrix, rng *rand.Rand) {
 		case nn.Q4_0:
 			for b := 0; b < nb; b++ {
 				put(base + b*18)
+			}
+		case nn.Q8_0:
+			for b := 0; b < nb; b++ {
+				put(base + b*34)
 			}
 		case nn.Q4_1:
 			for b := 0; b < nb; b++ {

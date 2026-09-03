@@ -251,6 +251,9 @@ void main() {
     uint rowBytes = (p.ffn >> 5) * 24u;
 #elif defined(Q41)
     uint rowBytes = (p.ffn >> 5) * 20u;
+#elif defined(Q80)
+    // Two bytes of scale and thirty-two of signed weights to a block.
+    uint rowBytes = (p.ffn >> 5) * 34u;
 #else
     uint rowBytes = (p.ffn >> 5) * 18u;
 #endif

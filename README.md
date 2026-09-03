@@ -149,20 +149,39 @@ no longer scales with how many experts it has, and what bounds it becomes host
 memory instead — sixteen gibibytes of addressable system memory here. The speeds
 are the table further down, which measures all of this on one continuation.
 
-**The card stops being the limit, and the next one is measured.** The cache
-sizes below hold as little as 1.6 GB of a 12.85 GB pool and answer the same
-tokens, so what a mixture costs the card is now whatever you give it. What the
-pool costs is a different ceiling: every submission of a token reaches every
-block's share of it, and `vk/residency_test.go` walks that up a gibibyte at a
-time — **fifteen submit and sixteen do not**, which is the heap's own size and
-amdgpu's `gttsize` behind it. Allocating is not submitting: thirty gibibytes
-allocate here without complaint, because the driver allocates lazily.
+**Neither side is large enough alone, and together they are.** Device memory
+holds about fifteen and a half gigabytes; the host memory the card can address
+holds fifteen and a half more, and a submission that reaches past *either* is
+refused outright — `vk/residency_test.go` walks that wall up a gibibyte at a
+time, and fifteen submit where sixteen does not. Allocating is not submitting:
+thirty gibibytes allocate without complaint, because the driver allocates
+lazily, and the first reading of that took it for headroom.
 
-So the 26B A4B in Q4_0 fits beside the card and runs. The same model in Q8_0 —
-`Q4_0` and `Q8_0` are both read by the routed kernels since v0.22.2 — puts 24 GB
-of experts against that fifteen and is refused at the first submission. Running
-*that* wants either a boot with a larger `gttsize` or a pool read from the mapped
-file, and neither has been done here.
+So the residency is decided **block by block**. The blocks that fit keep their
+experts on the card and need neither cache nor fetches; the rest live beside it
+and get both. The 26B A4B in Q8_0 — 26.9 GB, of which 24 are experts — runs that
+way at **2.4 tokens a second**, on a card that can hold neither half of it:
+
+| 26B A4B in Q8_0 | |
+| --- | --- |
+| experts | 24 GB, about half on the card and half beside it |
+| logit head | on the processor — the kernel wants a Q6_K embedding and this one is Q8_0 |
+| tokens a second *here* | 2.4 |
+
+**That last row is this machine's and travels worse than any other number in
+this file.** The card sits behind a switch on a PCIe 3.0 x8 host, so a missed
+expert crosses at 6.3 GB/s where a 5.0 x16 machine would carry it at eight times
+that; and the addressable host heap is about half of RAM, so a machine with
+sixty-four gigabytes would hold this pool entirely beside the card with no split
+at all. What is being shown is that the two ceilings can be used together — the
+rate is whatever the bus underneath happens to be.
+
+**And where an expert lives does not change what the model says.** A cache of
+twelve slots and one of forty put different numbers of blocks on the card and
+answer the same twenty-four tokens, exactly — `TestVulkanSameWhereverTheExpertsLive`.
+That is the control the processor cannot give: a mixture routes on logits the two
+paths compute differently, so a near-tie sends the router to another expert and
+they agree on most tokens and never on all.
 
 That arrangement is the floor for speed — every expert read across the bus,
 nothing cached — and the bus is what binds it: this card sits behind a switch and

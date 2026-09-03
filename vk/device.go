@@ -814,6 +814,24 @@ func (d *Device) run(record func(commandBuffer)) error {
 	return check("vkQueueWaitIdle", vkQueueWaitIdle(d.queue))
 }
 
+// HostAddressableBytes is the largest heap the card reads that is not its own
+// memory — the aperture a pool too large for the card lives in.
+//
+// It is a hard ceiling and not a hint: vk/residency_test.go walks host-visible
+// buffers up a gibibyte at a time and the first submission past this size is
+// refused, whatever else is free. Allocating is not submitting, and the driver
+// allocates lazily, so nothing complains until the work is handed over.
+func (d *Device) HostAddressableBytes() uint64 {
+	var most uint64
+	for i := uint32(0); i < d.memory.memoryHeapCount; i++ {
+		h := d.memory.memoryHeaps[i]
+		if h.flags&memoryDeviceLocal == 0 && h.size > most {
+			most = h.size
+		}
+	}
+	return most
+}
+
 // DeviceLocalFree is what the largest device-local heap has left, or zero when
 // the driver will not say.
 //

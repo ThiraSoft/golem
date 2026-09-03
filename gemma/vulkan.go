@@ -144,6 +144,18 @@ func (m *Model) UseVulkanStack() error {
 		}
 	}
 	mix, err := vk.NewMixture(d, cfg.Dim, cfg.ExpertFFN, dense, cfg.Experts, cfg.ExpertsUsed, vk.GELU)
+	if err == nil {
+		// How many mixture blocks are coming, which the residency has to know
+		// before the first of them arrives: how much of the card a pool may
+		// take depends on how many pools there are.
+		mixed := 0
+		for _, b := range cfg.Blocks {
+			if b.MoE {
+				mixed++
+			}
+		}
+		mix.Expect(mixed)
+	}
 	if err != nil {
 		attn.Close()
 		return err

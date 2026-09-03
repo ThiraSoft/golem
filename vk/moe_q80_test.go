@@ -225,3 +225,124 @@ func splitFor(packed []byte, rows, cols, stride int) []byte {
 	}
 	return splitQ4_0(packed, rows, cols)
 }
+
+// TestQ80DownAnswersWhatQ40Does is the other half, and it was missing: the
+// second projection was written by analogy with the first and only ever
+// compiled. It reads a different buffer, a different scale layout and a
+// different activation, so analogy is not evidence.
+func TestQ80DownAnswersWhatQ40Does(t *testing.T) {
+	d := open(t)
+	defer d.Close()
+
+	const dim, ffn, experts = 64, 64, 8
+	rng := rand.New(rand.NewSource(31))
+	weights := make([]float32, experts*dim*ffn)
+	for i := range weights {
+		weights[i] = rng.Float32()*0.4 - 0.2
+	}
+	// One column routing to eight experts, each with its own weight.
+	ids := []int32{5, 1, 7, 0, 3, 6, 2, 4}
+	cw := make([]float32, len(ids))
+	for i := range cw {
+		cw[i] = rng.Float32()
+	}
+	// The activation, one row per pair of a column and an expert.
+	act := make([]float32, len(ids)*ffn)
+	for i := range act {
+		act[i] = rng.Float32()*2 - 1
+	}
+	aq := make([]uint32, 0, len(ids)*ffn/4)
+	as := make([]float32, 0, 2*len(ids)*ffn/nn.QuantBlock)
+	widened := make([]float32, 0, len(act))
+	for k := range ids {
+		q, s, w := q80Column(act[k*ffn : (k+1)*ffn])
+		aq = append(aq, q...)
+		widened = append(widened, w...)
+		as = append(as, s...)
+	}
+	// The kernel wants every pair's scales together, then every pair's
+	// corrections: p.col*2*used*nb + k*nb + b, with the corrections a used*nb
+	// further on. q80Column hands them back one pair at a time, scales then
+	// corrections, so they are dealt out here.
+	nb := ffn / nn.QuantBlock
+	laid := make([]float32, 2*len(ids)*nb)
+	for k := range ids {
+		copy(laid[k*nb:], as[k*2*nb:k*2*nb+nb])
+		copy(laid[len(ids)*nb+k*nb:], as[k*2*nb+nb:k*2*nb+2*nb])
+	}
+
+	host := func(b []byte) *Buffer {
+		buf, err := d.Upload(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return buf
+	}
+	aqBuf := host(asBytesUint32(aq))
+	defer aqBuf.Close()
+	asBuf := host(asBytes(laid))
+	defer asBuf.Close()
+	idBuf := host(asBytesInt32(ids))
+	defer idBuf.Close()
+	cwBuf := host(asBytes(cw))
+	defer cwBuf.Close()
+
+	run := func(spirv []byte, packed []byte, stride int) []float32 {
+		t.Helper()
+		w := host(splitFor(packed, experts*dim, ffn, stride))
+		defer w.Close()
+		y, err := d.Readback(dim*4, bufferUsageStorage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer y.Close()
+		pipe, err := d.NewPipeline(spirv, 6, uint32(unsafe.Sizeof(moePush{})))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pipe.Close()
+		set, err := pipe.NewSet([]*Buffer{w, aqBuf, asBuf, idBuf, cwBuf, y})
+		if err != nil {
+			t.Fatal(err)
+		}
+		push := moePush{dim: dim, ffn: ffn, used: uint32(len(ids)), cap: 1}
+		if err := set.Dispatch(uint32(dim/downOuts), unsafe.Pointer(&push)); err != nil {
+			t.Fatal(err)
+		}
+		return append([]float32(nil), y.Floats()[:dim]...)
+	}
+
+	coarse := run(moeDownSPIRV, encodeQ4_0(weights), 18)
+	fine := run(moeDownQ80SPIRV, encodeQ8_0(weights), 34)
+
+	// The truth: the same eight products over the float weights and the
+	// activation the card sees, summed with the routing weights.
+	want := make([]float32, dim)
+	for k, e := range ids {
+		base := int(e) * dim * ffn
+		for r := 0; r < dim; r++ {
+			var s float32
+			for i := 0; i < ffn; i++ {
+				s += weights[base+r*ffn+i] * widened[k*ffn+i]
+			}
+			want[r] += cw[k] * s
+		}
+	}
+	off := func(got []float32) float64 {
+		var num, den float64
+		for i := range want {
+			diff := float64(got[i] - want[i])
+			num += diff * diff
+			den += float64(want[i]) * float64(want[i])
+		}
+		return math.Sqrt(num / den)
+	}
+	q4, q8 := off(coarse), off(fine)
+	t.Logf("against the float answer: Q4_0 is %.4f off, Q8_0 is %.4f", q4, q8)
+	if q8 >= q4 {
+		t.Fatalf("the Q8_0 down projection is %.4f from the truth and the Q4_0 one %.4f — the finer form must be the nearer", q8, q4)
+	}
+	if q8 > 0.05 {
+		t.Fatalf("the Q8_0 down projection sits %.4f from the float answer, which is not a quantization error", q8)
+	}
+}

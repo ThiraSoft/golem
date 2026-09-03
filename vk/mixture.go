@@ -273,11 +273,19 @@ type Mixture struct {
 	scatter, idCombine *Pipeline
 	// admit and fill are the cache's two kernels, built only when there is a
 	// cache. slots is how many experts of one block the card keeps.
-	admit, fill   *Pipeline
-	slots         int
-	scatterSet    *Set
-	combineSet    *Set
-	counts, pairs *Buffer
+	admit, fill *Pipeline
+	slots       int
+	// slotsAsked is the number the environment named, or nought to let
+	// planResidency choose. blockCount is how many blocks the caller will add,
+	// which the residency has to know before the first arrives; resident is how
+	// many keep their pool on the card and taken is how many of those have.
+	slotsAsked      int
+	blockCount      int
+	resident, taken int
+	planned         bool
+	scatterSet      *Set
+	combineSet      *Set
+	counts, pairs   *Buffer
 	// plan is the grid the by-expert product is dispatched against: one entry
 	// per expert and stretch of idProductBN that has work, written by the
 	// scatter beside the counts because only the card knows how many there
@@ -339,6 +347,9 @@ type mixtureBlock struct {
 	// hold `slots` experts each; table is where they are and when each was last
 	// wanted; fills is what the admission decided has to be fetched. All nil
 	// when the experts are resident, which is every model that fits.
+	// beside says this block's pool lives in host memory rather than on the
+	// card, which is what gives it a cache.
+	beside                 bool
 	cacheGateUp, cacheDown *Buffer
 	table, fills           *Buffer
 	setAdmit               *Set
@@ -543,30 +554,12 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 	}
 	coop := d.Coopmat()
 	m := &Mixture{d: d, dim: dim, ffn: ffn, dense: dense, experts: experts, act: act, coop: coop,
-		byExpertFrom: byExpertWidth(), slots: cacheSlots()}
+		byExpertFrom: byExpertWidth(), slots: cacheSlots(), slotsAsked: cacheSlots()}
 	if m.slots > experts {
 		// A cache larger than the pool is the pool, and the eviction has
 		// nothing to choose between.
 		m.slots = experts
 	}
-	if m.slots > 0 && expertsUsed > 0 {
-		// **A pass may not want more experts than the cache holds.** The
-		// admission runs once for the whole pass and the products then run a
-		// column at a time, so a later column that evicted an earlier column's
-		// slot would leave that column reading somebody else's weights — a
-		// wrong answer, not a slow one. Below this width every column's experts
-		// are still there when its product runs; at or above it the pass goes
-		// by expert instead, out of the pool, which is what a prompt wanted
-		// anyway.
-		if w := m.slots / expertsUsed; w < m.byExpertFrom {
-			m.byExpertFrom = w
-		}
-		if m.byExpertFrom < 1 {
-			m.Close()
-			return nil, fmt.Errorf("vk: a cache of %d slots cannot hold the %d experts one column routes to", m.slots, expertsUsed)
-		}
-	}
-
 	push := uint32(unsafe.Sizeof(moePush{}))
 	var err error
 	pipes := []struct {
@@ -620,18 +613,6 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		{&m.gateUp, 32, moeGateUpWidestSPIRV},
 	} {
 		if err := (*spec.pipe).Wide(spec.columns, spec.spirv); err != nil {
-			m.Close()
-			return nil, err
-		}
-	}
-	// The cache's two kernels, when there is a cache. They take their own push
-	// constants, which is why they are not in the table above.
-	if m.slots > 0 && experts > 0 {
-		if m.admit, err = d.NewPipeline(moeAdmitSPIRV, 3, uint32(unsafe.Sizeof(admitPush{}))); err != nil {
-			m.Close()
-			return nil, err
-		}
-		if m.fill, err = d.NewPipeline(moeFillSPIRV, 3, uint32(unsafe.Sizeof(fillPush{}))); err != nil {
 			m.Close()
 			return nil, err
 		}
@@ -873,9 +854,25 @@ func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, dow
 		// The two stacks are the only tensors here that go anywhere else: they
 		// are what a token reads eight of a hundred and twenty-eight of, which
 		// is what makes them worth not keeping.
+		// Where this block's pool lives, decided block by block against what
+		// the card has left.
+		//
+		// **Neither side is large enough alone.** A Q8_0 mixture of this size
+		// has 24 GB of experts; device memory holds fifteen and a half and the
+		// addressable host heap fifteen and a half, and a submission that
+		// reaches past either is refused — vk/residency_test.go walks that wall
+		// up a gibibyte at a time. Together they are thirty-one, which is
+		// enough, so the blocks that fit on the card go on the card and the
+		// rest go beside it. A block on the card needs no cache and no fetches;
+		// a block beside it gets both.
+		//
+		// The card is filled first because a resident block is eighty times
+		// faster than a fetched one, and blocks are alike: which of them go
+		// there does not matter, only how many.
 		hold := m.d.Upload
-		if expertsInHost() {
+		if !m.roomOnCard(len(gateUpExps) + len(downExps)) {
 			hold = m.d.HostResident
+			b.beside = true
 		}
 		split := splitQ4_0
 		if m.expertQuant == nn.Q8_0 {
@@ -887,7 +884,10 @@ func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, dow
 		if b.down, err = hold(split(downExps, m.experts*m.dim, m.ffn)); err != nil {
 			return fail(err)
 		}
-		if m.slots > 0 {
+		if m.slots > 0 && b.beside {
+			if err := m.cacheKernels(); err != nil {
+				return fail(err)
+			}
 			// The slice of the card this block keeps. One expert's size is the
 			// pool's divided by the experts in it — the split layout is by
 			// expert and contiguous, which is what lets a fetch be one range.
@@ -994,7 +994,10 @@ func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, dow
 			)
 		}
 	}
-	for _, spec := range sets {
+	for i, spec := range sets {
+		if spec.pipe == nil {
+			return fail(fmt.Errorf("vk: descriptor %d of this block names a kernel that was never built", i))
+		}
 		if *spec.into, err = spec.pipe.NewSet(spec.bufs); err != nil {
 			return fail(err)
 		}
@@ -1672,6 +1675,136 @@ func splitQ5_K(src []byte, rows, cols int) []byte {
 		}
 	})
 	return dst
+}
+
+// Expect says how many blocks will be added, which the residency has to know
+// before the first of them arrives: how much of the card a pool may take
+// depends on how many pools there are.
+func (m *Mixture) Expect(blocks int) { m.blockCount = blocks }
+
+// plan decides how many blocks keep their experts on the card and how large a
+// cache the rest get, from one block's pool in bytes.
+//
+// **The card is not filled with whole blocks first, which is the arrangement
+// this had and it was backwards.** A gibibyte spent on a resident block spares
+// that block's misses and nothing else; the same gibibyte spent on cache raises
+// the hit rate of *every* block that is not resident. With the rates
+// gemma/expert_cache_test.go measures — a hundred and sixty per cent of a pool's
+// first eighth answered, and still four fifths of the fifth — the cache wins by
+// four to twelve times over the whole useful range.
+//
+// So the card keeps the fewest blocks that make the rest fit in the aperture,
+// and everything left over becomes cache. The aperture is the hard constraint:
+// a submission that reaches past it is refused outright, where a cache that is
+// too small is merely slow.
+func (m *Mixture) planResidency(pool int) {
+	m.planned = true
+	if m.blockCount < 1 || pool <= 0 {
+		m.resident = m.blockCount
+		return
+	}
+	free := m.d.DeviceLocalFree()
+	if free == 0 {
+		free = m.d.DeviceLocalBytes()
+	}
+	// What the model needs on the card besides its experts: the attention, the
+	// shared branches, the head and the stream between them. Measured on the
+	// 26B A4B at 1348 MiB — the difference between what the card holds with the
+	// experts resident and with them beside it — and a quarter of that again
+	// for the driver's own.
+	const fixed = 1700 << 20
+	// The easy case, and the one every model that fits takes: the whole pool
+	// goes on the card and none of this happens. A cache of a stack that is
+	// already resident is a copy of it.
+	if !expertsInHost() && uint64(m.blockCount)*uint64(pool)+fixed <= free {
+		m.resident, m.slots = m.blockCount, 0
+		return
+	}
+
+	// What must stay off the card: enough blocks that the rest fit in the
+	// aperture, with a tenth of it left for whatever else asks.
+	aperture := uint64(float64(m.d.HostAddressableBytes()) * 0.9)
+	beside := int(aperture / uint64(pool))
+	m.resident = max(m.blockCount-beside, 0)
+
+	// The card, once those are on it and the fixed half of the model with them.
+	left := int64(free) - int64(fixed) - int64(m.resident)*int64(pool)
+	rest := m.blockCount - m.resident
+	if rest < 1 || left <= 0 {
+		m.slots = 0
+		return
+	}
+	if m.slotsAsked > 0 {
+		// An explicit ask is honoured, because a sweep has to be able to name
+		// the number it is sweeping.
+		m.slots = min(m.slotsAsked, m.experts)
+		m.narrowFor(m.slots)
+		return
+	}
+	each := left / int64(rest)
+	per := int64(pool) / int64(max(m.experts, 1))
+	m.slots = min(int(each/max(per, 1)), m.experts)
+	if m.slots < expertsUsed {
+		m.slots = 0
+	}
+	m.narrowFor(m.slots)
+}
+
+// narrowFor keeps a pass below the width the cache can serve.
+//
+// **A pass may not want more experts than the cache holds.** The admission runs
+// once for the whole pass and the products then run a column at a time, so a
+// later column that evicted an earlier column's slot would leave that column
+// reading somebody else's weights — a wrong answer, not a slow one.
+//
+// Two is the floor and it is not a detail: Record reads `columns >= byExpertFrom`,
+// so a one at this width sends *generation* down the prompt's path, which reads
+// every expert of a block out of the pool and never touches the cache. That cost
+// a third of the tokens a second on the first measurement of this and looked
+// like the cache not working.
+func (m *Mixture) narrowFor(slots int) {
+	if slots < 1 {
+		return
+	}
+	if w := slots / expertsUsed; w < m.byExpertFrom {
+		m.byExpertFrom = max(w, 2)
+	}
+}
+
+// roomOnCard says whether a pool of that many bytes still fits in device
+// memory beside everything already there, keeping a margin the driver wants for
+// its own allocations and for the cache of the blocks that will not fit.
+//
+// It asks the driver each time rather than counting, because what is free moves
+// with the desktop and with what the previous allocation has not settled — see
+// Device.DeviceLocalFree, which is what makes this answerable at all.
+func (m *Mixture) roomOnCard(bytes int) bool {
+	if !m.planned {
+		m.planResidency(bytes)
+	}
+	if m.taken < m.resident {
+		m.taken++
+		return true
+	}
+	return false
+}
+
+// cacheKernels builds the admission and the fetch, on the first block that
+// needs them. They cannot be built with the rest: how many slots there are —
+// and whether there are any — is decided by planResidency, which runs when the
+// first block's pool arrives and not before.
+func (m *Mixture) cacheKernels() error {
+	if m.admit != nil {
+		return nil
+	}
+	var err error
+	if m.admit, err = m.d.NewPipeline(moeAdmitSPIRV, 3, uint32(unsafe.Sizeof(admitPush{}))); err != nil {
+		return err
+	}
+	if m.fill, err = m.d.NewPipeline(moeFillSPIRV, 3, uint32(unsafe.Sizeof(fillPush{}))); err != nil {
+		return err
+	}
+	return nil
 }
 
 // buildQ80Experts makes the two routed kernels for a Q8_0 expert stack, at the
