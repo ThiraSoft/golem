@@ -3,9 +3,10 @@
 #extension GL_KHR_shader_subgroup_clustered : require
 
 // y = W * x for one Q4_0 matrix against one Q8_0 activation, and for Q4_1 under
-// -DQ41, Q4_K under -DQ4K, Q5_K under -DQ5K and Q6_K under -DQ6K.
+// -DQ41, Q4_K under -DQ4K, Q5_K under -DQ5K, Q6_K under -DQ6K and Q3_K
+// under -DQ3K.
 //
-// Five formats and one kernel, because the difference between them is where a
+// Six formats and one kernel, because the difference between them is where a
 // block's scale lives and how many instructions its magnitudes take to unpack —
 // thirty lines out of a hundred and fifty, and nothing outside the staging.
 // What they share is the whole of the arithmetic: a packed integer dot against
@@ -59,17 +60,33 @@ layout(push_constant) uniform Push {
 } p;
 
 
-#ifdef Q6K
-// sbyte reads one signed byte of the weights, which is what a Q6_K group scale
-// is: the quantizer writes them as int8 and the sign carries meaning.
+#if defined(Q6K) || defined(Q3K)
+// sbyte reads one signed byte of the weights, which is what a Q6_K or a Q3_K
+// group scale is: the quantizer writes them as int8 and the sign carries
+// meaning. Q3_K's six bits are unpacked and recentred by vk/split_q3k.go, so by
+// the time they are here the two formats hold the same thing.
 int sbyte(uint at) { return bitfieldExtract(int(w[at >> 2]), int((at & 3u) * 8u), 8); }
+#endif
+
+// RECENTRE is what a magnitude of this format is offset by: a Q6_K weight is
+// its magnitude less thirty-two and a Q3_K weight its magnitude less four.
+// Neither can be folded into the block's own scale, because the two halves of
+// a block carry different ones — so it is paid as a dot against a vector of
+// ones over each half.
+#if defined(Q3K)
+#define RECENTRE 4
+#else
+#define RECENTRE 32
 #endif
 
 // lanePart is one lane's share of a row against every column.
 void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
     uint nb  = p.ffn >> 5;
     uint aw  = p.ffn >> 2;   // one column of the activation, in uints
-#if defined(Q6K)
+#if defined(Q6K) || defined(Q3K)
+    // The same header both formats have: sixteen signed group scales and one
+    // fp16 to a superblock. vk/split_q3k.go and vk/mixture.go's splitQ6_K
+    // write it, and q3kBlockBase and q6kBlockBase are the same arithmetic.
     uint nsb  = p.ffn >> 8;
     uint magB = rowBase + 16u * nsb;
     uint nib  = rowBase + ((18u * nsb + 3u) & ~3u);
@@ -112,7 +129,10 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
         }
         float ws = dm.x * float(sc6);
         float wm = dm.y * float(mn6);
-#elif defined(Q6K)
+#elif defined(Q6K) || defined(Q3K)
+        // ws is the low sixteen weights' scale and wm the high sixteen's. They
+        // are not a scale and a minimum here, whatever the names say elsewhere
+        // in this kernel: both formats are symmetric and carry no minimum.
         uint sbi = b >> 3u;
         float dd = unpackHalf2x16(w[(magB + 2u * sbi) >> 2])[sbi & 1u];
         float ws = dd * float(sbyte(rowBase + 16u * sbi + 2u * (b & 7u)));
@@ -163,6 +183,30 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
             lo[u] = (word & 0x0F0F0F0Fu) | p0;
             hi[u] = ((word >> 4) & 0x0F0F0F0Fu) | p1;
         }
+#elif defined(Q3K)
+        // Three loads a block against the activation's eight: a word of low
+        // bit pairs for the first sixteen weights, a word for the second
+        // sixteen, and a word of third bits. vk/split_q3k.go writes them.
+        uint at = (nib + 12u * b) >> 2;
+        uint q0w = w[at], q1w = w[at + 1u], hw = w[at + 2u];
+        uint ab = b * 8u;
+        uint lo[4], hi[4];
+        for (uint u = 0u; u < 4u; u++) {
+            // Four weights a byte at bits 0, 2, 4 and 6, spread one to a byte
+            // with four masked shifts — Q6_K's pairs above, at the same offsets
+            // and for the same reason: a multiply carries between the copies.
+            uint x0 = (q0w >> (8u * u)) & 0xFFu;
+            uint x1 = (q1w >> (8u * u)) & 0xFFu;
+            lo[u] = (x0 & 3u) | ((x0 & 12u) << 6u) | ((x0 & 48u) << 12u) | ((x0 & 192u) << 18u);
+            hi[u] = (x1 & 3u) | ((x1 & 12u) << 6u) | ((x1 & 48u) << 12u) | ((x1 & 192u) << 18u);
+            // And the third bit, one to a weight, four of them a nibble of the
+            // high word — spread the way Q5_K spreads its fifth bit, times four
+            // rather than sixteen because it lands at bit 2 and not bit 4.
+            uint h0 = (hw >> (4u * u)) & 0xFu;
+            uint h1 = (hw >> (16u + 4u * u)) & 0xFu;
+            lo[u] |= ((h0 & 1u) | ((h0 & 2u) << 7u) | ((h0 & 4u) << 14u) | ((h0 & 8u) << 21u)) * 4u;
+            hi[u] |= ((h1 & 1u) | ((h1 & 2u) << 7u) | ((h1 & 4u) << 14u) | ((h1 & 8u) << 21u)) * 4u;
+        }
 #else
         uint at = (nib + 16u * b) >> 2;
         uint ab = b * 8u;
@@ -192,17 +236,20 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
         for (uint c = 0u; c < COLUMNS; c++) {
             uint ac = (p.col + c) * aw + ab;
             uint sc = (p.col + c) * 2u * nb;
-#ifdef Q6K
-            // Two scales to a block, sixteen weights each, and the low nibbles
-            // are exactly the first sixteen — so the halves of the loop are the
-            // groups and no regrouping is needed.
+#if defined(Q6K) || defined(Q3K)
+            // Two scales to a block, sixteen weights each, and lo[] is exactly
+            // the first sixteen — so the halves of the loop are the groups and
+            // no regrouping is needed. That is true of Q3_K only because
+            // vk/split_q3k.go made it true: in the file a block's two halves
+            // come from two windows of qs sixteen bytes apart.
             //
-            // The recentring by thirty-two cannot be folded into the block's
-            // stored correction the way Q4_0's eight is, because the two halves
-            // carry different scales. It is the activation's own sum over each
-            // half instead, which is one more packed dot against a vector of
-            // ones — and a magnitude of nought to sixty-three is a positive
-            // signed byte, so the dot itself needs no other change.
+            // The recentring, thirty-two here and four under -DQ3K, cannot be
+            // folded into the block's stored correction the way Q4_0's eight
+            // is, because the two halves carry different scales. It is the
+            // activation's own sum over each half instead, which is one more
+            // packed dot against a vector of ones — and a magnitude of nought
+            // to sixty-three, or to seven, is a positive signed byte, so the
+            // dot itself needs no other change.
             int accLo = 0, accHi = 0, sumLo = 0, sumHi = 0;
             for (uint u = 0u; u < 4u; u++) {
                 int alo = int(aq[ac + u]), ahi = int(aq[ac + u + 4u]);
@@ -211,7 +258,7 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
                 sumLo = dotPacked4x8AccSatEXT(0x01010101, alo, sumLo);
                 sumHi = dotPacked4x8AccSatEXT(0x01010101, ahi, sumHi);
             }
-            sum[c] += (float(accLo - 32 * sumLo) * ws + float(accHi - 32 * sumHi) * wm) * as_[sc + b];
+            sum[c] += (float(accLo - RECENTRE * sumLo) * ws + float(accHi - RECENTRE * sumHi) * wm) * as_[sc + b];
 #else
             int acc = 0;
             for (uint u = 0u; u < 4u; u++) {
@@ -247,6 +294,10 @@ void main() {
 
 #if defined(Q6K)
     uint rowBytes = (((p.ffn >> 8) * 210u) + 3u) & ~3u;
+#elif defined(Q3K)
+    // Eighteen bytes of superblock header and ninety-six of magnitudes, on a
+    // word for the reason Q6_K's two hundred and ten is rounded.
+    uint rowBytes = (((p.ffn >> 8) * 114u) + 3u) & ~3u;
 #elif defined(Q5K)
     uint rowBytes = (p.ffn >> 5) * 24u;
 #elif defined(Q41)

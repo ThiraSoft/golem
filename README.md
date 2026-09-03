@@ -106,11 +106,16 @@ models — both engines by the same fraction, checked by re-running llama.cpp's
 side as well — so the column to read is the difference between the two engines
 and not the rate, and even that difference is this machine's.
 
-**A K-quant runs on the card too.** Q4_0, Q4_1, Q4_K, Q5_K and Q6_K each have a
-mat-vec and a tiled product here, and a checkpoint may mix them the way
+**A K-quant runs on the card too.** Q4_0, Q4_1, Q3_K, Q4_K, Q5_K and Q6_K each
+have a mat-vec and a tiled product here, and a checkpoint may mix them the way
 llama.cpp's own quantizer does — a `Q4_K_M` gives the same role different
 formats in different blocks, six bits on half its `ffn_down` and four on the
-rest, and every matrix is asked what it is rather than told. A form with no
+rest, and every matrix is asked what it is rather than told. Q3_K is here even
+though golem's own `.golem` beats it at the same three bits: a client who will
+not compress a checkpoint, or cannot, downloads a `Q3_K_M`, and refusing it
+would refuse the model over a packing. A `Q3_K_S` runs entirely on the card at
+**97.7 tokens a second** on Qwen3-4B, against **16.1** on this machine's eight
+cores. A form with no
 kernel is an error naming it, never a guess: eighteen bytes to a block of
 thirty-two is Q4_0 and it is also Q4_K, so a reader that checked a length
 instead of a type would answer fluently out of the wrong bits.

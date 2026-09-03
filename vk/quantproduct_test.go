@@ -3,10 +3,10 @@ package vk
 // Every weight format vk/quantproduct.go offers, against nn's own reader of the
 // same bytes and the same activation.
 //
-// One test for five formats, because that is what the file is for: a caller
+// One test for six formats, because that is what the file is for: a caller
 // asks for a pipeline by type, lays the matrix out by type, and binds four
-// buffers. If that door is right for Q4_0 it is right for the other four, and
-// if it is wrong for one of them the failure names which.
+// buffers. If that door is right for Q4_0 it is right for the others, and if it
+// is wrong for one of them the failure names which.
 //
 // The matrices are random bytes in each format's own structure rather than a
 // quantizer's output. That is enough here and it is not enough everywhere: what
@@ -77,6 +77,10 @@ func TestQuantProductMatchesReference(t *testing.T) {
 	}{
 		{nn.Q4_0, cols / nn.QuantBlock * 18, 1e-3},
 		{nn.Q4_1, cols / nn.QuantBlock * 20, 1e-3},
+		// Q3_K is the one format here golem does not write. It is read because
+		// a Q3_K_M is what a client downloads who will not compress a
+		// checkpoint or cannot — vk/split_q3k.go says the rest.
+		{nn.Q3_K, cols / nn.SuperBlock * 110, 1e-3},
 		{nn.Q4_K, cols / nn.SuperBlock * 144, 1e-3},
 		// Q5_K is the one packing here that computes rather than moves:
 		// splitQ5_K multiplies d by each sub-block's scale and stores the
@@ -164,6 +168,10 @@ func sane(tb testing.TB, m nn.Matrix, rng *rand.Rand) {
 			for b := 0; b < nb; b++ {
 				put(base + b*20)
 				put(base + b*20 + 2)
+			}
+		case nn.Q3_K:
+			for sb := 0; sb < nsb; sb++ {
+				put(base + sb*110 + 108)
 			}
 		case nn.Q4_K:
 			for sb := 0; sb < nsb; sb++ {

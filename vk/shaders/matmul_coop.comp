@@ -383,7 +383,7 @@ uint  pwh[WPT];
 uint  pwh[WPT];
 uint  pwh2[WPT];
 #endif
-#if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41)
+#if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41) || defined(Q3K)
 // The minimum, which both K-quants carry and Q4_0 does not: their weight is a
 // magnitude times a scale less a minimum, where Q4_0's is a magnitude recentred
 // on eight.
@@ -412,7 +412,7 @@ void prefetch(uint kb) {
 #ifdef Q6K
             pwh2[i] = 0u;
 #endif
-#if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41)
+#if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41) || defined(Q3K)
             pwm[i] = 0.0;
 #endif
             if (row0 + r < p.dim && b < nb) {
@@ -444,6 +444,22 @@ void prefetch(uint kb) {
                 pwh[i]  = w[at4];
                 pwh2[i] = w[at4 + 1u];
                 pw[i]   = uvec4(w[at4 + 2u], w[at4 + 3u], w[at4 + 4u], w[at4 + 5u]);
+                uint sbi = b >> 3u;
+                float dd = unpackHalf2x16(w[(magB + 2u * sbi) >> 2])[sbi & 1u];
+                uint sat = base + 16u * sbi + 2u * (b & 7u);
+                pws[i] = dd * float(bitfieldExtract(int(w[sat >> 2]), int((sat & 3u) * 8u), 8));
+                pwm[i] = dd * float(bitfieldExtract(int(w[(sat + 1u) >> 2]), int(((sat + 1u) & 3u) * 8u), 8));
+#elif defined(Q3K)
+                // vk/split_q3k.go: the same header Q6_K has and half the
+                // magnitudes — three words a block against Q6_K's six, which
+                // is fewer registers held across the multiply, not more.
+                // pw.x is the low bit pairs of the first sixteen weights,
+                // pw.y of the second sixteen, pw.z the third bits.
+                uint nsb   = nb >> 3;
+                uint magB  = base + 16u * nsb;
+                uint blkB  = base + ((18u * nsb + 3u) & ~3u);
+                uint at4   = (blkB + 12u * b) >> 2;
+                pw[i]   = uvec4(w[at4], w[at4 + 1u], w[at4 + 2u], 0u);
                 uint sbi = b >> 3u;
                 float dd = unpackHalf2x16(w[(magB + 2u * sbi) >> 2])[sbi & 1u];
                 uint sat = base + 16u * sbi + 2u * (b & 7u);
@@ -524,7 +540,7 @@ void stageTile() {
         uint k  = idx / uint(BM);
         uint at = r * uint(SA_STRIDE) + k * 32u;
         float ws = pws[i];
-#if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41)
+#if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41) || defined(Q3K)
         float wm = pwm[i];
 #endif
 #if defined(Q5K) || defined(Q6K)
@@ -534,9 +550,30 @@ void stageTile() {
         uint  wh2 = pwh2[i];
 #endif
         [[unroll]] for (uint u = 0u; u < 4u; u++) {
+#ifndef Q3K
             uint w0 = pw[i][u] & 0x0F0F0F0Fu;
             uint w1 = (pw[i][u] >> 4u) & 0x0F0F0F0Fu;
-#ifdef Q5K
+#endif
+#if defined(Q3K)
+            // Three bits a weight, and the two halves of the block are two
+            // words rather than the two nibbles of one — so this is the only
+            // format here whose staging does not start from a nibble pair.
+            // The spread is Q6_K's four masked shifts, at two bits and then at
+            // one, for Q6_K's reason: a multiply would carry between copies.
+            uint x0 = (pw[i].x >> (8u * u)) & 0xFFu;
+            uint x1 = (pw[i].y >> (8u * u)) & 0xFFu;
+            uint w0 = (x0 & 3u) | ((x0 & 12u) << 6u) | ((x0 & 48u) << 12u) | ((x0 & 192u) << 18u);
+            uint w1 = (x1 & 3u) | ((x1 & 12u) << 6u) | ((x1 & 48u) << 12u) | ((x1 & 192u) << 18u);
+            uint g0 = (pw[i].z >> (4u * u)) & 0xFu;
+            uint g1 = (pw[i].z >> (16u + 4u * u)) & 0xFu;
+            uint h0 = ((g0 & 1u) | ((g0 & 2u) << 7u) | ((g0 & 4u) << 14u) | ((g0 & 8u) << 21u)) * 4u;
+            uint h1 = ((g1 & 1u) | ((g1 & 2u) << 7u) | ((g1 & 4u) << 14u) | ((g1 & 8u) << 21u)) * 4u;
+            // Recentred on four, and the two halves carry different scales —
+            // ws the first sixteen weights', wm the second sixteen's. Neither
+            // is a minimum; Q3_K has none.
+            vec4 v0 = (unpackUnorm4x8(w0 | h0) * 255.0 - 4.0) * ws;
+            vec4 v1 = (unpackUnorm4x8(w1 | h1) * 255.0 - 4.0) * wm;
+#elif defined(Q5K)
             // The fifth bits, four at a time, spread one to a byte so that
             // they or straight into the nibbles: multiplying a nibble by
             // 0x00204081 lands its four bits in bits 0, 8, 16 and 24, and the
@@ -657,6 +694,8 @@ void main() {
     rowBytes  = nb * 20u;
 #elif defined(Q6K)
     rowBytes  = ((nb >> 3) * 210u + 3u) & ~3u;
+#elif defined(Q3K)
+    rowBytes  = ((nb >> 3) * 114u + 3u) & ~3u;
 #else
     rowBytes  = nb * 18u;
 #endif

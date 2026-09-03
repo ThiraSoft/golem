@@ -127,6 +127,27 @@ var moeGateUpQ4KMidSPIRV []byte
 //go:embed shaders/moe_gateup_q4k32.spv
 var moeGateUpQ4KWidestSPIRV []byte
 
+// And over Q3_K weights, which is what a Q3_K_S or a Q3_K_M stores its gate and
+// up in. It is the same kernel again; vk/split_q3k.go is the layout, and
+// shaders/moe_gateup.comp under -DQ3K is the twenty lines that differ.
+//
+//go:generate glslc -O -DQ3K --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q3k.spv
+//go:generate glslc -O -DQ3K -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q3k8.spv
+//go:generate glslc -O -DQ3K -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q3k16.spv
+//go:generate glslc -O -DQ3K -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q3k32.spv
+
+//go:embed shaders/moe_gateup_q3k.spv
+var moeGateUpQ3KSPIRV []byte
+
+//go:embed shaders/moe_gateup_q3k8.spv
+var moeGateUpQ3KWideSPIRV []byte
+
+//go:embed shaders/moe_gateup_q3k16.spv
+var moeGateUpQ3KMidSPIRV []byte
+
+//go:embed shaders/moe_gateup_q3k32.spv
+var moeGateUpQ3KWidestSPIRV []byte
+
 // The expert kernels against Q8_0 weights. A mixture in that form is four
 // bytes a weight where Q4_0 is two and a quarter, so it is the smallest form
 // this engine reads whose expert pool does not fit in the memory a card can
@@ -256,8 +277,8 @@ type Mixture struct {
 	// The same two products over a K-quant. A mixture holds at most a couple of
 	// formats and each pipeline is several binaries, so they are built when a
 	// block asks and not before — vk/quantproduct.go says the rest.
-	products  *quantProducts
-	gateUpQ4K *Pipeline
+	products             *quantProducts
+	gateUpQ4K, gateUpQ3K *Pipeline
 	// The expert kernels against Q8_0 weights, built on the first block that
 	// brings them. expertQuant is the form the experts arrived in, which every
 	// block of a model shares.
@@ -790,9 +811,9 @@ type MixtureFormats struct {
 
 func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, down []byte) error {
 	switch f.GateUp {
-	case nn.Q4_0, nn.Q4_K, nn.Q8_0:
+	case nn.Q4_0, nn.Q3_K, nn.Q4_K, nn.Q8_0:
 	default:
-		return fmt.Errorf("vk: the shared gate and up are %s, and the fused kernel reads Q4_0, Q4_K and Q8_0", f.GateUp)
+		return fmt.Errorf("vk: the shared gate and up are %s, and the fused kernel reads Q4_0, Q3_K, Q4_K and Q8_0", f.GateUp)
 	}
 	shapes := []struct {
 		what       string
@@ -1253,6 +1274,10 @@ func (m *Mixture) Close() {
 	if m.gateUpQ4K != nil {
 		m.gateUpQ4K.Close()
 		m.gateUpQ4K = nil
+	}
+	if m.gateUpQ3K != nil {
+		m.gateUpQ3K.Close()
+		m.gateUpQ3K = nil
 	}
 	if m.dxf != nil {
 		m.dxf.Close()
@@ -1859,13 +1884,44 @@ func (m *Mixture) fusedFor(q nn.Quant) (*Pipeline, error) {
 		}
 		return m.gateUpQ80, nil
 	}
+	if q == nn.Q3_K {
+		if m.gateUpQ3K != nil {
+			return m.gateUpQ3K, nil
+		}
+		p, err := m.fusedPipeline(moeGateUpQ3KSPIRV,
+			moeGateUpQ3KWideSPIRV, moeGateUpQ3KMidSPIRV, moeGateUpQ3KWidestSPIRV)
+		if err != nil {
+			return nil, err
+		}
+		m.gateUpQ3K = p
+		return p, nil
+	}
 	if q != nn.Q4_K {
-		return nil, fmt.Errorf("vk: the fused gate and up reads Q4_0, Q4_K and Q8_0, not %s", q)
+		return nil, fmt.Errorf("vk: the fused gate and up reads Q4_0, Q3_K, Q4_K and Q8_0, not %s", q)
 	}
 	if m.gateUpQ4K != nil {
 		return m.gateUpQ4K, nil
 	}
-	p, err := m.d.NewPipeline(moeGateUpQ4KSPIRV, 7, uint32(unsafe.Sizeof(moePush{})))
+	p, err := m.fusedPipeline(moeGateUpQ4KSPIRV,
+		moeGateUpQ4KWideSPIRV, moeGateUpQ4KMidSPIRV, moeGateUpQ4KWidestSPIRV)
+	if err != nil {
+		return nil, err
+	}
+	m.gateUpQ4K = p
+	return p, nil
+}
+
+// fusedPipeline builds one format's fused gate-and-up: the one-column binary,
+// then the three wide ones a pass takes.
+//
+// The four are a format's whole set and they are passed together, because the
+// failure they are guarding against is silent. A wide entry built at one column
+// answers the right shape and fills only the first of its columns, and every
+// binary here is a file on disk with a name that says nothing about what is in
+// it — vk/mixture_test.go's TestFusedWidthsAreTheirOwnBinaries is what actually
+// holds them apart.
+func (m *Mixture) fusedPipeline(base, wide, mid, widest []byte) (*Pipeline, error) {
+	p, err := m.d.NewPipeline(base, 7, uint32(unsafe.Sizeof(moePush{})))
 	if err != nil {
 		return nil, err
 	}
@@ -1873,15 +1929,14 @@ func (m *Mixture) fusedFor(q nn.Quant) (*Pipeline, error) {
 		columns int
 		spirv   []byte
 	}{
-		{smallColumns, moeGateUpQ4KWideSPIRV},
-		{16, moeGateUpQ4KMidSPIRV},
-		{32, moeGateUpQ4KWidestSPIRV},
+		{smallColumns, wide},
+		{16, mid},
+		{32, widest},
 	} {
 		if err := p.Wide(w.columns, w.spirv); err != nil {
 			p.Close()
 			return nil, err
 		}
 	}
-	m.gateUpQ4K = p
 	return p, nil
 }

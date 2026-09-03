@@ -218,6 +218,14 @@ func NewMatMulQuant(d *Device, data []byte, rows, cols, columns int, coop bool, 
 			return nil, fmt.Errorf("vk: a Q6_K row needs a multiple of %d columns, given %d", nn.SuperBlock, cols)
 		}
 		rowBytes, relayout = rowBytesQ6_K, splitQ6_K
+	case nn.Q3_K:
+		if cols%nn.SuperBlock != 0 {
+			return nil, fmt.Errorf("vk: a Q3_K row needs a multiple of %d columns, given %d", nn.SuperBlock, cols)
+		}
+		// The file's own row and not the packed one: rowBytesQ3_K is what the
+		// card holds, a hundred and fourteen bytes a superblock, and what is
+		// being length-checked here is the tensor as the file gives it.
+		rowBytes, relayout = func(c int) int { return c / nn.SuperBlock * 110 }, splitQ3_K
 	default:
 		return nil, fmt.Errorf("vk: the tiled product has no staging for %s", q)
 	}
@@ -244,6 +252,8 @@ func NewMatMulQuant(d *Device, data []byte, rows, cols, columns int, coop bool, 
 			spirv, err = matmulCoopQ4KSPIRV(columns)
 		} else if q == nn.Q6_K {
 			spirv, err = matmulCoopQ6KSPIRV(columns)
+		} else if q == nn.Q3_K {
+			spirv, err = matmulCoopQ3KSPIRV(columns)
 		} else {
 			spirv, err = matmulCoopSPIRV(columns)
 		}
@@ -505,6 +515,25 @@ func matmulCoopQ6KSPIRV(columns int) ([]byte, error) {
 		return matmulCoopQ6K512SPIRV, nil
 	}
 	return nil, fmt.Errorf("vk: the cooperative Q6_K product is built at 64, 128, 256, 512 columns, not %d", columns)
+}
+
+// matmulCoopQ3KSPIRV is the cooperative Q3_K product at that width. It has the
+// thirty-two-column binary the other two do not, because vk/q3k_test.go holds
+// the staging at every width the door offers and the door offers five.
+func matmulCoopQ3KSPIRV(columns int) ([]byte, error) {
+	switch columns {
+	case 32:
+		return matmulCoopQ3K32SPIRV, nil
+	case 64:
+		return matmulCoopQ3K64SPIRV, nil
+	case 128:
+		return matmulCoopQ3K128SPIRV, nil
+	case 256:
+		return matmulCoopQ3K256SPIRV, nil
+	case 512:
+		return matmulCoopQ3K512SPIRV, nil
+	}
+	return nil, fmt.Errorf("vk: the cooperative Q3_K product is built at 32, 64, 128, 256, 512 columns, not %d", columns)
 }
 
 // matmulSPIRV is the binary built for that many columns.

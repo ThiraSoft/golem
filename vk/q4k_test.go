@@ -33,9 +33,15 @@ func aQ6_K(tb testing.TB) (*tensors.GGUF, nn.Matrix) {
 	return aKQuant(tb, "Q6_K", nn.Q6_K)
 }
 
+// aQ3_K is the three-bit tier, which lives in a different checkpoint: a Q4_K_M
+// holds none, and a Q3_K_S is Q3_K throughout.
+func aQ3_K(tb testing.TB) (*tensors.GGUF, nn.Matrix) {
+	return aKQuant(tb, "Q3_K", nn.Q3_K)
+}
+
 func aKQuant(tb testing.TB, dtype string, q nn.Quant) (*tensors.GGUF, nn.Matrix) {
 	tb.Helper()
-	for _, env := range []string{"GOLEM_MODEL_Q4KM", "GOLEM_MODEL_QWEN_Q4KM", "GOLEM_MODEL_12B_Q4KM"} {
+	for _, env := range []string{"GOLEM_MODEL_Q3KM", "GOLEM_MODEL_Q4KM", "GOLEM_MODEL_QWEN_Q4KM", "GOLEM_MODEL_12B_Q4KM"} {
 		path := os.Getenv(env)
 		if path == "" {
 			continue
@@ -58,7 +64,7 @@ func aKQuant(tb testing.TB, dtype string, q nn.Quant) (*tensors.GGUF, nn.Matrix)
 		}
 		g.Close()
 	}
-	tb.Skipf("set GOLEM_MODEL_Q4KM to a Q4_K_M checkpoint holding a %s tensor", dtype)
+	tb.Skipf("set GOLEM_MODEL_Q3KM or GOLEM_MODEL_Q4KM to a checkpoint holding a %s tensor", dtype)
 	return nil, nn.Matrix{}
 }
 
@@ -202,8 +208,11 @@ func kQuantAgainstQ8_0(m nn.Matrix, batch *nn.Batch, columns int) [][]float32 {
 	}
 	row := make([]float32, m.Cols)
 	stride, dequant := m.Cols/nn.SuperBlock*144, nn.DequantizeQ4_K
-	if m.Quant == nn.Q6_K {
+	switch m.Quant {
+	case nn.Q6_K:
 		stride, dequant = m.Cols/nn.SuperBlock*210, nn.DequantizeQ6_K
+	case nn.Q3_K:
+		stride, dequant = m.Cols/nn.SuperBlock*110, nn.DequantizeQ3_K
 	}
 	for i := 0; i < m.Rows; i++ {
 		dequant(m.Data[i*stride:(i+1)*stride], m.Cols, row)
@@ -227,8 +236,11 @@ func kQuantAgainstFloats(m nn.Matrix, batch *nn.Batch, columns int) [][]float32 
 	}
 	row := make([]float32, m.Cols)
 	stride, dequant := m.Cols/nn.SuperBlock*144, nn.DequantizeQ4_K
-	if m.Quant == nn.Q6_K {
+	switch m.Quant {
+	case nn.Q6_K:
 		stride, dequant = m.Cols/nn.SuperBlock*210, nn.DequantizeQ6_K
+	case nn.Q3_K:
+		stride, dequant = m.Cols/nn.SuperBlock*110, nn.DequantizeQ3_K
 	}
 	for i := 0; i < m.Rows; i++ {
 		dequant(m.Data[i*stride:(i+1)*stride], m.Cols, row)
