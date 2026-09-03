@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/engine"
+	"github.com/ThiraSoft/golem/sample"
 	"github.com/ThiraSoft/golem/stt"
 )
 
@@ -44,8 +45,16 @@ func main() {
 	}
 	flag.Parse()
 
+	if *model == "" && *sttDir == "" {
+		fail(fmt.Errorf("no model: pass -model or -stt, or set GOLEM_MODEL or GOLEM_STT"))
+	}
+	// A transcriber alone is a whole server. It holds no conversation, so
+	// nothing below this — the runner, the slots, the generators — has anything
+	// to own, and building them around a model that was never opened would only
+	// be a longer way of writing nil.
 	if *model == "" {
-		fail(fmt.Errorf("no model: pass -model, or set GOLEM_MODEL"))
+		serveTranscriptionsOnly(*sttDir, *addr)
+		return
 	}
 	start := time.Now()
 	m, err := engine.Open(*model, *context, *parallel)
@@ -153,6 +162,37 @@ func main() {
 	}
 	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 — %d conversations at once, batched into one pass\n",
 		listener.Addr(), m.Slots())
+	if err := http.Serve(listener, logging(os.Stderr, server.Handler())); err != nil {
+		fail(err)
+	}
+}
+
+// serveTranscriptionsOnly runs a server carrying an STT and nothing else.
+// Server.Handler registers the conversation route only when there is a pool,
+// so what this listens on is /v1/models and /v1/audio/transcriptions.
+func serveTranscriptionsOnly(dir, addr string) {
+	start := time.Now()
+	opts, err := stt.Locate(dir)
+	if err != nil {
+		fail(err)
+	}
+	model, err := stt.Open(opts)
+	if err != nil {
+		fail(err)
+	}
+	defer model.Close()
+
+	name := filepath.Base(filepath.Clean(dir))
+	server := NewServer(nil, nil, name, nil, sample.Params{})
+	server.SetSTT(model)
+
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Fprintf(os.Stderr, "%s: speech to text, loaded in %s on %d cores\n",
+		name, time.Since(start).Round(time.Millisecond), runtime.NumCPU())
+	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 — transcriptions only, one at a time\n", listener.Addr())
 	if err := http.Serve(listener, logging(os.Stderr, server.Handler())); err != nil {
 		fail(err)
 	}

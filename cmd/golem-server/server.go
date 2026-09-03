@@ -104,7 +104,13 @@ func carriesAudio(msgs []chat.Message) bool {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/models", s.models)
-	mux.HandleFunc("POST /v1/chat/completions", s.completions)
+	// A server started with -stt alone carries no pool and holds no
+	// conversation: the route that would answer one is not registered rather
+	// than registered and failing, so a client that probes learns it at the
+	// mux instead of at the first request.
+	if s.pool != nil {
+		mux.HandleFunc("POST /v1/chat/completions", s.completions)
+	}
 	if s.stt != nil {
 		mux.HandleFunc("POST /v1/audio/transcriptions", s.transcriptions)
 	}

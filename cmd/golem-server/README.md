@@ -300,8 +300,8 @@ curl -s http://localhost:8080/v1/audio/transcriptions \
 
 | | |
 |---|---|
-| `-model` | the GGUF, or `GOLEM_MODEL` |
-| `-stt` | directory holding the Kyutai STT model, or `GOLEM_STT` |
+| `-model` | the GGUF, or `GOLEM_MODEL`; not required when `-stt` is given |
+| `-stt` | directory holding the Kyutai STT model, or `GOLEM_STT`; a server may carry it alone, and then answers `/v1/models` and `/v1/audio/transcriptions` and nothing else |
 | `-mmproj` | the projector GGUF, which is what lets a model see and hear, or `GOLEM_MMPROJ` |
 | `-vulkan` | put the blocks and the logit head on a Vulkan device; it fails rather than falling back |
 | `-addr` | what to listen on; `127.0.0.1:8080` by default |
