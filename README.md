@@ -515,11 +515,40 @@ go build ./cmd/pocket-tts
 ./pocket-tts -voice someone.safetensors -o answer.wav "And now I speak in that voice."
 ```
 
+## 👂 Speech to text (Kyutai STT)
+
+The other direction, with `kyutai/stt-1b-en_fr`: sound in, words out, English
+and French, streaming by construction at one transformer step per 80 ms frame.
+
+```bash
+go build ./cmd/golem-cli
+
+./golem-cli -stt ~/models/stt-1b-en_fr -transcribe recording.wav
+./golem-cli -stt ~/models/stt-1b-en_fr -listen   # the microphone, until Ctrl-C
+```
+
+`-listen` finds its own recorder — `pw-record`, then `arecord`, then `ffmpeg` —
+and prints words as they are decided. The server carries it too, in OpenAI's
+shape, streamed or not, and may carry it alone:
+
+```bash
+./golem-server -stt ~/models/stt-1b-en_fr -addr 127.0.0.1:8080
+curl -s localhost:8080/v1/audio/transcriptions -F file=@recording.wav -F model=stt
+```
+
+It shares the Mimi codec with Pocket TTS — `internal/kyutai/` — and adds the
+split residual quantiser and a sixteen-block trunk of its own. On an i7-9700K
+with eight threads, one frame of the 80 ms budget costs 39.6 ms: 6.6 for the
+codec, 1.75 for the quantiser, 29.8 for the trunk in Q8_0. **Twice real time on
+the processor**, with the transcript bfloat16 gives, word for word. Q4_0 is half
+again as fast and loses six per cent of the words, which is why it is not the
+default.
+
 ## 🔬 The Method
 
 **No layer is deemed correct until its intermediate activations match the reference implementation.**
 
-Scripts load the real weights, inject a deterministic input, and write every intermediate quantity into `testdata/`. The Go tests read those files back, so they need neither Python nor llama.cpp at test time. For `gemma/` the reference is llama.cpp itself, instrumented, because a bf16 reference would bury a mistake under its own quantization error; for `pockettts/` it is PyTorch, layer by layer, to a few parts in a million end to end.
+Scripts load the real weights, inject a deterministic input, and write every intermediate quantity into `testdata/`. The Go tests read those files back, so they need neither Python nor llama.cpp at test time. For `gemma/` the reference is llama.cpp itself, instrumented, because a bf16 reference would bury a mistake under its own quantization error; for `pockettts/` and `stt/` it is PyTorch, layer by layer, to a few parts in a million end to end — in float32, because a bfloat16 fixture cannot hold a float32 implementation to any tolerance worth writing.
 
 Every number in this README is a benchmark in this repository, run on the machine named beside it. Nothing is estimated.
 
@@ -527,9 +556,10 @@ Every number in this README is a benchmark in this repository, run on the machin
 
 - `cmd/golem-cli`, `cmd/golem-server`, `cmd/pocket-tts`, `cmd/golemquant`, `cmd/golemtune` — the commands.
 - `engine/` — reads the architecture out of a GGUF and opens the engine that implements it.
-- `gemma/`, `qwen/`, `qwen35/`, `pockettts/` — standalone engine implementations; they do not import one another. `qwen35/` is Qwen3.8: a package is named for the architecture the GGUF declares, and this checkpoint declares `general.architecture = qwen35`, as llama.cpp's own `models/qwen35.cpp` does.
+- `gemma/`, `qwen/`, `qwen35/`, `pockettts/`, `stt/` — standalone engine implementations; they do not import one another. `qwen35/` is Qwen3.8: a package is named for the architecture the GGUF declares, and this checkpoint declares `general.architecture = qwen35`, as llama.cpp's own `models/qwen35.cpp` does.
 - `nn/` & `vk/` — the shared kernels: quantized AVX2 and NEON, and Vulkan compute.
 - `compress/` — the `.golem` format: calibration, the trellis codec, and the conversion pipeline `golemquant` drives.
+- `internal/kyutai/` — the Mimi codec and the Kyutai transformer layer, shared by the two directions of speech.
 - `tensors/`, `token/`, `chat/`, `sample/`, `audio/`, `imageio/` — the rest of the shared layer.
 - `ref/` — what recorded each test fixture, and how to record it again.
 
