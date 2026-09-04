@@ -393,3 +393,61 @@ func TestVulkanTranscriptMatchesProcessor(t *testing.T) {
 		}
 	}
 }
+
+// TestVulkanSharedByTwoGroups is the defect the card introduced into a shared
+// model.
+//
+// A Model is read by everything at once, which cost nothing while the weights
+// were only read. A card is written to: a product stages its columns into
+// buffers that belong to the matrix. Two groups on one Model would write each
+// other's activations and each read a mixture — no failure, just transcripts of
+// the wrong sound. Two groups here transcribe the same clip at the same time,
+// and both must say what the processor says.
+func TestVulkanSharedByTwoGroups(t *testing.T) {
+	m := testModel(t)
+	clip := speech(t)
+	want := transcribeAlone(t, m, clip)
+
+	card := testModel(t)
+	if err := card.UseVulkan(2); err != nil {
+		t.Skipf("no Vulkan trunk: %v", err)
+	}
+
+	const groups = 2
+	got := make([]string, groups)
+	var wg sync.WaitGroup
+	for i := 0; i < groups; i++ {
+		g := card.Group(context.Background(), 2)
+		defer g.Close()
+		live, err := g.Stream(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		wg.Add(1)
+		go func(i int, g *Group, live *Live) {
+			defer wg.Done()
+			var text strings.Builder
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				for seg := range live.Text() {
+					text.WriteString(seg.Text)
+				}
+			}()
+			live.Write(clip)
+			live.Close()
+			<-done
+			if err := g.Err(); err != nil {
+				t.Error(err)
+			}
+			got[i] = strings.TrimSpace(text.String())
+		}(i, g, live)
+	}
+	wg.Wait()
+
+	for i, g := range got {
+		if g != want {
+			t.Errorf("group %d sharing the card:\n got %q\nwant %q", i, g, want)
+		}
+	}
+}

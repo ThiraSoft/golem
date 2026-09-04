@@ -591,14 +591,14 @@ whole window, in aggregate seconds of audio per second of wall clock:
 
 | streams | separate | grouped | grouped + vulkan |
 | ------- | -------- | ------- | ---------------- |
-| 1       | 1.81     | 1.82    | 3.00             |
-| 2       | 1.82     | 2.17    | 3.41             |
-| 3       | 1.81     | 2.46    | 3.53             |
-| 4       | 1.81     | 2.63    | 3.65             |
+| 1       | 1.81     | 1.78    | 2.94             |
+| 2       | 1.82     | 2.17    | 3.38             |
+| 3       | 1.81     | 2.43    | 3.50             |
+| 4       | 1.81     | 2.61    | 3.64             |
 
 Per stream that is ×1.08 for two clients grouped, where separate streams left
-them at ×0.91 and falling behind, and ×1.18 for three on the card. One
-microphone alone goes from ×1.82 to ×3.00. Four still miss at ×0.91: the codec
+them at ×0.91 and falling behind, and ×1.17 for three on the card. One
+microphone alone goes from ×1.81 to ×2.94. Four still miss at ×0.91: the codec
 and the quantiser batch no better on a card than off one, and they are what the
 ceiling is now. A full group answers 429 rather than queueing, and `go test -run
 TestConcurrentStreams` with `GOLEM_STT_CAPACITY` set is the bench these numbers

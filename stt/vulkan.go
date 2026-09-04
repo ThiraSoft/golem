@@ -18,6 +18,7 @@ package stt
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/vk"
@@ -30,6 +31,22 @@ type Card struct {
 	width  int
 	quant  nn.Quant
 	layers []cardLayer
+
+	// mu is held for a whole block.
+	//
+	// A Model is shared — the server holds one and every transcription reads
+	// its weights at once — and that was true without cost while the weights
+	// were only read. A card is not only read: a product stages its columns
+	// into buffers that belong to the matrix and reads its answer out of
+	// another, so two callers on one Model would write each other's
+	// activations and each read a mixture. Nothing would fail; the transcripts
+	// would simply be of the wrong sound.
+	//
+	// There is one card and one queue on it, so serializing here costs what
+	// the hardware costs anyway. It is the block and not the product that is
+	// locked, so that the attention between two products of the same block
+	// cannot be overtaken by another caller's first one.
+	mu sync.Mutex
 }
 
 // cardLayer is one block's four matrices, in the order Step uses them.
@@ -130,6 +147,8 @@ func (c *Card) StepBatchOn(layer int, l *Layer, xs [][]float32, kvs []*KV, s *Ba
 	if n > c.width {
 		return fmt.Errorf("stt: a pass of %d streams on a card built for %d", n, c.width)
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	on := c.layers[layer]
 	s.wide.Size, s.deep.Size = n, n
 
