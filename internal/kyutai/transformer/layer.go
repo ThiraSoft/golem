@@ -286,18 +286,10 @@ func LoadLayer(m *tensors.Model, basePrefix string, index int, g Geometry) (*Lay
 		if len(t.Shape) != 2 || t.Shape[0] != outputs || t.Shape[1] != inputs {
 			return nn.Linear{}, fmt.Errorf("%s: shape %v, want [%d %d]", name, t.Shape, outputs, inputs)
 		}
-		raw := t.Raw
-		if t.DType == "F32" {
-			bf16 := make([]byte, t.Elems()*2)
-			for i := 0; i < t.Elems(); i++ {
-				bf16[i*2] = t.Raw[i*4+2]
-				bf16[i*2+1] = t.Raw[i*4+3]
-			}
-			raw = bf16
-		} else if t.DType != "BF16" {
-			return nn.Linear{}, fmt.Errorf("%s: dtype %s, the kernel expects BF16", name, t.DType)
+		if t.DType != "BF16" && t.DType != "F32" {
+			return nn.Linear{}, fmt.Errorf("%s: dtype %s, the kernel reads bfloat16 or float32", name, t.DType)
 		}
-		return nn.Linear{Weights: raw, Inputs: inputs, Outputs: outputs}, nil
+		return nn.Linear{Weights: t.Raw, Inputs: inputs, Outputs: outputs, F32: t.DType == "F32"}, nil
 	}
 
 	norm := func(name string) (nn.LayerNorm, error) {

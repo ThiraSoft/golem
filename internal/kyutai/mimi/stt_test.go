@@ -42,13 +42,13 @@ func TestSTTEncoderAgainstReference(t *testing.T) {
 	reference.Compare(t, "encoder", x, f.Read(t, "encoder"), 5e-5)
 
 	e.transformerSteps(x, steps)
-	reference.Compare(t, "encoder_transformer", x, f.Read(t, "encoder_transformer"), 2.5e-1)
+	reference.Compare(t, "encoder_transformer", x, f.Read(t, "encoder_transformer"), 5e-5)
 
 	latents, frames := e.down.Apply(x, steps, e.down.NewState())
 	if frames != 8 {
 		t.Fatalf("frames = %d, want 8", frames)
 	}
-	reference.Compare(t, "latents", latents, f.Read(t, "latents"), 5e-2)
+	reference.Compare(t, "latents", latents, f.Read(t, "latents"), 5e-5)
 }
 
 func TestSTTEncoderLoadAndRun(t *testing.T) {
