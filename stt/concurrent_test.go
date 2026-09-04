@@ -1,0 +1,354 @@
+package stt
+
+// THROWAWAY — spike, poc/stt-vulkan-batch.
+//
+// How many microphones one processor carries at once.
+//
+// One frame of 80 ms costs 39.6 ms on eight threads, so a single stream eats
+// about half the machine and two should saturate it. That is the arithmetic;
+// this measures the machine. The number that matters is not the wall clock but
+// the ratio — seconds of audio consumed per second elapsed — because a stream
+// that falls under 1.0 is a microphone that falls behind and never catches up.
+//
+// The streams are independent by construction: each Live owns its codec state,
+// its KV and its scratch, and the weights are read-only. So anything below
+// linear scaling up to the core count is contention, not the model.
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"os"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/ThiraSoft/golem/internal/kyutai/mimi"
+	"github.com/ThiraSoft/golem/nn"
+)
+
+// concurrentSeconds is how much audio each stream carries. Long enough that
+// the six frames of priming silence Stream writes are noise in the total.
+const concurrentSeconds = 8
+
+func TestConcurrentStreams(t *testing.T) {
+	dir := os.Getenv("GOLEM_STT")
+	if dir == "" {
+		t.Skip("GOLEM_STT not set")
+	}
+	o, err := Locate(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.Quant = nn.Q8_0
+	m, err := Open(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	frames := concurrentSeconds * 1000 / 80
+	audio := float64(frames) * 0.08
+
+	fmt.Printf("\n%-8s %12s %14s %14s %10s\n", "streams", "wall (s)", "x-real-time", "aggregate", "cores")
+	for _, n := range []int{1, 2, 3, 4, 6, 8} {
+		// Prime once per size so the first stream of a run does not pay for
+		// pages the previous one already touched.
+		warm := m.Stream(context.Background())
+		go drain(warm)
+		warm.Write(make([]float32, mimi.SamplesPerFrame))
+		warm.Close()
+
+		var wg sync.WaitGroup
+		before := cpuSeconds()
+		start := time.Now()
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				live := m.Stream(context.Background())
+				go drain(live)
+				frame := make([]float32, mimi.SamplesPerFrame)
+				for f := 0; f < frames; f++ {
+					live.Write(frame)
+				}
+				live.Close()
+			}()
+		}
+		wg.Wait()
+		wall := time.Since(start).Seconds()
+		cores := (cpuSeconds() - before) / wall
+		fmt.Printf("%-8d %12.2f %14.2f %14.2f %10.2f\n", n, wall, audio/wall, float64(n)*audio/wall, cores)
+	}
+	fmt.Println()
+}
+
+// cpuSeconds is user plus system time burned by this process so far. Divided
+// by the wall clock it says how many cores the work actually kept busy, which
+// is the one number that separates a saturated machine from a serialized one.
+func cpuSeconds() float64 {
+	var r syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &r); err != nil {
+		return 0
+	}
+	sec := func(t syscall.Timeval) float64 { return float64(t.Sec) + float64(t.Usec)/1e6 }
+	return sec(r.Utime) + sec(r.Stime)
+}
+
+func drain(l *Live) {
+	for range l.Text() {
+	}
+}
+
+// THROWAWAY — spike. What inside the trunk is actually the products.
+//
+// BenchmarkTrunk times sixteen blocks plus the final norm and the head
+// together, and a plan to move "the trunk" onto the card has to know which of
+// those three it is moving. The head is a bfloat16 8000x2048 read once a frame
+// — thirty-three megabytes — and it is not one of the four matrices a batched
+// product would carry.
+func BenchmarkTrunkParts(b *testing.B) {
+	m := benchModel(b, nn.Q8_0)
+	kv := NewKV()
+	scratch := NewScratch()
+	x := make([]float32, DModel)
+	logits := make([]float32, TextCard)
+	for i := range x {
+		x[i] = float32(i%13) * 0.01
+	}
+
+	b.Run("layers", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			for l, layer := range m.weights.Layers {
+				layer.Step(x, kv[l], scratch)
+			}
+		}
+	})
+	b.Run("head", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			nn.RMSNormPlain(x, m.weights.OutNorm, NormEps)
+			product(m.weights.Head, scratch.wide, x, logits)
+		}
+	})
+}
+
+// THROWAWAY — spike. Products against attention, at a full cache.
+//
+// BenchmarkTrunk starts from an empty KV, so its attention walks an average of
+// half the positions the steady state walks. A microphone that has been open
+// for a minute is at Context, and that is the cost a capacity plan has to use.
+func BenchmarkLayerParts(b *testing.B) {
+	m := benchModel(b, nn.Q8_0)
+	scratch := NewScratch()
+	x := make([]float32, DModel)
+	for i := range x {
+		x[i] = float32(i%13) * 0.01
+	}
+	layer := m.weights.Layers[0]
+
+	full := &KV{
+		K:        make([]float32, Context*NumHeads*HeadDim),
+		V:        make([]float32, Context*NumHeads*HeadDim),
+		Position: Context, // the steady state: the whole window is visible
+	}
+	for i := range full.K {
+		full.K[i] = float32(i%31) * 0.003
+		full.V[i] = float32(i%29) * 0.004
+	}
+
+	b.Run("step-full-kv", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			full.Position = Context
+			layer.Step(x, full, scratch)
+		}
+	})
+	b.Run("attend-only", func(b *testing.B) {
+		q := make([]float32, DModel)
+		copy(q, x)
+		for i := 0; i < b.N; i++ {
+			full.Position = Context
+			_ = full.attend(q)
+		}
+	})
+	b.Run("products-only", func(b *testing.B) {
+		qkv := scratch.qkv
+		out := scratch.out
+		gate := scratch.gate
+		ff := scratch.ff
+		for i := 0; i < b.N; i++ {
+			product(layer.InProj, scratch.wide, x, qkv)
+			product(layer.OutProj, scratch.wide, x, out)
+			product(layer.GateIn, scratch.wide, x, gate)
+			product(layer.GateOut, scratch.deep, gate[:DimFF], ff)
+		}
+	})
+}
+
+// THROWAWAY — spike. What N streams cost when their activations share one
+// read of the weights.
+//
+// The trunk's working set is fifty-four megabytes a layer in Q8_0, far past any
+// cache, so N streams stepping separately read the same weights N times from
+// main memory. nn.MatVecBatch already exists for exactly this — the row is the
+// outer loop and the batch the inner one — and it is what a prompt uses. This
+// asks whether concurrent microphones can use it too, which would be multi
+// client without a line of Vulkan.
+func BenchmarkBatchedProducts(b *testing.B) {
+	m := benchModel(b, nn.Q8_0)
+	layer := m.weights.Layers[0]
+
+	for _, width := range []int{1, 2, 4, 8} {
+		b.Run(fmt.Sprintf("separate-%d", width), func(b *testing.B) {
+			one := nn.NewBatch(DModel, 1)
+			deep := nn.NewBatch(DimFF, 1)
+			fill(one.F[0])
+			fill(deep.F[0])
+			one.Quantize()
+			deep.Quantize()
+			qkv := make([]float32, 3*DModel)
+			out := make([]float32, DModel)
+			gate := make([]float32, 2*DimFF)
+			ff := make([]float32, DModel)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				for s := 0; s < width; s++ {
+					layer.InProj.MatVec(one, qkv)
+					layer.OutProj.MatVec(one, out)
+					layer.GateIn.MatVec(one, gate)
+					layer.GateOut.MatVec(deep, ff)
+				}
+			}
+		})
+		b.Run(fmt.Sprintf("batched-%d", width), func(b *testing.B) {
+			wide := nn.NewBatch(DModel, width)
+			deep := nn.NewBatch(DimFF, width)
+			for c := 0; c < width; c++ {
+				fill(wide.F[c])
+				fill(deep.F[c])
+			}
+			wide.Quantize()
+			deep.Quantize()
+			qkv := columns(width, 3*DModel)
+			out := columns(width, DModel)
+			gate := columns(width, 2*DimFF)
+			ff := columns(width, DModel)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				layer.InProj.MatVecBatch(wide, qkv)
+				layer.OutProj.MatVecBatch(wide, out)
+				layer.GateIn.MatVecBatch(wide, gate)
+				layer.GateOut.MatVecBatch(deep, ff)
+			}
+		})
+	}
+}
+
+func fill(x []float32) {
+	for i := range x {
+		x[i] = float32(i%13) * 0.01
+	}
+}
+
+func columns(n, width int) [][]float32 {
+	ys := make([][]float32, n)
+	for i := range ys {
+		ys[i] = make([]float32, width)
+	}
+	return ys
+}
+
+// THROWAWAY — spike. attend over the heads, on the pool.
+//
+// kv.attend walks sixteen heads and seven hundred and fifty positions on one
+// thread while the other seven spin. The heads are independent — each reads its
+// own slice of K and V and writes its own slice of the output — so nothing but
+// the shared scratch buffer stands in the way of splitting them.
+func attendParallel(kv *KV, q []float32, bufs [][]float32) []float32 {
+	scale := float32(1.0 / math.Sqrt(float64(HeadDim)))
+	first := 0
+	if kv.Position+1 > Context {
+		first = kv.Position + 1 - Context
+	}
+	count := kv.Position + 1 - first
+	out := make([]float32, DModel)
+
+	nn.InParallel(NumHeads, NumHeads*count*HeadDim*2, func(start, end int) {
+		buffer := bufs[start%len(bufs)][:count]
+		for h := start; h < end; h++ {
+			qh := q[h*HeadDim : (h+1)*HeadDim]
+			for p := first; p <= kv.Position; p++ {
+				slot := p % Context
+				kp := kv.K[(slot*NumHeads+h)*HeadDim : (slot*NumHeads+h+1)*HeadDim]
+				buffer[p-first] = nn.DotF32(qh, kp) * scale
+			}
+			nn.SoftmaxInPlace(buffer)
+			oh := out[h*HeadDim : (h+1)*HeadDim]
+			for p := first; p <= kv.Position; p++ {
+				slot := p % Context
+				vp := kv.V[(slot*NumHeads+h)*HeadDim : (slot*NumHeads+h+1)*HeadDim]
+				nn.AxpyFull(oh, vp, buffer[p-first])
+			}
+		}
+	})
+	return out
+}
+
+func BenchmarkAttendParallel(b *testing.B) {
+	full := &KV{
+		K:        make([]float32, Context*NumHeads*HeadDim),
+		V:        make([]float32, Context*NumHeads*HeadDim),
+		Position: Context,
+	}
+	for i := range full.K {
+		full.K[i] = float32(i%31) * 0.003
+		full.V[i] = float32(i%29) * 0.004
+	}
+	q := make([]float32, DModel)
+	fill(q)
+	bufs := make([][]float32, NumHeads)
+	for i := range bufs {
+		bufs[i] = make([]float32, Context)
+	}
+
+	b.Run("serial", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			full.Position = Context
+			_ = full.attend(q)
+		}
+	})
+	b.Run("parallel", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			full.Position = Context
+			_ = attendParallel(full, q, bufs)
+		}
+	})
+}
+
+// The parallel attention has to agree with the serial one, or its speed means
+// nothing.
+func TestAttendParallelMatches(t *testing.T) {
+	kv := &KV{
+		K:        make([]float32, Context*NumHeads*HeadDim),
+		V:        make([]float32, Context*NumHeads*HeadDim),
+		Position: Context,
+	}
+	for i := range kv.K {
+		kv.K[i] = float32(i%31) * 0.003
+		kv.V[i] = float32(i%29) * 0.004
+	}
+	q := make([]float32, DModel)
+	fill(q)
+	bufs := make([][]float32, NumHeads)
+	for i := range bufs {
+		bufs[i] = make([]float32, Context)
+	}
+	want := kv.attend(q)
+	kv.Position = Context
+	got := attendParallel(kv, q, bufs)
+	for i := range want {
+		if d := want[i] - got[i]; d > 1e-6 || d < -1e-6 {
+			t.Fatalf("head %d element %d: serial %g, parallel %g", i/HeadDim, i%HeadDim, want[i], got[i])
+		}
+	}
+}
