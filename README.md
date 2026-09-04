@@ -569,11 +569,40 @@ whole window, in aggregate seconds of audio per second of wall clock:
 | 3       | 1.82     | 2.45    |
 | 4       | 1.82     | 2.55    |
 
-Two clients hold real time at ×1.08 each, where separate streams left them at
-×0.91 and falling behind; three do not, at ×0.82. The codec and the quantiser
-are what the ceiling becomes, since neither of them batches. A full group
-answers 429 rather than queueing, and `go test -run TestConcurrentStreams` with
-`GOLEM_STT_CAPACITY` set is the bench those numbers come from.
+And `-vulkan` puts the trunk's four products on the card, at the width the group
+runs:
+
+```bash
+./golem-server -stt ~/models/stt-1b-en_fr -stt-parallel 3 -vulkan
+./golem-cli -stt ~/models/stt-1b-en_fr -vulkan -listen
+```
+
+The products move and nothing else does. Attention stays on the processor —
+each stream owns a cache of seven hundred and fifty positions, and moving those
+would be moving the streams — so a block on the card is four dispatches with the
+processor between them. That middle is not free: a product staged, dispatched
+and read back costs about twice its kernel. It is paid anyway, because the same
+products cost six times more on the processor than the round trip costs on top.
+The logit head stays too: it is bfloat16, which these kernels do not read, and
+2.68 ms against the trunk's thirty.
+
+Seventy seconds of audio an arm, at the steady state where attention walks the
+whole window, in aggregate seconds of audio per second of wall clock:
+
+| streams | separate | grouped | grouped + vulkan |
+| ------- | -------- | ------- | ---------------- |
+| 1       | 1.81     | 1.82    | 3.00             |
+| 2       | 1.82     | 2.17    | 3.41             |
+| 3       | 1.81     | 2.46    | 3.53             |
+| 4       | 1.81     | 2.63    | 3.65             |
+
+Per stream that is ×1.08 for two clients grouped, where separate streams left
+them at ×0.91 and falling behind, and ×1.18 for three on the card. One
+microphone alone goes from ×1.82 to ×3.00. Four still miss at ×0.91: the codec
+and the quantiser batch no better on a card than off one, and they are what the
+ceiling is now. A full group answers 429 rather than queueing, and `go test -run
+TestConcurrentStreams` with `GOLEM_STT_CAPACITY` set is the bench these numbers
+come from.
 
 ## 🔬 The Method
 

@@ -60,18 +60,32 @@ func TestConcurrentStreams(t *testing.T) {
 	frames := concurrentSeconds * 1000 / 80
 	audio := float64(frames) * 0.08
 
-	fmt.Printf("\n%-10s %-8s %10s %13s %12s %8s\n",
+	// The card is a second model: UseVulkan is once per model, and the width it
+	// is built for is the widest group below.
+	const widest = 4
+	card, err := Open(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer card.Close()
+	onCard := card.UseVulkan(widest) == nil
+
+	fmt.Printf("\n%-16s %-8s %10s %13s %12s %8s\n",
 		"mode", "streams", "wall (s)", "x-real-time", "aggregate", "cores")
-	for _, grouped := range []bool{false, true} {
-		mode := "separate"
-		if grouped {
-			mode = "grouped"
+	for _, mode := range []string{"separate", "grouped", "grouped+vulkan"} {
+		if mode == "grouped+vulkan" && !onCard {
+			t.Log("no Vulkan device: the card rows are skipped")
+			continue
+		}
+		use := m
+		if mode == "grouped+vulkan" {
+			use = card
 		}
 		for _, n := range []int{1, 2, 3, 4} {
 			var g *Group
-			open := func() *Live { return m.Stream(context.Background()) }
-			if grouped {
-				g = m.Group(context.Background(), n)
+			open := func() *Live { return use.Stream(context.Background()) }
+			if mode != "separate" {
+				g = use.Group(context.Background(), n)
 				open = func() *Live {
 					live, err := g.Stream(context.Background())
 					if err != nil {
@@ -103,7 +117,7 @@ func TestConcurrentStreams(t *testing.T) {
 			if g != nil {
 				g.Close()
 			}
-			fmt.Printf("%-10s %-8d %10.2f %13.2f %12.2f %8.2f\n",
+			fmt.Printf("%-16s %-8d %10.2f %13.2f %12.2f %8.2f\n",
 				mode, n, wall, audio/wall, float64(n)*audio/wall, cores)
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -277,5 +278,118 @@ func TestGroupReleasesSlotOnCancel(t *testing.T) {
 			t.Fatalf("the slot was never given back: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestVulkanBlockMatchesProcessor is the card's block against the one it
+// mirrors, at three streams sitting at three different positions.
+//
+// A product on the card is the same arithmetic in a different order, so this
+// does not ask for equality: Q8_0 weights against a Q8_0 activation are exact
+// in the integers and the accumulation is not, and sixteen of these compound.
+// What it asks is that a block agree to a part in ten thousand of its own
+// scale, which a transposed column or a cache read for the wrong stream misses
+// by whole units.
+func TestVulkanBlockMatchesProcessor(t *testing.T) {
+	m := testModel(t)
+	const n = 3
+	if err := m.UseVulkan(n); err != nil {
+		t.Skipf("no Vulkan trunk: %v", err)
+	}
+	if on, width := m.Vulkan(); !on || width != n {
+		t.Fatalf("UseVulkan(%d) reports %v at %d", n, on, width)
+	}
+	layer := m.weights.Layers[0]
+
+	alone := make([][]float32, n)
+	onCard := make([][]float32, n)
+	aloneKV := make([]*KV, n)
+	cardKV := make([]*KV, n)
+	for i := 0; i < n; i++ {
+		alone[i] = make([]float32, DModel)
+		onCard[i] = make([]float32, DModel)
+		for j := range alone[i] {
+			alone[i][j] = float32((j+7*i)%13) * 0.01
+			onCard[i][j] = alone[i][j]
+		}
+		aloneKV[i] = filledKV(i, 40*i+11)
+		cardKV[i] = filledKV(i, 40*i+11)
+	}
+
+	s := NewScratch()
+	for i := 0; i < n; i++ {
+		layer.Step(alone[i], aloneKV[i], s)
+	}
+	if err := m.card.StepBatchOn(0, layer, onCard, cardKV, NewBatchScratch(n)); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < n; i++ {
+		var peak float64
+		for _, v := range alone[i] {
+			if a := math.Abs(float64(v)); a > peak {
+				peak = a
+			}
+		}
+		tol := float32(peak) * 1e-4
+		for j := range alone[i] {
+			if d := alone[i][j] - onCard[i][j]; d > tol || d < -tol {
+				t.Fatalf("stream %d element %d: processor %g, card %g (tolerance %g)",
+					i, j, alone[i][j], onCard[i][j], tol)
+			}
+		}
+		if aloneKV[i].Position != cardKV[i].Position {
+			t.Fatalf("stream %d: position %d on the processor, %d on the card", i, aloneKV[i].Position, cardKV[i].Position)
+		}
+	}
+}
+
+// TestVulkanTranscriptMatchesProcessor is the whole path: a group whose trunk
+// is on the card must say what the processor says, word for word.
+func TestVulkanTranscriptMatchesProcessor(t *testing.T) {
+	m := testModel(t)
+	clip := speech(t)
+	want := transcribeAlone(t, m, clip)
+
+	card := testModel(t)
+	const n = 2
+	if err := card.UseVulkan(n); err != nil {
+		t.Skipf("no Vulkan trunk: %v", err)
+	}
+	g := card.Group(context.Background(), n)
+	defer g.Close()
+
+	got := make([]string, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		live, err := g.Stream(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		wg.Add(1)
+		go func(i int, live *Live) {
+			defer wg.Done()
+			var text strings.Builder
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				for seg := range live.Text() {
+					text.WriteString(seg.Text)
+				}
+			}()
+			live.Write(clip)
+			live.Close()
+			<-done
+			got[i] = strings.TrimSpace(text.String())
+		}(i, live)
+	}
+	wg.Wait()
+	if err := g.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for i, g := range got {
+		if g != want {
+			t.Errorf("stream %d on the card:\n got %q\nwant %q", i, g, want)
+		}
 	}
 }

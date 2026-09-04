@@ -86,6 +86,9 @@ type Model struct {
 	quantizer *mimi.Quantizer
 	weights   *Weights
 	tokenizer *sentencepiece.Tokenizer
+	// card holds the trunk's four products in device memory when UseVulkan
+	// has put them there, and is nil when the processor carries them.
+	card *Card
 }
 
 func Open(o Options) (*Model, error) {
@@ -127,6 +130,12 @@ func Open(o Options) (*Model, error) {
 
 func (m *Model) Close() error {
 	var firstErr error
+	// The card first: its buffers are mapped from the weights the models below
+	// own, and it holds a device that outlives neither.
+	if m.card != nil {
+		m.card.Close()
+		m.card = nil
+	}
 	if m.mimiModel != nil {
 		if err := m.mimiModel.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -164,6 +173,11 @@ type Live struct {
 	cancel    context.CancelFunc
 	stopWatch func() bool
 	left      sync.Once
+	// batch is the one-column scratch a lone stream needs when the trunk is on
+	// a card, built the first time a frame reaches it.
+	batch *BatchScratch
+	errMu sync.Mutex
+	err   error
 	textCh     chan Segment
 	closed     bool
 	mu         sync.Mutex
@@ -231,15 +245,57 @@ func (l *Live) writeSamples(samples []float32) {
 func (l *Live) stepFrame(chunk []float32) {
 	x := make([]float32, DModel)
 	logits := make([]float32, TextCard)
+	// A stream that steps alone still reads the whole trunk for its one
+	// column, so a card is worth having here too: it is a batch of one, which
+	// is a width the kernels are built at.
+	var xs [][]float32
+	var kvs []*KV
+	if l.m.card != nil {
+		if l.batch == nil {
+			l.batch = NewBatchScratch(1)
+		}
+		xs, kvs = [][]float32{x}, make([]*KV, 1)
+	}
 	for _, codes := range l.codesFor(chunk) {
 		l.embed(codes, x)
-		for layerIdx, layer := range l.m.weights.Layers {
-			layer.Step(x, l.kv[layerIdx], l.scratch)
+		if l.m.card != nil {
+			for layerIdx, layer := range l.m.weights.Layers {
+				kvs[0] = l.kv[layerIdx]
+				if err := l.m.card.StepBatchOn(layerIdx, layer, xs, kvs, l.batch); err != nil {
+					l.faulted(err)
+					return
+				}
+			}
+		} else {
+			for layerIdx, layer := range l.m.weights.Layers {
+				layer.Step(x, l.kv[layerIdx], l.scratch)
+			}
 		}
 		nn.RMSNormPlain(x, l.m.weights.OutNorm, NormEps)
 		product(l.m.weights.Head, l.scratch.wide, x, logits)
 		l.emit(logits)
 	}
+}
+
+// faulted ends a lone stream that the card stopped answering for, and keeps the
+// reason for whoever asks. Half a block ran on the card and half here, so there
+// is no transcript to salvage.
+func (l *Live) faulted(err error) {
+	l.errMu.Lock()
+	if l.err == nil {
+		l.err = err
+	}
+	l.errMu.Unlock()
+	if l.cancel != nil {
+		l.cancel()
+	}
+}
+
+// Err is the fault that ended this stream early, or nil.
+func (l *Live) Err() error {
+	l.errMu.Lock()
+	defer l.errMu.Unlock()
+	return l.err
 }
 
 // codesFor runs the codec over one frame of sound and returns the codes of
@@ -415,7 +471,11 @@ func byteValue(s string) (byte, bool) {
 // TranscribeStream decodes a sound file — WAV, MP3 or FLAC, any rate, any channel
 // count — and calls back with each segment as it is decided.
 func (m *Model) TranscribeStream(ctx context.Context, file []byte, each func(Segment)) error {
-	return runStream(m.Stream(ctx), file, each)
+	live := m.Stream(ctx)
+	if err := runStream(live, file, each); err != nil {
+		return err
+	}
+	return live.Err()
 }
 
 // runStream feeds one decoded file to one stream and drains what it says. It is

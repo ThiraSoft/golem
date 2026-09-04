@@ -84,7 +84,7 @@ func main() {
 		if *sttDir == "" {
 			fail(fmt.Errorf("no STT checkpoint: pass -stt, or set GOLEM_STT"))
 		}
-		if err := runTranscribe(*sttDir, *transcribe); err != nil {
+		if err := runTranscribe(*sttDir, *transcribe, *vulkan); err != nil {
 			fail(err)
 		}
 		return
@@ -93,7 +93,7 @@ func main() {
 		if *sttDir == "" {
 			fail(fmt.Errorf("no STT checkpoint: pass -stt, or set GOLEM_STT"))
 		}
-		if err := runListen(*sttDir); err != nil {
+		if err := runListen(*sttDir, *vulkan); err != nil {
 			fail(err)
 		}
 		return

@@ -46,7 +46,7 @@ func recorderCmd(ctx context.Context) (*exec.Cmd, error) {
 	return nil, fmt.Errorf("unknown recorder %s", name)
 }
 
-func runListen(sttPath string) error {
+func runListen(sttPath string, vulkan bool) error {
 	opts, err := stt.Locate(sttPath)
 	if err != nil {
 		return err
@@ -56,6 +56,9 @@ func runListen(sttPath string) error {
 		return err
 	}
 	defer m.Close()
+	if err := useCard(m, vulkan, 1); err != nil {
+		return err
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -112,7 +115,22 @@ func runListen(sttPath string) error {
 	return nil
 }
 
-func runTranscribe(sttPath, filePath string) error {
+// useCard puts the trunk's four products on a Vulkan device when asked, and
+// says on stderr what happened: a transcriber that silently stayed on the
+// processor because a card refused it looks exactly like one that is simply
+// slow.
+func useCard(m *stt.Model, vulkan bool, width int) error {
+	if !vulkan {
+		return nil
+	}
+	if err := m.UseVulkan(width); err != nil {
+		return fmt.Errorf("stt on vulkan: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "stt trunk on vulkan in %s, passes of %d\n", m.Quant(), width)
+	return nil
+}
+
+func runTranscribe(sttPath, filePath string, vulkan bool) error {
 	opts, err := stt.Locate(sttPath)
 	if err != nil {
 		return err
@@ -122,6 +140,9 @@ func runTranscribe(sttPath, filePath string) error {
 		return err
 	}
 	defer m.Close()
+	if err := useCard(m, vulkan, 1); err != nil {
+		return err
+	}
 
 	data, err := os.ReadFile(filePath)
 	if err != nil {

@@ -352,6 +352,19 @@ func (p *Pipeline) widestUpTo(n int) int {
 func (s *Set) widest(n int) int { return s.p.widestUpTo(n) }
 
 // sortedWidths is what a pipeline was built for, for that message.
+// HasWidth says whether this pipeline carries a binary that answers exactly
+// that many columns in one pass. A caller that must not fall back — one sizing
+// its buffers to a width — asks before it builds rather than after, because
+// DispatchWide panics on a width it has no binary for.
+func (p *Pipeline) HasWidth(columns int) bool {
+	_, ok := p.wide[columns]
+	return ok
+}
+
+// Widths is every pass width this pipeline was built at, in order, for the
+// error message of a caller that asked for one it has not got.
+func (p *Pipeline) Widths() []int { return sortedWidths(p.wide) }
+
 func sortedWidths(wide map[int]uint64) []int {
 	out := make([]int, 0, len(wide))
 	for w := range wide {

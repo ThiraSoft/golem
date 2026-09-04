@@ -213,6 +213,15 @@ type Group struct {
 	// never wider than this, which is what keeps it inside the scratch.
 	mu   sync.Mutex
 	live int
+
+	// card is the model's, held here so a pass does not reach through the
+	// model for it every block. It is nil when the processor carries the trunk.
+	card *Card
+
+	// err is the first fault a pass met, which every stream of the group then
+	// reports. A card that stops answering stops all of them.
+	errMu sync.Mutex
+	err   error
 }
 
 // frameRequest is one stream's frame, and the channel that says it is finished.
@@ -240,6 +249,7 @@ func (m *Model) Group(ctx context.Context, size int) *Group {
 		cancel: cancel,
 		size:   size,
 		window: GroupWindow,
+		card:   m.card,
 		in:      make(chan *frameRequest, size),
 		done:    make(chan struct{}),
 		scratch: NewBatchScratch(size),
@@ -292,6 +302,26 @@ func (g *Group) Close() error {
 	return nil
 }
 
+// fail records the fault a pass met and ends the streams that were in it.
+func (g *Group) fail(err error, live []*Live) {
+	g.errMu.Lock()
+	if g.err == nil {
+		g.err = err
+	}
+	g.errMu.Unlock()
+	for _, l := range live {
+		l.faulted(err)
+	}
+}
+
+// Err is the first fault a pass of this group met, or nil. A transcription
+// that ended early asks it for the reason.
+func (g *Group) Err() error {
+	g.errMu.Lock()
+	defer g.errMu.Unlock()
+	return g.err
+}
+
 // leave is a stream saying it will send no more frames, and giving its slot to
 // whoever asks next.
 func (g *Group) leave() {
@@ -321,7 +351,12 @@ func (g *Group) TranscribeStream(ctx context.Context, file []byte, each func(Seg
 	if err != nil {
 		return err
 	}
-	return runStream(live, file, each)
+	if err := runStream(live, file, each); err != nil {
+		return err
+	}
+	// A stream that was evicted mid-pass ends quietly, so the group is asked
+	// whether it ended for a reason.
+	return g.Err()
 }
 
 // waiting is how many streams could still send a frame for this pass. The
@@ -433,6 +468,17 @@ func (g *Group) step(batch []*frameRequest) {
 		for layer := range g.m.weights.Layers {
 			for i, l := range live {
 				kvs[i] = l.kv[layer]
+			}
+			if g.card != nil {
+				if err := g.card.StepBatchOn(layer, g.m.weights.Layers[layer], xs, kvs, s); err != nil {
+					// The card failing mid-frame is not something a transcript
+					// can be salvaged from: half a block ran there and half
+					// here. The streams of this pass are ended and the reason
+					// is carried out through the group.
+					g.fail(err, live)
+					return
+				}
+				continue
 			}
 			g.m.weights.Layers[layer].StepBatch(xs, kvs, s)
 		}

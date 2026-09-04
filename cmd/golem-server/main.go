@@ -55,7 +55,7 @@ func main() {
 	// to own, and building them around a model that was never opened would only
 	// be a longer way of writing nil.
 	if *model == "" {
-		serveTranscriptionsOnly(*sttDir, *addr, *sttStreams)
+		serveTranscriptionsOnly(*sttDir, *addr, *sttStreams, *vulkan)
 		return
 	}
 	start := time.Now()
@@ -133,6 +133,7 @@ func main() {
 			fail(err)
 		}
 		defer sttModel.Close()
+		sttOnVulkan(sttModel, *vulkan, *sttStreams)
 		server.SetSTT(sttModel)
 		if group := sttGroupFor(sttModel, *sttStreams); group != nil {
 			defer group.Close()
@@ -186,10 +187,27 @@ func sttGroupFor(m *stt.Model, streams int) *stt.Group {
 	return m.Group(context.Background(), streams)
 }
 
+// sttOnVulkan puts the trunk's four products on the card, at the width the
+// group will run. It fails loudly rather than falling back: a server told
+// -vulkan and left on the processor would be a capacity plan built on a flag
+// that did nothing.
+func sttOnVulkan(m *stt.Model, vulkan bool, streams int) {
+	if !vulkan {
+		return
+	}
+	if streams < 1 {
+		streams = 1
+	}
+	if err := m.UseVulkan(streams); err != nil {
+		fail(fmt.Errorf("stt on vulkan: %w", err))
+	}
+	fmt.Fprintf(os.Stderr, "stt trunk on vulkan in %s, passes of %d\n", m.Quant(), streams)
+}
+
 // serveTranscriptionsOnly runs a server carrying an STT and nothing else.
 // Server.Handler registers the conversation route only when there is a pool,
 // so what this listens on is /v1/models and /v1/audio/transcriptions.
-func serveTranscriptionsOnly(dir, addr string, streams int) {
+func serveTranscriptionsOnly(dir, addr string, streams int, vulkan bool) {
 	start := time.Now()
 	opts, err := stt.Locate(dir)
 	if err != nil {
@@ -203,6 +221,7 @@ func serveTranscriptionsOnly(dir, addr string, streams int) {
 
 	name := filepath.Base(filepath.Clean(dir))
 	server := NewServer(nil, nil, name, nil, sample.Params{})
+	sttOnVulkan(model, vulkan, streams)
 	server.SetSTT(model)
 	if group := sttGroupFor(model, streams); group != nil {
 		defer group.Close()
