@@ -34,6 +34,12 @@ type Options struct {
 	Weights   string
 	Mimi      string
 	Tokenizer string
+
+	// Quant is the format the trunk's sixteen blocks are converted to at load.
+	// The zero value means nn.Q4_0, which is what a transcriber runs and what
+	// keeps it ahead of real time; nn.BF16 keeps the file's own weights, which
+	// is a quarter the speed and what the parity tests read.
+	Quant nn.Quant
 }
 
 // Locate fills the three paths from a directory holding the checkpoint as it
@@ -64,6 +70,12 @@ func Locate(dir string) (Options, error) {
 	return o, nil
 }
 
+// Quant names the format the trunk's blocks were converted to at load. It is
+// worth a startup line: the same checkpoint runs at three times the speed in
+// one format than in the other, and a server that quietly fell back would look
+// like a slow machine.
+func (m *Model) Quant() nn.Quant { return m.weights.Quant }
+
 type Model struct {
 	mimiModel *tensors.Model
 	sttModel  *tensors.Model
@@ -93,7 +105,11 @@ func Open(o Options) (*Model, error) {
 		m.Close()
 		return nil, fmt.Errorf("stt: open weights: %w", err)
 	}
-	if m.weights, err = LoadWeights(m.sttModel); err != nil {
+	quant := o.Quant
+	if quant == 0 {
+		quant = nn.Q4_0
+	}
+	if m.weights, err = LoadWeights(m.sttModel, quant); err != nil {
 		m.Close()
 		return nil, fmt.Errorf("stt: load weights: %w", err)
 	}
@@ -137,6 +153,7 @@ type Live struct {
 	prevToken  int
 	frameCount int
 	pending    []float32
+	scratch    *Scratch
 	textCh     chan Segment
 	closed     bool
 	mu         sync.Mutex
@@ -151,6 +168,7 @@ func (m *Model) Stream(ctx context.Context) *Live {
 		ctx:       ctx,
 		state:     m.encoder.NewState(),
 		kv:        NewKV(),
+		scratch:   NewScratch(),
 		prevToken: TextCard, // 8000: start of sequence
 		textCh:    make(chan Segment, 64),
 	}
@@ -217,12 +235,12 @@ func (l *Live) stepFrame(chunk []float32) {
 
 		// Trunk transformer layers
 		for layerIdx, layer := range l.m.weights.Layers {
-			layer.Step(x, l.kv[layerIdx])
+			layer.Step(x, l.kv[layerIdx], l.scratch)
 		}
 
 		// Out norm and head
 		nn.RMSNormPlain(x, l.m.weights.OutNorm, 1e-5)
-		l.m.weights.Head.Apply(x, logits)
+		product(l.m.weights.Head, l.scratch.wide, x, logits)
 
 		// Argmax over TextCard
 		bestTok, bestVal := 0, logits[0]

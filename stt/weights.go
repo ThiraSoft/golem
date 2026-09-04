@@ -12,13 +12,27 @@ type Weights struct {
 	Text    []byte   // (TextCard+1) x DModel, BF16
 	Layers  []*Layer
 	OutNorm []float32
-	Head    nn.Linear
+	Head    nn.Matrix
+	Quant   nn.Quant // what the sixteen blocks were converted to
 }
 
-func LoadWeights(m *tensors.Model) (*Weights, error) {
+// LoadWeights reads the trunk, converting its projections to `quant` as it
+// goes. nn.BF16 keeps the file's own format, which is what the tests that hold
+// this code against PyTorch ask for; nn.Q4_0 is what a transcriber runs, and
+// stt/quantize.go says why.
+//
+// The embedding tables and the logit head stay bfloat16 whatever is asked. The
+// tables are read one row at a time — thirty-three rows a frame, not a product
+// — and the head is 33 MiB against the blocks' 1.64 GiB, so neither is on the
+// path that the bus decides.
+func LoadWeights(m *tensors.Model, quant nn.Quant) (*Weights, error) {
+	if quant != nn.BF16 && quant != nn.Q4_0 {
+		return nil, fmt.Errorf("stt: the trunk is read as bfloat16 or as Q4_0, not as %s", quant)
+	}
 	w := &Weights{
 		Audio:  make([][]byte, Codebooks),
 		Layers: make([]*Layer, NumLayers),
+		Quant:  quant,
 	}
 
 	// Audio embedding tables: emb.{0..31}.weight [2049, 2048] BF16
@@ -61,7 +75,7 @@ func LoadWeights(m *tensors.Model) (*Weights, error) {
 	if textLin.DType != "BF16" {
 		return nil, fmt.Errorf("text_linear.weight: dtype %s, want BF16", textLin.DType)
 	}
-	w.Head = nn.Linear{Weights: textLin.Raw, Inputs: DModel, Outputs: TextCard}
+	w.Head = nn.Matrix{Data: textLin.Raw, Quant: nn.BF16, Rows: TextCard, Cols: DModel}
 
 	// Output norm: out_norm.alpha [1, 1, 2048] BF16
 	outNorm, err := m.Get("out_norm.alpha")
@@ -75,18 +89,28 @@ func LoadWeights(m *tensors.Model) (*Weights, error) {
 		return nil, err
 	}
 
-	lin := func(name string, inputs, outputs int) (nn.Linear, error) {
+	// Every projection goes through here, so the conversion is written once
+	// and no matrix can be forgotten by a later reader adding a fifth one.
+	lin := func(name string, inputs, outputs int) (nn.Matrix, error) {
 		t, err := m.Get(name)
 		if err != nil {
-			return nn.Linear{}, err
+			return nn.Matrix{}, err
 		}
 		if len(t.Shape) != 2 || t.Shape[0] != outputs || t.Shape[1] != inputs {
-			return nn.Linear{}, fmt.Errorf("%s: shape %v, want [%d %d]", name, t.Shape, outputs, inputs)
+			return nn.Matrix{}, fmt.Errorf("%s: shape %v, want [%d %d]", name, t.Shape, outputs, inputs)
 		}
 		if t.DType != "BF16" {
-			return nn.Linear{}, fmt.Errorf("%s: dtype %s, want BF16", name, t.DType)
+			return nn.Matrix{}, fmt.Errorf("%s: dtype %s, want BF16", name, t.DType)
 		}
-		return nn.Linear{Weights: t.Raw, Inputs: inputs, Outputs: outputs}, nil
+		out := nn.Matrix{Data: t.Raw, Quant: nn.BF16, Rows: outputs, Cols: inputs}
+		if quant == nn.Q4_0 {
+			out.Data = quantizeQ4_0(t.Raw, outputs, inputs)
+			out.Quant = nn.Q4_0
+			// The interleaved form of the same bytes, which is what the widest
+			// kernel reads. nn/pack_q4_0.go says what it buys.
+			out.Repack()
+		}
+		return out, nil
 	}
 
 	normAlpha := func(name string) ([]float32, error) {

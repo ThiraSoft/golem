@@ -25,7 +25,7 @@ func sttWeights(t *testing.T) *tensors.Model {
 
 func TestBlockZeroAgainstReference(t *testing.T) {
 	f := reference.Load(t, "stt")
-	w, err := LoadWeights(sttWeights(t))
+	w, err := LoadWeights(sttWeights(t), nn.BF16)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,18 +33,19 @@ func TestBlockZeroAgainstReference(t *testing.T) {
 	want := f.Read(t, "block0") // same shape
 	frames := len(emb) / DModel
 	kv := NewKV()
+	scratch := NewScratch()
 	got := make([]float32, 0, len(emb))
 	x := make([]float32, DModel)
 	for i := 0; i < frames; i++ {
 		copy(x, emb[i*DModel:(i+1)*DModel])
-		w.Layers[0].Step(x, kv[0])
+		w.Layers[0].Step(x, kv[0], scratch)
 		got = append(got, x...)
 	}
 	reference.Compare(t, "block0", got, want, 1e-1)
 }
 
 func TestLoadWeightsAndStep(t *testing.T) {
-	w, err := LoadWeights(sttWeights(t))
+	w, err := LoadWeights(sttWeights(t), nn.BF16)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,11 +56,12 @@ func TestLoadWeightsAndStep(t *testing.T) {
 		t.Fatalf("audio codebooks = %d, want %d", len(w.Audio), Codebooks)
 	}
 	kv := NewKV()
+	scratch := NewScratch()
 	x := make([]float32, DModel)
 	for i := range x {
 		x[i] = float32(i%10) * 0.1
 	}
-	w.Layers[0].Step(x, kv[0])
+	w.Layers[0].Step(x, kv[0], scratch)
 	if kv[0].Position != 1 {
 		t.Fatalf("kv.Position = %d, want 1", kv[0].Position)
 	}
@@ -67,13 +69,14 @@ func TestLoadWeightsAndStep(t *testing.T) {
 
 func TestTrunkAndLogitsAgainstReference(t *testing.T) {
 	f := reference.Load(t, "stt")
-	w, err := LoadWeights(sttWeights(t))
+	w, err := LoadWeights(sttWeights(t), nn.BF16)
 	if err != nil {
 		t.Fatal(err)
 	}
 	emb, wantTrunk, wantLogits := f.Read(t, "emb"), f.Read(t, "trunk"), f.Read(t, "logits")
 	frames := len(emb) / DModel
 	kv := NewKV()
+	scratch := NewScratch()
 	trunk := make([]float32, 0, len(emb))
 	logits := make([]float32, 0, frames*TextCard)
 	x := make([]float32, DModel)
@@ -81,11 +84,11 @@ func TestTrunkAndLogitsAgainstReference(t *testing.T) {
 	for i := 0; i < frames; i++ {
 		copy(x, emb[i*DModel:(i+1)*DModel])
 		for l, layer := range w.Layers {
-			layer.Step(x, kv[l])
+			layer.Step(x, kv[l], scratch)
 		}
 		nn.RMSNormPlain(x, w.OutNorm, 1e-5)
 		trunk = append(trunk, x...)
-		w.Head.Apply(x, row)
+		product(w.Head, scratch.wide, x, row)
 		logits = append(logits, row...)
 	}
 	reference.Compare(t, "trunk", trunk, wantTrunk, 1.5)
@@ -93,12 +96,13 @@ func TestTrunkAndLogitsAgainstReference(t *testing.T) {
 }
 
 func TestWholeTrunkSynthetic(t *testing.T) {
-	w, err := LoadWeights(sttWeights(t))
+	w, err := LoadWeights(sttWeights(t), nn.BF16)
 	if err != nil {
 		t.Fatal(err)
 	}
 	frames := 4
 	kv := NewKV()
+	scratch := NewScratch()
 	x := make([]float32, DModel)
 	row := make([]float32, TextCard)
 	for i := 0; i < frames; i++ {
@@ -106,10 +110,10 @@ func TestWholeTrunkSynthetic(t *testing.T) {
 			x[j] = float32(i+j%10) * 0.01
 		}
 		for l, layer := range w.Layers {
-			layer.Step(x, kv[l])
+			layer.Step(x, kv[l], scratch)
 		}
 		nn.RMSNormPlain(x, w.OutNorm, 1e-5)
-		w.Head.Apply(x, row)
+		product(w.Head, scratch.wide, x, row)
 		maxVal, maxIdx := float32(-1e9), -1
 		for idx, v := range row {
 			if v > maxVal {

@@ -190,8 +190,8 @@ func serveTranscriptionsOnly(dir, addr string) {
 	if err != nil {
 		fail(err)
 	}
-	fmt.Fprintf(os.Stderr, "%s: speech to text, loaded in %s on %d cores\n",
-		name, time.Since(start).Round(time.Millisecond), runtime.NumCPU())
+	fmt.Fprintf(os.Stderr, "%s: speech to text, trunk in %s, loaded in %s on %d cores\n",
+		name, model.Quant(), time.Since(start).Round(time.Millisecond), runtime.NumCPU())
 	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 — transcriptions only, one at a time\n", listener.Addr())
 	if err := http.Serve(listener, logging(os.Stderr, server.Handler())); err != nil {
 		fail(err)

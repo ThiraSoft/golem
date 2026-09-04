@@ -22,10 +22,47 @@ const (
 
 type Layer struct {
 	Norm1, Norm2 []float32
-	InProj       nn.Linear // 2048 -> 6144, Q K V concatenated
-	OutProj      nn.Linear // 2048 -> 2048
-	GateIn       nn.Linear // 2048 -> 11264
-	GateOut      nn.Linear // 5632 -> 2048
+	InProj       nn.Matrix // 2048 -> 6144, Q K V concatenated
+	OutProj      nn.Matrix // 2048 -> 2048
+	GateIn       nn.Matrix // 2048 -> 11264
+	GateOut      nn.Matrix // 5632 -> 2048
+}
+
+// Scratch is what one pass through the stack needs and one stream owns. The
+// weights are shared by every conversation the server holds at once, so
+// nothing that a product writes into may live beside them.
+type Scratch struct {
+	wide *nn.Batch // DModel-wide activations: the three projections and the gate
+	deep *nn.Batch // DimFF-wide: what comes out of the gate
+	h    []float32
+	qkv  []float32
+	out  []float32
+	gate []float32
+	ff   []float32
+}
+
+func NewScratch() *Scratch {
+	return &Scratch{
+		wide: nn.NewBatch(DModel, 1),
+		deep: nn.NewBatch(DimFF, 1),
+		h:    make([]float32, DModel),
+		qkv:  make([]float32, 3*DModel),
+		out:  make([]float32, DModel),
+		gate: make([]float32, 2*DimFF),
+		ff:   make([]float32, DModel),
+	}
+}
+
+// product computes y = W*x through whichever kernel the matrix's format asks
+// for. The activation is quantized only when the weights are: a bfloat16
+// matrix reads the floats as they are, and rounding them first would move the
+// answer away from what the reference computes.
+func product(m nn.Matrix, b *nn.Batch, x, y []float32) {
+	copy(b.F[0], x)
+	if m.Quant != nn.BF16 {
+		b.Quantize()
+	}
+	m.MatVec(b, y)
 }
 
 // KV is the cache of one layer, a ring over Context positions.
@@ -81,13 +118,13 @@ func (kv *KV) attend(q []float32) []float32 {
 }
 
 // Step advances one position in place. x holds DModel values.
-func (l *Layer) Step(x []float32, kv *KV) {
-	h := make([]float32, DModel)
+func (l *Layer) Step(x []float32, kv *KV, s *Scratch) {
+	h := s.h
 	copy(h, x)
 	nn.RMSNormPlain(h, l.Norm1, 1e-5)
 
-	qkv := make([]float32, 3*DModel)
-	l.InProj.Apply(h, qkv)
+	qkv := s.qkv
+	product(l.InProj, s.wide, h, qkv)
 	q, k, v := qkv[:DModel], qkv[DModel:2*DModel], qkv[2*DModel:]
 	for head := 0; head < NumHeads; head++ {
 		nn.ApplyRoPE(q[head*HeadDim:(head+1)*HeadDim], kv.Position, MaxPeriod)
@@ -96,19 +133,19 @@ func (l *Layer) Step(x []float32, kv *KV) {
 	kv.write(k, v)
 
 	attn := kv.attend(q) // NumHeads x HeadDim, softmax over the visible past
-	out := make([]float32, DModel)
-	l.OutProj.Apply(attn, out)
+	out := s.out
+	product(l.OutProj, s.wide, attn, out)
 	for i := range x {
 		x[i] += out[i]
 	}
 
 	copy(h, x)
 	nn.RMSNormPlain(h, l.Norm2, 1e-5)
-	gate := make([]float32, 2*DimFF)
-	l.GateIn.Apply(h, gate)
+	gate := s.gate
+	product(l.GateIn, s.wide, h, gate)
 	nn.SwiGLURange(gate[:DimFF], gate[DimFF:], 0, DimFF) // silu(first) * second
-	ff := make([]float32, DModel)
-	l.GateOut.Apply(gate[:DimFF], ff)
+	ff := s.ff
+	product(l.GateOut, s.deep, gate[:DimFF], ff)
 	for i := range x {
 		x[i] += ff[i]
 	}
