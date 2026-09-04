@@ -18,6 +18,15 @@ const (
 	Codebooks = 32
 	CodeCard  = 2048
 	TextPadID = 3
+
+	// NormEps is what the trunk's RMS norms add under the square root, and it
+	// is 1e-8 and not the 1e-5 that a transformer usually carries: the
+	// checkpoint asks for "rms_norm_f32", which the reference builds with
+	// 1e-8. On a variance around 5e-3 the difference is one part in a
+	// thousand, applied twice a layer and sixteen layers deep — enough to put
+	// the trunk's waypoint eighty-six per cent of its own scale away from the
+	// reference while still transcribing well enough to look correct.
+	NormEps = 1e-8
 )
 
 type Layer struct {
@@ -121,7 +130,7 @@ func (kv *KV) attend(q []float32) []float32 {
 func (l *Layer) Step(x []float32, kv *KV, s *Scratch) {
 	h := s.h
 	copy(h, x)
-	nn.RMSNormPlain(h, l.Norm1, 1e-5)
+	nn.RMSNormPlain(h, l.Norm1, NormEps)
 
 	qkv := s.qkv
 	product(l.InProj, s.wide, h, qkv)
@@ -140,7 +149,7 @@ func (l *Layer) Step(x []float32, kv *KV, s *Scratch) {
 	}
 
 	copy(h, x)
-	nn.RMSNormPlain(h, l.Norm2, 1e-5)
+	nn.RMSNormPlain(h, l.Norm2, NormEps)
 	gate := s.gate
 	product(l.GateIn, s.wide, h, gate)
 	nn.SwiGLURange(gate[:DimFF], gate[DimFF:], 0, DimFF) // silu(first) * second

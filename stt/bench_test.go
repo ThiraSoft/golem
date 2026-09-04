@@ -48,7 +48,7 @@ func BenchmarkFrame(b *testing.B) {
 	for _, c := range []struct {
 		name  string
 		quant nn.Quant
-	}{{"bf16", nn.BF16}, {"q4_0", nn.Q4_0}} {
+	}{{"bf16", nn.BF16}, {"q8_0", nn.Q8_0}, {"q4_0", nn.Q4_0}} {
 		b.Run(c.name, func(b *testing.B) {
 			m := benchModel(b, c.quant)
 			live := m.Stream(context.Background())
@@ -99,7 +99,7 @@ func BenchmarkTrunk(b *testing.B) {
 	for _, c := range []struct {
 		name  string
 		quant nn.Quant
-	}{{"bf16", nn.BF16}, {"q4_0", nn.Q4_0}} {
+	}{{"bf16", nn.BF16}, {"q8_0", nn.Q8_0}, {"q4_0", nn.Q4_0}} {
 		b.Run(c.name, func(b *testing.B) {
 			m := benchModel(b, c.quant)
 			kv := NewKV()
@@ -114,7 +114,7 @@ func BenchmarkTrunk(b *testing.B) {
 				for l, layer := range m.weights.Layers {
 					layer.Step(x, kv[l], scratch)
 				}
-				nn.RMSNormPlain(x, m.weights.OutNorm, 1e-5)
+				nn.RMSNormPlain(x, m.weights.OutNorm, NormEps)
 				product(m.weights.Head, scratch.wide, x, logits)
 			}
 		})

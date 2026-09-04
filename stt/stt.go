@@ -36,9 +36,12 @@ type Options struct {
 	Tokenizer string
 
 	// Quant is the format the trunk's sixteen blocks are converted to at load.
-	// The zero value means nn.Q4_0, which is what a transcriber runs and what
-	// keeps it ahead of real time; nn.BF16 keeps the file's own weights, which
-	// is a quarter the speed and what the parity tests read.
+	// The zero value means nn.Q8_0, and the choice was measured rather than
+	// assumed: on half a minute of read English, Q8_0 gives bfloat16's
+	// transcript word for word at twice real time, where Q4_0 is half again as
+	// fast and drops the "st" of a date — three per cent of the words, and on
+	// exactly the kind of token a transcriber is for. nn.BF16 keeps the file's
+	// own weights, which is what the tests that hold this against PyTorch read.
 	Quant nn.Quant
 }
 
@@ -107,7 +110,7 @@ func Open(o Options) (*Model, error) {
 	}
 	quant := o.Quant
 	if quant == 0 {
-		quant = nn.Q4_0
+		quant = nn.Q8_0
 	}
 	if m.weights, err = LoadWeights(m.sttModel, quant); err != nil {
 		m.Close()
@@ -239,7 +242,7 @@ func (l *Live) stepFrame(chunk []float32) {
 		}
 
 		// Out norm and head
-		nn.RMSNormPlain(x, l.m.weights.OutNorm, 1e-5)
+		nn.RMSNormPlain(x, l.m.weights.OutNorm, NormEps)
 		product(l.m.weights.Head, l.scratch.wide, x, logits)
 
 		// Argmax over TextCard

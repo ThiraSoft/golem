@@ -34,10 +34,7 @@ func quantizeQ4_0(bf16 []byte, rows, cols int) []byte {
 	const blockBytes = 18
 	out := make([]byte, rows*blocks*blockBytes)
 
-	source := func(r, i int) float32 {
-		at := (r*cols + i) * 2
-		return math.Float32frombits(uint32(binary.LittleEndian.Uint16(bf16[at:])) << 16)
-	}
+	source := func(r, i int) float32 { return bf16At(bf16, r*cols+i) }
 
 	// One row per unit of work: the rows are independent, and a matrix of this
 	// size takes long enough that handing them out beats doing them in turn.
@@ -54,6 +51,60 @@ func quantizeQ4_0(bf16 []byte, rows, cols int) []byte {
 		}
 	})
 	return out
+}
+
+// quantizeQ8_0 converts a row-major bfloat16 matrix into Q8_0: 34 bytes to a
+// block of thirty-two, a half-precision scale then one signed byte a weight.
+// Twice the bytes of Q4_0 and four more bits of mantissa a weight, for whoever
+// would rather pay the bus than the precision.
+func quantizeQ8_0(bf16 []byte, rows, cols int) []byte {
+	if cols%nn.QuantBlock != 0 {
+		panic("stt: a Q8_0 row must be a whole number of blocks")
+	}
+	blocks := cols / nn.QuantBlock
+	const blockBytes = 34
+	out := make([]byte, rows*blocks*blockBytes)
+
+	nn.InParallel(rows, rows*cols, func(start, end int) {
+		for r := start; r < end; r++ {
+			for b := 0; b < blocks; b++ {
+				var amax float32
+				at := r*cols + b*nn.QuantBlock
+				for i := 0; i < nn.QuantBlock; i++ {
+					v := bf16At(bf16, at+i)
+					if a := float32(math.Abs(float64(v))); a > amax {
+						amax = a
+					}
+				}
+				// The grid runs from -128 to 127 and is symmetric about zero;
+				// dividing by 127 rather than by 128 keeps it that way, which
+				// is what llama.cpp does and what its shaders expect back.
+				scale := amax / 127
+				var inverse float32
+				if scale != 0 {
+					inverse = 1 / scale
+				}
+				block := out[(r*blocks+b)*blockBytes:]
+				binary.LittleEndian.PutUint16(block, nn.FloatToHalf(scale))
+				for i := 0; i < nn.QuantBlock; i++ {
+					q := int(math.Round(float64(bf16At(bf16, at+i) * inverse)))
+					if q > 127 {
+						q = 127
+					}
+					if q < -128 {
+						q = -128
+					}
+					block[2+i] = byte(int8(q))
+				}
+			}
+		}
+	})
+	return out
+}
+
+// bf16At reads one weight out of the mapped bytes.
+func bf16At(bf16 []byte, i int) float32 {
+	return math.Float32frombits(uint32(binary.LittleEndian.Uint16(bf16[i*2:])) << 16)
 }
 
 // quantizeBlockQ4_0 writes one block. The scale is taken from the value of

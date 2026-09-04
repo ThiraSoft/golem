@@ -41,7 +41,7 @@ func TestBlockZeroAgainstReference(t *testing.T) {
 		w.Layers[0].Step(x, kv[0], scratch)
 		got = append(got, x...)
 	}
-	reference.Compare(t, "block0", got, want, 1e-1)
+	reference.Compare(t, "block0", got, want, 5e-5)
 }
 
 func TestLoadWeightsAndStep(t *testing.T) {
@@ -86,13 +86,19 @@ func TestTrunkAndLogitsAgainstReference(t *testing.T) {
 		for l, layer := range w.Layers {
 			layer.Step(x, kv[l], scratch)
 		}
-		nn.RMSNormPlain(x, w.OutNorm, 1e-5)
+		nn.RMSNormPlain(x, w.OutNorm, NormEps)
 		trunk = append(trunk, x...)
 		product(w.Head, scratch.wide, x, row)
 		logits = append(logits, row...)
 	}
-	reference.Compare(t, "trunk", trunk, wantTrunk, 1.5)
-	reference.Compare(t, "logits", logits, wantLogits, 1.0)
+	// Five parts in ten thousand, and the number is measured rather than
+	// chosen: sixteen layers of float32 residual accumulate 2e-4 of the
+	// tensor's own scale against PyTorch, which sums in a different order and
+	// fuses different multiplies. The single waypoints above hold at 5e-5,
+	// which is where a fault would show. This was 1.32 — a hundred and
+	// thirty-two per cent — until the norms' epsilon was found to be 1e-8.
+	reference.Compare(t, "trunk", trunk, wantTrunk, 5e-4)
+	reference.Compare(t, "logits", logits, wantLogits, 5e-5)
 }
 
 func TestWholeTrunkSynthetic(t *testing.T) {
@@ -112,7 +118,7 @@ func TestWholeTrunkSynthetic(t *testing.T) {
 		for l, layer := range w.Layers {
 			layer.Step(x, kv[l], scratch)
 		}
-		nn.RMSNormPlain(x, w.OutNorm, 1e-5)
+		nn.RMSNormPlain(x, w.OutNorm, NormEps)
 		product(w.Head, scratch.wide, x, row)
 		maxVal, maxIdx := float32(-1e9), -1
 		for idx, v := range row {

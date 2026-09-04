@@ -26,8 +26,10 @@ type Weights struct {
 // — and the head is 33 MiB against the blocks' 1.64 GiB, so neither is on the
 // path that the bus decides.
 func LoadWeights(m *tensors.Model, quant nn.Quant) (*Weights, error) {
-	if quant != nn.BF16 && quant != nn.Q4_0 {
-		return nil, fmt.Errorf("stt: the trunk is read as bfloat16 or as Q4_0, not as %s", quant)
+	switch quant {
+	case nn.BF16, nn.Q4_0, nn.Q8_0:
+	default:
+		return nil, fmt.Errorf("stt: the trunk is read as bfloat16, Q4_0 or Q8_0, not as %s", quant)
 	}
 	w := &Weights{
 		Audio:  make([][]byte, Codebooks),
@@ -102,13 +104,15 @@ func LoadWeights(m *tensors.Model, quant nn.Quant) (*Weights, error) {
 		if t.DType != "BF16" {
 			return nn.Matrix{}, fmt.Errorf("%s: dtype %s, want BF16", name, t.DType)
 		}
-		out := nn.Matrix{Data: t.Raw, Quant: nn.BF16, Rows: outputs, Cols: inputs}
-		if quant == nn.Q4_0 {
+		out := nn.Matrix{Data: t.Raw, Quant: quant, Rows: outputs, Cols: inputs}
+		switch quant {
+		case nn.Q4_0:
 			out.Data = quantizeQ4_0(t.Raw, outputs, inputs)
-			out.Quant = nn.Q4_0
 			// The interleaved form of the same bytes, which is what the widest
 			// kernel reads. nn/pack_q4_0.go says what it buys.
 			out.Repack()
+		case nn.Q8_0:
+			out.Data = quantizeQ8_0(t.Raw, outputs, inputs)
 		}
 		return out, nil
 	}

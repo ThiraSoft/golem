@@ -2,7 +2,8 @@
 
 Usage (from a venv that holds moshi):
     pip install moshi
-    python ref/dump_stt.py kyutai/stt-1b-en_fr testdata/stt
+    python ref/dump_stt.py $GOLEM_STT testdata/stt          # a local directory
+    python ref/dump_stt.py kyutai/stt-1b-en_fr testdata/stt # or the repository
 
 Writes one raw float32 file per activation — int32 for the codes — plus a
 fixtures.json describing the shapes. The Go tests read these back; they need
@@ -42,7 +43,12 @@ def main() -> None:
     else:
         info = loaders.CheckpointInfo.from_hf_repo(repo)
     mimi = info.get_mimi(device="cpu")
-    lm = info.get_moshi(device="cpu")
+    # float32 on purpose. get_moshi defaults to bfloat16, and a fixture in
+    # bfloat16 cannot be compared to a Go implementation that computes in
+    # float32 at any tolerance worth writing: the trunk's own waypoint came out
+    # 131% of its scale away, which is not a tolerance but a test that checks
+    # nothing. The codec is float32 already — get_mimi does not round.
+    lm = info.get_moshi(device="cpu", dtype=torch.float32)
     mimi.eval()
     lm.eval()
 
