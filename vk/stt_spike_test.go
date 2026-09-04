@@ -151,3 +151,90 @@ func cpuPass(t *testing.T, rows, cols, width int) time.Duration {
 	}
 	return best * time.Duration(width)
 }
+
+// TestSTTRoundTrip is what the spike missed.
+//
+// Attention sits between InProj and OutProj, and it reads a cache that lives on
+// the processor. So a card that carries only the four products does not run a
+// block: it runs a quarter of one, hands the answer back, and waits. What that
+// costs is not the kernel — RunTimes measures the kernel, with the inputs
+// already in place and no answer copied out — but Run, which stages the
+// activation, dispatches, and copies the answer back across the bus.
+//
+// Sixty-four of those a frame is the price of leaving attention where it is.
+func TestSTTRoundTrip(t *testing.T) {
+	d := open(t)
+	defer d.Close()
+
+	const width = 8
+	fmt.Printf("\n%-9s %12s %12s %12s\n", "shape", "kernel", "round trip", "overhead")
+	var kernels, trips time.Duration
+	for _, s := range sttShapes {
+		kernel, err := gpuPass(t, d, s.rows, s.cols, width, false)
+		if err != nil {
+			t.Skip(err)
+		}
+		trip, err := gpuRoundTrip(t, d, s.rows, s.cols, width)
+		if err != nil {
+			t.Fatal(err)
+		}
+		kernels += kernel
+		trips += trip
+		fmt.Printf("%-9s %12s %12s %12s\n", s.name,
+			kernel.Round(time.Microsecond), trip.Round(time.Microsecond),
+			(trip - kernel).Round(time.Microsecond))
+	}
+	fmt.Printf("%-9s %12s %12s %12s\n", "block", kernels.Round(time.Microsecond),
+		trips.Round(time.Microsecond), (trips - kernels).Round(time.Microsecond))
+	fmt.Printf("%-9s %12s %12s %12s   (16 blocks, of an 80 ms frame)\n", "frame",
+		(kernels * sttLayers).Round(time.Microsecond),
+		(trips * sttLayers).Round(time.Microsecond),
+		((trips - kernels) * sttLayers).Round(time.Microsecond))
+	fmt.Println()
+}
+
+// gpuRoundTrip is one product paid for the way a processor-side attention makes
+// you pay for it: staged, dispatched and read back, once per call.
+func gpuRoundTrip(t *testing.T, d *Device, rows, cols, width int) (time.Duration, error) {
+	data := make([]byte, rows*(nn.Matrix{Quant: nn.Q4_0, Cols: cols}).RowBytes())
+	rand.New(rand.NewSource(7)).Read(data)
+	m, err := NewMatMulQuant(d, data, rows, cols, width, false, nn.Q4_0)
+	if err != nil {
+		return 0, err
+	}
+	defer m.Close()
+
+	b := nn.NewBatch(cols, 1)
+	for i := range b.F[0] {
+		b.F[0][i] = float32(i%13) * 0.01
+	}
+	b.Quantize()
+	out := make([][]float32, width)
+	for i := range out {
+		out[i] = make([]float32, rows)
+	}
+	for c := 0; c < width; c++ {
+		if err := m.SetColumn(c, b); err != nil {
+			return 0, err
+		}
+	}
+	for i := 0; i < 4; i++ {
+		if err := m.Run(out); err != nil {
+			return 0, err
+		}
+	}
+	best := time.Hour
+	for try := 0; try < 5; try++ {
+		const times = 32
+		start := time.Now()
+		for i := 0; i < times; i++ {
+			if err := m.Run(out); err != nil {
+				return 0, err
+			}
+		}
+		if e := time.Since(start) / times; e < best {
+			best = e
+		}
+	}
+	return best, nil
+}
