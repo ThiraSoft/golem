@@ -17,7 +17,6 @@ package stt
 import (
 	"context"
 	"fmt"
-	"math"
 	"os"
 	"sync"
 	"syscall"
@@ -28,9 +27,13 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 )
 
-// concurrentSeconds is how much audio each stream carries. Long enough that
-// the six frames of priming silence Stream writes are noise in the total.
-const concurrentSeconds = 8
+// concurrentSeconds is how much audio each stream carries, and it is past the
+// window on purpose. Attention walks the visible past, so a stream that has
+// been open eight seconds attends a hundred positions and one that has been
+// open a minute attends the whole seven hundred and fifty: a short clip
+// measures the cheap end and calls it the cost. Sixty seconds of audio reaches
+// the steady state and spends most of its frames there.
+const concurrentSeconds = 70
 
 func TestConcurrentStreams(t *testing.T) {
 	dir := os.Getenv("GOLEM_STT")
@@ -52,7 +55,7 @@ func TestConcurrentStreams(t *testing.T) {
 	audio := float64(frames) * 0.08
 
 	fmt.Printf("\n%-8s %12s %14s %14s %10s\n", "streams", "wall (s)", "x-real-time", "aggregate", "cores")
-	for _, n := range []int{1, 2, 3, 4, 6, 8} {
+	for _, n := range []int{1, 2, 3, 4} {
 		// Prime once per size so the first stream of a run does not pay for
 		// pages the previous one already touched.
 		warm := m.Stream(context.Background())
@@ -168,7 +171,7 @@ func BenchmarkLayerParts(b *testing.B) {
 		copy(q, x)
 		for i := 0; i < b.N; i++ {
 			full.Position = Context
-			_ = full.attend(q)
+			_ = full.attend(q, scratch)
 		}
 	})
 	b.Run("products-only", func(b *testing.B) {
@@ -256,99 +259,4 @@ func columns(n, width int) [][]float32 {
 		ys[i] = make([]float32, width)
 	}
 	return ys
-}
-
-// THROWAWAY — spike. attend over the heads, on the pool.
-//
-// kv.attend walks sixteen heads and seven hundred and fifty positions on one
-// thread while the other seven spin. The heads are independent — each reads its
-// own slice of K and V and writes its own slice of the output — so nothing but
-// the shared scratch buffer stands in the way of splitting them.
-func attendParallel(kv *KV, q []float32, bufs [][]float32) []float32 {
-	scale := float32(1.0 / math.Sqrt(float64(HeadDim)))
-	first := 0
-	if kv.Position+1 > Context {
-		first = kv.Position + 1 - Context
-	}
-	count := kv.Position + 1 - first
-	out := make([]float32, DModel)
-
-	nn.InParallel(NumHeads, NumHeads*count*HeadDim*2, func(start, end int) {
-		buffer := bufs[start%len(bufs)][:count]
-		for h := start; h < end; h++ {
-			qh := q[h*HeadDim : (h+1)*HeadDim]
-			for p := first; p <= kv.Position; p++ {
-				slot := p % Context
-				kp := kv.K[(slot*NumHeads+h)*HeadDim : (slot*NumHeads+h+1)*HeadDim]
-				buffer[p-first] = nn.DotF32(qh, kp) * scale
-			}
-			nn.SoftmaxInPlace(buffer)
-			oh := out[h*HeadDim : (h+1)*HeadDim]
-			for p := first; p <= kv.Position; p++ {
-				slot := p % Context
-				vp := kv.V[(slot*NumHeads+h)*HeadDim : (slot*NumHeads+h+1)*HeadDim]
-				nn.AxpyFull(oh, vp, buffer[p-first])
-			}
-		}
-	})
-	return out
-}
-
-func BenchmarkAttendParallel(b *testing.B) {
-	full := &KV{
-		K:        make([]float32, Context*NumHeads*HeadDim),
-		V:        make([]float32, Context*NumHeads*HeadDim),
-		Position: Context,
-	}
-	for i := range full.K {
-		full.K[i] = float32(i%31) * 0.003
-		full.V[i] = float32(i%29) * 0.004
-	}
-	q := make([]float32, DModel)
-	fill(q)
-	bufs := make([][]float32, NumHeads)
-	for i := range bufs {
-		bufs[i] = make([]float32, Context)
-	}
-
-	b.Run("serial", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			full.Position = Context
-			_ = full.attend(q)
-		}
-	})
-	b.Run("parallel", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			full.Position = Context
-			_ = attendParallel(full, q, bufs)
-		}
-	})
-}
-
-// The parallel attention has to agree with the serial one, or its speed means
-// nothing.
-func TestAttendParallelMatches(t *testing.T) {
-	kv := &KV{
-		K:        make([]float32, Context*NumHeads*HeadDim),
-		V:        make([]float32, Context*NumHeads*HeadDim),
-		Position: Context,
-	}
-	for i := range kv.K {
-		kv.K[i] = float32(i%31) * 0.003
-		kv.V[i] = float32(i%29) * 0.004
-	}
-	q := make([]float32, DModel)
-	fill(q)
-	bufs := make([][]float32, NumHeads)
-	for i := range bufs {
-		bufs[i] = make([]float32, Context)
-	}
-	want := kv.attend(q)
-	kv.Position = Context
-	got := attendParallel(kv, q, bufs)
-	for i := range want {
-		if d := want[i] - got[i]; d > 1e-6 || d < -1e-6 {
-			t.Fatalf("head %d element %d: serial %g, parallel %g", i/HeadDim, i%HeadDim, want[i], got[i])
-		}
-	}
 }

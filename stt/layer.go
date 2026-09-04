@@ -48,18 +48,29 @@ type Scratch struct {
 	out  []float32
 	gate []float32
 	ff   []float32
+	attn []float32 // where attend writes: NumHeads x HeadDim
+	// scores is one buffer of Context per head, and not one shared buffer,
+	// because the heads are attended in parallel: two heads sharing the row of
+	// scores they softmax would each read what the other wrote.
+	scores [][]float32
 }
 
 func NewScratch() *Scratch {
-	return &Scratch{
-		wide: nn.NewBatch(DModel, 1),
-		deep: nn.NewBatch(DimFF, 1),
-		h:    make([]float32, DModel),
-		qkv:  make([]float32, 3*DModel),
-		out:  make([]float32, DModel),
-		gate: make([]float32, 2*DimFF),
-		ff:   make([]float32, DModel),
+	s := &Scratch{
+		wide:   nn.NewBatch(DModel, 1),
+		deep:   nn.NewBatch(DimFF, 1),
+		h:      make([]float32, DModel),
+		qkv:    make([]float32, 3*DModel),
+		out:    make([]float32, DModel),
+		gate:   make([]float32, 2*DimFF),
+		ff:     make([]float32, DModel),
+		attn:   make([]float32, DModel),
+		scores: make([][]float32, NumHeads),
 	}
+	for i := range s.scores {
+		s.scores[i] = make([]float32, Context)
+	}
+	return s
 }
 
 // product computes y = W*x through whichever kernel the matrix's format asks
@@ -98,31 +109,46 @@ func (kv *KV) write(k, v []float32) {
 	copy(kv.V[base:base+DModel], v)
 }
 
-func (kv *KV) attend(q []float32) []float32 {
+// attend is the softmax over the visible past, one head at a time and the heads
+// on the pool.
+//
+// The heads are independent — each reads its own slice of K and V and writes
+// its own slice of the answer — and there are sixteen of them over a window of
+// seven hundred and fifty positions, which is enough work to be worth splitting
+// and was not being split: this walked one thread while the other seven spun,
+// and at a full window it was forty-three per cent of what a block costs. The
+// buffers come from the scratch the stream owns, so a second stream attending
+// at the same time writes into its own.
+func (kv *KV) attend(q []float32, s *Scratch) []float32 {
 	scale := float32(1.0 / math.Sqrt(float64(HeadDim)))
 	first := 0
 	if kv.Position+1 > Context {
 		first = kv.Position + 1 - Context
 	}
 	count := kv.Position + 1 - first
-	out := make([]float32, DModel)
-	buffer := make([]float32, count)
+	out := s.attn
+	clear(out)
 
-	for h := 0; h < NumHeads; h++ {
-		qh := q[h*HeadDim : (h+1)*HeadDim]
-		for p := first; p <= kv.Position; p++ {
-			slot := p % Context
-			kp := kv.K[(slot*NumHeads+h)*HeadDim : (slot*NumHeads+h+1)*HeadDim]
-			buffer[p-first] = nn.DotF32(qh, kp) * scale
+	// Two dot products of HeadDim per position per head: what the split has to
+	// be worth is measured on the work, not on the head count.
+	nn.InParallel(NumHeads, NumHeads*count*HeadDim*2, func(start, end int) {
+		for h := start; h < end; h++ {
+			buffer := s.scores[h][:count]
+			qh := q[h*HeadDim : (h+1)*HeadDim]
+			for p := first; p <= kv.Position; p++ {
+				slot := p % Context
+				kp := kv.K[(slot*NumHeads+h)*HeadDim : (slot*NumHeads+h+1)*HeadDim]
+				buffer[p-first] = nn.DotF32(qh, kp) * scale
+			}
+			nn.SoftmaxInPlace(buffer)
+			oh := out[h*HeadDim : (h+1)*HeadDim]
+			for p := first; p <= kv.Position; p++ {
+				slot := p % Context
+				vp := kv.V[(slot*NumHeads+h)*HeadDim : (slot*NumHeads+h+1)*HeadDim]
+				nn.AxpyFull(oh, vp, buffer[p-first])
+			}
 		}
-		nn.SoftmaxInPlace(buffer)
-		oh := out[h*HeadDim : (h+1)*HeadDim]
-		for p := first; p <= kv.Position; p++ {
-			slot := p % Context
-			vp := kv.V[(slot*NumHeads+h)*HeadDim : (slot*NumHeads+h+1)*HeadDim]
-			nn.AxpyFull(oh, vp, buffer[p-first])
-		}
-	}
+	})
 	return out
 }
 
@@ -141,7 +167,7 @@ func (l *Layer) Step(x []float32, kv *KV, s *Scratch) {
 	}
 	kv.write(k, v)
 
-	attn := kv.attend(q) // NumHeads x HeadDim, softmax over the visible past
+	attn := kv.attend(q, s) // NumHeads x HeadDim, softmax over the visible past
 	out := s.out
 	product(l.OutProj, s.wide, attn, out)
 	for i := range x {
