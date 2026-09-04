@@ -191,6 +191,10 @@ func (m Matrix) rows(b *Batch, ys [][]float32, start, end int) {
 		}
 		matVecQ6_KRows(m.Data, b, m.Cols, ys, start, end)
 	case Q8_0:
+		// Reads the batch's Q8_0 form, as Q4_0 does, and not its floats: the
+		// product is in integers. A caller that hands over a batch it never
+		// quantized gets zeros, which is the same contract every other
+		// quantized format here has always had.
 		matVecQ8_0Rows(m.Data, b, m.Cols, ys, start, end)
 	case T3G, T4G, T5G:
 		matVecT4GRows(m.Data, b, m.Cols, m.Quant, ys, start, end)
@@ -321,6 +325,20 @@ func dequantizeQ4_0Row(w []byte, n int, out []float32) {
 			byteValue := nibbles[j]
 			dst[j] = float32(int32(byteValue&0x0F)-8) * scale
 			dst[j+16] = float32(int32(byteValue>>4)-8) * scale
+		}
+	}
+}
+
+// matMatF32Rows is matVecF32Rows for several activations at once. The row is
+// the outer loop so that it is read once for the whole batch and stays in the
+// first-level cache while every column meets it — the same bargain
+// MatMatBF16Rows makes, without the conversion, because there is none to make.
+func matMatF32Rows(w []byte, x []float32, outputs, inputs, batch int, y []float32, start, end int) {
+	weights := unsafe.Slice((*float32)(unsafe.Pointer(&w[0])), len(w)/4)
+	for o := start; o < end; o++ {
+		row := weights[o*inputs : (o+1)*inputs]
+		for k := 0; k < batch; k++ {
+			y[k*outputs+o] = DotF32(row, x[k*inputs:(k+1)*inputs])
 		}
 	}
 }
