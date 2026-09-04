@@ -34,7 +34,8 @@ type Server struct {
 	// tower has already made of the pictures it was sent.
 	vision engine.Media
 	images *imageCache
-	stt    *stt.Model
+	stt      *stt.Model
+	sttGroup *stt.Group
 }
 
 func NewServer(pool *Pool, v Vocabulary, name string, tpl chat.Template, defaults sample.Params) *Server {
@@ -47,6 +48,12 @@ func (s *Server) SetVision(v engine.Media) { s.vision = v }
 
 // SetSTT lets this server answer speech-to-text transcriptions.
 func (s *Server) SetSTT(m *stt.Model) { s.stt = m }
+
+// SetSTTGroup makes those transcriptions share one pass: the streams of the
+// group are stepped together, so the trunk's weights are read once for all of
+// them rather than once each. Without it every request runs on its own, which
+// is right for a server that carries one.
+func (s *Server) SetSTTGroup(g *stt.Group) { s.sttGroup = g }
 
 // look runs the tower over every picture the conversation carries, in the
 // order the turns carry them, which is the order the markers appear in the

@@ -13,6 +13,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"math/rand/v2"
@@ -39,6 +40,7 @@ func main() {
 	parallel := flag.Int("parallel", 1, "conversations to keep at once; the context is cut into that many slots, each holding its own")
 	ttl := flag.Duration("cache-ttl", 0, "forget a conversation's tokens after this long idle; 0 never forgets. The memory is allocated at startup and is released by neither")
 	vulkan := flag.Bool("vulkan", false, "put the logit head and the expert stacks on a Vulkan device")
+	sttStreams := flag.Int("stt-parallel", 1, "transcriptions to carry at once; they are stepped together, so the trunk's weights are read once for all of them")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [options]\n", filepath.Base(os.Args[0]))
 		flag.PrintDefaults()
@@ -53,7 +55,7 @@ func main() {
 	// to own, and building them around a model that was never opened would only
 	// be a longer way of writing nil.
 	if *model == "" {
-		serveTranscriptionsOnly(*sttDir, *addr)
+		serveTranscriptionsOnly(*sttDir, *addr, *sttStreams)
 		return
 	}
 	start := time.Now()
@@ -170,7 +172,7 @@ func main() {
 // serveTranscriptionsOnly runs a server carrying an STT and nothing else.
 // Server.Handler registers the conversation route only when there is a pool,
 // so what this listens on is /v1/models and /v1/audio/transcriptions.
-func serveTranscriptionsOnly(dir, addr string) {
+func serveTranscriptionsOnly(dir, addr string, streams int) {
 	start := time.Now()
 	opts, err := stt.Locate(dir)
 	if err != nil {
@@ -185,6 +187,11 @@ func serveTranscriptionsOnly(dir, addr string) {
 	name := filepath.Base(filepath.Clean(dir))
 	server := NewServer(nil, nil, name, nil, sample.Params{})
 	server.SetSTT(model)
+	if streams > 1 {
+		group := model.Group(context.Background(), streams)
+		defer group.Close()
+		server.SetSTTGroup(group)
+	}
 
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -192,7 +199,11 @@ func serveTranscriptionsOnly(dir, addr string) {
 	}
 	fmt.Fprintf(os.Stderr, "%s: speech to text, trunk in %s, loaded in %s on %d cores\n",
 		name, model.Quant(), time.Since(start).Round(time.Millisecond), runtime.NumCPU())
-	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 — transcriptions only, one at a time\n", listener.Addr())
+	carrying := "one at a time"
+	if streams > 1 {
+		carrying = fmt.Sprintf("%d at a time, stepped together", streams)
+	}
+	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 — transcriptions only, %s\n", listener.Addr(), carrying)
 	if err := http.Serve(listener, logging(os.Stderr, server.Handler())); err != nil {
 		fail(err)
 	}

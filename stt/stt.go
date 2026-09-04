@@ -157,6 +157,7 @@ type Live struct {
 	frameCount int
 	pending    []float32
 	scratch    *Scratch
+	group      *Group // nil when this stream steps alone
 	textCh     chan Segment
 	closed     bool
 	mu         sync.Mutex
@@ -166,12 +167,19 @@ type Live struct {
 // 24 kHz mono; Text yields segments as they are decided and closes when Close
 // has been called and the tail has been flushed.
 func (m *Model) Stream(ctx context.Context) *Live {
+	return m.newLive(ctx, nil)
+}
+
+// newLive builds one stream and primes it. When g is not nil the stream hands
+// its frames to that group instead of stepping them itself.
+func (m *Model) newLive(ctx context.Context, g *Group) *Live {
 	l := &Live{
 		m:         m,
 		ctx:       ctx,
 		state:     m.encoder.NewState(),
 		kv:        NewKV(),
 		scratch:   NewScratch(),
+		group:     g,
 		prevToken: TextCard, // 8000: start of sequence
 		textCh:    make(chan Segment, 64),
 	}
@@ -199,75 +207,95 @@ func (l *Live) writeSamples(samples []float32) {
 	for len(l.pending) >= mimi.SamplesPerFrame {
 		chunk := l.pending[:mimi.SamplesPerFrame]
 		l.pending = l.pending[mimi.SamplesPerFrame:]
+		if l.group != nil {
+			l.group.submit(l, chunk)
+			continue
+		}
 		l.stepFrame(chunk)
 	}
 }
 
 func (l *Live) stepFrame(chunk []float32) {
+	x := make([]float32, DModel)
+	logits := make([]float32, TextCard)
+	for _, codes := range l.codesFor(chunk) {
+		l.embed(codes, x)
+		for layerIdx, layer := range l.m.weights.Layers {
+			layer.Step(x, l.kv[layerIdx], l.scratch)
+		}
+		nn.RMSNormPlain(x, l.m.weights.OutNorm, NormEps)
+		product(l.m.weights.Head, l.scratch.wide, x, logits)
+		l.emit(logits)
+	}
+}
+
+// codesFor runs the codec over one frame of sound and returns the codes of
+// every latent it produced — usually one, and none while the encoder is still
+// filling its first window.
+//
+// It is separate from embed because it depends on nothing the trunk decides,
+// which is what lets a group run the codec of several streams before stepping
+// any of them. embed cannot be hoisted the same way: the activation carries the
+// token the previous position produced.
+func (l *Live) codesFor(chunk []float32) [][]int {
 	latents, n := l.m.encoder.Push(chunk, l.state)
 	if n == 0 {
-		return
+		return nil
 	}
 	latent := make([]float32, mimi.STTConfig.LatentDim)
-	codes := make([]int, l.m.quantizer.Codebooks)
-	logits := make([]float32, TextCard)
-
+	out := make([][]int, n)
 	for f := 0; f < n; f++ {
 		for c := 0; c < mimi.STTConfig.LatentDim; c++ {
 			latent[c] = latents[c*n+f]
 		}
+		codes := make([]int, l.m.quantizer.Codebooks)
 		l.m.quantizer.Encode(latent, codes)
+		out[f] = codes
+	}
+	return out
+}
 
-		x := make([]float32, DModel)
-		// Sum audio embeddings
-		for q := 0; q < Codebooks; q++ {
-			c := codes[q]
-			base := c * DModel * 2
-			for j := 0; j < DModel; j++ {
-				bits := uint32(binary.LittleEndian.Uint16(l.m.weights.Audio[q][base+j*2:])) << 16
-				x[j] += math.Float32frombits(bits)
-			}
-		}
-
-		// Add previous text token embedding
-		textBase := l.prevToken * DModel * 2
+// embed builds the activation of one position: the thirty-two audio codebooks
+// summed, plus the embedding of the token the previous position decided.
+func (l *Live) embed(codes []int, x []float32) {
+	clear(x)
+	for q := 0; q < Codebooks; q++ {
+		c := codes[q]
+		base := c * DModel * 2
 		for j := 0; j < DModel; j++ {
-			bits := uint32(binary.LittleEndian.Uint16(l.m.weights.Text[textBase+j*2:])) << 16
+			bits := uint32(binary.LittleEndian.Uint16(l.m.weights.Audio[q][base+j*2:])) << 16
 			x[j] += math.Float32frombits(bits)
 		}
-
-		// Trunk transformer layers
-		for layerIdx, layer := range l.m.weights.Layers {
-			layer.Step(x, l.kv[layerIdx], l.scratch)
-		}
-
-		// Out norm and head
-		nn.RMSNormPlain(x, l.m.weights.OutNorm, NormEps)
-		product(l.m.weights.Head, l.scratch.wide, x, logits)
-
-		// Argmax over TextCard
-		bestTok, bestVal := 0, logits[0]
-		for tok := 1; tok < TextCard; tok++ {
-			if logits[tok] > bestVal {
-				bestVal = logits[tok]
-				bestTok = tok
-			}
-		}
-
-		l.prevToken = bestTok
-		if bestTok > TextPadID {
-			text := l.m.decodePiece(bestTok)
-			if text != "" {
-				frameIdx := l.frameCount - AudioDelayFrames
-				select {
-				case l.textCh <- Segment{Text: text, Frame: frameIdx}:
-				case <-l.ctx.Done():
-					return
-				}
-			}
-		}
-		l.frameCount++
 	}
+	textBase := l.prevToken * DModel * 2
+	for j := 0; j < DModel; j++ {
+		bits := uint32(binary.LittleEndian.Uint16(l.m.weights.Text[textBase+j*2:])) << 16
+		x[j] += math.Float32frombits(bits)
+	}
+}
+
+// emit takes the argmax of one position, remembers it for the next embedding,
+// and sends whatever text it names.
+func (l *Live) emit(logits []float32) {
+	bestTok, bestVal := 0, logits[0]
+	for tok := 1; tok < TextCard; tok++ {
+		if logits[tok] > bestVal {
+			bestVal = logits[tok]
+			bestTok = tok
+		}
+	}
+	l.prevToken = bestTok
+	if bestTok > TextPadID {
+		if text := l.m.decodePiece(bestTok); text != "" {
+			frameIdx := l.frameCount - AudioDelayFrames
+			select {
+			case l.textCh <- Segment{Text: text, Frame: frameIdx}:
+			case <-l.ctx.Done():
+				return
+			}
+		}
+	}
+	l.frameCount++
 }
 
 func (l *Live) Close() error {
@@ -288,6 +316,11 @@ func (l *Live) Close() error {
 	tail := make([]float32, AudioDelayFrames*mimi.SamplesPerFrame)
 	l.writeSamples(tail)
 
+	// The group must stop waiting for a stream that will send nothing more, or
+	// the streams still open would spend the gathering window on it every frame.
+	if l.group != nil {
+		l.group.leave()
+	}
 	close(l.textCh)
 	return nil
 }
@@ -325,14 +358,20 @@ func byteValue(s string) (byte, bool) {
 // TranscribeStream decodes a sound file — WAV, MP3 or FLAC, any rate, any channel
 // count — and calls back with each segment as it is decided.
 func (m *Model) TranscribeStream(ctx context.Context, file []byte, each func(Segment)) error {
+	return runStream(ctx, m.Stream(ctx), file, each)
+}
+
+// runStream feeds one decoded file to one stream and drains what it says. It is
+// shared by the lone path and the group's, which differ only in where the
+// stream came from.
+func runStream(ctx context.Context, live *Live, file []byte, each func(Segment)) error {
 	samples, rate, channels, err := decode.Decode(bytes.NewReader(file))
 	if err != nil {
+		live.Close()
 		return err
 	}
-	mono := resample.Mono(samples, channels)
-	resampled := resample.To(mono, rate, SampleRate)
+	resampled := resample.To(resample.Mono(samples, channels), rate, SampleRate)
 
-	live := m.Stream(ctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

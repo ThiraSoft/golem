@@ -54,35 +54,52 @@ func TestConcurrentStreams(t *testing.T) {
 	frames := concurrentSeconds * 1000 / 80
 	audio := float64(frames) * 0.08
 
-	fmt.Printf("\n%-8s %12s %14s %14s %10s\n", "streams", "wall (s)", "x-real-time", "aggregate", "cores")
-	for _, n := range []int{1, 2, 3, 4} {
-		// Prime once per size so the first stream of a run does not pay for
-		// pages the previous one already touched.
-		warm := m.Stream(context.Background())
-		go drain(warm)
-		warm.Write(make([]float32, mimi.SamplesPerFrame))
-		warm.Close()
-
-		var wg sync.WaitGroup
-		before := cpuSeconds()
-		start := time.Now()
-		for i := 0; i < n; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				live := m.Stream(context.Background())
-				go drain(live)
-				frame := make([]float32, mimi.SamplesPerFrame)
-				for f := 0; f < frames; f++ {
-					live.Write(frame)
-				}
-				live.Close()
-			}()
+	fmt.Printf("\n%-10s %-8s %10s %13s %12s %8s\n",
+		"mode", "streams", "wall (s)", "x-real-time", "aggregate", "cores")
+	for _, grouped := range []bool{false, true} {
+		mode := "separate"
+		if grouped {
+			mode = "grouped"
 		}
-		wg.Wait()
-		wall := time.Since(start).Seconds()
-		cores := (cpuSeconds() - before) / wall
-		fmt.Printf("%-8d %12.2f %14.2f %14.2f %10.2f\n", n, wall, audio/wall, float64(n)*audio/wall, cores)
+		for _, n := range []int{1, 2, 3, 4} {
+			var g *Group
+			open := func() *Live { return m.Stream(context.Background()) }
+			if grouped {
+				g = m.Group(context.Background(), n)
+				open = func() *Live {
+					live, err := g.Stream()
+					if err != nil {
+						t.Fatal(err)
+					}
+					return live
+				}
+			}
+
+			var wg sync.WaitGroup
+			before := cpuSeconds()
+			start := time.Now()
+			for i := 0; i < n; i++ {
+				live := open()
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					go drain(live)
+					frame := make([]float32, mimi.SamplesPerFrame)
+					for f := 0; f < frames; f++ {
+						live.Write(frame)
+					}
+					live.Close()
+				}()
+			}
+			wg.Wait()
+			wall := time.Since(start).Seconds()
+			cores := (cpuSeconds() - before) / wall
+			if g != nil {
+				g.Close()
+			}
+			fmt.Printf("%-10s %-8d %10.2f %13.2f %12.2f %8.2f\n",
+				mode, n, wall, audio/wall, float64(n)*audio/wall, cores)
+		}
 	}
 	fmt.Println()
 }

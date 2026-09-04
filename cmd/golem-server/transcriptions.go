@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +11,22 @@ import (
 
 	"github.com/ThiraSoft/golem/stt"
 )
+
+// transcribe and transcribeStream take the group when the server was given one,
+// and the model alone when it was not.
+func (s *Server) transcribe(raw []byte) (string, error) {
+	if s.sttGroup == nil {
+		return s.stt.Transcribe(raw)
+	}
+	return s.sttGroup.Transcribe(raw)
+}
+
+func (s *Server) transcribeStream(ctx context.Context, raw []byte, each func(stt.Segment)) error {
+	if s.sttGroup == nil {
+		return s.stt.TranscribeStream(ctx, raw, each)
+	}
+	return s.sttGroup.TranscribeStream(ctx, raw, each)
+}
 
 // POST /v1/audio/transcriptions — OpenAI-compatible endpoint.
 // Reads multipart form with fields: file, model, response_format, stream.
@@ -30,8 +48,12 @@ func (s *Server) transcriptions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.FormValue("stream") != "true" {
-		text, err := s.stt.Transcribe(raw)
+		text, err := s.transcribe(raw)
 		if err != nil {
+			if errors.Is(err, stt.ErrGroupFull) {
+				refuse(w, http.StatusTooManyRequests, "rate_limit_error", err.Error())
+				return
+			}
 			refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
@@ -52,7 +74,7 @@ func (s *Server) transcriptions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var whole strings.Builder
-	err = s.stt.TranscribeStream(r.Context(), raw, func(seg stt.Segment) {
+	err = s.transcribeStream(r.Context(), raw, func(seg stt.Segment) {
 		whole.WriteString(seg.Text)
 		send(map[string]any{"type": "transcript.text.delta", "delta": seg.Text})
 	})
