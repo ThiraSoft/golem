@@ -158,6 +158,12 @@ type Live struct {
 	pending    []float32
 	scratch    *Scratch
 	group      *Group // nil when this stream steps alone
+	// cancel ends this stream alone, and left gives its slot back exactly
+	// once however it ends — closed by its caller, cancelled by the caller's
+	// context, or evicted for not reading what it asked for.
+	cancel    context.CancelFunc
+	stopWatch func() bool
+	left      sync.Once
 	textCh     chan Segment
 	closed     bool
 	mu         sync.Mutex
@@ -167,13 +173,17 @@ type Live struct {
 // 24 kHz mono; Text yields segments as they are decided and closes when Close
 // has been called and the tail has been flushed.
 func (m *Model) Stream(ctx context.Context) *Live {
-	return m.newLive(ctx, nil)
+	l := m.newLive(ctx, nil)
+	l.prime()
+	return l
 }
 
-// newLive builds one stream and primes it. When g is not nil the stream hands
-// its frames to that group instead of stepping them itself.
+// newLive builds one stream. When g is not nil the stream hands its frames to
+// that group instead of stepping them itself. The caller primes it, so that a
+// group can finish wiring the stream's ending before half a second of silence
+// goes through the shared pass.
 func (m *Model) newLive(ctx context.Context, g *Group) *Live {
-	l := &Live{
+	return &Live{
 		m:         m,
 		ctx:       ctx,
 		state:     m.encoder.NewState(),
@@ -183,10 +193,13 @@ func (m *Model) newLive(ctx context.Context, g *Group) *Live {
 		prevToken: TextCard, // 8000: start of sequence
 		textCh:    make(chan Segment, 64),
 	}
-	// Write 0.5 s (6 frames) of silence as required by stt_config.audio_delay_seconds.
+}
+
+// prime writes the half second of silence stt_config.audio_delay_seconds asks
+// for before anything real is fed.
+func (l *Live) prime() {
 	silence := make([]float32, AudioDelayFrames*mimi.SamplesPerFrame)
 	l.writeSamples(silence)
-	return l
 }
 
 func (l *Live) Text() <-chan Segment {
@@ -274,6 +287,54 @@ func (l *Live) embed(codes []int, x []float32) {
 	}
 }
 
+// send hands one segment to whoever is reading, and decides what to do when
+// nobody is.
+//
+// A stream that steps alone may wait: the only clock it holds up is its own.
+// A stream in a group may not — the pass that produced this segment is
+// carrying every other stream of the group, and blocking it on one reader
+// stops all of them. The buffer is sixty-four segments, which at twelve and a
+// half frames a second is about five seconds of speech; a reader that far
+// behind is gone rather than slow, so the stream is ended instead of waited
+// for, and its caller sees a transcript that stops.
+func (l *Live) send(seg Segment) {
+	if l.group == nil {
+		select {
+		case l.textCh <- seg:
+		case <-l.ctx.Done():
+		}
+		return
+	}
+	select {
+	case l.textCh <- seg:
+	case <-l.ctx.Done():
+	default:
+		l.evict()
+	}
+}
+
+// evict ends this stream because nothing is reading it. The group stops
+// gathering it at once; the caller still has to close it.
+func (l *Live) evict() {
+	if l.cancel != nil {
+		l.cancel()
+	}
+	l.release()
+}
+
+// release gives the group's slot back, once, however the stream ended.
+func (l *Live) release() {
+	if l.group == nil {
+		return
+	}
+	l.left.Do(func() {
+		if l.stopWatch != nil {
+			l.stopWatch()
+		}
+		l.group.leave()
+	})
+}
+
 // emit takes the argmax of one position, remembers it for the next embedding,
 // and sends whatever text it names.
 func (l *Live) emit(logits []float32) {
@@ -287,12 +348,7 @@ func (l *Live) emit(logits []float32) {
 	l.prevToken = bestTok
 	if bestTok > TextPadID {
 		if text := l.m.decodePiece(bestTok); text != "" {
-			frameIdx := l.frameCount - AudioDelayFrames
-			select {
-			case l.textCh <- Segment{Text: text, Frame: frameIdx}:
-			case <-l.ctx.Done():
-				return
-			}
+			l.send(Segment{Text: text, Frame: l.frameCount - AudioDelayFrames})
 		}
 	}
 	l.frameCount++
@@ -318,8 +374,9 @@ func (l *Live) Close() error {
 
 	// The group must stop waiting for a stream that will send nothing more, or
 	// the streams still open would spend the gathering window on it every frame.
-	if l.group != nil {
-		l.group.leave()
+	l.release()
+	if l.cancel != nil {
+		l.cancel()
 	}
 	close(l.textCh)
 	return nil
@@ -358,13 +415,16 @@ func byteValue(s string) (byte, bool) {
 // TranscribeStream decodes a sound file — WAV, MP3 or FLAC, any rate, any channel
 // count — and calls back with each segment as it is decided.
 func (m *Model) TranscribeStream(ctx context.Context, file []byte, each func(Segment)) error {
-	return runStream(ctx, m.Stream(ctx), file, each)
+	return runStream(m.Stream(ctx), file, each)
 }
 
 // runStream feeds one decoded file to one stream and drains what it says. It is
 // shared by the lone path and the group's, which differ only in where the
-// stream came from.
-func runStream(ctx context.Context, live *Live, file []byte, each func(Segment)) error {
+// stream came from. The context is not taken here on purpose: it is the stream
+// that has to carry it — Model.Stream and Group.Stream each build the stream
+// around the caller's context — and a second copy of it in this function would
+// be one that stops nothing.
+func runStream(live *Live, file []byte, each func(Segment)) error {
 	samples, rate, channels, err := decode.Decode(bytes.NewReader(file))
 	if err != nil {
 		live.Close()

@@ -3,10 +3,12 @@ package stt
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ThiraSoft/golem/audio/decode"
 	"github.com/ThiraSoft/golem/audio/resample"
@@ -98,7 +100,7 @@ func TestGroupTranscriptMatchesAlone(t *testing.T) {
 	got := make([]string, n)
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
-		live, err := g.Stream()
+		live, err := g.Stream(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -135,12 +137,12 @@ func TestGroupRefusesPastItsSize(t *testing.T) {
 	g := m.Group(context.Background(), 1)
 	defer g.Close()
 
-	first, err := g.Stream()
+	first, err := g.Stream(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.Close()
-	if _, err := g.Stream(); err == nil {
+	if _, err := g.Stream(context.Background()); err == nil {
 		t.Fatal("a group of one opened a second stream")
 	}
 }
@@ -206,4 +208,74 @@ func transcribeAlone(t *testing.T, m *Model, clip []float32) string {
 	live.Close()
 	<-done
 	return strings.TrimSpace(text.String())
+}
+
+// TestGroupEvictsAStreamNobodyReads is the one that stops a bad client from
+// stopping the good ones.
+//
+// A segment is handed to the stream's reader from inside the group's pass, and
+// that pass is carrying every other stream. So a reader that has stopped must
+// end its own stream rather than hold the pass: this fills the buffer, sends
+// one more, and asks that the send returned and the stream is over.
+func TestGroupEvictsAStreamNobodyReads(t *testing.T) {
+	m := testModel(t)
+	g := m.Group(context.Background(), 2)
+	defer g.Close()
+
+	live, err := g.Stream(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+
+	for i := 0; i < cap(live.textCh); i++ {
+		live.textCh <- Segment{Text: "x"}
+	}
+
+	sent := make(chan struct{})
+	go func() {
+		defer close(sent)
+		live.send(Segment{Text: "one too many"})
+	}()
+	select {
+	case <-sent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("send blocked on a reader that had stopped")
+	}
+	select {
+	case <-live.ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stream was not ended")
+	}
+}
+
+// TestGroupReleasesSlotOnCancel checks that a caller who walks away without
+// closing gives the slot back anyway: a group that kept counting it would make
+// every remaining stream pay the gathering window on every frame, for ever.
+func TestGroupReleasesSlotOnCancel(t *testing.T) {
+	m := testModel(t)
+	g := m.Group(context.Background(), 1)
+	defer g.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if _, err := g.Stream(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Stream(context.Background()); !errors.Is(err, ErrGroupFull) {
+		t.Fatalf("a group of one opened a second stream: %v", err)
+	}
+	cancel()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		second, err := g.Stream(context.Background())
+		if err == nil {
+			second.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the slot was never given back: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

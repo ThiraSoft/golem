@@ -35,10 +35,16 @@ import (
 // the steady state and spends most of its frames there.
 const concurrentSeconds = 70
 
+// TestConcurrentStreams is a capacity bench and not a test: it carries seventy
+// seconds of audio an arm through eight configurations and takes ten minutes,
+// which has no business in `go test ./stt/`. It runs when asked for by name.
 func TestConcurrentStreams(t *testing.T) {
 	dir := os.Getenv("GOLEM_STT")
 	if dir == "" {
 		t.Skip("GOLEM_STT not set")
+	}
+	if os.Getenv("GOLEM_STT_CAPACITY") == "" {
+		t.Skip("GOLEM_STT_CAPACITY not set: this is a ten-minute capacity bench")
 	}
 	o, err := Locate(dir)
 	if err != nil {
@@ -67,7 +73,7 @@ func TestConcurrentStreams(t *testing.T) {
 			if grouped {
 				g = m.Group(context.Background(), n)
 				open = func() *Live {
-					live, err := g.Stream()
+					live, err := g.Stream(context.Background())
 					if err != nil {
 						t.Fatal(err)
 					}

@@ -14,11 +14,11 @@ import (
 
 // transcribe and transcribeStream take the group when the server was given one,
 // and the model alone when it was not.
-func (s *Server) transcribe(raw []byte) (string, error) {
+func (s *Server) transcribe(ctx context.Context, raw []byte) (string, error) {
 	if s.sttGroup == nil {
 		return s.stt.Transcribe(raw)
 	}
-	return s.sttGroup.Transcribe(raw)
+	return s.sttGroup.Transcribe(ctx, raw)
 }
 
 func (s *Server) transcribeStream(ctx context.Context, raw []byte, each func(stt.Segment)) error {
@@ -48,7 +48,7 @@ func (s *Server) transcriptions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.FormValue("stream") != "true" {
-		text, err := s.transcribe(raw)
+		text, err := s.transcribe(r.Context(), raw)
 		if err != nil {
 			if errors.Is(err, stt.ErrGroupFull) {
 				refuse(w, http.StatusTooManyRequests, "rate_limit_error", err.Error())

@@ -134,6 +134,10 @@ func main() {
 		}
 		defer sttModel.Close()
 		server.SetSTT(sttModel)
+		if group := sttGroupFor(sttModel, *sttStreams); group != nil {
+			defer group.Close()
+			server.SetSTTGroup(group)
+		}
 	}
 
 	head := vulkanLine(m.Vulkan())
@@ -169,6 +173,19 @@ func main() {
 	}
 }
 
+// sttGroupFor is the group that carries more than one transcription at once, or
+// nil for a server carrying one: a group of one is a gathering window and a
+// goroutine around a stream that would step alone anyway.
+//
+// It is a function and not four lines in main because main names a flag
+// `context`, which hides the package of the same name for the rest of it.
+func sttGroupFor(m *stt.Model, streams int) *stt.Group {
+	if streams <= 1 {
+		return nil
+	}
+	return m.Group(context.Background(), streams)
+}
+
 // serveTranscriptionsOnly runs a server carrying an STT and nothing else.
 // Server.Handler registers the conversation route only when there is a pool,
 // so what this listens on is /v1/models and /v1/audio/transcriptions.
@@ -187,8 +204,7 @@ func serveTranscriptionsOnly(dir, addr string, streams int) {
 	name := filepath.Base(filepath.Clean(dir))
 	server := NewServer(nil, nil, name, nil, sample.Params{})
 	server.SetSTT(model)
-	if streams > 1 {
-		group := model.Group(context.Background(), streams)
+	if group := sttGroupFor(model, streams); group != nil {
 		defer group.Close()
 		server.SetSTTGroup(group)
 	}

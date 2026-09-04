@@ -16,12 +16,22 @@ package vk
 
 import (
 	"fmt"
+	"os"
 	"math/rand"
 	"testing"
 	"time"
 
 	"github.com/ThiraSoft/golem/nn"
 )
+
+// spikeOnly keeps these out of an ordinary run. They measure and print; they
+// assert nothing and cannot fail, so a suite that runs them only spends a
+// card's time to learn nothing it did not already record.
+func spikeOnly(t *testing.T) {
+	if os.Getenv("GOLEM_VK_SPIKE") == "" {
+		t.Skip("GOLEM_VK_SPIKE not set: these measure, they do not check")
+	}
+}
 
 // The trunk of stt/layer.go: sixteen blocks of these four products.
 var sttShapes = []struct {
@@ -40,6 +50,7 @@ const sttLayers = 16
 const frameBudget = 80 * time.Millisecond
 
 func TestSTTSpike(t *testing.T) {
+	spikeOnly(t)
 	d := open(t)
 	defer d.Close()
 
@@ -163,6 +174,7 @@ func cpuPass(t *testing.T, rows, cols, width int) time.Duration {
 //
 // Sixty-four of those a frame is the price of leaving attention where it is.
 func TestSTTRoundTrip(t *testing.T) {
+	spikeOnly(t)
 	d := open(t)
 	defer d.Close()
 

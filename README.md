@@ -544,6 +544,37 @@ the processor**, with the transcript bfloat16 gives, word for word. Q4_0 is half
 again as fast and loses six per cent of the words, which is why it is not the
 default.
 
+More than one microphone at once is `-stt-parallel`:
+
+```bash
+./golem-server -stt ~/models/stt-1b-en_fr -stt-parallel 2
+```
+
+One stream saturates that processor, and separate streams do not share
+anything: their aggregate throughput is flat from one client to eight, because
+the trunk holds fifty-four megabytes of weights a layer, nothing of that size
+stays in a cache, and each stream reads all of it again for its one column. So
+the streams of a group are stepped together and the weights are read once for
+all of them — the row the outer loop and the batch the inner one, which is what
+lets a prompt be read faster than an answer is written. Attention is not shared:
+each stream has its own cache and its own window.
+
+Seventy seconds of audio an arm, at the steady state where attention walks the
+whole window, in aggregate seconds of audio per second of wall clock:
+
+| streams | separate | grouped |
+| ------- | -------- | ------- |
+| 1       | 1.81     | 1.82    |
+| 2       | 1.82     | 2.16    |
+| 3       | 1.82     | 2.45    |
+| 4       | 1.82     | 2.55    |
+
+Two clients hold real time at ×1.08 each, where separate streams left them at
+×0.91 and falling behind; three do not, at ×0.82. The codec and the quantiser
+are what the ceiling becomes, since neither of them batches. A full group
+answers 429 rather than queueing, and `go test -run TestConcurrentStreams` with
+`GOLEM_STT_CAPACITY` set is the bench those numbers come from.
+
 ## 🔬 The Method
 
 **No layer is deemed correct until its intermediate activations match the reference implementation.**

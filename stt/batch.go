@@ -257,7 +257,7 @@ var ErrGroupFull = errors.New("stt: every stream of the group is open")
 // Stream opens one transcription inside the group. It refuses past the size the
 // group was built for, because a batch wider than its scratch has nowhere to
 // put its columns.
-func (g *Group) Stream() (*Live, error) {
+func (g *Group) Stream(ctx context.Context) (*Live, error) {
 	g.mu.Lock()
 	if g.live >= g.size {
 		g.mu.Unlock()
@@ -265,10 +265,24 @@ func (g *Group) Stream() (*Live, error) {
 	}
 	g.live++
 	g.mu.Unlock()
-	// Outside the lock: priming the stream writes half a second of silence
-	// through the group, and the pass that carries it asks how many streams
-	// are still live.
-	return g.m.newLive(g.ctx, g), nil
+
+	// The stream ends when its caller's context does, and also when the
+	// group's does. It is the caller's context that matters here: a request
+	// that goes away has to release its slot and stop being gathered, and
+	// before this the streams of a group all carried the group's context and
+	// so noticed nothing until the server itself stopped.
+	inner, cancel := context.WithCancel(ctx)
+	l := g.m.newLive(inner, g)
+	l.cancel = cancel
+	l.stopWatch = context.AfterFunc(g.ctx, cancel)
+	// A caller that abandons a stream without closing it must not cost the
+	// others the gathering window on every frame for ever.
+	context.AfterFunc(inner, l.release)
+
+	// Priming is outside the lock: it writes half a second of silence through
+	// the group, and the pass that carries it asks how many streams are live.
+	l.prime()
+	return l, nil
 }
 
 // Close stops the group's pass. The streams it opened must be closed first.
@@ -286,10 +300,11 @@ func (g *Group) leave() {
 	g.mu.Unlock()
 }
 
-// Transcribe reads a whole sound file on one of the group's streams.
-func (g *Group) Transcribe(file []byte) (string, error) {
+// Transcribe reads a whole sound file on one of the group's streams, ending it
+// with the caller's context.
+func (g *Group) Transcribe(ctx context.Context, file []byte) (string, error) {
 	var whole strings.Builder
-	if err := g.TranscribeStream(g.ctx, file, func(seg Segment) {
+	if err := g.TranscribeStream(ctx, file, func(seg Segment) {
 		whole.WriteString(seg.Text)
 	}); err != nil {
 		return "", err
@@ -302,11 +317,11 @@ func (g *Group) Transcribe(file []byte) (string, error) {
 // when the group is full rather than queueing: a caller that wants to wait can
 // wait, and one that wants to answer "busy" has something to answer with.
 func (g *Group) TranscribeStream(ctx context.Context, file []byte, each func(Segment)) error {
-	live, err := g.Stream()
+	live, err := g.Stream(ctx)
 	if err != nil {
 		return err
 	}
-	return runStream(ctx, live, file, each)
+	return runStream(live, file, each)
 }
 
 // waiting is how many streams could still send a frame for this pass. The
