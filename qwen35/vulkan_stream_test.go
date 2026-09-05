@@ -65,6 +65,7 @@ func calibTokens(n int) []int32 {
 // Every one of those is invisible in a single window and changes the answer in
 // several.
 func TestStreamedCalibrationIsWindowIndependent(t *testing.T) {
+	heavy.Skip(t, "it calibrates a twenty-seven billion parameter checkpoint on the processor")
 	m, err := Open(qwen38, 256)
 	if err != nil {
 		t.Skipf("open: %v", err)

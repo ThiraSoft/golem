@@ -6,6 +6,8 @@ import (
 	"image/color"
 	"image/png"
 	"testing"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 // A picture with something in it: a gradient with a square, so a tower that
@@ -31,6 +33,7 @@ func testPNG(t *testing.T, w, h int) []byte {
 
 // An image in, one row per output token out, each as wide as the model.
 func TestEncodeImageProducesRows(t *testing.T) {
+	heavy.Skip(t, "it runs the 27B vision tower on the processor")
 	m, err := Open(qwen38, 256)
 	if err != nil {
 		t.Skipf("open: %v", err)

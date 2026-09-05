@@ -10,7 +10,6 @@ import (
 
 	"github.com/ThiraSoft/golem/chat"
 	"github.com/ThiraSoft/golem/engine"
-	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 // The tests with weights: a conversation declaring a tool, whose answer is a
@@ -78,7 +77,6 @@ func liveToolCall(t *testing.T, path string) {
 }
 
 func TestLiveParallelSlotsVulkan(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	for _, key := range []string{"GOLEM_MODEL", "GOLEM_MODEL_QWEN"} {
 		t.Run(key, func(t *testing.T) {
 			path := os.Getenv(key)

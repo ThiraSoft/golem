@@ -479,6 +479,7 @@ func TestVulkanGolemSpeculationDrawsWhatTheModelDraws(t *testing.T) {
 // grows or collapses through the trunk looks like. This prints the size of it
 // so that the block where it leaves the rails can be named.
 func TestVulkanGolemStreamNorms(t *testing.T) {
+	heavy.Skip(t, "it streams a twenty-seven billion parameter checkpoint on the processor")
 	path := golemPath(t)
 	m, err := Open(path, 512)
 	if err != nil {

@@ -13,7 +13,6 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/tensors"
 )
@@ -60,12 +59,13 @@ func activation(width int) *nn.Batch {
 	return b
 }
 
-// open is the one door onto the card in this package's tests, and the guard
-// sits in it: every test here submits work to a device, which is heavy in the
-// sense internal/heavy means — the card runs flat out, and it gets hot.
+// open is the one door onto the card in this package's tests. A kernel test
+// submits a matrix and reads it back, which is a fraction of a second and no
+// weight to speak of: those run by default. What waits behind internal/heavy
+// in this package is the sweeps and the transfers of gigabytes, each guarded
+// where it stands.
 func open(tb testing.TB) *Device {
 	tb.Helper()
-	heavy.Skip(tb, "it puts work on the card")
 	d, err := Open()
 	if err != nil {
 		tb.Skipf("no Vulkan compute device: %v", err)

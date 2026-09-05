@@ -17,6 +17,7 @@ import (
 
 func openQuantizedStack(t *testing.T) (*fixture, *Model) {
 	t.Helper()
+	t.Helper()
 	f := loadFixture(t, "layers_q4")
 	m := openQuantized(t)
 	if err := m.UseVulkanStack(); err != nil {
@@ -61,7 +62,6 @@ func TestVulkanFullStackMatchesReference(t *testing.T) {
 // And the head, which is Q4_0 here and Q6_K on the checkpoints vk/q6k.go was
 // written for. The tolerance is the CPU test's.
 func TestVulkanLogitsMatchReference(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	f, m := openQuantizedStack(t)
 	if err := m.UseVulkanHead(); err != nil {
 		t.Skipf("no Vulkan head: %v", err)
@@ -86,7 +86,6 @@ func TestVulkanLogitsMatchReference(t *testing.T) {
 // TestVulkanHeadMatchesCPULogits is the wiring rather than the arithmetic: the
 // same hidden state through both heads, on the same model.
 func TestVulkanHeadMatchesCPULogits(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	m := openQuantized(t)
 	var hidden []float32
 	for pos := 0; pos < 8; pos++ {
@@ -112,7 +111,6 @@ func TestVulkanHeadMatchesCPULogits(t *testing.T) {
 // The reference's own continuation, drawn with every block and the head on the
 // card.
 func TestVulkanGreedyContinuationMatchesReference(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	f, m := openQuantizedStack(t)
 	if err := m.UseVulkanHead(); err != nil {
 		t.Skipf("no Vulkan head: %v", err)

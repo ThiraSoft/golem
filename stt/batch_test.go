@@ -293,7 +293,6 @@ func TestGroupReleasesSlotOnCancel(t *testing.T) {
 // scale, which a transposed column or a cache read for the wrong stream misses
 // by whole units.
 func TestVulkanBlockMatchesProcessor(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	m := testModel(t)
 	const n = 3
 	if err := m.UseVulkan(n); err != nil {
@@ -350,7 +349,6 @@ func TestVulkanBlockMatchesProcessor(t *testing.T) {
 // TestVulkanTranscriptMatchesProcessor is the whole path: a group whose trunk
 // is on the card must say what the processor says, word for word.
 func TestVulkanTranscriptMatchesProcessor(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	m := testModel(t)
 	clip := speech(t)
 	want := transcribeAlone(t, m, clip)
@@ -408,7 +406,6 @@ func TestVulkanTranscriptMatchesProcessor(t *testing.T) {
 // the wrong sound. Two groups here transcribe the same clip at the same time,
 // and both must say what the processor says.
 func TestVulkanSharedByTwoGroups(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	m := testModel(t)
 	clip := speech(t)
 	want := transcribeAlone(t, m, clip)

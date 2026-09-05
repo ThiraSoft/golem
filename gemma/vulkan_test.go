@@ -119,6 +119,8 @@ func benchToken(b *testing.B, m *Model) {
 // unchanged.
 func load26BStack(t *testing.T) (*fixture, *Model) {
 	t.Helper()
+	heavy.Skip(t, "it puts a model on the card")
+	t.Helper()
 	f, m := load26B(t)
 	if m.Cfg.Experts == 0 {
 		t.Skip("this checkpoint has no mixture blocks")

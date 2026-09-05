@@ -18,6 +18,8 @@ import (
 
 func load12BStack(t *testing.T) (*fixture, *Model) {
 	t.Helper()
+	heavy.Skip(t, "it puts a model on the card")
+	t.Helper()
 	f := loadFixture(t, "layers12")
 	m := open12BEngine(t)
 	if err := m.UseVulkanStack(); err != nil {
