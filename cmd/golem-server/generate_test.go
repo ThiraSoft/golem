@@ -43,12 +43,20 @@ func (v *wordVocab) Encode(text string, addBOS, parseSpecial bool) []int32 {
 	return out
 }
 
+// A vocabulary asked about an identifier it does not hold has no piece for it.
+// The real ones are as wide as the logits row; this one grows as words are met,
+// and anything a grammar sweeps past the end is simply not a token.
 func (v *wordVocab) Piece(id int32, special bool) string {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	if int(id) >= len(v.texts) {
+		return ""
+	}
 	return v.texts[id]
 }
-func (v *wordVocab) IsEOG(id int32) bool { return v.texts[id] == "<turn|>" }
+func (v *wordVocab) IsEOG(id int32) bool {
+	return v.Piece(id, false) == "<turn|>"
+}
 
 // An engine that speaks a script: each call to Logits names the next word.
 type scriptedEngine struct {
@@ -90,10 +98,15 @@ func (e *scriptedEngine) LogitsBatch(hidden [][]float32, out [][]float32) {
 func (e *scriptedEngine) Reset()      {}
 func (e *scriptedEngine) UseSlot(int) {}
 
-func newGenerator(tb testing.TB, script []string, maxTokens int) (*Generator, *wordVocab) {
+func newGenerator(tb testing.TB, script []string, maxTokens int, words ...string) (*Generator, *wordVocab) {
 	v := newWordVocab()
 	e := &scriptedEngine{vocab: v, script: script}
 	for _, word := range script {
+		v.id(word)
+	}
+	// Words the script never says, for a test that wants them in the
+	// vocabulary without the model ever choosing them.
+	for _, word := range words {
 		v.id(word)
 	}
 	v.id("<turn|>")

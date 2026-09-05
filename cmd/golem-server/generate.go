@@ -45,6 +45,10 @@ func NewGenerator(ctx *Context, v Vocabulary, tpl chat.Template, vocabSize, maxT
 		maxTokens: maxTokens, calls: &calls}
 }
 
+// Width is how many identifiers this generator scores, which is the width of
+// the vocabulary a grammar has to read.
+func (g *Generator) Width() int { return len(g.logits) }
+
 // WithMaxTokens is the same generator over the same context, stopping sooner.
 // A request naming its own limit gets one of these rather than changing the
 // server's.

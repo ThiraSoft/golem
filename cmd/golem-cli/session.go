@@ -18,6 +18,7 @@ import (
 
 	"github.com/ThiraSoft/golem/chat"
 	"github.com/ThiraSoft/golem/engine"
+	"github.com/ThiraSoft/golem/grammar"
 	"github.com/ThiraSoft/golem/qwen35"
 	"github.com/ThiraSoft/golem/sample"
 )
@@ -90,6 +91,12 @@ type Session struct {
 	// model and a card, and it moves whenever the kernels do.
 	noDraft bool
 
+	// rules is the grammar every answer of this conversation has to stay
+	// inside, and tokens is the vocabulary a grammar reads through. Both are
+	// nil unless the command line asked for one.
+	rules  *grammar.Rules
+	tokens *grammar.Tokens
+
 	// history is the conversation as messages, because the template is what
 	// turns it into text and only the template knows how.
 	history []chat.Message
@@ -148,6 +155,20 @@ func (s *Session) OnDevice() { s.width = devicePassWidth }
 // NoDraft makes this conversation generate a token at a time even where the
 // checkpoint carries a prediction block. See Session.noDraft.
 func (s *Session) NoDraft() { s.noDraft = true }
+
+// Constrain makes every answer stay inside a grammar, written in GBNF. The
+// vocabulary is read once here rather than once a turn: it is a quarter of a
+// million pieces.
+func (s *Session) Constrain(src string) error {
+	rules, err := grammar.Parse(src)
+	if err != nil {
+		return err
+	}
+	s.rules = rules
+	s.tokens = grammar.NewTokens(s.vocabSize,
+		func(id int32) string { return s.vocab.Piece(id, false) }, s.vocab.IsEOG)
+	return nil
+}
 
 func NewSession(m forward, v vocabulary, tpl chat.Template, p sample.Params,
 	vocabSize, maxContext, maxTokens int, system string, thinking bool) *Session {
@@ -262,6 +283,11 @@ func (s *Session) AskWithMedia(text string, images, audio [][]byte, w io.Writer)
 			states := s.model.ForwardBatch(ids[at:to], at)
 			hidden = states[len(states)-1]
 		}
+	}
+	if s.rules != nil {
+		// A grammar constrains an answer, not a conversation: each turn gets a
+		// fresh walk from the root.
+		s.sampler.Constrain(grammar.New(s.rules, s.tokens))
 	}
 	s.held = append(s.held[:0], ids...)
 	// The penalties read the conversation and not only what is drawn: every

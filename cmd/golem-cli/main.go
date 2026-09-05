@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/engine"
+	"github.com/ThiraSoft/golem/grammar/schema"
 )
 
 // stringList collects a flag given more than once, in the order it was given.
@@ -69,6 +70,9 @@ func main() {
 	flag.Var(&images, "image", "a picture to put in the first turn; repeat for several")
 	var recordings stringList
 	flag.Var(&recordings, "audio", "a sound file — WAV, MP3 or FLAC — to put in the first turn; repeat for several")
+	jsonOut := flag.Bool("json", false, "answer with a JSON value, whatever its shape")
+	jsonSchema := flag.String("json-schema", "", "file holding a JSON Schema the answer has to satisfy")
+	grammarFile := flag.String("grammar", "", "file holding a GBNF grammar the answer has to satisfy")
 	prompt := flag.String("p", "", "answer this and exit, instead of reading turns")
 	stats := flag.Bool("stats", false, "report tokens and speed after each answer")
 	vulkan := flag.Bool("vulkan", false, "put the logit head and the expert stacks on a Vulkan device")
@@ -191,6 +195,13 @@ func main() {
 		}
 	}
 
+	// What the answers have to look like, as GBNF, whichever of the three
+	// flags asked for it.
+	constraint, err := constraintOf(*jsonOut, *jsonSchema, *grammarFile)
+	if err != nil {
+		fail(err)
+	}
+
 	newSession := func() *Session {
 		s := NewSession(m.Forward, m.Vocab, m.Template, params,
 			m.Vocabulary, *context, *maxTokens, *system, *think)
@@ -204,6 +215,11 @@ func main() {
 		}
 		if !*draft {
 			s.NoDraft()
+		}
+		if constraint != "" {
+			if err := s.Constrain(constraint); err != nil {
+				fail(err)
+			}
 		}
 		return s
 	}
@@ -313,4 +329,36 @@ func vulkanLine(head, blocks bool) string {
 		return "head on vulkan"
 	}
 	return "all on cpu"
+}
+
+// constraintOf reads the grammar the flags ask for. The three of them say the
+// same thing in three ways, so a command line that names two of them is a
+// command line that has not decided.
+func constraintOf(anyJSON bool, schemaFile, grammarFile string) (string, error) {
+	named := 0
+	for _, on := range []bool{anyJSON, schemaFile != "", grammarFile != ""} {
+		if on {
+			named++
+		}
+	}
+	switch {
+	case named == 0:
+		return "", nil
+	case named > 1:
+		return "", fmt.Errorf("-json, -json-schema and -grammar each say what an answer must look like; name one")
+	case anyJSON:
+		return schema.JSON(), nil
+	case schemaFile != "":
+		raw, err := os.ReadFile(schemaFile)
+		if err != nil {
+			return "", err
+		}
+		return schema.ToGBNF(raw)
+	default:
+		raw, err := os.ReadFile(grammarFile)
+		if err != nil {
+			return "", err
+		}
+		return string(raw), nil
+	}
 }

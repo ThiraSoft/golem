@@ -11,8 +11,8 @@ import (
 	"github.com/ThiraSoft/golem/sample"
 )
 
-func newTestServer(t testing.TB, script []string) *Server {
-	g, v := newGenerator(t, script, 64)
+func newTestServer(t testing.TB, script []string, words ...string) *Server {
+	g, v := newGenerator(t, script, 64, words...)
 	return NewServer(poolOf(g), v, "test-model", wordTemplate{}, greedy())
 }
 
@@ -240,5 +240,72 @@ func TestSamplingReadsThePenaltyFields(t *testing.T) {
 	}
 	if none := s.sampling(&completionRequest{}); none.PenaltyRepeat != 1 || none.PenaltyLastN != 64 {
 		t.Fatalf("a request naming nothing changed the file's values: %+v", none)
+	}
+}
+
+// answerOf reads the assistant's text out of a completion.
+func answerOf(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Fatalf("%d: %s", w.Code, w.Body)
+	}
+	var out struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil || len(out.Choices) == 0 {
+		t.Fatalf("the answer was %s", w.Body)
+	}
+	return out.Choices[0].Message.Content
+}
+
+// The model is scripted to say no; the grammar allows only yes. What comes back
+// is what the grammar allows, which is the whole point of the thing.
+func TestAGrammarDecidesTheAnswer(t *testing.T) {
+	s := newTestServer(t, []string{"no", "no", "<turn|>"}, "yes")
+	w := post(t, s, `{"model":"test-model","messages":[{"role":"user","content":"hi"}],
+		"grammar":"root ::= \"yes\""}`)
+	if got := answerOf(t, w); got != "yes" {
+		t.Fatalf("the answer is %q, and the grammar allows only yes", got)
+	}
+}
+
+// A schema arrives as JSON and leaves as a grammar; here it allows one word and
+// the model wanted another.
+func TestAJSONSchemaConstrainsTheAnswer(t *testing.T) {
+	s := newTestServer(t, []string{"no", "no", "<turn|>"}, "42")
+	w := post(t, s, `{"model":"test-model","messages":[{"role":"user","content":"hi"}],
+		"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"const":42}}}}`)
+	if got := answerOf(t, w); !strings.Contains(got, "42") {
+		t.Fatalf("the answer is %q, and the schema names the constant 42", got)
+	}
+}
+
+// What is refused, and refused before a slot is taken: a request that will not
+// be answered has no business waiting behind one that will.
+func TestWhatAConstrainedRequestIsRefusedFor(t *testing.T) {
+	s := newTestServer(t, []string{"no", "<turn|>"})
+	for _, body := range []string{
+		`{"messages":[{"role":"user","content":"hi"}],"grammar":"root ::= ("}`,
+		`{"messages":[{"role":"user","content":"hi"}],"grammar":"root ::= \"a\"","response_format":{"type":"json_object"}}`,
+		`{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_schema"}}`,
+		`{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"string","pattern":"^a$"}}}}`,
+		`{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"yaml"}}`,
+	} {
+		if w := post(t, s, body); w.Code != http.StatusBadRequest {
+			t.Fatalf("%s answered %d, want 400", body, w.Code)
+		}
+	}
+}
+
+// A request naming no format is not constrained at all, and builds no table.
+func TestAnUnconstrainedRequestBuildsNoTokenTable(t *testing.T) {
+	s := newTestServer(t, []string{"hello", "<turn|>"})
+	post(t, s, `{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`)
+	if s.tokens != nil {
+		t.Fatal("a request that asked for no grammar built the vocabulary table anyway")
 	}
 }

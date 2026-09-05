@@ -18,6 +18,7 @@ import (
 
 	"github.com/ThiraSoft/golem/chat"
 	"github.com/ThiraSoft/golem/engine"
+	"github.com/ThiraSoft/golem/grammar"
 	"github.com/ThiraSoft/golem/sample"
 	"github.com/ThiraSoft/golem/stt"
 )
@@ -36,6 +37,12 @@ type Server struct {
 	images   *imageCache
 	stt      *stt.Model
 	sttGroup *stt.Group
+	// tokens is what a grammar reads the vocabulary through. It is built on
+	// the first request that asks for one and shared by every request after:
+	// a quarter of a million pieces is not something to decode twice, nor to
+	// pay for on a server nobody asks a schema of.
+	tokensOnce sync.Once
+	tokens     *grammar.Tokens
 }
 
 func NewServer(pool *Pool, v Vocabulary, name string, tpl chat.Template, defaults sample.Params) *Server {
@@ -216,6 +223,12 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 
 	params := s.sampling(&req)
 	gen := slot.gen
+	if con, err := s.constrain(&req, gen.Width()); err != nil {
+		refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	} else if con != nil {
+		params.Constraint = con
+	}
 	if req.MaxTokens != nil && *req.MaxTokens > 0 {
 		gen = gen.WithMaxTokens(*req.MaxTokens)
 	}
@@ -260,6 +273,16 @@ func check(req *completionRequest) error {
 	if req.LogProbs != nil && *req.LogProbs {
 		return fmt.Errorf("logprobs is not implemented")
 	}
+	// What constrains the answer is refused here rather than in the middle of
+	// one: a schema that does not compile is the client's mistake, and a
+	// request that will not be answered has no business waiting for a slot.
+	if src, err := req.grammarFor(); err != nil {
+		return err
+	} else if src != "" {
+		if _, err := grammar.Parse(src); err != nil {
+			return err
+		}
+	}
 	switch pick := req.ToolChoice.(type) {
 	case nil:
 	case string:
@@ -303,6 +326,24 @@ func (s *Server) sampling(req *completionRequest) sample.Params {
 		p.PenaltyPresent = float32(*req.PresencePenalty)
 	}
 	return p
+}
+
+// constrain builds the grammar a request asked for, over a vocabulary read
+// once. A request that asked for nothing gets nothing, and no table is built.
+func (s *Server) constrain(req *completionRequest, width int) (*grammar.Grammar, error) {
+	src, err := req.grammarFor()
+	if err != nil || src == "" {
+		return nil, err
+	}
+	rules, err := grammar.Parse(src)
+	if err != nil {
+		return nil, err
+	}
+	s.tokensOnce.Do(func() {
+		s.tokens = grammar.NewTokens(width,
+			func(id int32) string { return s.vocab.Piece(id, false) }, s.vocab.IsEOG)
+	})
+	return grammar.New(rules, s.tokens), nil
 }
 
 // waitedFor tells the log line which slot answered, and how long the request

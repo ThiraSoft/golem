@@ -38,6 +38,11 @@ type Params struct {
 	// PenaltyPresent once for any appearance at all. Zero is no penalty.
 	PenaltyFreq    float32
 	PenaltyPresent float32
+
+	// Constraint is what the draw has to stay inside — a grammar, in
+	// practice. It belongs to one answer rather than to a file, and a
+	// sampler that outlives an answer takes Constrain instead.
+	Constraint Constraint
 }
 
 // Defaults are the values Gemma 4's own file declares under general.sampling,
@@ -75,6 +80,7 @@ func New(p Params) *Sampler {
 	return &Sampler{
 		p:   p,
 		pen: newWindow(p),
+		con: p.Constraint,
 		// PCG rather than the global source: a sampler is a value with a seed,
 		// and two of them must not interfere.
 		rng: rand.New(rand.NewPCG(p.Seed, p.Seed^0x9e3779b97f4a7c15)),

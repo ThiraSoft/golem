@@ -69,8 +69,16 @@ func (v *wordVocab) Encode(text string, addBOS, parseSpecial bool) []int32 {
 	return out
 }
 
-func (v *wordVocab) Piece(id int32, special bool) string { return v.texts[id] }
-func (v *wordVocab) IsEOG(id int32) bool                 { return v.texts[id] == "<turn|>" }
+// A vocabulary asked about an identifier it does not hold has no piece for it:
+// this one grows as words are met, where a real one is as wide as a logits row.
+func (v *wordVocab) Piece(id int32, special bool) string {
+	if int(id) >= len(v.texts) {
+		return ""
+	}
+	return v.texts[id]
+}
+
+func (v *wordVocab) IsEOG(id int32) bool { return v.Piece(id, false) == "<turn|>" }
 
 // An engine that answers from a script: each call to Logits names the next
 // token of the script, and the hidden state carries nothing.
@@ -334,5 +342,35 @@ func TestAPromptIsReadAtThePassWidth(t *testing.T) {
 				t.Errorf("the first pass carried %d positions, want %d", e.widths[0], one.want)
 			}
 		})
+	}
+}
+
+// A grammar decides the answer even when the model wanted to say something
+// else, and it decides it again from the root at every turn.
+func TestAGrammarConstrainsEveryTurn(t *testing.T) {
+	v := newWordVocab()
+	v.id("yes")
+	e := &scriptedEngine{vocab: v, script: []string{"no", "<turn|>", "no", "<turn|>"}}
+	s := newSession(t, v, e, 8, "")
+	if err := s.Constrain(`root ::= "yes"`); err != nil {
+		t.Fatal(err)
+	}
+
+	for turn := 1; turn <= 2; turn++ {
+		got, err := s.Ask("hi", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Text != "yes" {
+			t.Fatalf("turn %d answered %q, and the grammar allows only yes", turn, got.Text)
+		}
+	}
+}
+
+func TestAGrammarThatDoesNotParseIsRefused(t *testing.T) {
+	v := newWordVocab()
+	s := newSession(t, v, &scriptedEngine{vocab: v}, 8, "")
+	if err := s.Constrain(`root ::= (`); err == nil {
+		t.Fatal("a grammar with an unclosed group was accepted")
 	}
 }

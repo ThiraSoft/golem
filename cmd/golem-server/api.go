@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/ThiraSoft/golem/chat"
+	"github.com/ThiraSoft/golem/grammar/schema"
 )
 
 type completionRequest struct {
@@ -30,8 +31,51 @@ type completionRequest struct {
 	PresencePenalty  *float64 `json:"presence_penalty"`
 	RepeatPenalty    *float64 `json:"repeat_penalty"`
 	RepeatLastN      *int     `json:"repeat_last_n"`
-	N                *int     `json:"n"`
-	LogProbs         *bool    `json:"logprobs"`
+	// What the answer has to look like. ResponseFormat is OpenAI's shape and
+	// Grammar is llama-server's; a request carries one or the other.
+	ResponseFormat *responseFormat `json:"response_format"`
+	Grammar        string          `json:"grammar"`
+	N              *int            `json:"n"`
+	LogProbs       *bool           `json:"logprobs"`
+}
+
+// responseFormat is what a client asks the answer to be: any JSON object, or
+// one a schema describes.
+type responseFormat struct {
+	Type       string `json:"type"`
+	JSONSchema struct {
+		Name   string          `json:"name"`
+		Schema json.RawMessage `json:"schema"`
+	} `json:"json_schema"`
+}
+
+// grammarFor turns what the request asked for into GBNF, or says why it
+// cannot. An empty string is a request that asked for nothing.
+func (req *completionRequest) grammarFor() (string, error) {
+	if req.Grammar != "" && req.ResponseFormat != nil {
+		return "", fmt.Errorf("a request carries either a grammar or a response_format, not both")
+	}
+	if req.Grammar != "" {
+		return req.Grammar, nil
+	}
+	if req.ResponseFormat == nil {
+		return "", nil
+	}
+	switch req.ResponseFormat.Type {
+	case "", "text":
+		return "", nil
+	case "json_object":
+		return schema.JSON(), nil
+	case "json_schema":
+		raw := req.ResponseFormat.JSONSchema.Schema
+		if len(raw) == 0 {
+			return "", fmt.Errorf("response_format is json_schema and names no schema")
+		}
+		return schema.ToGBNF(raw)
+	default:
+		return "", fmt.Errorf("response_format %q is not one this server writes; text, json_object and json_schema are",
+			req.ResponseFormat.Type)
+	}
 }
 
 // requestMessages reads the two shapes the API gives a turn's content: a
