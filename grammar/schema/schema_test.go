@@ -239,3 +239,61 @@ func TestWhatIsRefused(t *testing.T) {
 		}
 	}
 }
+
+// The two halves together: a schema compiled to a grammar, and a document
+// walked through it byte by byte. The tokenizer here is the cruellest one — a
+// token per byte — because that is what makes the automaton do the most work.
+func TestADocumentWalksThroughACompiledSchema(t *testing.T) {
+	src, err := ToGBNF([]byte(`{
+		"type": "object",
+		"properties": {"city": {"type": "string"}, "population": {"type": "integer"}},
+		"required": ["city", "population"],
+		"additionalProperties": false
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules, err := grammar.Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// One token per byte, plus one that ends the turn.
+	const eog = 256
+	toks := grammar.NewTokens(eog+1,
+		func(id int32) string {
+			if int(id) == eog {
+				return "<eos>"
+			}
+			return string([]byte{byte(id)})
+		},
+		func(id int32) bool { return int(id) == eog })
+
+	walk := func(doc string) (int, bool) {
+		g := grammar.New(rules, toks)
+		for i := 0; i < len(doc); i++ {
+			id := int32(doc[i])
+			if !g.Allows(id) {
+				return i, false
+			}
+			g.Accept(id)
+		}
+		return len(doc), g.Allows(eog)
+	}
+
+	good := `{"city": "Lyon", "population": 520000}`
+	if at, done := walk(good); !done {
+		t.Fatalf("a document the schema describes stopped at byte %d of %q", at, good)
+	}
+
+	for _, bad := range []string{
+		`{"city": "Lyon"}`,                             // a required property missing
+		`{"city": "Lyon", "population": "520000"}`,     // an integer written as a string
+		`{"city": "Lyon", "population": 5, "x": true}`, // a property the schema forbids
+		`{"population": 5, "city": "Lyon"}`,            // the properties out of order
+	} {
+		if _, done := walk(bad); done {
+			t.Fatalf("the grammar accepted %q and the schema does not describe it", bad)
+		}
+	}
+}

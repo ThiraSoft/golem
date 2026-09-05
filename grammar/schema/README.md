@@ -35,6 +35,13 @@ would make a converter fetch what a request names. A constraint silently dropped
 is worse than a request refused — the answer comes back looking right and is
 not.
 
+One consequence worth knowing before a schema is written: the required
+properties of an object come out in the order the schema declares them, because
+that is the order the rule puts them in. llama.cpp does the same. A model asked
+for `{"city", "population"}` cannot answer with the population first — it is not
+that the answer is rejected afterwards, it is that the token opening the wrong
+key is never drawn.
+
 The whitespace rule is llama.cpp's, and it is not cosmetic. A BPE vocabulary
 holds tokens like `": "` and `",\n    "`; a grammar that demanded a single space
 would refuse all of them and force the model onto one-character tokens.
