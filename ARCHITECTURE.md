@@ -21,7 +21,8 @@ The same rule holds for speed. Every number in these READMEs is a benchmark in t
 | `token/` | tokenizers, one package per family |
 | `audio/` | sound: reading and writing WAV, decoding MP3 and FLAC, resampling to mono at the model's rate, and the log-mel front end a speech tower reads |
 | `imageio/` | decoding an image and putting it in the shape a vision encoder reads: planar RGB, one float a channel a pixel |
-| `sample/` | top-k, top-p, temperature, and a seeded draw over a row of logits |
+| `sample/` | top-k, top-p, temperature and a seeded draw over a row of logits, the three repetition penalties before them, and the hook a grammar plugs into |
+| `grammar/` | GBNF parsed into rules, the pushdown automaton a drawn token walks, and `grammar/schema/`, which turns a JSON Schema into GBNF. Ports of llama.cpp's own two, compared against its output rule for rule. |
 | `compress/` | the `.golem` format: two codebooks — a D4 lattice at 3.26 bits a weight and a trellis at 4.19 — the salience scale their columns are measured against, and the packing a shader reads. `compress/README.md` says what the format is and which of its rules a reader has to keep. |
 | `chat/` | a conversation's shape — messages, tools, calls — and the interface an engine implements to write one out |
 | `vk/` | Vulkan compute, bound through `purego` rather than cgo: devices, buffers, pipelines, and the three dozen kernels the blocks of three architectures are made of — with a vision tower of its own, whose fp16 weights and mean-subtracting norms share nothing with the text kernels. |

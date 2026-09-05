@@ -263,12 +263,47 @@ measured against thirty-two on this engine, and thirty-two won every time: at
 3919 positions, 76.2/s against 71.7 at sixty-four and 46.4 at five hundred and
 twelve. Past that the activations stop fitting in the caches.
 
+## An answer a schema can read
+
+`response_format` in its two shapes, and llama-server's `grammar` field beside
+them:
+
+```bash
+curl -s localhost:8080/v1/chat/completions -d '{
+  "messages": [{"role": "user", "content": "Lyon, please."}],
+  "response_format": {"type": "json_schema", "json_schema": {"name": "city", "schema": {
+    "type": "object",
+    "properties": {"city": {"type": "string"}, "population": {"type": "integer"}},
+    "required": ["city", "population"],
+    "additionalProperties": false}}}}'
+```
+
+`{"type": "json_object"}` asks for any JSON value at all; `"grammar": "root ::=
+…"` asks for whatever the GBNF describes. A request carries one of them, never
+two.
+
+The token that would break the document is refused before the draw, and the turn
+cannot end while the braces are open. A schema that does not compile, a grammar
+that does not parse and a request carrying both are refused with a 400 before a
+slot is taken: a request that will not be answered has no business waiting
+behind one that will.
+
+The vocabulary a grammar reads through is decoded on the first request that asks
+for one and shared by every request after. A server nobody asks a schema of
+never builds it.
+
+The four penalty fields — `repeat_penalty`, `repeat_last_n`,
+`frequency_penalty`, `presence_penalty` — are llama.cpp's, and the window is
+seeded with the prompt before the first draw, as llama-server does.
+
 ## What it refuses
 
 With a 400 and OpenAI's error envelope, rather than answering something else:
 `n` above 1, `logprobs`, `tool_choice` beyond `auto` and `none`, a conversation
 with no message, a tool result answering no call, and a prompt longer than
-`-context`.
+`-context`. In a schema: `pattern`, a numeric bound, and a `$ref` into another
+document — each by name, because a constraint silently dropped is worse than a
+request refused.
 
 Not implemented at all: `/v1/completions`, embeddings.
 

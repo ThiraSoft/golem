@@ -42,23 +42,36 @@ func (s *Sampler) allowed(logits []float32, k int, penalise bool) []candidate {
 	if width <= 0 || width > len(logits) {
 		width = len(logits)
 	}
-	for {
-		kept := s.topK(logits, widthOrAll(width, len(logits)))
+	for width < len(logits) {
+		kept := s.topK(logits, width)
 		s.keep = s.keep[:0]
 		for _, c := range kept {
-			// The byte first, because it is one comparison against a table
-			// and the walk behind Allows is not. In a state that refuses
-			// nearly everything — the start of an object, just after a comma —
-			// this is what keeps a sweep of the vocabulary affordable.
-			if first[s.con.FirstByte(c.id)] && s.con.Allows(c.id) {
+			if s.permits(first, c.id) {
 				s.keep = append(s.keep, c)
 			}
 		}
-		if len(s.keep) >= target || width >= len(logits) {
-			break
+		if len(s.keep) >= target {
+			if penalise {
+				return s.penalise(s.keep, k)
+			}
+			if k > 0 && len(s.keep) > k {
+				s.keep = s.keep[:k]
+			}
+			return s.keep
 		}
 		width *= 4
 	}
+
+	// The whole row, and it is swept rather than sorted: sorting a quarter of a
+	// million candidates to keep sixty-four of them costs more than the pass
+	// that produced them, and the survivors of a grammar are few.
+	s.keep = s.keep[:0]
+	for id, logit := range logits {
+		if s.permits(first, int32(id)) {
+			s.keep = append(s.keep, candidate{id: int32(id), logit: logit})
+		}
+	}
+	sortCandidates(s.keep)
 	if len(s.keep) == 0 {
 		return nil
 	}
@@ -71,11 +84,10 @@ func (s *Sampler) allowed(logits []float32, k int, penalise bool) []candidate {
 	return s.keep
 }
 
-// widthOrAll turns a prefix width into the k topK reads, where anything at or
-// past the row is the whole row.
-func widthOrAll(width, n int) int {
-	if width >= n {
-		return 0
-	}
-	return width
+// permits is the two tests in the order that makes the second one rare: the
+// lead byte against a table, and only then the walk through the constraint.
+// In a state that allows almost nothing — the start of an object, just after a
+// comma — the table is what keeps a sweep of the vocabulary affordable.
+func (s *Sampler) permits(first *[256]bool, id int32) bool {
+	return first[s.con.FirstByte(id)] && s.con.Allows(id)
 }

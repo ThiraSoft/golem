@@ -27,6 +27,7 @@ A golem is inert matter given a voice. That is what these engines do to a file o
 - **Vulkan GPU**: bound through `purego` rather than cgo, and level with `llama.cpp`'s own Vulkan build on the one AMD card this has been measured on. The table below gives every number both ways, including where golem is behind and by how much.
 - **Its own weight format**: `.golem` is 18 % smaller than llama.cpp's Q3_K_M on Qwen3-4B and ahead of it on every measure — a trellis codebook with no lookup table, converted on the card. [What it costs](#-golem--the-engines-own-weight-format).
 - **A mixture's experts need not be on the card**: they can stay in system memory and be read across the bus where they lie, which takes the 26B A4B's footprint on the card from 13.6 GiB to 1.3. A cache of the ones a token keeps asking for buys the speed back — two fifths of the pool is four fifths of the tokens — and the answers do not change. [The measured curve](#-a-mixtures-experts-need-not-be-on-the-card).
+- **An answer a schema can read**: `response_format` in its two shapes, or a raw GBNF grammar, constrained at the draw rather than asked for in prose — a port of llama.cpp's own grammar engine and schema converter, compared against its output rule for rule. [What it constrains, and what it refuses](#-an-answer-a-schema-can-read).
 - **Serves several clients at once**: `-parallel N` holds N conversations and carries a token for each of them through one read of the weights, on the card as well as on the processor — Qwen3.8 on the card excepted, for a reason [written below](#-several-conversations-one-pass).
 
 ## 🚀 Quickstart
@@ -50,6 +51,48 @@ go build ./cmd/golem-server
 ```
 
 `-parallel N` cuts the context into N slots, each holding its own conversation.
+
+## 📐 An answer a schema can read
+
+A model asked for JSON in prose usually obliges. A model drawing inside a
+grammar cannot do otherwise: every token that would break the document is
+refused before the draw, and the turn cannot end while the braces are open.
+
+```bash
+curl -s localhost:8080/v1/chat/completions -d '{
+  "messages": [{"role": "user", "content": "Lyon, please."}],
+  "response_format": {"type": "json_schema", "json_schema": {"name": "city", "schema": {
+    "type": "object",
+    "properties": {"city": {"type": "string"}, "population": {"type": "integer"}},
+    "required": ["city", "population"],
+    "additionalProperties": false}}}}'
+```
+
+`{"type": "json_object"}` asks for any JSON value at all, and a `grammar` field
+carrying GBNF asks for whatever it describes. On the command line the same three
+are `-json`, `-json-schema <file>` and `-grammar <file>`.
+
+```
+$ ./golem-cli -model Qwen3-0.6B-BF16.gguf -json -temp 0 \
+    -p "Give the city of Lyon: its name, population and whether it rained today."
+{ "city": "Lyon", "population": "1,000,000", "whether_rained_today": "No" }
+```
+
+`grammar/` is a port of llama.cpp's `llama-grammar.cpp` and `grammar/schema/` of
+its `json-schema-to-grammar.cpp`, down to the names they give the rules they
+generate: the tests compare the grammars golem produces against llama.cpp's
+expected output line for line. What a schema may not ask for is refused by name
+— `pattern`, a numeric bound, a `$ref` into another document — because a
+constraint silently dropped is worse than a request refused.
+
+The cost is what a lazy check costs. The chain draws first and asks the grammar
+about the one token that came out; only a refusal pays for more, and then it
+reads a prefix of the sorted row rather than the row.
+
+Beside them, the three penalties llama.cpp runs before top-k —
+`repeat_penalty`, `frequency_penalty` and `presence_penalty` over
+`repeat_last_n` tokens, the prompt included, with the same arithmetic and the
+same defaults.
 
 ## 👥 Several conversations, one pass
 
@@ -620,6 +663,7 @@ Every number in this README is a benchmark in this repository, run on the machin
 - `nn/` & `vk/` — the shared kernels: quantized AVX2 and NEON, and Vulkan compute.
 - `compress/` — the `.golem` format: calibration, the trellis codec, and the conversion pipeline `golemquant` drives.
 - `internal/kyutai/` — the Mimi codec and the Kyutai transformer layer, shared by the two directions of speech.
+- `grammar/` — GBNF, the automaton a token walks, and `grammar/schema/`, which turns a JSON Schema into one.
 - `tensors/`, `token/`, `chat/`, `sample/`, `audio/`, `imageio/` — the rest of the shared layer.
 - `ref/` — what recorded each test fixture, and how to record it again.
 

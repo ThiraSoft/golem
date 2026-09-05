@@ -20,6 +20,27 @@ The sampling flags — `-temp`, `-top-k`, `-top-p` — default to the values the
 model file declares for itself, which for E2B are 1, 64 and 0.95. A temperature
 of zero is greedy. `-seed` fixes the draw; left at zero, each run differs.
 
+`-repeat-penalty`, `-repeat-last-n`, `-frequency-penalty` and
+`-presence-penalty` are llama.cpp's three penalties over its window, and they
+read the whole conversation: what was fed joins the window as it is fed, what
+was drawn joins it as it is drawn.
+
+## An answer that has to be JSON
+
+`-json` makes every answer a JSON value, `-json-schema <file>` makes it one a
+schema describes, and `-grammar <file>` makes it whatever a GBNF grammar
+describes. Name one of the three, not two.
+
+```bash
+./golem-cli -model Qwen3-0.6B-BF16.gguf -json -temp 0 \
+  -p "Give the city of Lyon: its name, population and whether it rained today."
+{ "city": "Lyon", "population": "1,000,000", "whether_rained_today": "No" }
+```
+
+The grammar is rebuilt at the start of each turn — it constrains an answer, not
+a conversation — and the vocabulary it reads through is decoded once, when the
+flag is read.
+
 ## Rendered every turn, fed once
 
 Every turn re-renders the whole conversation, because the template is the only
