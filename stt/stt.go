@@ -175,12 +175,12 @@ type Live struct {
 	left      sync.Once
 	// batch is the one-column scratch a lone stream needs when the trunk is on
 	// a card, built the first time a frame reaches it.
-	batch *BatchScratch
-	errMu sync.Mutex
-	err   error
-	textCh     chan Segment
-	closed     bool
-	mu         sync.Mutex
+	batch  *BatchScratch
+	errMu  sync.Mutex
+	err    error
+	textCh chan Segment
+	closed bool
+	mu     sync.Mutex
 }
 
 // Stream transcribes as it is fed. Write takes any number of samples at

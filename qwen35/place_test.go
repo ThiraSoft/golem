@@ -1,6 +1,10 @@
 package qwen35
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
+)
 
 // A run of text has all four components equal, which is the whole reason the
 // engine has needed one integer until now.
@@ -42,6 +46,7 @@ func TestPlaceSeparatesCacheFromRotation(t *testing.T) {
 // with four equal components, and if that is not exactly the old rotation then
 // every fixture recorded before this change is wrong.
 func TestTextIsUnmovedByPlaces(t *testing.T) {
+	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	m, err := Open(qwen38, 512)
 	if err != nil {
 		t.Skipf("open: %v", err)

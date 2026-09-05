@@ -19,13 +19,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/token/bpe"
 )
 
 func TestExpertCacheSpeed(t *testing.T) {
-	if testing.Short() {
-		t.Skip("generates a few hundred tokens on the card")
-	}
+	heavy.Skip(t, "generates a few hundred tokens on the card")
 	path := model26BPath(t)
 	m, err := Open(path, 2048)
 	if err != nil {

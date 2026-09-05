@@ -25,10 +25,7 @@ import (
 )
 
 func TestMatVecAgainstLlamaCpp(t *testing.T) {
-	d, err := Open()
-	if err != nil {
-		t.Skip(err)
-	}
+	d := open(t)
 	defer d.Close()
 
 	for _, s := range []struct {

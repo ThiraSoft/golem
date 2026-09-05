@@ -5,14 +5,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/tensors"
 )
 
 func TestVulkanTokenCost(t *testing.T) {
 	// A bench. See TestGenerationCost.
-	if testing.Short() {
-		t.Skip("a bench; -short is for correctness")
-	}
+	heavy.Skip(t, "a bench: it reads a checkpoint of tens of gigabytes and times a run over it")
 	g, err := tensors.OpenGGUF(qwen38)
 	if err != nil {
 		t.Skipf("open: %v", err)

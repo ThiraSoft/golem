@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/internal/kyutai/mimi"
 	"github.com/ThiraSoft/golem/nn"
 )
@@ -39,6 +40,7 @@ const concurrentSeconds = 70
 // seconds of audio an arm through eight configurations and takes ten minutes,
 // which has no business in `go test ./stt/`. It runs when asked for by name.
 func TestConcurrentStreams(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	dir := os.Getenv("GOLEM_STT")
 	if dir == "" {
 		t.Skip("GOLEM_STT not set")

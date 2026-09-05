@@ -6,11 +6,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/tensors"
 	"github.com/ThiraSoft/golem/token/bytebpe"
 )
 
 func TestVulkanGenerate(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	g, err := tensors.OpenGGUF(qwen38)
 	if err != nil {
 		t.Skipf("open: %v", err)

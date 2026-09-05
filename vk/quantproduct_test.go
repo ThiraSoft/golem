@@ -63,10 +63,7 @@ func q80Column(x []float32) (q []uint32, scales, widened []float32) {
 }
 
 func TestQuantProductMatchesReference(t *testing.T) {
-	d, err := Open()
-	if err != nil {
-		t.Skip(err)
-	}
+	d := open(t)
 	defer d.Close()
 
 	const rows, cols = 48, 512

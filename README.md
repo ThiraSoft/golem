@@ -667,6 +667,26 @@ Every number in this README is a benchmark in this repository, run on the machin
 - `tensors/`, `token/`, `chat/`, `sample/`, `audio/`, `imageio/` — the rest of the shared layer.
 - `ref/` — what recorded each test fixture, and how to record it again.
 
+## 🧪 Running the tests
+
+`go test ./...` is the correctness suite and takes about a minute. It is safe to
+run at any time: nothing in it opens the card or a checkpoint of tens of
+gigabytes.
+
+```bash
+go test ./...                      # correctness, ~1 min, no card
+GOLEM_FULL_TEST=1 go test ./vk/    # the heavy ones, one package at a time
+```
+
+The rest — every test that submits work to the Vulkan device, runs a 12B, 26B or
+27B checkpoint, or times a kernel over thousands of passes — waits behind
+`GOLEM_FULL_TEST`. Those are as much a load test as a test: the card and the
+processor both run flat out and both get hot, and running all of them in one go
+has taken a machine down. Run them a package at a time, and watch the machine
+while they run. Each says what makes it heavy when it skips.
+
+`internal/heavy` is the whole mechanism: one guard, one reason per test.
+
 ## 🤝 Contributing
 
 We want to make Golem the best pure-Go inference engine available. We especially need:

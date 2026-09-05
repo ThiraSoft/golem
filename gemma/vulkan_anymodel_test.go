@@ -19,12 +19,12 @@ import (
 	"fmt"
 	"math"
 	"testing"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 func TestVulkanMatchesCPUOnAnyModel(t *testing.T) {
-	if testing.Short() {
-		t.Skip("generates on both paths")
-	}
+	heavy.Skip(t, "generates on both paths")
 	path := model26BPath(t)
 
 	// **Tokens, not hidden states.** The two paths sum the same products in a
@@ -117,9 +117,7 @@ func TestVulkanMatchesCPUOnAnyModel(t *testing.T) {
 // tokens and never on all, and no threshold on that number means much. This one
 // is exact or it is broken.
 func TestVulkanSameWhereverTheExpertsLive(t *testing.T) {
-	if testing.Short() {
-		t.Skip("generates on the card twice")
-	}
+	heavy.Skip(t, "generates on the card twice")
 	path := model26BPath(t)
 
 	run := func(slots string) []int32 {
@@ -173,9 +171,7 @@ func TestVulkanSameWhereverTheExpertsLive(t *testing.T) {
 // first *step change*: a block whose output is several times further apart than
 // the one before it, which is what a kernel reading the wrong bytes gives.
 func TestVulkanFirstDivergingBlock(t *testing.T) {
-	if testing.Short() {
-		t.Skip("forwards the model on both paths")
-	}
+	heavy.Skip(t, "forwards the model on both paths")
 	path := model26BPath(t)
 	ids := []int32{2, 1596, 3072, 611}
 

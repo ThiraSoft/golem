@@ -6,6 +6,8 @@ import (
 	"sort"
 	"testing"
 	"time"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 // rel is the relative difference between two site vectors, which is what a
@@ -120,9 +122,7 @@ func TestStreamedCalibrationIsWindowIndependent(t *testing.T) {
 //     arithmetic — and the streamed path is the more exact of the two, since it
 //     is the one that did not round the activation to eight bits.
 func TestStreamedCalibrationMatchesResident(t *testing.T) {
-	if testing.Short() {
-		t.Skip("uploads the model twice")
-	}
+	heavy.Skip(t, "uploads the model twice")
 	m, err := Open(qwen38, 256)
 	if err != nil {
 		t.Skipf("open: %v", err)
@@ -211,9 +211,7 @@ const qwen38BF16 = "/mnt/data/LLMs_models/unsloth/Qwen3.8-27B-GGUF/BF16/Qwen3.8-
 // A logit dump is the number every divergence in compress/README.md is taken
 // from, and a wrong one looks exactly like a right one.
 func TestForwardStreamedMatchesCPU(t *testing.T) {
-	if testing.Short() {
-		t.Skip("streams a fifty-four gigabyte checkpoint")
-	}
+	heavy.Skip(t, "streams a fifty-four gigabyte checkpoint")
 	m, err := Open(qwen38BF16, 256)
 	if err != nil {
 		t.Skipf("open: %v", err)

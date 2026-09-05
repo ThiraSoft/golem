@@ -17,10 +17,7 @@ import (
 )
 
 func TestRopeTableMatchesTheCPU(t *testing.T) {
-	d, err := Open()
-	if err != nil {
-		t.Skipf("no Vulkan device: %v", err)
-	}
+	d := open(t)
 	defer d.Close()
 
 	const dim, heads, kv, queryHeads, context = 256, 256, 256, 4, 4096

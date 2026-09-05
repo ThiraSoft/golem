@@ -31,12 +31,12 @@ import (
 	"testing"
 	"time"
 	"unsafe"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 func TestWeightsInHostMemory(t *testing.T) {
-	if testing.Short() {
-		t.Skip("moves a gigabyte through a kernel several times")
-	}
+	heavy.Skip(t, "moves a gigabyte through a kernel several times")
 	d := open(t)
 	defer d.Close()
 

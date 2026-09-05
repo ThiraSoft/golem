@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/chat"
+	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/tensors"
 	"github.com/ThiraSoft/golem/token/bytebpe"
@@ -38,6 +39,7 @@ func golemPath(t *testing.T) string {
 // right: the hidden state stays inside the gap two arithmetics leave, and both
 // paths name the same token.
 func TestVulkanGolemMatchesCPU(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	path := golemPath(t)
 	m, err := Open(path, 512)
 	if err != nil {
@@ -91,6 +93,7 @@ func TestVulkanGolemMatchesCPU(t *testing.T) {
 // that there is one. Probe stops the card after n blocks and hands back the
 // stream; the processor is run to the same point.
 func TestVulkanGolemWaypoints(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	path := golemPath(t)
 	m, err := Open(path, 512)
 	if err != nil {
@@ -162,6 +165,7 @@ func TestVulkanGolemWaypoints(t *testing.T) {
 // them is told where its columns start — an offset that is easy to write and
 // impossible to see in a pass of one, which is what the waypoints are.
 func TestVulkanGolemWidePassMatchesTokenPath(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	path := golemPath(t)
 	m, err := Open(path, 1024)
 	if err != nil {
@@ -218,6 +222,7 @@ func TestVulkanGolemWidePassMatchesTokenPath(t *testing.T) {
 // plain pass answers for it. The second is the half that can corrupt the state
 // rather than merely waste a draft.
 func TestVulkanGolemPredictionBlock(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	path := golemPath(t)
 	m, err := Open(path, 1024)
 	if err != nil {
@@ -280,6 +285,7 @@ func TestVulkanGolemPredictionBlock(t *testing.T) {
 // which they now can be, so a .golem model sees on the card exactly as a Q4_0
 // one does.
 func TestVulkanGolemDescribesAnImage(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	path := golemPath(t)
 	g, err := tensors.OpenGGUF(path)
 	if err != nil {
@@ -393,6 +399,7 @@ func TestVulkanGolemDescribesAnImage(t *testing.T) {
 // So: the same continuation drawn twice, once through the speculator and once
 // a token at a time, and they have to be the same tokens.
 func TestVulkanGolemSpeculationDrawsWhatTheModelDraws(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	path := golemPath(t)
 	m, err := Open(path, 1024)
 	if err != nil {
@@ -530,6 +537,7 @@ func TestVulkanGolemStreamNorms(t *testing.T) {
 // each makes of it, which is the only way to say which of the two is wrong
 // when a generation goes somewhere the processor does not.
 func TestVulkanGolemHeadMatchesCPU(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	path := golemPath(t)
 	m, err := Open(path, 512)
 	if err != nil {

@@ -20,13 +20,12 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/nn"
 )
 
 func TestGolemAgainstQ40(t *testing.T) {
-	if testing.Short() {
-		t.Skip("times four kernels over a 9728x2560 product")
-	}
+	heavy.Skip(t, "times four kernels over a 9728x2560 product")
 	const rows, cols = 9728, 2560
 	const times, rounds = 128, 20
 

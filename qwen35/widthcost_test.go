@@ -3,6 +3,8 @@ package qwen35
 import (
 	"testing"
 	"time"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 // TestVulkanWidthCost is what a pass costs at each width it may take. A second
@@ -11,6 +13,7 @@ import (
 // 1.20, and the shape of this curve says whether that is a fixed price for any
 // width past one or a price a column.
 func TestVulkanWidthCost(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	m, err := Open(qwen38, 1024)
 	if err != nil {
 		t.Skipf("open: %v", err)

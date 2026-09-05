@@ -11,6 +11,8 @@ package qwen
 import (
 	"testing"
 	"time"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 func openQuantizedStack(t *testing.T) (*fixture, *Model) {
@@ -59,6 +61,7 @@ func TestVulkanFullStackMatchesReference(t *testing.T) {
 // And the head, which is Q4_0 here and Q6_K on the checkpoints vk/q6k.go was
 // written for. The tolerance is the CPU test's.
 func TestVulkanLogitsMatchReference(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	f, m := openQuantizedStack(t)
 	if err := m.UseVulkanHead(); err != nil {
 		t.Skipf("no Vulkan head: %v", err)
@@ -83,6 +86,7 @@ func TestVulkanLogitsMatchReference(t *testing.T) {
 // TestVulkanHeadMatchesCPULogits is the wiring rather than the arithmetic: the
 // same hidden state through both heads, on the same model.
 func TestVulkanHeadMatchesCPULogits(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	m := openQuantized(t)
 	var hidden []float32
 	for pos := 0; pos < 8; pos++ {
@@ -108,6 +112,7 @@ func TestVulkanHeadMatchesCPULogits(t *testing.T) {
 // The reference's own continuation, drawn with every block and the head on the
 // card.
 func TestVulkanGreedyContinuationMatchesReference(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	f, m := openQuantizedStack(t)
 	if err := m.UseVulkanHead(); err != nil {
 		t.Skipf("no Vulkan head: %v", err)
@@ -154,6 +159,7 @@ func benchToken(b *testing.B, m *Model) {
 func BenchmarkQuantizedToken(b *testing.B) { benchToken(b, openQuantizedBench(b)) }
 
 func BenchmarkQuantizedTokenVulkan(b *testing.B) {
+	heavy.Skip(b, "it puts a model on the card")
 	m := openQuantizedBench(b)
 	if err := m.UseVulkanHead(); err != nil {
 		b.Skipf("no Vulkan head: %v", err)
@@ -169,6 +175,7 @@ func BenchmarkQuantizedTokenVulkan(b *testing.B) {
 // whether or not the prompt fills it, so a prompt shorter than one pass pays
 // for the columns it did not ask for.
 func BenchmarkQuantizedPrefillVulkan(b *testing.B) {
+	heavy.Skip(b, "it puts a model on the card")
 	for _, n := range []int{64, 128, 256, 512} {
 		b.Run(itoa(n), func(b *testing.B) {
 			m := openQuantizedBench(b)

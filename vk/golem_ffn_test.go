@@ -19,10 +19,7 @@ import (
 // wrong site, the halves of the stacked product swapped, a barrier missing
 // between a write and the read of it.
 func TestGolemFFNMatchesCPU(t *testing.T) {
-	d, err := Open()
-	if err != nil {
-		t.Skip(err)
-	}
+	d := open(t)
 	defer d.Close()
 
 	const dim, ffn, columns = 512, 1024, 4

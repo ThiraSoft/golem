@@ -21,10 +21,7 @@ import (
 // Gemma 4 12B's attention. The formats whose row is already a whole number of
 // words — Q4_0, Q4_K — cannot show this, which is why it survived.
 func TestTiledProductTakesOddSuperblockRows(t *testing.T) {
-	d, err := Open()
-	if err != nil {
-		t.Skip(err)
-	}
+	d := open(t)
 	defer d.Close()
 	if !d.Coopmat() {
 		t.Skip("no cooperative matrices on this device")

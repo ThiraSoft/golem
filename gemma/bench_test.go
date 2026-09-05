@@ -1,6 +1,10 @@
 package gemma
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
+)
 
 // One token through the whole stack, with a prompt already in the cache — the
 // steady state of generation. The logit head is measured separately because it
@@ -48,6 +52,7 @@ func BenchmarkPrefill(b *testing.B) {
 // fifth of the traffic on a dense model at full context and the format it is
 // held in stops being a detail.
 func BenchmarkForwardAtDepth(b *testing.B) {
+	heavy.Skip(b, "it runs a checkpoint of tens of gigabytes")
 	const depth = 4000
 	m, err := Open(model12BPath(b), 4096)
 	if err != nil {

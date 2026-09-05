@@ -4,6 +4,8 @@ import (
 	"math"
 	"os"
 	"testing"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 // A .golem checkpoint through the card against the same one through the
@@ -18,6 +20,7 @@ import (
 //
 // GOLEM_MODEL_GOLEM points at the file; the test says nothing without it.
 func TestVulkanGolemMatchesCPU(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	path := os.Getenv("GOLEM_MODEL_GOLEM")
 	if path == "" {
 		t.Skip("GOLEM_MODEL_GOLEM unset")

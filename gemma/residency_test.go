@@ -15,12 +15,12 @@ package gemma
 import (
 	"os"
 	"testing"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 func TestExpertResidency(t *testing.T) {
-	if testing.Short() {
-		t.Skip("uploads the 26B twice")
-	}
+	heavy.Skip(t, "uploads the 26B twice")
 	path := model26BPath(t)
 
 	measure := func(inHost bool) (uint64, error) {

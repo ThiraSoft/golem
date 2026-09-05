@@ -5,6 +5,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/nn"
 )
 
@@ -46,6 +47,7 @@ func (m *Model) cpuMixer(token int32, pos, block int) ([]float32, []float32) {
 }
 
 func TestVulkanProbeBlocks(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	m, err := Open(qwen38, 512)
 	if err != nil {
 		t.Skipf("open: %v", err)

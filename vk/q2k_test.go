@@ -29,10 +29,7 @@ import (
 func TestVulkanQ2KMatVecMatchesCPU(t *testing.T) {
 	g, m := aQ2_K(t)
 	defer g.Close()
-	d, err := Open()
-	if err != nil {
-		t.Skip(err)
-	}
+	d := open(t)
 	defer d.Close()
 
 	for _, columns := range []int{1, 2, 4, 8, 16} {
@@ -75,10 +72,7 @@ func TestVulkanQ2KMatVecMatchesCPU(t *testing.T) {
 func TestVulkanQ2KTiledMatchesCPU(t *testing.T) {
 	g, m := aQ2_K(t)
 	defer g.Close()
-	d, err := Open()
-	if err != nil {
-		t.Skip(err)
-	}
+	d := open(t)
 	defer d.Close()
 	if !d.Coopmat() {
 		t.Skip("no cooperative matrices on this device")

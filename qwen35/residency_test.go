@@ -2,6 +2,8 @@ package qwen35
 
 import (
 	"testing"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 // TestVulkanResidency says what the card is asked for and what it holds, which
@@ -10,6 +12,7 @@ import (
 // the last buffer in system memory and the model reads it across the bus every
 // token, fluently and eighty per cent slower.
 func TestVulkanResidency(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	for _, drafts := range []bool{true, false} {
 		m, err := Open(qwen38, 2048)
 		if err != nil {

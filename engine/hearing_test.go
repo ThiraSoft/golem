@@ -19,13 +19,12 @@ import (
 
 	"github.com/ThiraSoft/golem/audio/wav"
 	"github.com/ThiraSoft/golem/chat"
+	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/pockettts"
 )
 
 func TestTheEngineHearsWhatItSaid(t *testing.T) {
-	if testing.Short() {
-		t.Skip("this test synthesizes and then transcribes; it is not short")
-	}
+	heavy.Skip(t, "it synthesizes a sound and then transcribes it, over two models")
 	path, proj := os.Getenv("GOLEM_MODEL"), os.Getenv("GOLEM_MMPROJ")
 	if path == "" || proj == "" {
 		t.Skip("set GOLEM_MODEL and GOLEM_MMPROJ to run this test")

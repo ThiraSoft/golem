@@ -12,6 +12,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/tensors"
 )
 
@@ -78,6 +79,7 @@ func TestMoEVisionTowerMatchesTheReference(t *testing.T) {
 // TestMoEVisionGeneration is what the tower is for: the reference's own answer
 // about the picture, token for token.
 func TestMoEVisionGeneration(t *testing.T) {
+	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	f := loadVisionFixture(t, "vision26")
 	path := model26BPathT(t)
 	proj := mmproj26BPath(t)

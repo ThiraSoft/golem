@@ -25,12 +25,12 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 func TestStreamedBF16MatchesWidened(t *testing.T) {
-	if testing.Short() {
-		t.Skip("streams a fifty-two gigabyte checkpoint twice")
-	}
+	heavy.Skip(t, "streams a fifty-two gigabyte checkpoint twice")
 	if _, err := os.Stat(qwen38BF16); err != nil {
 		t.Skipf("%s is not there", qwen38BF16)
 	}

@@ -28,6 +28,8 @@ import (
 	"testing"
 	"time"
 	"unsafe"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 // uploadBytes is what every route moves. A gigabyte is large enough that one
@@ -105,9 +107,7 @@ func linkAt(dir string) (gts, lanes float64, ok bool) {
 // TestUploadRoutes measures every way this repository has of putting a byte on
 // the card, and prints them beside the link.
 func TestUploadRoutes(t *testing.T) {
-	if testing.Short() {
-		t.Skip("moves tens of gigabytes across the bus")
-	}
+	heavy.Skip(t, "moves tens of gigabytes across the bus")
 	d := open(t)
 	defer d.Close()
 

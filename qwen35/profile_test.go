@@ -3,6 +3,8 @@ package qwen35
 import (
 	"testing"
 	"time"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 // TestVulkanPassProfile is not a test of anything; it is the instrument this
@@ -20,6 +22,7 @@ import (
 // wall clock around the submission, the difference is time the card spent
 // inside no dispatch, which is the one cost no kernel rewrite can reach.
 func TestVulkanPassProfile(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	m, err := Open(qwen38, 1024)
 	if err != nil {
 		t.Skipf("open: %v", err)
@@ -76,6 +79,7 @@ func TestVulkanPassProfile(t *testing.T) {
 // engines it was the token profile that found a fifth of the time sitting in
 // an attention built for thirty-two columns.
 func TestVulkanTokenProfile(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	m, err := Open(qwen38, 1024)
 	if err != nil {
 		t.Skipf("open: %v", err)

@@ -1,6 +1,10 @@
 package qwen
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
+)
 
 // Two slots do not see each other, which is only shown by making them hold
 // different conversations: a slot that continues its own after another slot
@@ -73,6 +77,7 @@ func same(a, b []float32) bool {
 // was indexed by the position alone, was enough to hand slot 0 the other's
 // keys.
 func TestSlotsAreIndependentVulkan(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	m := openQuantized(t)
 	if err := m.SetSlots(2); err != nil {
 		t.Fatal(err)
@@ -107,6 +112,7 @@ func TestSlotsAreIndependentVulkan(t *testing.T) {
 // holds, and ask that column 0 come out unchanged — same shape, same binaries,
 // bit for bit. When the ring was indexed by the position alone it did not.
 func TestOneSlotOfAMixedPassIgnoresTheOther(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	m := openQuantized(t)
 	if err := m.SetSlots(2); err != nil {
 		t.Fatal(err)
@@ -149,6 +155,7 @@ func TestOneSlotOfAMixedPassIgnoresTheOther(t *testing.T) {
 // so the pass is cut into runs of one slot before the tiles are laid out.
 // Forty columns a conversation is two tiles each, one of them partial.
 func TestAMixedPromptKeepsATileInOneConversation(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	m := openQuantized(t)
 	if err := m.SetSlots(2); err != nil {
 		t.Fatal(err)
@@ -187,6 +194,7 @@ func TestAMixedPromptKeepsATileInOneConversation(t *testing.T) {
 // chosen before it and not after. Asking afterwards is refused rather than
 // answered with a model whose rings are the wrong size.
 func TestVulkanStackRefusesSlotsAskedForAfterIt(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	m := openQuantized(t)
 	if err := m.UseVulkanStack(); err != nil {
 		t.Skipf("no Vulkan stack: %v", err)

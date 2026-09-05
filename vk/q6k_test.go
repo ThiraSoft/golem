@@ -13,6 +13,7 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/tensors"
 )
@@ -23,6 +24,12 @@ func head(tb testing.TB) (*tensors.GGUF, nn.Matrix) {
 	path := os.Getenv("GOLEM_MODEL_26B")
 	if path == "" {
 		tb.Skip("set GOLEM_MODEL_26B to run the Vulkan head tests")
+	}
+	// A variable naming a file that is not there is a machine that does not
+	// have the model, not a fault in the kernel. gemma's own openers say the
+	// same thing the same way.
+	if _, err := os.Stat(path); err != nil {
+		tb.Skipf("GOLEM_MODEL_26B names %s, which is not there", path)
 	}
 	g, err := tensors.OpenGGUF(path)
 	if err != nil {
@@ -53,8 +60,12 @@ func activation(width int) *nn.Batch {
 	return b
 }
 
+// open is the one door onto the card in this package's tests, and the guard
+// sits in it: every test here submits work to a device, which is heavy in the
+// sense internal/heavy means — the card runs flat out, and it gets hot.
 func open(tb testing.TB) *Device {
 	tb.Helper()
+	heavy.Skip(tb, "it puts work on the card")
 	d, err := Open()
 	if err != nil {
 		tb.Skipf("no Vulkan compute device: %v", err)

@@ -244,12 +244,12 @@ func (m *Model) Group(ctx context.Context, size int) *Group {
 	}
 	inner, cancel := context.WithCancel(ctx)
 	g := &Group{
-		m:      m,
-		ctx:    inner,
-		cancel: cancel,
-		size:   size,
-		window: GroupWindow,
-		card:   m.card,
+		m:       m,
+		ctx:     inner,
+		cancel:  cancel,
+		size:    size,
+		window:  GroupWindow,
+		card:    m.card,
 		in:      make(chan *frameRequest, size),
 		done:    make(chan struct{}),
 		scratch: NewBatchScratch(size),

@@ -13,10 +13,7 @@ import (
 // and another way on the other is the failure this catches, and it is silent:
 // the weights still look like weights and the answer is somebody else's.
 func TestPrepareGolemMatchesCPU(t *testing.T) {
-	d, err := Open()
-	if err != nil {
-		t.Skip(err)
-	}
+	d := open(t)
 	defer d.Close()
 
 	const n, columns, group = 1024, 3, 128
@@ -80,10 +77,7 @@ func TestPrepareGolemMatchesCPU(t *testing.T) {
 // its blocks of thirty-two before their corrections. Reading the corrections as
 // scales would be a shift of one block and a plausible, wrong answer.
 func TestPrepareGolemFromQ8MatchesCPU(t *testing.T) {
-	d, err := Open()
-	if err != nil {
-		t.Skip(err)
-	}
+	d := open(t)
 	defer d.Close()
 
 	const n, columns, group = 512, 2, 128

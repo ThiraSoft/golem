@@ -16,8 +16,8 @@ package vk
 
 import (
 	"fmt"
-	"os"
 	"math/rand"
+	"os"
 	"testing"
 	"time"
 

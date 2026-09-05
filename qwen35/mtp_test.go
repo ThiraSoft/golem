@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/tensors"
 	"github.com/ThiraSoft/golem/token/bytebpe"
 )
@@ -14,6 +15,7 @@ import (
 // token the model itself goes on to choose. That ratio is the whole of what
 // speculative decoding can buy.
 func TestMTPAcceptance(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	g, err := tensors.OpenGGUF(qwen38)
 	if err != nil {
 		t.Skipf("open: %v", err)
@@ -89,6 +91,7 @@ func TestMTPAcceptance(t *testing.T) {
 // TestSpeculativeGenerate generates the same answer twice, once a token at a
 // time and once with the prediction block drafting, and reports both rates.
 func TestSpeculativeGenerate(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	g, err := tensors.OpenGGUF(qwen38)
 	if err != nil {
 		t.Skipf("open: %v", err)

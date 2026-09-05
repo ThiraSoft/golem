@@ -2,14 +2,14 @@ package qwen35
 
 import (
 	"fmt"
-
-	"github.com/ThiraSoft/golem/vk"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/tensors"
 	"github.com/ThiraSoft/golem/token/bytebpe"
+	"github.com/ThiraSoft/golem/vk"
 )
 
 // What a token costs on each path, and what the prediction block is worth on
@@ -29,9 +29,7 @@ func TestGenerationCost(t *testing.T) {
 	// package — so it is the thing to skip when the question is whether the
 	// code is still correct, and the thing to run when the question is what it
 	// costs.
-	if testing.Short() {
-		t.Skip("a bench; -short is for correctness")
-	}
+	heavy.Skip(t, "a bench: it reads a checkpoint of tens of gigabytes and times a run over it")
 	g, err := tensors.OpenGGUF(qwen38)
 	if err != nil {
 		t.Skipf("open: %v", err)
@@ -254,6 +252,7 @@ func TestGenerationCost(t *testing.T) {
 // column in stops fitting in registers, which is why the projections that can
 // go through the tiled product now do.
 func TestPassWidthCost(t *testing.T) {
+	heavy.Skip(t, "it puts a model on the card")
 	g, err := tensors.OpenGGUF(qwen38)
 	if err != nil {
 		t.Skipf("open: %v", err)

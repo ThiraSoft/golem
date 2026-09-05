@@ -39,10 +39,7 @@ func TestMemoryPropertiesLayout(t *testing.T) {
 // answered zero would size a working set to nothing and be taken for a small
 // card rather than for a misread structure, which is exactly what happened.
 func TestDeviceLocalBytesIsPlausible(t *testing.T) {
-	d, err := Open()
-	if err != nil {
-		t.Skipf("no device: %v", err)
-	}
+	d := open(t)
 	defer d.Close()
 	n := d.DeviceLocalBytes()
 	if n < 128<<20 {

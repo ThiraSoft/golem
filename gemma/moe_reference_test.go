@@ -13,6 +13,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/tensors"
 )
 
@@ -56,6 +57,7 @@ var moeBlocks = []int{0, 1, 5, 6, 17}
 // three million of the reference; block 17, fed by sixteen blocks of that,
 // within three parts in a hundred.
 func TestMoEForwardBlockByBlock(t *testing.T) {
+	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	f, m := load26B(t)
 	for pos, token := range f.Tokens {
 		m.Forward(token, pos)
@@ -74,6 +76,7 @@ func TestMoEForwardBlockByBlock(t *testing.T) {
 // those accumulate about three times the 12B's rounding. What that costs in
 // practice is settled below, by the choice of token rather than by a gap.
 func TestMoEResultNorm(t *testing.T) {
+	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	f, m := load26B(t)
 	var hidden []float32
 	for pos, token := range f.Tokens {
@@ -85,6 +88,7 @@ func TestMoEResultNorm(t *testing.T) {
 // TestMoEArgmax is what the rounding above actually costs: nothing, if the
 // model still chooses the reference's token.
 func TestMoEArgmax(t *testing.T) {
+	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	f, m := load26B(t)
 	var hidden []float32
 	for pos, token := range f.Tokens {
@@ -107,6 +111,7 @@ func TestMoEArgmax(t *testing.T) {
 // The prompt is not a chat turn, so both engines run into the same degenerate
 // repetition; what is tested is that they run into it together.
 func TestMoEGreedyMatchesTheReference(t *testing.T) {
+	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	f, m := load26B(t)
 	pos := 0
 	var hidden []float32

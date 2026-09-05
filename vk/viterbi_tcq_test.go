@@ -34,10 +34,7 @@ func TestViterbiMatchesCPU(t *testing.T) {
 }
 
 func viterbiAgainstCPU(t *testing.T, kbits int) {
-	d, err := Open()
-	if err != nil {
-		t.Skip(err)
-	}
+	d := open(t)
 	defer d.Close()
 
 	const n = TrellisGPUSeq * 512
@@ -129,10 +126,7 @@ func TestViterbiPathDecodesToItsReconstruction(t *testing.T) {
 }
 
 func viterbiPathDecodesToItsReconstruction(t *testing.T, kbits int) {
-	d, err := Open()
-	if err != nil {
-		t.Skip(err)
-	}
+	d := open(t)
 	defer d.Close()
 
 	const n = TrellisGPUSeq * 64

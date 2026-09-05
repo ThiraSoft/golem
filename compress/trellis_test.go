@@ -4,6 +4,8 @@ import (
 	"math"
 	"math/rand"
 	"testing"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 // The rotation makes every tensor statistically the same Gaussian, which is why
@@ -96,9 +98,7 @@ func TestTrellisAtFourBits(t *testing.T) {
 // The rate ladder, which is what says how big the file has to be to reach a
 // given quality — the whole question, once the codec is chosen.
 func TestTrellisRateLadder(t *testing.T) {
-	if testing.Short() {
-		t.Skip("the ladder is minutes, not seconds")
-	}
+	heavy.Skip(t, "the ladder is minutes, not seconds")
 	const n = 1 << 18
 	x := gaussian(n, 11)
 	for _, k := range []int{2, 3, 4, 5} {

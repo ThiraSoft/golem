@@ -43,10 +43,7 @@ func TestMatVecShapeSweep(t *testing.T) {
 	}
 	sort.Strings(files)
 
-	d, err := Open()
-	if err != nil {
-		t.Skip(err)
-	}
+	d := open(t)
 	defer d.Close()
 
 	// Qwen3-4B's gate and up are 9728 by 2560, and that matrix is fourteen

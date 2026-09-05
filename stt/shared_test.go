@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 // TestSeparateStreamsKeepTheirOwnScratch is the guard on a Model being shared.
@@ -17,6 +19,7 @@ import (
 // day. This is two ordinary streams, no group and no card, and they must each
 // say exactly what one stream alone says.
 func TestSeparateStreamsKeepTheirOwnScratch(t *testing.T) {
+	heavy.Skip(t, "it transcribes real speech end to end on the processor")
 	m := testModel(t)
 	clip := speech(t)
 	want := transcribeAlone(t, m, clip)

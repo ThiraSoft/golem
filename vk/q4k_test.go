@@ -83,10 +83,7 @@ func aKQuant(tb testing.TB, dtype string, q nn.Quant) (*tensors.GGUF, nn.Matrix)
 func TestVulkanQ4KMatVecMatchesCPU(t *testing.T) {
 	g, m := aQ4_K(t)
 	defer g.Close()
-	d, err := Open()
-	if err != nil {
-		t.Skip(err)
-	}
+	d := open(t)
 	defer d.Close()
 
 	const columns = 16
@@ -272,10 +269,7 @@ func kQuantAgainstFloats(m nn.Matrix, batch *nn.Batch, columns int) [][]float32 
 func TestVulkanQ4KTiledMatchesCPU(t *testing.T) {
 	g, m := aQ4_K(t)
 	defer g.Close()
-	d, err := Open()
-	if err != nil {
-		t.Skip(err)
-	}
+	d := open(t)
 	defer d.Close()
 	if !d.Coopmat() {
 		t.Skip("no cooperative matrices on this device")
@@ -332,10 +326,7 @@ func TestVulkanQ4KTiledMatchesCPU(t *testing.T) {
 func TestVulkanQ6KMatVecMatchesCPU(t *testing.T) {
 	g, m := aQ6_K(t)
 	defer g.Close()
-	d, err := Open()
-	if err != nil {
-		t.Skip(err)
-	}
+	d := open(t)
 	defer d.Close()
 
 	const columns = 16
@@ -434,10 +425,7 @@ func TestVulkanQ6KMatVecMatchesCPU(t *testing.T) {
 func TestVulkanQ6KTiledMatchesCPU(t *testing.T) {
 	g, m := aQ6_K(t)
 	defer g.Close()
-	d, err := Open()
-	if err != nil {
-		t.Skip(err)
-	}
+	d := open(t)
 	defer d.Close()
 	if !d.Coopmat() {
 		t.Skip("no cooperative matrices on this device")

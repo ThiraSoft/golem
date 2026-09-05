@@ -3,6 +3,8 @@ package vk
 import (
 	"testing"
 	"unsafe"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 // How much host memory a submission may reach at once.
@@ -23,9 +25,7 @@ import (
 // model in Q8_0 wants 24 GB and cannot, on this machine, without a boot
 // parameter or a pool read from the file instead.
 func TestResidencyCap(t *testing.T) {
-	if testing.Short() {
-		t.Skip("allocates and submits gigabytes of host memory")
-	}
+	heavy.Skip(t, "allocates and submits gigabytes of host memory")
 	d := open(t)
 	defer d.Close()
 	pipe, err := d.NewPipeline(moeFillSPIRV, 3, uint32(unsafe.Sizeof(fillPush{})))
