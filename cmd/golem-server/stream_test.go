@@ -119,3 +119,33 @@ func TestStreamSendsACallInOnePiece(t *testing.T) {
 		t.Fatalf("reason %q", reason)
 	}
 }
+
+// A streamed answer is constrained like any other: the grammar reaches the
+// sampler through the same parameters, and nothing in the streaming path
+// touches them.
+func TestStreamStaysInsideTheGrammar(t *testing.T) {
+	s := newTestServer(t, []string{"no", "no", "<turn|>"}, "yes")
+	w := post(t, s, `{"messages":[{"role":"user","content":"hi"}],"stream":true,
+		"grammar":"root ::= \"yes\""}`)
+
+	var text strings.Builder
+	for _, frame := range frames(t, w.Body.String()) {
+		if frame == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(frame), &chunk); err != nil {
+			t.Fatalf("%q: %v", frame, err)
+		}
+		text.WriteString(chunk.Choices[0].Delta.Content)
+	}
+	if text.String() != "yes" {
+		t.Fatalf("the stream carried %q, and the grammar allows only yes", text.String())
+	}
+}
