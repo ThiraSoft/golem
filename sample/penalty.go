@@ -105,6 +105,9 @@ func (w *window) apply(id int32, logit float32) float32 {
 // so a caller that hands Pick to a speculative step has nothing else to do.
 func (s *Sampler) Accept(id int32) {
 	s.pen.push(id)
+	if s.con != nil {
+		s.con.Accept(id)
+	}
 }
 
 // Seed puts a whole run of tokens into the window at once, which is what the

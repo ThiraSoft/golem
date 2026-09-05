@@ -65,6 +65,10 @@ type Sampler struct {
 	// scratch holds a penalised copy of the row, for the weights the
 	// shortcut cannot take. Nothing else allocates a row here.
 	scratch []float32
+	// con is what a grammar arrives as, and keep is where the candidates it
+	// allows are gathered.
+	con  Constraint
+	keep []candidate
 }
 
 func New(p Params) *Sampler {
@@ -133,23 +137,49 @@ func (s *Sampler) Pick(logits []float32) int32 {
 
 // draw is Pick without the bookkeeping.
 func (s *Sampler) draw(logits []float32) int32 {
-	switch {
-	case !s.pen.active():
-		return s.plainDraw(logits)
-	case s.pen.raises():
+	row, penalise := logits, s.pen.active()
+	if penalise && s.pen.raises() {
 		// Weights that can lift a logit rather than lower it. The shortcut
-		// below cannot see those coming, so the row is penalised in full.
-		return s.plainDraw(s.penalised(logits))
+		// cannot see those coming, so the row is penalised in full and the
+		// chain reads that instead.
+		row, penalise = s.penalised(logits), false
 	}
 
+	id := s.unconstrained(row, penalise)
+	if s.con == nil || s.con.Allows(id) {
+		return id
+	}
+
+	// The draw fell outside what the grammar allows, so it is drawn again
+	// among what it does. This is llama.cpp's laziness: the sweep below is the
+	// expensive road, and most draws never take it.
+	kept := s.allowed(row, s.width(), penalise)
+	if len(kept) == 0 {
+		// The grammar allows nothing at all. Refusing to name a token would
+		// hang the answer; the caller sees an unconstrained one and can stop.
+		return id
+	}
+	return s.pickFrom(kept)
+}
+
+// unconstrained is the chain with the penalties and without the grammar.
+func (s *Sampler) unconstrained(row []float32, penalise bool) int32 {
+	if !penalise {
+		return s.plainDraw(row)
+	}
 	// The shortcut: k+u raw candidates, penalised and cut back to k, which is
 	// the set a full pass would have left.
-	k := s.p.TopK
+	k := s.width()
+	return s.pickFrom(s.penalise(s.topK(row, widen(k, s.pen.distinct(), len(row))), k))
+}
+
+// width is how many candidates the chain keeps: top-k, or one when the draw is
+// greedy and the rest of the row cannot matter.
+func (s *Sampler) width() int {
 	if s.p.Temperature <= 0 {
-		k = 1
+		return 1
 	}
-	kept := s.penalise(s.topK(logits, widen(k, s.pen.distinct(), len(logits))), k)
-	return s.pickFrom(kept)
+	return s.p.TopK
 }
 
 // plainDraw is the chain over a row that needs no penalising.

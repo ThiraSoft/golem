@@ -355,6 +355,10 @@ func (g *Grammar) FirstBytes() *[256]bool {
 	}
 	g.first = [256]bool{}
 	g.firstOK = true
+	// Zero is the byte a token with no piece of its own reports — an
+	// end-of-turn token, or a control token. Those are decided by Allows and
+	// must never be dropped by this table.
+	g.first[0] = true
 
 	if g.partial.remain > 0 {
 		// A character is open: only a continuation byte can come next.
@@ -413,9 +417,11 @@ func leadByte(r rune) byte {
 	}
 }
 
-// FirstByte is the lead byte of a token's piece, for the sweep above.
+// FirstByte is the lead byte of a token's piece, for the sweep above. A token
+// that ends a turn reports zero whatever it prints: whether it is allowed is a
+// question about the grammar being finished, not about its bytes.
 func (g *Grammar) FirstByte(id int32) byte {
-	if int(id) >= len(g.toks.first) {
+	if int(id) >= len(g.toks.first) || g.toks.eog[id] {
 		return 0
 	}
 	return g.toks.first[id]
