@@ -230,7 +230,8 @@ planner spends whatever device memory is going on a cache of the experts a
 token keeps asking for, so `GOLEM_MOE_EXPERTS_HOST=1` alone fills the card
 again and answers at nearly the resident rate. `GOLEM_MOE_CACHE_SLOTS=N` is
 what names a footprint between the two, and the table further down is that
-whole curve.
+whole curve; `GOLEM_MOE_CACHE_SLOTS=0` is what names the floor itself, and
+`gemma/residency_test.go` measures both rows from the driver's own budget.
 
 **What stays on the card is the shared branches, the attention and the head**;
 the twelve gigabytes that leave are the experts. So what a mixture costs the card

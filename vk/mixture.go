@@ -491,16 +491,30 @@ const byExpertFrom = 32
 func expertsInHost() bool { return os.Getenv("GOLEM_MOE_EXPERTS_HOST") != "" || cacheSlots() > 0 }
 
 // cacheSlots is how many of a block's experts the card keeps a copy of, from
-// GOLEM_MOE_CACHE_SLOTS, or zero for no cache at all.
+// GOLEM_MOE_CACHE_SLOTS, or -1 when nothing was said and planResidency is to
+// size the cache itself.
 //
-// It implies the pool is in host memory, because a cache of a stack that is
-// already resident is a copy of it. On the 26B A4B one expert is 3.35 MB and a
-// block has a hundred and twenty-eight, so forty slots a block is 5.1 GB over
-// thirty blocks — the share gemma/expert_cache_test.go measures at 91.9 %.
+// A number above nought implies the pool is in host memory, because a cache of
+// a stack that is already resident is a copy of it. On the 26B A4B one expert
+// is 3.35 MB and a block has a hundred and twenty-eight, so forty slots a block
+// is 5.1 GB over thirty blocks — the share gemma/expert_cache_test.go measures
+// at 91.9 %.
+//
+// **An explicit nought is a nought, and it is not the same as saying nothing.**
+// Left to itself the planner spends whatever device memory is going on cache,
+// so GOLEM_MOE_EXPERTS_HOST=1 alone fills the card back up — on the 26B A4B it
+// plans a hundred and twenty-eight slots a block, which is a copy of the whole
+// pool. A nought here is how a caller asks for the floor instead: the pool in
+// host memory and none of it on the card. It is the README's "no cache" row,
+// and gemma/residency_test.go is what measures it.
 func cacheSlots() int {
-	n, err := strconv.Atoi(os.Getenv("GOLEM_MOE_CACHE_SLOTS"))
-	if err != nil || n < 1 {
-		return 0
+	v, ok := os.LookupEnv("GOLEM_MOE_CACHE_SLOTS")
+	if !ok {
+		return -1
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return -1
 	}
 	return n
 }
@@ -595,7 +609,7 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 	}
 	coop := d.Coopmat()
 	m := &Mixture{d: d, dim: dim, ffn: ffn, dense: dense, experts: experts, act: act, coop: coop,
-		byExpertFrom: byExpertWidth(), slots: cacheSlots(), slotsAsked: cacheSlots()}
+		byExpertFrom: byExpertWidth(), slots: max(cacheSlots(), 0), slotsAsked: cacheSlots()}
 	if m.slots > experts {
 		// A cache larger than the pool is the pool, and the eviction has
 		// nothing to choose between.
@@ -1793,9 +1807,10 @@ func (m *Mixture) planResidency(pool int) {
 		m.slots = 0
 		return
 	}
-	if m.slotsAsked > 0 {
+	if m.slotsAsked >= 0 {
 		// An explicit ask is honoured, because a sweep has to be able to name
-		// the number it is sweeping.
+		// the number it is sweeping — and a nought is an ask like any other,
+		// the floor with nothing of the pool on the card.
 		m.slots = min(m.slotsAsked, m.experts)
 		m.narrowFor(m.slots)
 		return
