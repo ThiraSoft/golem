@@ -51,13 +51,7 @@ func (s *Sampler) allowed(logits []float32, k int, penalise bool) []candidate {
 			}
 		}
 		if len(s.keep) >= target {
-			if penalise {
-				return s.penalise(s.keep, k)
-			}
-			if k > 0 && len(s.keep) > k {
-				s.keep = s.keep[:k]
-			}
-			return s.keep
+			return s.cut(k, penalise)
 		}
 		width *= 4
 	}
@@ -72,6 +66,12 @@ func (s *Sampler) allowed(logits []float32, k int, penalise bool) []candidate {
 		}
 	}
 	sortCandidates(s.keep)
+	return s.cut(k, penalise)
+}
+
+// cut is what the gathered candidates become: penalised where the shortcut
+// asked for extra of them, sorted, and no more than k.
+func (s *Sampler) cut(k int, penalise bool) []candidate {
 	if len(s.keep) == 0 {
 		return nil
 	}
