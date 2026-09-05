@@ -19,7 +19,7 @@ import (
 // day. This is two ordinary streams, no group and no card, and they must each
 // say exactly what one stream alone says.
 func TestSeparateStreamsKeepTheirOwnScratch(t *testing.T) {
-	heavy.Skip(t, "it transcribes real speech end to end on the processor")
+	heavy.Skip(t, "it takes thirty seconds running two streams of real speech together")
 	m := testModel(t)
 	clip := speech(t)
 	want := transcribeAlone(t, m, clip)

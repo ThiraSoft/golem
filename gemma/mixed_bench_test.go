@@ -3,8 +3,6 @@ package gemma
 import (
 	"testing"
 	"time"
-
-	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 // What a pass costs as more conversations share it, and what the head costs
@@ -105,7 +103,6 @@ func TestMixedPrefillCost(t *testing.T) {
 // only while there is nothing else to do: by eight columns the arithmetic and
 // the head are what is left.
 func TestMixedBatchCostVulkan(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	// Four hundred and forty-eight positions of context, not a handful: a
 	// token drawn at position 64 costs 7.6ms on this model and one drawn at
 	// 512 costs 14.1ms, because the attention reads everything before it. A
@@ -177,7 +174,6 @@ func TestMixedBatchCostVulkan(t *testing.T) {
 // and twelve positions each seeing everything before them is twice the scores
 // of two runs of two hundred and fifty-six.
 func TestMixedPrefillCostVulkan(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	const width = 512
 	m := open26B(t)
 	if err := m.SetSlots(2); err != nil {

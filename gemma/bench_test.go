@@ -52,7 +52,7 @@ func BenchmarkPrefill(b *testing.B) {
 // fifth of the traffic on a dense model at full context and the format it is
 // held in stops being a detail.
 func BenchmarkForwardAtDepth(b *testing.B) {
-	heavy.Skip(b, "it runs a checkpoint of tens of gigabytes")
+	heavy.Skip(b, "a bench is a measurement, not a check, and it runs until it has one")
 	const depth = 4000
 	m, err := Open(model12BPath(b), 4096)
 	if err != nil {

@@ -669,30 +669,35 @@ Every number in this README is a benchmark in this repository, run on the machin
 
 ## 🧪 Running the tests
 
-`go test ./...` is the correctness suite. It runs the real models — parity
-against the llama.cpp fixtures, generation, vision, speech, the Vulkan kernels
-and the small checkpoints on the card — and takes two to three minutes on the
-machine below.
+`go test ./...` is the correctness suite. It runs the real models on both paths
+— the parity fixtures, generation, vision, speech, the Vulkan kernels, and the
+12B, 26B and 27B on the card — and takes about seventeen minutes on the machine
+below, package by package.
 
 ```bash
-go test ./...                           # correctness, real models, the card
-GOLEM_FULL_TEST=1 go test ./qwen35/     # the heavy ones, one package at a time
+go test ./...                           # correctness, every model, the card
+GOLEM_FULL_TEST=1 go test ./qwen35/     # the rest, one package at a time
 ```
 
-What waits behind `GOLEM_FULL_TEST`: the 12B, the 26B and the 27B, on the card
-and on the processor both; the kernel sweeps and the transfers of gigabytes; the
-benchmarks; and the transcriptions of real speech end to end. Those are as much
-a load test as a test — the card and the processor run flat out and both get
-hot, and running all of them at once has taken this machine down. Run them a
-package at a time, and watch the machine while they do.
+The line is thirty seconds. A check that takes longer than that waits behind
+`GOLEM_FULL_TEST`, whichever device it runs on, and so does anything that is a
+measurement rather than a check — a profile, a cost, a bench — and anything that
+streams a checkpoint larger than the card. Each says which it is when it skips.
 
-Package by package on an i7-9700K and an RX 9070 XT, with every checkpoint on
-disk: `stt` 110 s, `compress` 108 s, `pockettts` 96 s, `gemma` 88 s, `qwen`
-63 s, `vk` 51 s, `cmd/golem-server` 16 s, `qwen35` 0.8 s, everything else under
-four. `go test` runs eight packages at once, so the wall time is far below the
-sum — but several of them map a checkpoint of tens of gigabytes at the same
-time, and on a machine with less memory `-p 2` is the flag that keeps it
-comfortable.
+That leaves fifteen tests behind the variable, and they are the ones worth
+knowing about: `TestVulkanPassProfile` runs longer than the test timeout allows,
+`TestStreamedBF16MatchesWidened` streams fifty-two gigabytes twice,
+`TestStreamedCalibrationIsWindowIndependent` calibrates the 27B on the processor
+for three minutes. Run them a package at a time and watch the machine: they are
+as much a load test as a test, and running everything at once has taken this
+machine down.
+
+Package by package on an i7-9700K and an RX 9070 XT, `-p 1`, every checkpoint on
+disk: `gemma` 378 s, `qwen35` 214 s, `vk` 117 s, `stt` 105 s, `pockettts` 96 s,
+`compress` 92 s, `cmd/golem-server` 35 s, `qwen` 22 s, everything else under six.
+`go test` runs eight packages at once by default, which is faster and hungrier:
+several of them map a checkpoint of tens of gigabytes at the same time, so on a
+machine with less memory `-p 2` is the flag that keeps it comfortable.
 
 `internal/heavy` is the whole mechanism: one guard, one reason per test, and
 that reason reaches the skip line.

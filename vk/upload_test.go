@@ -107,7 +107,7 @@ func linkAt(dir string) (gts, lanes float64, ok bool) {
 // TestUploadRoutes measures every way this repository has of putting a byte on
 // the card, and prints them beside the link.
 func TestUploadRoutes(t *testing.T) {
-	heavy.Skip(t, "moves tens of gigabytes across the bus")
+	heavy.Skip(t, "it measures the bus rather than checking anything, and takes thirty seconds moving tens of gigabytes to do it")
 	d := open(t)
 	defer d.Close()
 

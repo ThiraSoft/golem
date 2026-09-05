@@ -1,6 +1,7 @@
 package gemma
 
 import (
+	"github.com/ThiraSoft/golem/internal/heavy"
 	"math"
 	"testing"
 )
@@ -89,6 +90,7 @@ func TestLogitsMatchTheReference(t *testing.T) {
 // a window block and a global one see exactly the same positions, and a missing
 // mask costs nothing. This is the test that fails when the window is wrong.
 func TestWindowMasksBeyondItsReach(t *testing.T) {
+	heavy.Skip(t, "it takes thirty-one seconds walking a window past its reach")
 	f := loadFixture(t, "window")
 	m := openEngine(t, 4096)
 

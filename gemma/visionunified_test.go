@@ -13,7 +13,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/tensors"
 )
 
@@ -114,7 +113,6 @@ func TestUnifiedProjectionMatchesTheReference(t *testing.T) {
 // for E2B: the picture encoded, spliced into the fixture's own tokens, and the
 // same continuation drawn from it.
 func TestUnifiedVisionGenerationMatchesTheReference(t *testing.T) {
-	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	f := loadVisionFixture(t, "vision12")
 	if os.Getenv("GOLEM_MMPROJ_12B") == "" {
 		t.Skip("set GOLEM_MMPROJ_12B to run this test")

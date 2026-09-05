@@ -89,7 +89,7 @@ func TestStepBatchOneMatchesStep(t *testing.T) {
 // TestGroupTranscriptMatchesAlone is the whole point, end to end: three streams
 // stepped together must say exactly what each of them says on its own.
 func TestGroupTranscriptMatchesAlone(t *testing.T) {
-	heavy.Skip(t, "it transcribes real speech end to end on the processor")
+	heavy.Skip(t, "it takes thirty-two seconds transcribing the same speech twice")
 	m := testModel(t)
 	clip := speech(t)
 

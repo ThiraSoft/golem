@@ -32,7 +32,6 @@ func open26B(t *testing.T) *Model {
 }
 
 func TestVulkanHeadMatchesCPULogits(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	m := open26B(t)
 
 	// Something with a real hidden state behind it rather than a made-up
@@ -83,7 +82,7 @@ func TestVulkanHeadMatchesCPULogits(t *testing.T) {
 
 // BenchmarkMoETokenVulkanHead is a whole token with only the head moved.
 func BenchmarkMoETokenVulkanHead(b *testing.B) {
-	heavy.Skip(b, "it puts a model on the card")
+	heavy.Skip(b, "a bench is a measurement, not a check, and it runs until it has one")
 	m := open26BEngine(b)
 	if err := m.UseVulkanHead(); err != nil {
 		b.Skipf("no Vulkan head: %v", err)
@@ -119,7 +118,6 @@ func benchToken(b *testing.B, m *Model) {
 // unchanged.
 func load26BStack(t *testing.T) (*fixture, *Model) {
 	t.Helper()
-	heavy.Skip(t, "it puts a model on the card")
 	t.Helper()
 	f, m := load26B(t)
 	if m.Cfg.Experts == 0 {
@@ -150,7 +148,6 @@ func load26BStack(t *testing.T) (*fixture, *Model) {
 // thirty blocks of drift and the last number says nothing about where it
 // began.
 func TestVulkanForwardBlockByBlock(t *testing.T) {
-	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	f, m := load26BStack(t)
 	m.TraceBlocks()
 	for pos, token := range f.Tokens {
@@ -164,7 +161,6 @@ func TestVulkanForwardBlockByBlock(t *testing.T) {
 
 // TestVulkanResultNorm is the last norm the logits are drawn from.
 func TestVulkanResultNorm(t *testing.T) {
-	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	f, m := load26BStack(t)
 	var hidden []float32
 	for pos, token := range f.Tokens {
@@ -186,7 +182,6 @@ func TestVulkanResultNorm(t *testing.T) {
 // that failed the shader would be measuring the summation order rather than
 // the device.
 func TestVulkanGreedyMatchesTheReference(t *testing.T) {
-	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	f, m := load26BStack(t)
 	pos := 0
 	var hidden []float32
@@ -215,7 +210,7 @@ func TestVulkanGreedyMatchesTheReference(t *testing.T) {
 // BenchmarkMoETokenVulkan is a whole token with every block and the head on
 // the card, against BenchmarkMoEToken on the CPU alone.
 func BenchmarkMoETokenVulkan(b *testing.B) {
-	heavy.Skip(b, "it puts a model on the card")
+	heavy.Skip(b, "a bench is a measurement, not a check, and it runs until it has one")
 	m := open26BEngine(b)
 	if err := m.UseVulkanHead(); err != nil {
 		b.Skipf("no Vulkan head: %v", err)
@@ -229,7 +224,7 @@ func BenchmarkMoETokenVulkan(b *testing.B) {
 // BenchmarkMoETokenVulkanBlocks leaves the head on the CPU, which separates
 // the two gains.
 func BenchmarkMoETokenVulkanBlocks(b *testing.B) {
-	heavy.Skip(b, "it puts a model on the card")
+	heavy.Skip(b, "a bench is a measurement, not a check, and it runs until it has one")
 	m := open26BEngine(b)
 	if err := m.UseVulkanStack(); err != nil {
 		b.Skipf("no Vulkan stack: %v", err)
@@ -240,7 +235,6 @@ func BenchmarkMoETokenVulkanBlocks(b *testing.B) {
 // TestVulkanStackProfile is not a test of anything; it is the instrument that
 // says which stage of a block a token is spent in. Run it with -v.
 func TestVulkanStackProfile(t *testing.T) {
-	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	_, m := load26BStack(t)
 	tl, err := m.NewStackTimeline()
 	if err != nil {
@@ -283,7 +277,6 @@ func TestVulkanStackProfile(t *testing.T) {
 // within one per cent of llama.cpp. So the tolerance here is the token path's,
 // unchanged, and the comparison is to the same recording.
 func TestVulkanBatchBlockByBlock(t *testing.T) {
-	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	f, m := load26BStack(t)
 	m.TraceBlocks()
 	m.ForwardBatch(f.Tokens, 0)
@@ -300,7 +293,6 @@ func TestVulkanBatchBlockByBlock(t *testing.T) {
 // filled by the by-expert branch has to answer what one filled a token at a
 // time answers.
 func TestVulkanBatchGreedyMatchesTheReference(t *testing.T) {
-	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	f, m := load26BStack(t)
 	hidden := m.ForwardBatch(f.Tokens, 0)
 	last := hidden[len(hidden)-1]
@@ -329,7 +321,7 @@ func TestVulkanBatchGreedyMatchesTheReference(t *testing.T) {
 // once for a pass rather than once for each of its columns, so what this
 // reports should rise with the width of the pass and not stay flat.
 func BenchmarkMoEPrefillVulkan(b *testing.B) {
-	heavy.Skip(b, "it puts a model on the card")
+	heavy.Skip(b, "a bench is a measurement, not a check, and it runs until it has one")
 	for _, n := range []int{64, 128, 256, 512, 1024} {
 		b.Run(itoa(n), func(b *testing.B) {
 			m := open26BEngine(b)
@@ -366,7 +358,6 @@ func BenchmarkMoEPrefillVulkan(b *testing.B) {
 // rather than a token: which stage of a mixture block a batch is spent in.
 // Run it with -v.
 func TestVulkanPromptProfile(t *testing.T) {
-	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	_, m := load26BStack(t)
 	tl, err := m.NewStackTimeline()
 	if err != nil {
@@ -416,7 +407,6 @@ func TestVulkanPromptProfile(t *testing.T) {
 // room, and it is a ceiling, not a target. If a change here needs it raised,
 // the change is wrong.
 func TestVulkanBatchMatchesTokenPath(t *testing.T) {
-	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	t.Setenv("GOLEM_MOE_BY_EXPERT_FROM", "2")
 	f, m := load26BStack(t)
 	m.TraceBlocks()
@@ -464,7 +454,6 @@ func TestVulkanBatchMatchesTokenPath(t *testing.T) {
 // times tighter than the batch test's beside it and a hundred times looser
 // than the fault it hunts.
 func TestVulkanColumnsMatchTokenPath(t *testing.T) {
-	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	f, m := load26BStack(t)
 	if len(f.Tokens) < 2 {
 		t.Skipf("the fixture is %d tokens", len(f.Tokens))

@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/imageio"
-	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/tensors"
 	"github.com/ThiraSoft/golem/vk"
 )
@@ -54,7 +53,6 @@ func visionImage(t *testing.T, path string) *imageio.Image {
 // works at all. TestVulkanVisionTowerMatchesLlamaCpp is what names the block a
 // divergence began in.
 func TestVulkanVisionTowerMatchesCPU(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	tower := openVisionTower(t)
 	im := visionImage(t, filepath.Join("..", "testdata", "gemma", "shapes.png"))
 
@@ -106,7 +104,6 @@ func TestVulkanVisionTowerMatchesCPU(t *testing.T) {
 // the processor's tower; what this adds is the six waypoints inside a block,
 // so that a divergence names not only its block but its stage.
 func TestVulkanVisionTowerMatchesLlamaCpp(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	idx, dir := visionFixture(t)
 	tower := openVisionTower(t)
 
@@ -172,7 +169,6 @@ func TestVulkanVisionTowerMatchesLlamaCpp(t *testing.T) {
 // are checked against the resident form. This forces the other and holds it to
 // the same rows.
 func TestVulkanVisionTowerStreamed(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	tower := openVisionTower(t)
 	im := visionImage(t, filepath.Join("..", "testdata", "gemma", "shapes.png"))
 	want := tower.Encode(im)
@@ -221,7 +217,6 @@ func TestVulkanVisionTowerStreamed(t *testing.T) {
 // choice this machine fell on. Whether the weights fit beside a 27B depends on
 // the context the model was opened with, so it is logged and not required.
 func TestVulkanVisionTowerBesideTheModel(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	g, err := tensors.OpenGGUF(qwen38)
 	if err != nil {
 		t.Skipf("open: %v", err)

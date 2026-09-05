@@ -30,7 +30,7 @@ import (
 )
 
 func TestStreamedBF16MatchesWidened(t *testing.T) {
-	heavy.Skip(t, "streams a fifty-two gigabyte checkpoint twice")
+	heavy.Skip(t, "it streams a fifty-two gigabyte checkpoint twice")
 	if _, err := os.Stat(qwen38BF16); err != nil {
 		t.Skipf("%s is not there", qwen38BF16)
 	}

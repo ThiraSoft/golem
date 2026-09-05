@@ -65,7 +65,7 @@ func calibTokens(n int) []int32 {
 // Every one of those is invisible in a single window and changes the answer in
 // several.
 func TestStreamedCalibrationIsWindowIndependent(t *testing.T) {
-	heavy.Skip(t, "it calibrates a twenty-seven billion parameter checkpoint on the processor")
+	heavy.Skip(t, "it calibrates a twenty-seven billion parameter checkpoint on the processor, for three minutes")
 	m, err := Open(qwen38, 256)
 	if err != nil {
 		t.Skipf("open: %v", err)
@@ -123,7 +123,7 @@ func TestStreamedCalibrationIsWindowIndependent(t *testing.T) {
 //     arithmetic — and the streamed path is the more exact of the two, since it
 //     is the one that did not round the activation to eight bits.
 func TestStreamedCalibrationMatchesResident(t *testing.T) {
-	heavy.Skip(t, "uploads the model twice")
+	heavy.Skip(t, "it streams a checkpoint larger than the card, twice over")
 	m, err := Open(qwen38, 256)
 	if err != nil {
 		t.Skipf("open: %v", err)
@@ -212,7 +212,7 @@ const qwen38BF16 = "/mnt/data/LLMs_models/unsloth/Qwen3.8-27B-GGUF/BF16/Qwen3.8-
 // A logit dump is the number every divergence in compress/README.md is taken
 // from, and a wrong one looks exactly like a right one.
 func TestForwardStreamedMatchesCPU(t *testing.T) {
-	heavy.Skip(t, "streams a fifty-four gigabyte checkpoint")
+	heavy.Skip(t, "it streams a checkpoint larger than the card and forwards it on both paths")
 	m, err := Open(qwen38BF16, 256)
 	if err != nil {
 		t.Skipf("open: %v", err)

@@ -15,7 +15,7 @@ import (
 // token the model itself goes on to choose. That ratio is the whole of what
 // speculative decoding can buy.
 func TestMTPAcceptance(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
+	heavy.Skip(t, "it takes thirty-six seconds drafting against itself")
 	g, err := tensors.OpenGGUF(qwen38)
 	if err != nil {
 		t.Skipf("open: %v", err)
@@ -91,7 +91,6 @@ func TestMTPAcceptance(t *testing.T) {
 // TestSpeculativeGenerate generates the same answer twice, once a token at a
 // time and once with the prediction block drafting, and reports both rates.
 func TestSpeculativeGenerate(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	g, err := tensors.OpenGGUF(qwen38)
 	if err != nil {
 		t.Skipf("open: %v", err)

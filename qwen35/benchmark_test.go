@@ -11,7 +11,7 @@ import (
 
 func TestVulkanTokenCost(t *testing.T) {
 	// A bench. See TestGenerationCost.
-	heavy.Skip(t, "a bench: it reads a checkpoint of tens of gigabytes and times a run over it")
+	heavy.Skip(t, "a cost is a measurement, not a check")
 	g, err := tensors.OpenGGUF(qwen38)
 	if err != nil {
 		t.Skipf("open: %v", err)

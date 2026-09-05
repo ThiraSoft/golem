@@ -15,7 +15,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/tensors"
 )
 
@@ -123,7 +122,6 @@ func TestBlock12B(t *testing.T) {
 // which is what TestBlock12B holds, and the logits still choose the same
 // tokens.
 func TestForward12BMatchesTheReference(t *testing.T) {
-	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	f := loadFixture(t, "layers12")
 	m := open12BEngine(t)
 
@@ -144,7 +142,6 @@ func TestForward12BMatchesTheReference(t *testing.T) {
 
 // The logits, and the token the reference would have chosen from them.
 func TestLogits12BMatchTheReference(t *testing.T) {
-	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	f := loadFixture(t, "layers12")
 	m := open12BEngine(t)
 
@@ -183,7 +180,6 @@ func TestLogits12BMatchTheReference(t *testing.T) {
 // turn, so both engines run into the same degenerate repetition; what is tested
 // is that they run into it together.
 func TestGreedy12BMatchesTheReference(t *testing.T) {
-	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	f := loadFixture(t, "layers12")
 	m := open12BEngine(t)
 

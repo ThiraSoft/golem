@@ -157,7 +157,7 @@ func benchToken(b *testing.B, m *Model) {
 func BenchmarkQuantizedToken(b *testing.B) { benchToken(b, openQuantizedBench(b)) }
 
 func BenchmarkQuantizedTokenVulkan(b *testing.B) {
-	heavy.Skip(b, "it puts a model on the card")
+	heavy.Skip(b, "a bench is a measurement, not a check, and it runs until it has one")
 	m := openQuantizedBench(b)
 	if err := m.UseVulkanHead(); err != nil {
 		b.Skipf("no Vulkan head: %v", err)
@@ -173,7 +173,7 @@ func BenchmarkQuantizedTokenVulkan(b *testing.B) {
 // whether or not the prompt fills it, so a prompt shorter than one pass pays
 // for the columns it did not ask for.
 func BenchmarkQuantizedPrefillVulkan(b *testing.B) {
-	heavy.Skip(b, "it puts a model on the card")
+	heavy.Skip(b, "a bench is a measurement, not a check, and it runs until it has one")
 	for _, n := range []int{64, 128, 256, 512} {
 		b.Run(itoa(n), func(b *testing.B) {
 			m := openQuantizedBench(b)

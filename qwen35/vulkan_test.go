@@ -6,8 +6,6 @@ import (
 	"os"
 	"testing"
 	"time"
-
-	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 // qwen38 is the checkpoint these tests read. GOLEM_MODEL_QWEN35 points them at
@@ -38,7 +36,6 @@ func diff(a, b []float32) (maxAbs, rel float64) {
 }
 
 func TestVulkanMatchesCPU(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	m, err := Open(qwen38, 512)
 	if err != nil {
 		t.Skipf("open: %v", err)
@@ -93,7 +90,6 @@ func TestVulkanMatchesCPU(t *testing.T) {
 // run from one column to the next inside the pass, which is the part that a
 // per-column dispatch cannot do for itself.
 func TestVulkanTwoColumns(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	m, err := Open(qwen38, 512)
 	if err != nil {
 		t.Skipf("open: %v", err)
@@ -167,7 +163,6 @@ func TestVulkanTwoColumns(t *testing.T) {
 // 3e-2. What must not differ is the token, which is asserted as well: an index
 // fault does not drift, it answers something else.
 func TestVulkanWidePassMatchesTokenPath(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	m, err := Open(qwen38, 1024)
 	if err != nil {
 		t.Skipf("open: %v", err)

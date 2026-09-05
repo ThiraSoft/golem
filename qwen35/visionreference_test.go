@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/ThiraSoft/golem/imageio"
-	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/tensors"
 )
 
@@ -77,7 +76,6 @@ func worstGap(got, want []float32) (float64, int) {
 // is the interpolation or the reordering of the learned table. Only then do
 // the blocks mean anything.
 func TestVisionTowerMatchesLlamaCpp(t *testing.T) {
-	heavy.Skip(t, "it runs a checkpoint of tens of gigabytes")
 	idx, dir := visionFixture(t)
 
 	g, err := tensors.OpenGGUF(qwen38mmproj)

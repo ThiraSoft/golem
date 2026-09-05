@@ -5,8 +5,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-
-	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 // TestTranscribeClip is the only test here that judges the transcript, and it
@@ -72,7 +70,6 @@ func wordErrorRate(want, got []string) float64 {
 // TestTranscribeMatchesStream checks that the two doors are one path: the same
 // clip written in one call and in 80 ms pieces must give the same text.
 func TestTranscribeMatchesStream(t *testing.T) {
-	heavy.Skip(t, "it transcribes real speech end to end on the processor")
 	dir := os.Getenv("GOLEM_STT")
 	if dir == "" {
 		t.Skip("GOLEM_STT not set")

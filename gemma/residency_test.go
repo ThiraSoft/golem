@@ -20,7 +20,7 @@ import (
 )
 
 func TestExpertResidency(t *testing.T) {
-	heavy.Skip(t, "uploads the 26B twice")
+	heavy.Skip(t, "it fails: moving the experts off the card frees nothing on this driver, which is a bug and not a slow test")
 	path := model26BPath(t)
 
 	measure := func(inHost bool) (uint64, error) {

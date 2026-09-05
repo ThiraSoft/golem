@@ -12,7 +12,6 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/nn"
 )
 
@@ -101,7 +100,6 @@ func TestGolemBuildsAgree(t *testing.T) {
 // does not assert: the fastest shape is the card's answer, not this
 // repository's.
 func TestGolemSweep(t *testing.T) {
-	heavy.Skip(t, "times every shape of every pass width over a 9728x2560 product")
 	d := open(t)
 	defer d.Close()
 	rows, err := TuneGolem(d, 9728, 2560, 5)

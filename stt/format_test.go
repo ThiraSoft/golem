@@ -17,7 +17,6 @@ import (
 )
 
 func TestFormatsAgreeOnTheTranscript(t *testing.T) {
-	heavy.Skip(t, "it transcribes real speech end to end on the processor")
 	dir := os.Getenv("GOLEM_STT")
 	if dir == "" {
 		t.Skip("GOLEM_STT not set")
@@ -63,7 +62,7 @@ func TestFormatsAgreeOnTheTranscript(t *testing.T) {
 // the reference — there is no ground truth file for this clip, and what is
 // being measured is what quantizing takes away, not what the model knows.
 func TestFormatsOnRealSpeech(t *testing.T) {
-	heavy.Skip(t, "it transcribes real speech end to end on the processor")
+	heavy.Skip(t, "it takes thirty-six seconds transcribing real speech in every format")
 	dir := os.Getenv("GOLEM_STT")
 	if dir == "" {
 		t.Skip("GOLEM_STT not set")

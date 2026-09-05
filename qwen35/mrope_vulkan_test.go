@@ -17,7 +17,7 @@ import (
 // They share a model because loading one costs 12.8 GiB of a 16 GiB card, and
 // qwen35's suite already spends nine of those.
 func TestVulkanMRoPE(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
+	heavy.Skip(t, "it takes forty seconds, the longest check in the package")
 	m, err := Open(qwen38, 512)
 	if err != nil {
 		t.Skipf("open: %v", err)

@@ -29,7 +29,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/token/bpe"
 )
@@ -52,7 +51,6 @@ type routeLog [][]int32
 // TestExpertCacheHitRate decodes a continuation and reports what a cache of
 // each size would have held.
 func TestExpertCacheHitRate(t *testing.T) {
-	heavy.Skip(t, "decodes several hundred tokens on the processor")
 	path := model26BPath(t)
 	m, err := Open(path, 2048)
 	if err != nil {

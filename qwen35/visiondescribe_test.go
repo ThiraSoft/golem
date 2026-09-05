@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/ThiraSoft/golem/chat"
-	"github.com/ThiraSoft/golem/internal/heavy"
 	"github.com/ThiraSoft/golem/tensors"
 	"github.com/ThiraSoft/golem/token/bytebpe"
 )
@@ -19,7 +18,6 @@ import (
 // that the rows reach the model at the right positions and that the model has
 // something to say about them — which is the half no waypoint can check.
 func TestVulkanDescribesAnImage(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	g, err := tensors.OpenGGUF(qwen38)
 	if err != nil {
 		t.Skipf("open: %v", err)

@@ -29,7 +29,7 @@ func TestGenerationCost(t *testing.T) {
 	// package — so it is the thing to skip when the question is whether the
 	// code is still correct, and the thing to run when the question is what it
 	// costs.
-	heavy.Skip(t, "a bench: it reads a checkpoint of tens of gigabytes and times a run over it")
+	heavy.Skip(t, "a cost is a measurement, not a check")
 	g, err := tensors.OpenGGUF(qwen38)
 	if err != nil {
 		t.Skipf("open: %v", err)
@@ -252,7 +252,7 @@ func TestGenerationCost(t *testing.T) {
 // column in stops fitting in registers, which is why the projections that can
 // go through the tiled product now do.
 func TestPassWidthCost(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
+	heavy.Skip(t, "a cost is a measurement, not a check")
 	g, err := tensors.OpenGGUF(qwen38)
 	if err != nil {
 		t.Skipf("open: %v", err)

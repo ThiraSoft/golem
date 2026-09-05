@@ -18,7 +18,6 @@ import (
 
 func load12BStack(t *testing.T) (*fixture, *Model) {
 	t.Helper()
-	heavy.Skip(t, "it puts a model on the card")
 	t.Helper()
 	f := loadFixture(t, "layers12")
 	m := open12BEngine(t)
@@ -61,7 +60,6 @@ func TestVulkan12BResultNorm(t *testing.T) {
 // mixture's was: the two paths sum the same products in a different order, and
 // this prompt is a degenerate repetition whose logits sit close together.
 func TestVulkan12BGreedyMatchesTheReference(t *testing.T) {
-	heavy.Skip(t, "it puts a model on the card")
 	f, m := load12BStack(t)
 	if err := m.UseVulkanHead(); err != nil {
 		t.Logf("the head stays on the CPU: %v", err)
@@ -105,7 +103,7 @@ func open12BEngineBench(b *testing.B) *Model {
 func Benchmark12BToken(b *testing.B) { benchToken(b, open12BEngineBench(b)) }
 
 func Benchmark12BTokenVulkan(b *testing.B) {
-	heavy.Skip(b, "it puts a model on the card")
+	heavy.Skip(b, "a bench is a measurement, not a check, and it runs until it has one")
 	m := open12BEngineBench(b)
 	if err := m.UseVulkanHead(); err != nil {
 		b.Skipf("no Vulkan head: %v", err)
@@ -119,7 +117,7 @@ func Benchmark12BTokenVulkan(b *testing.B) {
 // Benchmark12BPrefillVulkan is a prompt of sixty-four positions, which the
 // device path reads one column at a time.
 func Benchmark12BPrefillVulkan(b *testing.B) {
-	heavy.Skip(b, "it puts a model on the card")
+	heavy.Skip(b, "a bench is a measurement, not a check, and it runs until it has one")
 	m := open12BEngineBench(b)
 	if err := m.UseVulkanHead(); err != nil {
 		b.Skipf("no Vulkan head: %v", err)
