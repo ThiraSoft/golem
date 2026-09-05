@@ -24,8 +24,14 @@ type completionRequest struct {
 	MaxTokens   *int            `json:"max_tokens"`
 	Seed        *uint64         `json:"seed"`
 	Stop        stopStrings     `json:"stop"`
-	N           *int            `json:"n"`
-	LogProbs    *bool           `json:"logprobs"`
+	// The penalties, under the names OpenAI gives two of them and llama.cpp
+	// the other two.
+	FrequencyPenalty *float64 `json:"frequency_penalty"`
+	PresencePenalty  *float64 `json:"presence_penalty"`
+	RepeatPenalty    *float64 `json:"repeat_penalty"`
+	RepeatLastN      *int     `json:"repeat_last_n"`
+	N                *int     `json:"n"`
+	LogProbs         *bool    `json:"logprobs"`
 }
 
 // requestMessages reads the two shapes the API gives a turn's content: a

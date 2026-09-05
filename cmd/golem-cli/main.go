@@ -60,6 +60,10 @@ func main() {
 	topK := flag.Int("top-k", -1, "candidates kept; 0 keeps all, negative takes the file's own value")
 	topP := flag.Float64("top-p", -1, "share of the mass kept; negative takes the file's own value")
 	seed := flag.Uint64("seed", 0, "seed of the draw; 0 for a different answer every time")
+	repeatPenalty := flag.Float64("repeat-penalty", -1, "divide the logit of a token already in the conversation; 1 is no penalty, negative takes the file's own value")
+	repeatLastN := flag.Int("repeat-last-n", -2, "how many of the conversation's last tokens the penalties read; 0 turns them off, -1 reads the whole conversation")
+	freqPenalty := flag.Float64("frequency-penalty", -1, "subtract this once per appearance in that window; negative takes the file's own value")
+	presPenalty := flag.Float64("presence-penalty", -1, "subtract this once for any appearance at all; negative takes the file's own value")
 	mmproj := flag.String("mmproj", os.Getenv("GOLEM_MMPROJ"), "projector GGUF, which is what lets a model see (or GOLEM_MMPROJ)")
 	var images stringList
 	flag.Var(&images, "image", "a picture to put in the first turn; repeat for several")
@@ -144,6 +148,20 @@ func main() {
 	if *topP >= 0 {
 		params.TopP = float32(*topP)
 	}
+	if *repeatPenalty >= 0 {
+		params.PenaltyRepeat = float32(*repeatPenalty)
+	}
+	// -2 is this flag's own "not given": -1 is a window of the whole
+	// conversation, which is a value a caller may actually want.
+	if *repeatLastN > -2 {
+		params.PenaltyLastN = *repeatLastN
+	}
+	if *freqPenalty >= 0 {
+		params.PenaltyFreq = float32(*freqPenalty)
+	}
+	if *presPenalty >= 0 {
+		params.PenaltyPresent = float32(*presPenalty)
+	}
 	params.Seed = *seed
 	if params.Seed == 0 {
 		params.Seed = rand.Uint64()
@@ -156,6 +174,10 @@ func main() {
 			loading.Round(time.Millisecond), runtime.NumCPU())
 		fmt.Fprintf(os.Stderr, "sampling: temperature %g, top-k %d, top-p %g, seed %d\n",
 			params.Temperature, params.TopK, params.TopP, params.Seed)
+		if params.PenaltyRepeat != 1 || params.PenaltyFreq != 0 || params.PenaltyPresent != 0 {
+			fmt.Fprintf(os.Stderr, "penalties: repeat %g, frequency %g, presence %g, over the last %d tokens\n",
+				params.PenaltyRepeat, params.PenaltyFreq, params.PenaltyPresent, params.PenaltyLastN)
+		}
 
 		// The image tower, when there is one. It is worth a line of its own: a
 		// tower that did not fit beside the model still runs on the card, and the

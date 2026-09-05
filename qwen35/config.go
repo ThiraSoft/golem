@@ -186,5 +186,17 @@ func loadSampling(g *tensors.GGUF) sample.Params {
 	if v, err := g.Float32("general.sampling.top_p"); err == nil {
 		p.TopP = v
 	}
+	if v, err := g.Uint32("general.sampling.penalty_last_n"); err == nil {
+		p.PenaltyLastN = int(v)
+	}
+	if v, err := g.Float32("general.sampling.penalty_repeat"); err == nil {
+		p.PenaltyRepeat = v
+	}
+	if v, err := g.Float32("general.sampling.penalty_freq"); err == nil {
+		p.PenaltyFreq = v
+	}
+	if v, err := g.Float32("general.sampling.penalty_present"); err == nil {
+		p.PenaltyPresent = v
+	}
 	return p
 }

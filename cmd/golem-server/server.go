@@ -32,8 +32,8 @@ type Server struct {
 	served   int
 	// vision is nil unless a projector was opened, and images is what the
 	// tower has already made of the pictures it was sent.
-	vision engine.Media
-	images *imageCache
+	vision   engine.Media
+	images   *imageCache
 	stt      *stt.Model
 	sttGroup *stt.Group
 }
@@ -289,6 +289,18 @@ func (s *Server) sampling(req *completionRequest) sample.Params {
 	}
 	if req.Seed != nil {
 		p.Seed = *req.Seed
+	}
+	if req.RepeatPenalty != nil {
+		p.PenaltyRepeat = float32(*req.RepeatPenalty)
+	}
+	if req.RepeatLastN != nil {
+		p.PenaltyLastN = *req.RepeatLastN
+	}
+	if req.FrequencyPenalty != nil {
+		p.PenaltyFreq = float32(*req.FrequencyPenalty)
+	}
+	if req.PresencePenalty != nil {
+		p.PenaltyPresent = float32(*req.PresencePenalty)
 	}
 	return p
 }

@@ -279,3 +279,21 @@ func (wordTemplate) ParseCalls(text string) (string, []chat.ToolCall, error) {
 	}
 	return before, calls, nil
 }
+
+// The penalties read the conversation, not only the answer: llama-server feeds
+// every prompt token to the sampler before the first draw
+// (tools/server/server-context.cpp:254-260). A word already in the prompt is
+// worth less, and here it is worth so much less that the model's own favourite
+// loses to a word it never scored.
+func TestGenerationSeedsThePenaltyWindowWithThePrompt(t *testing.T) {
+	g, v := newGenerator(t, []string{"hello", "<turn|>"}, 4)
+	p := sample.Params{Temperature: 0, PenaltyLastN: 64, PenaltyRepeat: 1, PenaltyPresent: 200}
+
+	answer, err := g.Generate(context.Background(), v.Encode("hello", false, true), p, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(answer.Text, "hello") {
+		t.Fatalf("the answer is %q, and hello was already in the prompt", answer.Text)
+	}
+}

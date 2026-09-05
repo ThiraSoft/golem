@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ThiraSoft/golem/sample"
 )
 
 func newTestServer(t testing.TB, script []string) *Server {
@@ -220,5 +222,23 @@ func TestAnUnknownPathIs404(t *testing.T) {
 	s.Handler().ServeHTTP(w, httptest.NewRequest("GET", "/v1/embeddings", nil))
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("%d", w.Code)
+	}
+}
+
+// The four penalty fields a request may carry, over the file's own values.
+func TestSamplingReadsThePenaltyFields(t *testing.T) {
+	s := newTestServer(t, []string{"a", "<turn|>"})
+	s.defaults = sample.Params{Temperature: 1, PenaltyLastN: 64, PenaltyRepeat: 1}
+
+	lastN, repeat, freq, present := 128, 1.2, 0.3, 0.4
+	got := s.sampling(&completionRequest{RepeatLastN: &lastN, RepeatPenalty: &repeat,
+		FrequencyPenalty: &freq, PresencePenalty: &present})
+
+	if got.PenaltyLastN != 128 || got.PenaltyRepeat != 1.2 ||
+		got.PenaltyFreq != 0.3 || got.PenaltyPresent != 0.4 {
+		t.Fatalf("the request asked for 128/1.2/0.3/0.4 and the sampler took %+v", got)
+	}
+	if none := s.sampling(&completionRequest{}); none.PenaltyRepeat != 1 || none.PenaltyLastN != 64 {
+		t.Fatalf("a request naming nothing changed the file's values: %+v", none)
 	}
 }

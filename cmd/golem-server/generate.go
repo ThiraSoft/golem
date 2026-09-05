@@ -78,6 +78,10 @@ func (g *Generator) GeneratePrompt(ctx context.Context, prompt engine.Prompt, p 
 	answer := Answer{Prompt: fed, Prefill: time.Since(start), Reason: "stop"}
 	start = time.Now()
 	sampler := sample.New(p)
+	// The penalties read the conversation, not only what is drawn from here
+	// on: llama-server seeds its sampler with every prompt token before the
+	// first draw (tools/server/server-context.cpp:254-260).
+	sampler.Seed(prompt.Tokens())
 
 	var drawn strings.Builder // everything drawn, calls included
 	sent := 0                 // how much of it has left through emit

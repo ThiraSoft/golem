@@ -264,6 +264,11 @@ func (s *Session) AskWithMedia(text string, images, audio [][]byte, w io.Writer)
 		}
 	}
 	s.held = append(s.held[:0], ids...)
+	// The penalties read the conversation and not only what is drawn: every
+	// token fed here joins their window, as llama-server does with a prompt
+	// before its first draw. What was drawn before is already in it — Pick put
+	// it there — and is not fed again.
+	s.sampler.Seed(ids[from:])
 	turn := Turn{Prompt: len(ids) - from, Prefill: time.Since(start)}
 
 	var answer strings.Builder
