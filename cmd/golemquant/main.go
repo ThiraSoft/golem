@@ -16,11 +16,13 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/ThiraSoft/golem/compress"
+	"github.com/ThiraSoft/golem/internal/version"
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/qwen"
 	"github.com/ThiraSoft/golem/qwen35"
@@ -56,7 +58,13 @@ func main() {
 	salFile := flag.String("salience", "", "read the sites from this file, or write them to it after measuring; the salience does not depend on -alpha, -clamp or the codec, and measuring it again for each of them is most of a sweep's wall clock")
 	calibWindow := flag.Int("calib-window", 0, "how many blocks of a float checkpoint are resident on the card at once while it is calibrated. Zero sizes the window from the block's own weight, which is all this has to go on: nothing here asks the driver what is free")
 	measure := flag.Bool("measure-only", false, "stop once the sites are written, converting nothing. The two halves of a conversion do not want the same device — the card cannot run a BF16 checkpoint at all, and only the card can encode one in reasonable time — so a model too large to calibrate on the card is done in two commands: this one with -vulkan=false to measure the checkpoint exactly, then the conversion with -salience, which reads the file and never runs the model")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(filepath.Base(os.Args[0]), version.String())
+		return
+	}
 	if *measure && *salFile == "" {
 		must(fmt.Errorf("golemquant: -measure-only writes the sites and nothing else, so it wants a -salience file to write them to"))
 	}

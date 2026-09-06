@@ -35,9 +35,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
+      # Pinned, and not to the newest either. Go 1.23.12 and 1.24.9 link this
+      # module into a binary that segfaults before main: purego imports dlopen
+      # through //go:cgo_import_dynamic, those two toolchains drop the libc and
+      # libpthread NEEDED entries on the way out, and the first call lands on
+      # address zero. 1.23.8, 1.25.x and 1.26.x are all fine. The smoke step
+      # below is what would catch the next one.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.25.x'
 
       # CGO_ENABLED=0 is the whole point of the project and not a precaution:
       # a binary that links libc is a binary that stops running one glibc
@@ -59,6 +65,25 @@ jobs:
           done
           cp LICENSE README.md "dist/${dir}/"
           tar -C dist -czf "dist/${dir}.tar.gz" "${dir}"
+
+      # A binary nobody ran is a binary nobody knows about. The runner is
+      # linux/amd64, so it can run one of the four builds; the others are
+      # taken on the strength of that one and of the same toolchain.
+      - name: smoke
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          for b in dist/golem_${TAG}_linux_amd64/*; do
+            case "$b" in *.md|*LICENSE) continue;; esac
+            code=0
+            "$b" -version || code=$?
+            if [ "$code" -ge 128 ]; then
+              echo "$b died on signal $((code - 128))" >&2
+              exit 1
+            fi
+          done
 
       - uses: actions/upload-artifact@v4
         with:

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/audio/wav"
+	"github.com/ThiraSoft/golem/internal/version"
 	"github.com/ThiraSoft/golem/pockettts"
 )
 
@@ -25,12 +26,18 @@ func main() {
 	saveVoice := flag.String("save-voice", "", "write the cloned voice here, to be reused with -voice")
 	out := flag.String("o", "out.wav", "WAV file to write, or - for standard output")
 	seed := flag.Uint64("seed", 0, "seed of the random draw; 0 for a different voice every time")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [options] <text>\n", filepath.Base(os.Args[0]))
 		fmt.Fprintln(os.Stderr, "  Without text, the text is read from standard input.")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(filepath.Base(os.Args[0]), version.String())
+		return
+	}
 
 	lang, err := pockettts.LookupLanguage(*language)
 	if err != nil {
