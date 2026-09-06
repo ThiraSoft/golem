@@ -150,7 +150,7 @@ func (p *QwenPipeline) prepare(r *Recorder, x *PrepareGolem, columns int) {
 func (p *QwenPipeline) golemProduct(r *Recorder, m *GolemMatrix, columns int) {
 	for at := 0; at < columns; {
 		w := 1
-		for _, c := range GolemWidths {
+		for _, c := range golemAllWidths() {
 			if c <= columns-at && c > w {
 				w = c
 			}

@@ -316,3 +316,40 @@ func TestPassWidthCost(t *testing.T) {
 	fmt.Printf("a prompt of %d: %v (%.0f positions/s)\n", len(toks), d.Round(time.Millisecond),
 		float64(len(toks))/d.Seconds())
 }
+
+// TestPrefillCost is a prompt read end to end at a context length a prompt of
+// that size actually wants, which is the one regime TestPassWidthCost above
+// cannot see: it opens the model at a thousand positions, and the attention's
+// cost and the cache's are both the context's.
+//
+// It is also where the tiled golem product is read off honestly. GOLEM_NO_TILE
+// takes vk/matmul_golem.go's widths back out and puts the pass width back to
+// sixty-four with them, so the two runs are one binary and differ only in the
+// shape of the product. Measured on the 27B in t3g, 2048 positions at a
+// context of 10240: 98.7 positions a second against 189.2.
+func TestPrefillCost(t *testing.T) {
+	heavy.Skip(t, "a cost is a measurement, not a check")
+	const positions, context = 2048, 10240
+	g, err := tensors.OpenGGUF(qwen38)
+	if err != nil {
+		t.Skipf("open: %v", err)
+	}
+	m, err := New(g, context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.UseVulkan(); err != nil {
+		t.Skipf("no Vulkan: %v", err)
+	}
+	toks := make([]int32, positions)
+	for i := range toks {
+		toks[i] = int32(1000 + i*7%40000)
+	}
+	m.Reset()
+	start := time.Now()
+	m.ForwardBatch(toks, 0)
+	d := time.Since(start)
+	fmt.Printf("a prompt of %d at a context of %d: %v (%.1f positions/s)\n",
+		positions, context, d.Round(time.Millisecond), float64(positions)/d.Seconds())
+}

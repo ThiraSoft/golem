@@ -73,7 +73,7 @@ func BenchmarkGolemMatVec(b *testing.B) {
 	// blk.0.ffn_gate of the 4B: 9728 rows by 2560.
 	const rows, cols = 9728, 2560
 	for _, kind := range []nn.Quant{nn.T3G, nn.T4G, nn.T5G} {
-		for _, columns := range []int{1, 8} {
+		for _, columns := range []int{1, 8, 32, 64} {
 			b.Run(kind.String()+"/c"+itoa(columns), func(b *testing.B) {
 				benchGolemShape(b, kind, rows, cols, columns)
 			})

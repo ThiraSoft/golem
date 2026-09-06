@@ -481,6 +481,19 @@ generates more slowly than either. Qwen3-4B on an RX 9070 XT, same card, greedy:
 | **golem `.golem` T4G** | **1.97 GiB** | **80.3** |
 | **golem `.golem` T3G** | **1.57 GiB** | **82.5** |
 
+**A prompt is a different shape and it is answered.** The decode is paid once
+per column of a pass, so a mat-vec that stops at eight columns pays it eight
+times where a tiled product pays it once for a whole tile. `.golem` has one
+now: a workgroup owns sixty-four rows by thirty-two columns of the answer and
+decodes each weight once into shared memory for all of them. On Qwen3.8-27B in
+T3G that is **98.7 positions a second to 189.2** for a prompt of 2048 at a
+context of 10240, one binary and two runs — and the pass width the format may
+take goes from sixty-four columns to two hundred and fifty-six with it, because
+what used to stop it was the dispatch count.
+
+The generation figure above is unmoved: a token is one column, and one column
+has nothing to tile.
+
 The reason is the codebook and it does not go away with tuning: a trellis weight
 is decoded one at a time out of twelve bits of state, where a nibble format
 decodes eight per instruction. About half of the trellis mat-vec is that decode.

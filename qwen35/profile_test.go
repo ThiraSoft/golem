@@ -32,7 +32,9 @@ func TestVulkanPassProfile(t *testing.T) {
 		t.Skipf("no Vulkan: %v", err)
 	}
 
-	for _, width := range []int{256, 512} {
+	// Sixty-four as well as the two wide ones: it is where a .golem pipeline
+	// stops, and vk/qwen_pipeline.go's golemWidestPass says why.
+	for _, width := range []int{64, 256, 512} {
 		if width > m.gpuPipe.Columns() {
 			continue
 		}

@@ -1,0 +1,413 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Y = W * X for a golem matrix against a batch of float activations.
+//
+// shaders/matvec_t4g.comp is the same product one column at a time, and for a
+// token that is the right shape. It is the wrong shape for a prompt, and the
+// reason is not the one a K-quant kernel has. There, a wide pass amortizes the
+// weight traffic; here the weights are already four tenths of a byte and the
+// traffic was never the wall. What a golem weight costs is the *decode* — a
+// window cut out of a bit stream, a hash, a multiply — about five instructions,
+// and the mat-vec pays them once per column of the pass. At eight columns,
+// which is where GolemWidths stops, that is five instructions of decode against
+// eight of product, and the activation is read from memory once per weight per
+// column on top.
+//
+// So the tile. A workgroup owns BM rows by BN columns of the answer and walks
+// the shared dimension one block of sixty-four at a time. Each step it decodes
+// the block's weights *once* into shared memory and stages the block's
+// activations beside them, and every thread then meets its own TM by TN corner
+// of the answer out of shared memory. A weight is decoded once and spent BN
+// times, so at sixty-four columns the decode is a sixty-fourth of what the
+// mat-vec spends on it rather than an eighth.
+//
+// The block of sixty-four is not a choice: it is the span of one step code, so
+// a staged tile that stops there needs no second scale, and it is the width at
+// which the decoded tile — BM by sixty-four floats — still leaves the card room
+// for more than one workgroup. Sixteen kibibytes is what a decoded golem tile
+// costs where a Q4_0 one costs two, and that is the price of a format that has
+// no bytes to stage.
+//
+// **The codebook's table is not here and that is deliberate.** matvec_t4g.comp
+// builds the hash's whole image in shared memory because a narrow pass hashes
+// every weight for every column. Here a weight is hashed once and spent BN
+// times, so the hash is already amortized by the tile and the table would be
+// sixteen kibibytes bought against the occupancy for nothing.
+//
+// The activation is float and one column after another, exactly as
+// matvec_t4g.comp reads it, and it has already been through PrepareGolem: the
+// per-column vector and the rotation belong to the site and are undone on this
+// side.
+//
+// What it is worth
+// ------------------------------------------------------------------
+// On Qwen3.8-27B in t3g, one pass of sixty-four columns, read off the card's
+// own clock through qwen35.TestVulkanPassProfile — the same pass, the same
+// process, the tiled widths taken out with GOLEM_NO_TILE:
+//
+//   stage        mat-vec    tiled
+//   ffn up       300.2 ms   169.6 ms
+//   ffn down     151.1 ms   110.4 ms
+//   ssm in       107.2 ms    68.4 ms
+//   ssm out       40.4 ms    29.4 ms
+//   attn qkv      31.1 ms    17.8 ms
+//   whole pass   652.8 ms   414.8 ms
+//
+// and with the pass then widened to two hundred and fifty-six, which the tile
+// is what makes affordable, 9497 microseconds a column becomes 4773: **twice
+// the prefill**, and vk/qwen_pipeline.go's golemWidestPass says why the line
+// is there and not higher.
+//
+// The geometry, and how it was found
+// ------------------------------------------------------------------
+// The tile is preprocessor arithmetic, so a shape is a binary; vk's
+// TestGolemTileSweep compiles a directory of them and times them interleaved
+// with the order rotating, for the reason vk/golemtune.go gives at length.
+//
+// **The first sweep was run at the wrong size and said the wrong thing.**
+// Timed on a 9728x2560 product — the shape vk/golem_bench_test.go has always
+// used — the answer was BM 32, BN 32, two by two, and every larger tile lost.
+// That matrix gives a hundred and fifty-two workgroups on a sixty-four unit
+// card, which is a measurement of the launch and not of the tile. At the 27B's
+// own 34816x5120, Gweight a second:
+//
+//   BM   BN  TM  TN   gate 34816x5120   down 5120x17408   qkv 6144x5120
+//   64   32   2   2        4186              3408             3160
+//  128   64   8   4        4110              3710             3054
+//   64   32   4   2        4090              3502             3169
+//  128   64   4   4        4069              3529                -
+//   32   32   2   2        3713              3356             3274
+//
+// Four by two over sixty-four by thirty-two is the one that is near the top of
+// all three, and in the engine it is worth six per cent over the small tile the
+// first sweep chose. The spread across the top five is three per cent, which is
+// this card's floor for reading a difference at all.
+//
+// **Reading the staged tiles sixteen bytes at a time loses**, which is the one
+// axis that cuts the inner loop's instruction count: a thread's step is TM+TN
+// shared reads against TM*TN*4 products, four reads for sixteen products where
+// the scalar loop is sixteen. It is 2327 Gweight a second against 3891 at the
+// same shape, and 2209 against 3191 at another. shaders/matmul.comp measured
+// the same thing on the same card and its header says the same sentence: wide
+// shared reads are not what this card wants, the scalar loop at an odd stride
+// is. VEC4 keeps both shapes so that the next person measures rather than
+// assumes.
+//
+// **What is left, and it is not a geometry.** At four by two the walk issues
+// about five hundred and twelve products against three hundred and eighty-four
+// shared reads and a hundred and fifty of everything else — the product is half
+// the issue, and the card gives about a fifth of its float rate. The only axis
+// that moves that ratio further is a larger register tile, and every one of
+// them loses here for the reason shaders/matmul.comp names: this card is short
+// of waves in flight rather than of arithmetic per wave. What would move it is
+// staging the two tiles as sixteen-bit floats and pairing the products —
+// v_dot2_f32_f16 is two multiply-accumulates an instruction and halves the
+// shared traffic with them — and that is a change to what the product answers,
+// not to how fast it answers it. It is not made here.
+
+#ifndef COLUMNS
+#define COLUMNS 64
+#endif
+
+// The tier: three bits, four, or five. Only the geometry changes with it.
+#ifndef KBITS
+#define KBITS 4
+#endif
+
+// The tile. TM rows by TN columns to a thread, BM rows by BN columns to a
+// workgroup. BM and BN are said twice — here and in vk/matmul_golem.go's
+// golemTileRows and golemTileCols — and left disagreeing the dispatch covers a
+// fraction of the answer and leaves the rest zero, which reads as a speed-up.
+#ifndef TM
+#define TM 4
+#endif
+#ifndef TN
+#define TN 2
+#endif
+#ifndef BM
+#define BM 64
+#endif
+#ifndef BN
+#if COLUMNS > 32
+#define BN 32
+#else
+#define BN COLUMNS
+#endif
+#endif
+// A pass narrower than BN has one column group and not a fraction of one.
+#if BN > COLUMNS
+#undef BN
+#define BN COLUMNS
+#endif
+#define CGROUPS (COLUMNS / BN)
+#define COLTH   (BN / TN)
+#define THREADS ((BM / TM) * COLTH)
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer W { uint  w[]; };
+layout(std430, binding = 1) readonly  buffer T { float steps[]; };
+layout(std430, binding = 2) readonly  buffer X { float x[]; };
+// The same activation seen sixteen bytes at a time. A column is p.ffn floats
+// and a block sixty-four, both multiples of four, so every staged run is
+// sixteen-byte aligned.
+layout(std430, binding = 2) readonly  buffer X4 { vec4 x4[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint dim; // outputs
+    uint ffn; // inputs
+    uint col; // the first column of the pass this dispatch answers
+} p;
+
+const uint SEQ   = 128u; // weights in one path
+const uint BLOCK = 64u;  // weights sharing one step
+#if KBITS == 5
+const uint SEQB  = 81u;
+const uint HALFB = 40u;
+#elif KBITS == 3
+const uint SEQB  = 50u;
+const uint HALFB = 24u;
+#else
+const uint SEQB  = 65u;
+const uint HALFB = 32u;
+#endif
+
+// WPT is how many of a block's sixty-four weights one thread decodes, and
+// SPLITW how many threads share a block. Four threads to a block is what makes
+// the staging exactly fill a workgroup at BM sixty-four: the four of them read
+// overlapping windows of the same words, which the memory system answers as one
+// transaction because they are adjacent lanes. It is a define so that the sweep
+// can move it with BM; the staging loop carries the bound either way.
+#ifndef SPLITW
+#define SPLITW  4
+#endif
+#define WPT     (int(BLOCK) / SPLITW)
+#define WITEMS  (BM * SPLITW)
+#define WLOADS  ((WITEMS + THREADS - 1) / THREADS)
+
+// SJ is how many words of realigned stream one thread's WPT weights lie in:
+// the last of them starts at bit (WPT-1)*KBITS and is twelve wide. One more
+// word than that is read, because the realignment pairs word j with word j+1.
+#define SJ (((WPT - 1) * KBITS + 12 + 31) / 32)
+
+// VEC4 reads the staged tiles sixteen bytes at a time — one ds_read_b128 where
+// there are four scalar reads — which is the one axis that moves the ratio the
+// sweep is stuck on. A thread's inner step is TM+TN shared reads against
+// TM*TN*4 products, so at two by two it is four reads for sixteen products
+// where the scalar loop is sixteen for sixteen.
+//
+// shaders/matmul.comp measured the same change 1.4 times *slower* on this card
+// and says so in its header. It is not the same kernel: there a staged operand
+// is a Q8_0 block already read four uints at a time, and the wide read only
+// moved where the unpacking happened. Here every staged value is one float and
+// the scalar loop issues one instruction for each of them.
+#ifndef VEC4
+#define VEC4 0
+#endif
+
+// The activation, BN columns of one block, in vec4 where the tile is read that
+// way and in floats where it is not.
+#if VEC4
+#define AITEMS (BN * int(BLOCK) / 4)
+#else
+#define AITEMS (BN * int(BLOCK))
+#endif
+#define ALOADS ((AITEMS + THREADS - 1) / THREADS)
+
+// The staged tiles, padded so that a wave's lanes land on different banks: a
+// stride of sixty-four floats is exactly twice the bank count, and every lane
+// of a row would read the same bank. The padding is four floats and not one
+// where the tiles are read as vectors, because a vec4 wants its sixteen bytes
+// aligned.
+#if VEC4
+#define WSTRIDE (int(BLOCK) / 4 + 1)
+#define XSTRIDE (int(BLOCK) / 4 + 1)
+shared vec4 swt[BM * WSTRIDE];
+shared vec4 sxt[BN * XSTRIDE];
+#else
+#define WSTRIDE (int(BLOCK) + 1)
+#define XSTRIDE (int(BLOCK) + 1)
+shared float swt[BM * WSTRIDE];
+shared float sxt[BN * XSTRIDE];
+#endif
+
+// The format numbers the stream's bits from the top of byte zero, so a word of
+// it read little-endian has its bytes the wrong way round.
+uint bswap(uint v) {
+    return (v >> 24u) | ((v >> 8u) & 0xFF00u) | ((v << 8u) & 0xFF0000u) | (v << 24u);
+}
+
+// The 1MAD code of nn/t4g.go, hashed rather than looked up: see the header.
+float t4gHash(uint s) {
+    uint v = (((519u * s) & 0xFFFFu) << 16u) + (25297u * s + 76625530u);
+    uint sum = uint(dotPacked4x8EXT(v, 0x01010101u));
+    return (float(sum) - 510.0) * 0.00676589971;
+}
+
+// seqOf is the byte a block's stream starts at.
+uint seqOf(uint codeBase, uint b) {
+    return codeBase + (b >> 1u) * SEQB + (b & 1u) * HALFB;
+}
+
+// The three places the two layouts differ, so that the walk above reads the
+// same either way.
+#if VEC4
+#define WSTORE(r, k, v) swt[(r) * uint(WSTRIDE) + (k) / 4u][(k) & 3u] = (v);
+#define VLOAD(idx, kb) \
+    { uint c = (idx) / (BLOCK / 4u), k4 = (idx) % (BLOCK / 4u); \
+      av[i] = (idx) < uint(AITEMS) \
+          ? x4[(((p.col + col0 + c) * p.ffn + (kb) * BLOCK) >> 2) + k4] : vec4(0.0); }
+#define VSTORE(idx) \
+    { uint c = (idx) / (BLOCK / 4u), k4 = (idx) % (BLOCK / 4u); \
+      sxt[c * uint(XSTRIDE) + k4] = av[i]; }
+#else
+#define WSTORE(r, k, v) swt[(r) * uint(WSTRIDE) + (k)] = (v);
+#define VLOAD(idx, kb) \
+    { uint c = (idx) / BLOCK, k = (idx) % BLOCK; \
+      av[i] = (idx) < uint(AITEMS) ? x[(p.col + col0 + c) * p.ffn + (kb) * BLOCK + k] : 0.0; }
+#define VSTORE(idx) \
+    { uint c = (idx) / BLOCK, k = (idx) % BLOCK; \
+      sxt[c * uint(XSTRIDE) + k] = av[i]; }
+#endif
+
+void main() {
+    uint t   = gl_LocalInvocationID.x;
+    uint tr  = t / uint(COLTH);   // which TM rows this thread owns
+    uint tc  = t % uint(COLTH);   // which TN columns
+
+    uint groups = (p.dim + uint(BM) - 1u) / uint(BM);
+    uint ir   = gl_WorkGroupID.x % groups;
+    uint ic   = (gl_WorkGroupID.x / groups) % uint(CGROUPS);
+    uint row0 = ir * uint(BM);
+    uint col0 = ic * uint(BN);
+
+    uint nb = p.ffn / BLOCK; // step codes, and blocks, in a row
+    uint ns = p.ffn / SEQ;   // paths in a row
+
+    float acc[TM][TN];
+    [[unroll]] for (uint r = 0u; r < TM; r++) {
+        [[unroll]] for (uint c = 0u; c < TN; c++) acc[r][c] = 0.0;
+    }
+
+    // The staging is issued a block ahead into registers, and written to
+    // shared memory only after the previous block's arithmetic has run. Read
+    // and used in the same breath, the walk stalls on memory once a block with
+    // nothing between the loads and the barrier but the barrier.
+    uint  raw[WLOADS][SJ + 1];
+    float wstep[WLOADS];
+#if VEC4
+    vec4  av[ALOADS];
+#else
+    float av[ALOADS];
+#endif
+
+#define FETCH(kb) \
+    [[unroll]] for (uint i = 0u; i < uint(WLOADS); i++) { \
+        uint idx = t + i * uint(THREADS); \
+        uint r = idx / uint(SPLITW), q = idx % uint(SPLITW); \
+        uint row = row0 + r; \
+        if (idx < uint(WITEMS) && row < p.dim) { \
+            uint rowBase  = row * (nb + ns * SEQB); \
+            uint stepAt   = rowBase + (kb); \
+            wstep[i] = steps[(w[stepAt >> 2u] >> ((stepAt & 3u) * 8u)) & 0xFFu]; \
+            uint absBit = (seqOf(rowBase + nb, (kb)) << 3u) + q * uint(WPT) * uint(KBITS); \
+            uint at = absBit >> 5u; \
+            [[unroll]] for (uint j = 0u; j <= uint(SJ); j++) raw[i][j] = w[at + j]; \
+        } else { \
+            wstep[i] = 0.0; \
+            [[unroll]] for (uint j = 0u; j <= uint(SJ); j++) raw[i][j] = 0u; \
+        } \
+    } \
+    [[unroll]] for (uint i = 0u; i < uint(ALOADS); i++) { \
+        uint idx = t + i * uint(THREADS); \
+        VLOAD(idx, kb) \
+    }
+
+#define STAGE(kb) \
+    [[unroll]] for (uint i = 0u; i < uint(WLOADS); i++) { \
+        uint idx = t + i * uint(THREADS); \
+        if (idx >= uint(WITEMS)) continue; \
+        uint r = idx / uint(SPLITW), q = idx % uint(SPLITW); \
+        uint row = row0 + r; \
+        uint rowBase = row * (nb + ns * SEQB); \
+        uint absBit = (seqOf(rowBase + nb, (kb)) << 3u) + q * uint(WPT) * uint(KBITS); \
+        uint sh = absBit & 31u; \
+        uint s[SJ]; \
+        { \
+            uint prev = bswap(raw[i][0]); \
+            [[unroll]] for (uint j = 0u; j < uint(SJ); j++) { \
+                uint next = bswap(raw[i][j + 1u]); \
+                s[j] = (prev << sh) | ((next >> 1u) >> (31u - sh)); \
+                prev = next; \
+            } \
+        } \
+        [[unroll]] for (uint n = 0u; n < uint(WPT); n++) { \
+            const uint o  = n * uint(KBITS); \
+            const uint wi = o >> 5u; \
+            const uint bi = o & 31u; \
+            uint v; \
+            if (bi <= 20u) { \
+                v = bitfieldExtract(s[wi], int(20u - bi), 12); \
+            } else { \
+                v = ((s[wi] << bi) | (s[wi + 1u] >> (32u - bi))) >> 20u; \
+            } \
+            WSTORE(r, q * uint(WPT) + n, t4gHash(v) * wstep[i]) \
+        } \
+    } \
+    [[unroll]] for (uint i = 0u; i < uint(ALOADS); i++) { \
+        uint idx = t + i * uint(THREADS); \
+        if (idx >= uint(AITEMS)) continue; \
+        VSTORE(idx) \
+    }
+
+    FETCH(0u)
+    for (uint kb = 0u; kb < nb; kb++) {
+        barrier();
+        STAGE(kb)
+        barrier();
+        if (kb + 1u < nb) { FETCH(kb + 1u) }
+
+#if VEC4
+        [[unroll]] for (uint k4 = 0u; k4 < BLOCK / 4u; k4++) {
+            vec4 wv[TM];
+            [[unroll]] for (uint r = 0u; r < TM; r++) {
+                wv[r] = swt[(tr * uint(TM) + r) * uint(WSTRIDE) + k4];
+            }
+            vec4 xv[TN];
+            [[unroll]] for (uint c = 0u; c < TN; c++) {
+                xv[c] = sxt[(tc * uint(TN) + c) * uint(XSTRIDE) + k4];
+            }
+            [[unroll]] for (uint r = 0u; r < TM; r++) {
+                [[unroll]] for (uint c = 0u; c < TN; c++) {
+                    acc[r][c] += dot(wv[r], xv[c]);
+                }
+            }
+        }
+#else
+        [[unroll]] for (uint k = 0u; k < BLOCK; k++) {
+            float wv[TM];
+            [[unroll]] for (uint r = 0u; r < TM; r++) {
+                wv[r] = swt[(tr * uint(TM) + r) * uint(WSTRIDE) + k];
+            }
+            float xv[TN];
+            [[unroll]] for (uint c = 0u; c < TN; c++) {
+                xv[c] = sxt[(tc * uint(TN) + c) * uint(XSTRIDE) + k];
+            }
+            [[unroll]] for (uint r = 0u; r < TM; r++) {
+                [[unroll]] for (uint c = 0u; c < TN; c++) acc[r][c] += wv[r] * xv[c];
+            }
+        }
+#endif
+    }
+
+    [[unroll]] for (uint r = 0u; r < TM; r++) {
+        uint row = row0 + tr * uint(TM) + r;
+        if (row >= p.dim) continue;
+        [[unroll]] for (uint c = 0u; c < TN; c++) {
+            y[(p.col + col0 + tc * uint(TN) + c) * p.dim + row] = acc[r][c];
+        }
+    }
+}

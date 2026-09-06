@@ -176,7 +176,13 @@ func TestVulkanGolemWidePassMatchesTokenPath(t *testing.T) {
 		t.Skipf("vulkan stack: %v", err)
 	}
 
-	for _, w := range []int{2, 3, 4, 8, 16, 32} {
+	// Up to whatever the pipeline's widest pass is, and not up to a number
+	// written down once: this list stopped at thirty-two, which was half of
+	// what a .golem pass could then carry and an eighth of what it carries
+	// now. A wide-pass guard that does not reach the width a prompt runs at is
+	// not guarding the prompt. Three is in it because a width that is not a
+	// power of two picks a different binary for its tail.
+	for _, w := range []int{2, 3, 4, 8, 16, 32, 64, 128, 256} {
 		if w > m.gpuPipe.Columns() {
 			continue
 		}

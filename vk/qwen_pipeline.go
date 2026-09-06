@@ -249,11 +249,6 @@ var qwenAttnGQASPIRV []byte
 //go:embed shaders/norm_wide.spv
 var normWideSPIRV []byte
 
-// qwenMaxContext is the longest run shaders/qwen_attn_gqa.comp holds scores
-// for, which is its MAXCTX. A model asked for more than this cannot use the
-// pipeline at all, and says so rather than answering out of a shorter array.
-const qwenMaxContext = 8192
-
 // matvecRows is how many outputs one workgroup of the *float-activation*
 // mat-vecs answers — matvec_f32.comp, matvec_q4k.comp and matvec_q6k.comp,
 // which is what a float input and the prediction block's front projection
@@ -723,9 +718,6 @@ func (p *QwenPipeline) wideProduct() *Pipeline {
 }
 
 func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
-	if shape.MaxContext > qwenMaxContext {
-		return nil, fmt.Errorf("vk: qwen pipeline holds %d positions of scores, not %d", qwenMaxContext, shape.MaxContext)
-	}
 	p := &QwenPipeline{
 		d:          d,
 		shape:      shape,
@@ -2434,23 +2426,40 @@ func (p *QwenPipeline) WidthFor(n int) int {
 // golemWidestPass is how wide a pass a .golem model takes.
 //
 // Not because a wider one is wrong — vk/qwen_golem.go answers any width and
-// TestVulkanGolemWidePassMatchesTokenPath holds it to the token path bit for
-// bit — but because of what a wide one costs to record. The Golem kernels are
-// built for eight columns and no more, where the quantized products have a
-// tiled form for a wide pass, so a pass of two hundred and fifty-six columns is
-// thirty-two dispatches for every matrix: seventeen thousand of them and as
-// many barriers, in one submission, which the driver's watchdog ends by
-// resetting the card mid-pass. Sixty-four keeps a submission to something a
-// card finishes.
+// bit for bit — but because of what a wide one costs to record. That used to
+// put the line at sixty-four: the Golem kernels stopped at eight columns, so a
+// pass of two hundred and fifty-six was thirty-two dispatches for every matrix,
+// seventeen thousand of them and as many barriers in one submission, which the
+// driver's watchdog ended by resetting the card mid-pass.
 //
-// The cost is prefill throughput, and the fix is a tiled Golem product rather
-// than a smaller number here.
-const golemWidestPass = 64
+// vk/matmul_golem.go moved that line. A tiled pass answers sixty-four columns
+// in one dispatch, so two hundred and fifty-six is four a matrix and about
+// sixteen hundred in a submission. Measured on Qwen3.8-27B in t3g, microseconds
+// a column: 5304 at sixty-four, 4961 at a hundred and twenty-eight, 4773 at two
+// hundred and fifty-six.
+//
+// **Five hundred and twelve still resets the card**, and not for the dispatch
+// count — it is a quarter of what the old sixty-four-column line was already
+// submitting. It is one submission taking two and a half seconds. So the line
+// is what a submission finishes in, and two hundred and fifty-six is the widest
+// that does.
+const golemWidestPass = 256
+
+// golemMatvecWidestPass is the line that held before the tiled product, and it
+// is what GOLEM_NO_TILE goes back to: a mat-vec at two hundred and fifty-six
+// columns is thirty-two dispatches a matrix and resets the card, so an escape
+// hatch that left the width behind would not be an escape hatch, it would be a
+// crash. The A/B is meant to be one binary and two runs.
+const golemMatvecWidestPass = 64
 
 // widestPass is the widest a submission of this pipeline may carry.
 func (p *QwenPipeline) widestPass() int {
 	if p.usesGolem() {
-		return min(golemWidestPass, p.shape.width())
+		widest := golemMatvecWidestPass
+		if golemTiled() {
+			widest = golemWidestPass
+		}
+		return min(widest, p.shape.width())
 	}
 	return p.shape.width()
 }

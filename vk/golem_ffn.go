@@ -148,7 +148,7 @@ func golemPassWidth(columns int) (int, bool) {
 		return 0, false
 	}
 	best := 0
-	for _, w := range GolemWidths {
+	for _, w := range golemAllWidths() {
 		if columns%w == 0 && w > best {
 			best = w
 		}

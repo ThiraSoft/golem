@@ -269,9 +269,15 @@ func golemRowsPerGroup(columns int) int { return GolemShapes()[columns].Threads 
 // the word it is paired with. Sixteen bytes covers every tier.
 const golemReadTail = 16
 
-// GolemWidths are the pass widths the kernels are built for, and the reason is
-// vk/qwen_pipeline.go's: a pass of two costs 1.056 of a pass of one because the
-// weights are read once either way, and eight is where a mat-vec stops.
+// GolemWidths are the pass widths the *mat-vec* is built for, and the reason
+// is vk/qwen_pipeline.go's: a pass of two costs 1.056 of a pass of one because
+// the weights are read once either way, and eight is where a mat-vec stops.
+//
+// Above them the shape changes rather than the width: vk/matmul_golem.go's
+// tiled product decodes a weight once for a whole tile of the answer instead
+// of once per column, and GolemTiledWidths is where a prompt goes. Both are
+// bound to the same four bindings and the same push block, so a matrix holds
+// one descriptor set a width whichever kernel reads it.
 var GolemWidths = []int{1, 2, 4, 8}
 
 // GolemKernels is everything about the golem product that belongs to the device
@@ -297,7 +303,22 @@ func NewGolemKernels(d *Device, q nn.Quant) (*GolemKernels, error) {
 		return nil, err
 	}
 	for _, columns := range GolemWidths {
-		p, err := d.NewPipelineSpec(spirv[columns], 4, uint32(unsafe.Sizeof(golemPush{})), GolemShapes()[columns].Spec())
+		p, err := d.NewPipelineSpec(spirv[columns], 4, golemPushSize, GolemShapes()[columns].Spec())
+		if err != nil {
+			k.Close()
+			return nil, err
+		}
+		k.pipes[columns] = p
+	}
+	// And the tiled product above them, which reads the same four bindings and
+	// takes the same push block, so a matrix binds one set a width either way.
+	tiled, ok := golemTiledSPIRV(q)
+	if !ok {
+		k.Close()
+		return nil, fmt.Errorf("vk: there is no tiled kernel for %s", q)
+	}
+	for _, columns := range GolemTiledWidths {
+		p, err := d.NewPipeline(tiled[columns], 4, golemPushSize)
 		if err != nil {
 			k.Close()
 			return nil, err
@@ -391,8 +412,7 @@ func NewGolemMatrixOn(k *GolemKernels, data []byte, rows, cols int, act, out *Bu
 		return nil, err
 	}
 	m.owned = append(m.owned, m.weights)
-	for _, columns := range GolemWidths {
-		pipe := k.pipes[columns]
+	for columns, pipe := range k.pipes {
 		if m.sets[columns], err = pipe.NewSet([]*Buffer{m.weights, k.table, act, out}); err != nil {
 			m.Close()
 			return nil, err
@@ -402,6 +422,9 @@ func NewGolemMatrixOn(k *GolemKernels, data []byte, rows, cols int, act, out *Bu
 	for _, columns := range GolemWidths {
 		per := golemRowsPerGroup(columns)
 		m.groups[columns] = uint32((rows + per - 1) / per)
+	}
+	for _, columns := range GolemTiledWidths {
+		m.groups[columns] = golemTiledGroups(rows, columns)
 	}
 	return m, nil
 }

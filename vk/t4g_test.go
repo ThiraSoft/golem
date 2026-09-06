@@ -218,7 +218,7 @@ func testGolemWidePassesMatchCPU(t *testing.T, kind nn.Quant) {
 	}
 	defer k.Close()
 
-	for _, width := range GolemWidths {
+	for _, width := range golemAllWidths() {
 		// A different activation a column, so a kernel that mixed up which
 		// column it read would not pass by accident.
 		xs := make([][]float32, width)
