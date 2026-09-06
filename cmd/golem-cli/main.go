@@ -25,6 +25,7 @@ import (
 
 	"github.com/ThiraSoft/golem/engine"
 	"github.com/ThiraSoft/golem/grammar/schema"
+	"github.com/ThiraSoft/golem/internal/version"
 )
 
 // stringList collects a flag given more than once, in the order it was given.
@@ -79,11 +80,17 @@ func main() {
 	sttDir := flag.String("stt", os.Getenv("GOLEM_STT"), "directory holding a Kyutai STT checkpoint (or GOLEM_STT)")
 	transcribe := flag.String("transcribe", "", "sound file to transcribe; prints the text and exits")
 	listen := flag.Bool("listen", false, "transcribe the microphone until interrupted")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [options]\n", filepath.Base(os.Args[0]))
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(filepath.Base(os.Args[0]), version.String())
+		return
+	}
 
 	if *transcribe != "" && *listen {
 		fail(fmt.Errorf("cannot use both -transcribe and -listen"))

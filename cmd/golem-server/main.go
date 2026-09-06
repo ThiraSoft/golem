@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/engine"
+	"github.com/ThiraSoft/golem/internal/version"
 	"github.com/ThiraSoft/golem/sample"
 	"github.com/ThiraSoft/golem/stt"
 )
@@ -41,11 +42,17 @@ func main() {
 	ttl := flag.Duration("cache-ttl", 0, "forget a conversation's tokens after this long idle; 0 never forgets. The memory is allocated at startup and is released by neither")
 	vulkan := flag.Bool("vulkan", false, "put the logit head and the expert stacks on a Vulkan device")
 	sttStreams := flag.Int("stt-parallel", 1, "transcriptions to carry at once; they are stepped together, so the trunk's weights are read once for all of them")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [options]\n", filepath.Base(os.Args[0]))
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(filepath.Base(os.Args[0]), version.String())
+		return
+	}
 
 	if *model == "" && *sttDir == "" {
 		fail(fmt.Errorf("no model: pass -model or -stt, or set GOLEM_MODEL or GOLEM_STT"))

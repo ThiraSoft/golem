@@ -1,0 +1,115 @@
+# Binaries for a tag. Everything here is what `go build` already gives; the
+# workflow only crosses it and attaches it, so a user without a Go toolchain
+# can still run the thing.
+#
+# Windows is absent because it does not build: `tensors/mmap.go` maps a
+# checkpoint through `syscall.Mmap`, which that platform does not have. It is
+# a missing file rather than a missing port, and until someone writes it a
+# broken archive would be worse than none.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'existing tag to build and attach binaries to'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,  goarch: amd64 }
+          - { goos: linux,  goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      # CGO_ENABLED=0 is the whole point of the project and not a precaution:
+      # a binary that links libc is a binary that stops running one glibc
+      # older than the one it was built against.
+      - name: build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          dir="golem_${TAG}_${GOOS}_${GOARCH}"
+          mkdir -p "dist/${dir}"
+          for c in golem-cli golem-server pocket-tts golemquant; do
+            go build -trimpath \
+              -ldflags "-s -w -X github.com/ThiraSoft/golem/internal/version.value=${TAG}" \
+              -o "dist/${dir}/${c}" "./cmd/${c}"
+          done
+          cp LICENSE README.md "dist/${dir}/"
+          tar -C dist -czf "dist/${dir}.tar.gz" "${dir}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: golem_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # One file of checksums beside the archives, so a download can be
+      # verified without trusting the page it came from.
+      - name: checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          notes=$(mktemp)
+          {
+            echo "Static binaries, no cgo. Unpack and run:"
+            echo
+            echo '```'
+            echo "tar xzf golem_${TAG}_linux_amd64.tar.gz"
+            echo "./golem_${TAG}_linux_amd64/golem-cli -model your-model.gguf -p 'hello'"
+            echo '```'
+            echo
+            echo "Each archive holds \`golem-cli\`, \`golem-server\`, \`pocket-tts\` and \`golemquant\`."
+            echo "Verify with \`sha256sum -c SHA256SUMS\`."
+            echo
+            echo "Weights are not shipped here. Any GGUF of a supported architecture works;"
+            echo "the README says which."
+          } > "$notes"
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --title "$TAG" \
+            --notes-file "$notes" \
+            --verify-tag \
+            || gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
