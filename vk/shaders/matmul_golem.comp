@@ -95,17 +95,44 @@
 // is. VEC4 keeps both shapes so that the next person measures rather than
 // assumes.
 //
-// **What is left, and it is not a geometry.** At four by two the walk issues
-// about five hundred and twelve products against three hundred and eighty-four
-// shared reads and a hundred and fifty of everything else — the product is half
-// the issue, and the card gives about a fifth of its float rate. The only axis
-// that moves that ratio further is a larger register tile, and every one of
-// them loses here for the reason shaders/matmul.comp names: this card is short
-// of waves in flight rather than of arithmetic per wave. What would move it is
-// staging the two tiles as sixteen-bit floats and pairing the products —
-// v_dot2_f32_f16 is two multiply-accumulates an instruction and halves the
-// shared traffic with them — and that is a change to what the product answers,
-// not to how fast it answers it. It is not made here.
+// **What is left was then measured rather than counted**, with the ABLATE
+// switch below, at the 27B's gate geometry. Each line is what the kernel loses
+// when that part is taken out, against the shipped binary — and ABLATE zero is
+// held to compiling byte for byte identically to a build with no ABLATE at all,
+// because a baseline that is a different kernel measures nothing:
+//
+//   the activation's read from memory            23 %
+//   the window cut                                4 %
+//   the 1MAD hash                                 4 %
+//   the weight tile's shared walk                 3 %
+//   the activation tile's shared walk             2 %
+//   the weight stream's read from memory           —
+//
+// **The decode is eight per cent**, which is the tile having done its job: in
+// the mat-vec it was half. The weight stream is not visible at all — it is four
+// tenths of a byte a weight and it hides under everything else. What is left
+// over, about three fifths, is the product itself, the shared writes and the
+// barriers, and at that share the multiply-accumulate loop is running at about
+// two thirds of this card's float rate. There is no geometry left in that.
+//
+// So two things remain, and only one of them is free:
+//
+//   - **The twenty-three per cent is re-reading.** A workgroup owns BM rows, so
+//     the activation is read dim/BM times over; at BM sixty-four that is five
+//     hundred and forty-four times for the 27B's gate. Doubling BM halves it,
+//     and BM is capped by the shared memory the *weight* tile takes — sixteen
+//     kibibytes of floats. The tile could hold the trellis integer instead,
+//     which is (sum - 510) and so a whole number in [-510, 510]: sixteen-bit
+//     floats represent those **exactly**, and the step and the scale are
+//     constant across a block, so they come out of the walk and multiply the
+//     partial sum after it. Half the shared memory, and the same answer.
+//   - **The three fifths is float arithmetic**, and the only thing that moves
+//     it is doing more than one product an instruction: sixteen-bit pairs
+//     (v_pk_fma_f16, two) or the eight-bit dot the K-quant path already uses
+//     (v_dot4_i32_iu8, eight — which is most of why that path is ahead here).
+//     Both round an operand this kernel does not round today, so both are a
+//     change to what the product *answers*. Neither is made here, and neither
+//     should be made against a benchmark: they want a perplexity first.
 
 #ifndef COLUMNS
 #define COLUMNS 64
@@ -114,6 +141,27 @@
 // The tier: three bits, four, or five. Only the geometry changes with it.
 #ifndef KBITS
 #define KBITS 4
+#endif
+
+// ABLATE removes one part of the product at a time so that a sweep can say what
+// that part costs, and is zero in every shipped binary. It is the same
+// instrument shaders/matvec_t4g.comp carries, and it exists because every
+// reading of this kernel so far that was reasoned rather than measured has been
+// wrong in one direction or the other.
+//
+//   1 the 1MAD hash, replaced by the window's own bits
+//   2 the window cut, replaced by twelve bits of the first word
+//   3 the activation's shared read, pinned to one index
+//   4 the activation's read from memory, replaced by a constant
+//   5 the weight stream's read from memory, replaced by the loop index
+//   6 the weight tile's shared read, pinned to one index
+//
+// Every one of them leaves the rest of the walk live: an ablation that lets the
+// compiler delete the half it was not aiming at measures nothing and reports
+// four hundred gigabytes a second, which is the trap shaders/matmul.comp's
+// header names.
+#ifndef ABLATE
+#define ABLATE 0
 #endif
 
 // The tile. TM rows by TN columns to a thread, BM rows by BN columns to a
@@ -252,6 +300,53 @@ uint seqOf(uint codeBase, uint b) {
     return codeBase + (b >> 1u) * SEQB + (b & 1u) * HALFB;
 }
 
+// The four places an ablation cuts in, spelled by the preprocessor and not by a
+// condition on a constant: ABLATE zero has to compile to the same binary as a
+// build with no ABLATE at all, and a ternary on a folded constant did not — the
+// SPIR-V came out different, which is enough to make the baseline a different
+// kernel from the one that ships.
+#if ABLATE == 1
+#define HASH(v) float(v)             // the 1MAD hash, gone
+#else
+#define HASH(v) t4gHash(v)
+#endif
+#if ABLATE == 2
+// Masked to twelve bits: the point is to drop the cut, not to index anything
+// out of range. It is confounded — a state that is the same for several weights
+// lets the compiler hash it once — and it bounds the cut from above.
+#define CUTV(v, s, wi, bi) v = (s)[0] & 0xFFFu;
+#else
+#define CUTV(v, s, wi, bi) \
+    if ((bi) <= 20u) { \
+        v = bitfieldExtract((s)[wi], int(20u - (bi)), 12); \
+    } else { \
+        v = (((s)[wi] << (bi)) | ((s)[(wi) + 1u] >> (32u - (bi)))) >> 20u; \
+    }
+#endif
+#if ABLATE == 3
+#define XK(k) 0u                     // the shared walk across the tile, gone
+#else
+#define XK(k) (k)
+#endif
+#if ABLATE == 6
+#define WK(k) 0u                     // the weight tile's shared walk, gone
+#else
+#define WK(k) (k)
+#endif
+#if ABLATE == 5
+// The index rather than a constant, so that the decode below still has
+// something that varies to work on and is not folded away with the load.
+#define WREAD(at, j) ((at) + (j))
+#else
+#define WREAD(at, j) w[(at) + (j)]
+#endif
+#if ABLATE == 4
+#define AREAD(idx, kb, c, k) 1.0     // the activation's read from memory, gone
+#else
+#define AREAD(idx, kb, c, k) \
+    ((idx) < uint(AITEMS) ? x[(p.col + col0 + (c)) * p.ffn + (kb) * BLOCK + (k)] : 0.0)
+#endif
+
 // The three places the two layouts differ, so that the walk above reads the
 // same either way.
 #if VEC4
@@ -267,7 +362,7 @@ uint seqOf(uint codeBase, uint b) {
 #define WSTORE(r, k, v) swt[(r) * uint(WSTRIDE) + (k)] = (v);
 #define VLOAD(idx, kb) \
     { uint c = (idx) / BLOCK, k = (idx) % BLOCK; \
-      av[i] = (idx) < uint(AITEMS) ? x[(p.col + col0 + c) * p.ffn + (kb) * BLOCK + k] : 0.0; }
+      av[i] = AREAD((idx), (kb), c, k); }
 #define VSTORE(idx) \
     { uint c = (idx) / BLOCK, k = (idx) % BLOCK; \
       sxt[c * uint(XSTRIDE) + k] = av[i]; }
@@ -315,7 +410,7 @@ void main() {
             wstep[i] = steps[(w[stepAt >> 2u] >> ((stepAt & 3u) * 8u)) & 0xFFu]; \
             uint absBit = (seqOf(rowBase + nb, (kb)) << 3u) + q * uint(WPT) * uint(KBITS); \
             uint at = absBit >> 5u; \
-            [[unroll]] for (uint j = 0u; j <= uint(SJ); j++) raw[i][j] = w[at + j]; \
+            [[unroll]] for (uint j = 0u; j <= uint(SJ); j++) raw[i][j] = WREAD(at, j); \
         } else { \
             wstep[i] = 0.0; \
             [[unroll]] for (uint j = 0u; j <= uint(SJ); j++) raw[i][j] = 0u; \
@@ -349,12 +444,8 @@ void main() {
             const uint wi = o >> 5u; \
             const uint bi = o & 31u; \
             uint v; \
-            if (bi <= 20u) { \
-                v = bitfieldExtract(s[wi], int(20u - bi), 12); \
-            } else { \
-                v = ((s[wi] << bi) | (s[wi + 1u] >> (32u - bi))) >> 20u; \
-            } \
-            WSTORE(r, q * uint(WPT) + n, t4gHash(v) * wstep[i]) \
+            CUTV(v, s, wi, bi) \
+            WSTORE(r, q * uint(WPT) + n, HASH(v) * wstep[i]) \
         } \
     } \
     [[unroll]] for (uint i = 0u; i < uint(ALOADS); i++) { \
@@ -390,11 +481,11 @@ void main() {
         [[unroll]] for (uint k = 0u; k < BLOCK; k++) {
             float wv[TM];
             [[unroll]] for (uint r = 0u; r < TM; r++) {
-                wv[r] = swt[(tr * uint(TM) + r) * uint(WSTRIDE) + k];
+                wv[r] = swt[(tr * uint(TM) + r) * uint(WSTRIDE) + WK(k)];
             }
             float xv[TN];
             [[unroll]] for (uint c = 0u; c < TN; c++) {
-                xv[c] = sxt[(tc * uint(TN) + c) * uint(XSTRIDE) + k];
+                xv[c] = sxt[(tc * uint(TN) + c) * uint(XSTRIDE) + XK(k)];
             }
             [[unroll]] for (uint r = 0u; r < TM; r++) {
                 [[unroll]] for (uint c = 0u; c < TN; c++) acc[r][c] += wv[r] * xv[c];

@@ -32,13 +32,13 @@ type tileGeom struct {
 	name                   string
 	kbits, columns, bm, bn int
 	tm, tn, splitw         int
-	vec4                   int
+	vec4, ablate           int
 	spirv                  []byte
 }
 
 func parseTileName(path string) (tileGeom, error) {
 	g := tileGeom{name: strings.TrimSuffix(filepath.Base(path), ".spv")}
-	fields := map[string]*int{"k": &g.kbits, "c": &g.columns, "bm": &g.bm, "bn": &g.bn, "tm": &g.tm, "tn": &g.tn, "sw": &g.splitw, "v": &g.vec4}
+	fields := map[string]*int{"k": &g.kbits, "c": &g.columns, "bm": &g.bm, "bn": &g.bn, "tm": &g.tm, "tn": &g.tn, "sw": &g.splitw, "v": &g.vec4, "a": &g.ablate}
 	for _, part := range strings.Split(g.name, "_")[1:] {
 		i := 0
 		for i < len(part) && (part[i] < '0' || part[i] > '9') {
