@@ -24,8 +24,6 @@ golem-cli -model gemma-4-E2B-it-QAT-Q4_0.gguf -p "Explain a mutex in one sentenc
 
 Without a Go toolchain, take a static binary from [the releases](https://github.com/ThiraSoft/golem/releases): Linux and macOS, amd64 and arm64. Windows does not build yet, because `tensors/` maps a checkpoint through a call that platform does not have.
 
-One toolchain note, and it is not a preference. Go 1.23.12 and 1.24.9 link this module into a binary that dies before `main` when cgo is off: `purego` imports `dlopen` through `//go:cgo_import_dynamic`, those two drop the `libc` and `libpthread` entries on the way out, and the first call lands on address zero. So `go.mod` asks for 1.25, which is a linker requirement rather than a language one: a machine on an older toolchain downloads one and builds something that runs, instead of something that cannot start.
-
 There is no configuration file to write. The engine reads `general.architecture` out of the GGUF and opens whichever implementation matches, which is why no command below names a model family.
 
 ## Who this is for
