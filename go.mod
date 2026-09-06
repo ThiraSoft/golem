@@ -1,13 +1,15 @@
 module github.com/ThiraSoft/golem
 
-go 1.23.2
-
-// Go 1.23.12 and 1.24.9 link this module into a binary that dies before main
-// when cgo is off: purego imports dlopen through //go:cgo_import_dynamic, and
-// those two toolchains drop the libc and libpthread NEEDED entries, so the
-// first call lands on address zero. Naming a toolchain here is what keeps a
-// `go install` on such a machine from building one.
-toolchain go1.25.3
+// 1.25 is not a language requirement, it is a linker one. Go 1.23.12 and
+// 1.24.9 link this module into a binary that dies before main when cgo is off:
+// purego imports dlopen through //go:cgo_import_dynamic, and those two drop the
+// libc and libpthread NEEDED entries, so the first call lands on address zero.
+//
+// It is the go line rather than a toolchain line because of where the rule
+// bites. `go install pkg@version` has no main module, so it reads this line and
+// nothing else to decide whether to step the toolchain up; a toolchain line is
+// read only when the module is the one being built from a checkout.
+go 1.25.0
 
 require (
 	github.com/ebitengine/purego v0.8.0
