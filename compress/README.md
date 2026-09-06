@@ -557,6 +557,22 @@ to win any of it. What is left below is the window cut and the table read, and
 those are the codebook: a trellis decodes one weight at a time from twelve bits
 of state, and Q4_0 decodes eight from one instruction.
 
+### A prompt is a different shape, and it is answered
+
+Everything above is about generation, where a token is one column and one column
+has nothing to tile. A prompt is not that shape. The decode is paid once per
+column of a pass, so a mat-vec that stops at eight columns pays it eight times
+where a tiled product pays it once for a whole tile.
+
+`.golem` has a tiled product now: a workgroup owns sixty-four rows by thirty-two
+columns of the answer and decodes each weight once into shared memory for all of
+them. On Qwen3.8-27B in T3G that is **98.7 positions a second to 189.2** for a
+prompt of 2048 at a context of 10240, one binary and two runs. The pass width
+the format may take goes from sixty-four columns to two hundred and fifty-six
+with it, because what used to stop it was the dispatch count.
+
+The generation figure is unmoved, and for the reason at the top of this section.
+
 ### What else was tried
 
 Everything below was measured on the same instrument and none of it is in the

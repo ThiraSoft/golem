@@ -63,3 +63,36 @@ What is not here: the two token elements of GBNF (`<[id]>` and its negation),
 lazy triggers for tool calls, and llguidance. The first is the only part of a
 grammar that depends on which vocabulary it was written for; the others are
 llama.cpp's answers to questions golem has not asked.
+
+## From outside
+
+Three flags on the command line and three fields over the API reach all of this.
+`-json` asks for any JSON value at all, `-json-schema <file>` for one shape, and
+`-grammar <file>` for whatever GBNF describes. Over HTTP those are
+`response_format` in its two forms and a `grammar` field.
+
+```bash
+curl -s localhost:8080/v1/chat/completions -d '{
+  "messages": [{"role": "user", "content": "Lyon, please."}],
+  "response_format": {"type": "json_schema", "json_schema": {"name": "city", "schema": {
+    "type": "object",
+    "properties": {"city": {"type": "string"}, "population": {"type": "integer"}},
+    "required": ["city", "population"],
+    "additionalProperties": false}}}}'
+```
+
+`grammar/schema/` is the port of `json-schema-to-grammar.cpp`, down to the names
+it gives the rules it generates.
+
+**What a schema may not ask for is refused by name**: `pattern`, a numeric
+bound, a `$ref` into another document. A constraint silently dropped is worse
+than a request refused.
+
+**The cost is what a lazy check costs.** The chain draws first and asks the
+grammar about the one token that came out. Only a refusal pays for more, and
+then it reads a prefix of the sorted row rather than the row.
+
+Beside this sit the three penalties llama.cpp runs before top-k:
+`repeat_penalty`, `frequency_penalty` and `presence_penalty` over
+`repeat_last_n` tokens with the prompt included, same arithmetic and same
+defaults.

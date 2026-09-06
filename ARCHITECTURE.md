@@ -43,7 +43,7 @@ Worth knowing before diving into the code:
 
 `-vulkan` moves all four, and then everything between them. On the 26B A4B, **13.4 tokens a second becomes 133.5**, against llama.cpp's Vulkan build at 124.8 on the same card, and **the prompt goes from 40 a second to 4541** — against their 4038. It costs those matrices being resident — 12.8 gibibytes, which is why a card with sixteen is the smallest that can do this — and about nine seconds of upload.
 
-**Resident is a default, not a requirement, and only for a mixture.** Of those 12.8 gibibytes the expert stacks are 12.85 GB, and a token routes to eight matrices of a hundred and twenty-eight — eleven of the twelve sit untouched on any given token. So they need not be on the card at all: `vk.Device.HostResident` leaves a stack in system memory the card addresses, and the kernels read it there, because a compute shader reads a storage buffer the same way wherever it lives. On the 26B A4B that is 7.4 tokens a second against 108, which is the bus and not the card — 6.37 GB/s measured through the model, against a link this machine trains at 7.9 — and the reference test passes with the same tokens and the same tie margins. A cache of the experts a token does keep asking for is what climbs back up from there; it does not exist yet, and `gemma/expert_cache_test.go` prices it. A *dense* model that does not fit has no such answer: one column of a pass is one multiply per weight, so every byte crossing the bus is used once, and making the weights smaller is the only route.
+**Resident is a default, not a requirement, and only for a mixture.** Of those 12.8 gibibytes the expert stacks are 12.85 GB, and a token routes to eight matrices of a hundred and twenty-eight — eleven of the twelve sit untouched on any given token. So they need not be on the card at all: `vk.Device.HostResident` leaves a stack in system memory the card addresses, and the kernels read it there, because a compute shader reads a storage buffer the same way wherever it lives. On the 26B A4B that is 7.4 tokens a second against 108, which is the bus and not the card — 6.37 GB/s measured through the model, against a link this machine trains at 7.9 — and the reference test passes with the same tokens and the same tie margins. A cache of the experts a token does keep asking for is what climbs back up from there, and `gemma/README.md`'s *Experts off the card* is that whole curve. A *dense* model that does not fit has no such answer: one column of a pass is one multiply per weight, so every byte crossing the bus is used once, and making the weights smaller is the only route.
 
 A dense checkpoint goes the same way, because a dense block is a mixture block with one branch: the shared branch of a mixture and an ordinary feed forward are the same three matrices under the same norm, and what differs is the end of the block — one post-norm instead of three, and no routing. On the 12B, **5.0 tokens a second becomes 65.4**, against llama.cpp's 64.6 on the same card.
 
@@ -69,9 +69,86 @@ It is not bit-identical to the CPU path and cannot be: the two sum the same prod
 
 There is no cgo: `vk/` opens `libvulkan.so.1` through `purego`, and `CGO_ENABLED=0 go build ./...` still passes. A machine with no Vulkan loader is one where the flag fails and everything else works.
 
+### The full comparison, 2026-09-03
+
+The README carries the two columns that matter. This is all four widths, from
+the same sitting: an RX 9070 XT against llama.cpp's Vulkan build (`ba1df050f`,
+b9603) on the same Q4_0 files, both sides warmed before timing, the desktop
+holding 1.0 GiB of the card throughout.
+
+| tokens a second | golem gen | llama gen | golem pp64 | llama pp64 | golem pp256 | llama pp256 | golem pp512 | llama pp512 |
+| --------------- | --------: | --------: | ---------: | ---------: | ----------: | ----------: | ----------: | ----------: |
+| Gemma 4 26B A4B | **153.4** |     125.1 |   **2051** |       1050 |    **3940** |        2867 |    **4434** |        4059 |
+| Gemma 4 12B     |  **72.3** |      64.6 |   **1555** |       1204 |    **2674** |        2561 |        2901 |        2978 |
+| Qwen3 4B        | **180.5** |     172.0 |   **4015** |       3164 |    **6252** |        5702 |        5977 |        7117 |
+| Qwen3 0.6B      |     368.2 | **407.9** |  **13230** |      10064 |   **22711** |       19440 |       23445 |       23677 |
+
+Generation is the median of three runs and the prompt columns are one run each.
+
+Reading a prompt, golem is the faster of the two on every model at sixty-four
+and two hundred and fifty-six positions, by a factor of one and nine tenths on
+the 26B A4B at sixty-four. At five hundred and twelve it is ahead on the 26B
+A4B and behind on the other three, because a wide pass is where llama.cpp's
+tiled kernels have the most to amortise.
+
+Generating, golem is ahead on three of the four (23 % on the 26B A4B, 12 % on
+the 12B, 5 % on the 4B) and 11 % behind on the 0.6B, which spends a token in
+dispatch latency rather than in arithmetic.
+
+**That is a change of direction from the table of 2026-08-31**, which had golem
+two to nine per cent behind on generation across the board. Both columns were
+remeasured. llama.cpp's own generation figures agree with themselves to half a
+per cent across two passes, so the movement is golem's. What moved it is not
+one thing: the two-bit and three-bit kernels, the split residency, a
+double-buffered upload path, and a logit head that now claims its device memory
+before the blocks take all of it. No attempt is made here to divide the credit.
+
+### K-quants on the card
+
+Q4_0, Q4_1, Q2_K, Q3_K, Q4_K, Q5_K and Q6_K each have a mat-vec and a tiled
+product here, and a checkpoint may mix them the way llama.cpp's own quantizer
+does. A `Q4_K_M` gives the same role different formats in different blocks, six
+bits on half its `ffn_down` and four on the rest, so every matrix is asked what
+it is rather than told.
+
+The two-bit and three-bit tiers are here even though golem's own `.golem` beats
+them at the same rate. A client who will not compress a checkpoint, or cannot,
+downloads a `Q3_K_M`, and refusing it would refuse the model over a packing.
+With those two added, every K-quant llama.cpp writes now runs: a `Q2_K` file is
+itself a mix of Q2_K, Q3_K, Q4_K and Q6_K, so the last format added is what
+opened the whole family.
+
+| on Qwen3-4B | card | eight cores |
+|---|---|---|
+| `Q2_K` | **121.6** t/s | **13.8** t/s |
+| `Q3_K_S` | **97.7** t/s | **16.1** t/s |
+
+Q3_K on the processor was 0.69 tokens a second before it had an integer
+product, because a `Q3_K_S` is that one format for 252 of its tensors.
+
+A form with no kernel is an error naming it and never a guess. Eighteen bytes
+to a block of thirty-two is Q4_0 and it is also Q4_K, so a reader that checked
+a length instead of a type would answer fluently out of the wrong bits.
+
+`-vulkan` is all or nothing and says so. A card without
+`VK_KHR_shader_integer_dot_product`, a machine with no Vulkan loader, a dense
+model too large for the card: each is an error at startup rather than a silent
+half-move.
+
+### This machine's bus is narrow
+
+The card is a PCIe 5.0 x16 part reaching the processor over PCIe 3.0 x8, which
+is 7.88 GB/s. The CPU is a Coffee Lake whose sixteen lanes are split eight and
+eight, and the second port holds a wireless card.
+
+Nothing in the tables above depends on it, since a model resident on the card
+does not touch the bus. Everything about streaming experts does, and on a board
+that gives the card its sixteen lanes at PCIe 4.0 those figures are what
+changes, upward, by up to four.
+
 ### Generation Speed vs Prompt Speed
 
-**These are one card's numbers on one afternoon, and they are kept here for the story that follows rather than as a claim.** The current table is the README's, taken in a later sitting, and it reads differently: level generating on the 12B and two to nine per cent behind on the other four, ahead reading a prompt on four of five at every width. Both sittings say the same thing about the two engines — that they are level on this machine — and neither says anything about another card, another driver or another checkpoint, because nobody has run either there.
+**These are one card's numbers on one afternoon, and they are kept here for the story that follows rather than as a claim.** The current table is the one above, taken in a later sitting, and it reads differently: ahead generating on three models of four, and ahead reading a prompt on every model up to two hundred and fifty-six positions. Both sittings say the same thing about the two engines — that they are level on this machine — and neither says anything about another card, another driver or another checkpoint, because nobody has run either there.
 
 What the table below is for is the *shape* it had at the time, which is what found the softcap.
 

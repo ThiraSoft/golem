@@ -64,6 +64,20 @@ base of 100, and the token range of 40 … 280. They are what llama.cpp
 hardcodes for this projector, and a file that disagreed with them would run
 under llama.cpp with those values anyway.
 
+### The tower on the card
+
+The tower goes to the card with the model. A 640×426 picture takes 33.6 seconds
+on an i7-9700K and **1.03 on an RX 9070 XT**, and every waypoint of the card's
+tower is held to llama.cpp's the way the processor's is: worst gap 9.9e-3 over
+the twenty-seven blocks, against the same 0.02 bar. Reading the prompt and
+drawing the answer then run wherever the model does.
+
+The projector is 884 MiB in fp16 and shares the card with the model, so it is
+resident when there is room and streamed one block at a time when there is not.
+That is 1.03 seconds an image against 1.41, rather than a fall back to the
+processor's thirty-three. `GOLEM_VISION_STREAM=1` forces the second path, which
+is how it gets tested on a machine that has room for the first.
+
 ### Two projectors, and only one of them is a tower
 
 The 12B's projector is not the same architecture as E2B's. It declares
@@ -256,9 +270,8 @@ the two expert stacks in system memory the card addresses and lets the kernels
 read them there: 7.4 tokens a second against 108, which is the bus rather than
 the card, and the same tokens out. `vk/mixture.go`'s `expertsInHost` is the
 whole of the change, because a compute shader reads a storage buffer the same
-way wherever it lives. The root README's *A mixture larger than the card* says
-what a cache of the hot ones would buy back, and `gemma/expert_cache_test.go`
-measures it.
+way wherever it lives. *Experts off the card* below says what a cache of the hot ones buys back, and
+how far this goes on a checkpoint that fits neither side alone.
 
 What it has that nothing else here does is a **mixture of experts**, and it is
 not the usual one. The shared expert is the ordinary dense feed forward, and
@@ -314,6 +327,144 @@ The expert stacks are the one kind of matrix `Repack` leaves alone. Only eight
 of a hundred and twenty-eight are read per position, so the interleaved second
 copy that pays for itself elsewhere would double the resident weights to speed
 up six percent of the rows.
+
+## Experts off the card
+
+**A dense model that does not fit cannot be rescued.** One column of a pass is
+one multiply per weight, so every byte crossing the bus is used exactly once.
+Qwen3.8 27B in BF16 is 54.8 GB a token, which is eight seconds a token on this
+machine's link, and no amount of engineering moves it. Making the weights
+smaller is the only answer there, and that is what `compress/` is for.
+
+**A mixture is different, and the difference is the whole opportunity.** The
+26B A4B keeps 12.85 GB of experts and reads eight matrices out of a hundred and
+twenty-eight per block, which is 0.8 GB a token. Eleven of its twelve gigabytes
+are resident and untouched on any given token. So the cost of streaming a
+mixture is what a token *activates* rather than what the model *has*.
+
+| 26B A4B on an RX 9070 XT | on the card |
+| --- | ---: |
+| experts resident in VRAM | 13.6 GiB |
+| experts in system memory, no cache | **1.3 GiB** |
+
+That second row is the floor and not the default. Left to itself the planner
+spends whatever device memory is going on a cache of the experts a token keeps
+asking for, so `GOLEM_MOE_EXPERTS_HOST=1` alone fills the card again and
+answers at nearly the resident rate. `GOLEM_MOE_CACHE_SLOTS=N` names a
+footprint between the two, and `GOLEM_MOE_CACHE_SLOTS=0` names the floor
+itself. `residency_test.go` measures both rows from the driver's own budget.
+
+What stays on the card is the shared branches, the attention and the head. So
+what a mixture costs the card no longer scales with how many experts it has,
+and what bounds it becomes host memory instead, which is sixteen gibibytes of
+addressable system memory here.
+
+### What a cache buys back
+
+`GOLEM_MOE_CACHE_SLOTS=N` keeps a copy of N experts per block in device memory
+and fetches a missing one on the way past. Measured on a continuation the model
+wrote itself: 160 tokens, greedy, after a warm-up that is not counted.
+
+| experts kept in VRAM | that much VRAM | tokens/s |
+| --- | ---: | ---: |
+| 2 of 128, the floor | 0.2 GB | 7.8 |
+| 16 of 128 | 1.6 GB | 16.0 |
+| 32 of 128 | 3.2 GB | 30.2 |
+| 40 of 128 | 4.0 GB | 39.9 |
+| **51 of 128** | **5.1 GB** | **56.2** |
+| 64 of 128 | 6.4 GB | 73.8 |
+| all 128, the resident path | 12.9 GB | 131.6 |
+
+**Two fifths of the pool is four fifths of the tokens.** The shape was known
+before the cache existed: the router is arithmetic, so simulating a cache
+against the model's own routing costs a map and no card time at all, and
+`expert_cache_test.go` predicted this curve. The shape held. The rates under it
+have since moved as the rest of the engine did.
+
+These are the 2026-09-03 sitting. An earlier one, before the logit head claimed
+its device memory ahead of the blocks, read 7.3 / 15.1 / 27.3 / 35.3 / 47.4 /
+58.0 / 82.1 down the same column. The resident path was sixty per cent slower
+than it is here because a 577 MiB head on a card this full was being read
+across the bus for every token, and nothing said so.
+
+That simulation is also what says which cache to build. FreeToken reports that
+one pool shared by every layer beats a split per layer by ten to fifteen
+points. On this checkpoint the two sit under a point apart, so golem keeps one
+cache per block: simpler to index, and the blocks do not compete.
+
+### Nothing on the host decides any of this
+
+The experts are picked on the card, one block at a time, inside a program
+recorded once and re-run per token. A host that had to choose would cost a
+readback between every pair of blocks.
+
+`shaders/moe_admit.comp` turns each identifier into the slot holding a copy of
+it, `shaders/moe_fill.comp` fetches whatever was missing, and the two product
+kernels read a slot where they used to read an identifier. It is the same
+instruction. A fetch costs what reading the expert where it lay would have
+cost, and buys every later token that wants it again.
+
+The prompt path is unchanged. A wide pass reads every expert of a block at
+once, so a cache of a few dozen has nothing to offer it, and passes above the
+cache's width go by expert straight out of the pool.
+
+### A checkpoint that fits neither side alone
+
+Device memory holds about fifteen and a half gigabytes. The host memory the
+card can address holds fifteen and a half more, and a submission reaching past
+either one is refused outright. `vk/residency_test.go` walks that wall up a
+gibibyte at a time, and fifteen submit where sixteen does not. Allocating is
+not submitting: thirty gibibytes allocate without complaint because the driver
+allocates lazily, and the first reading of that took it for headroom.
+
+So residency is decided **block by block**. The blocks that fit keep their
+experts on the card and need neither cache nor fetches, and the rest live
+beside it and get both. The 26B A4B in Q8_0 is 26.9 GB, of which 24 are
+experts, and it runs that way at **2.4 tokens a second** on a card that can
+hold neither half of it.
+
+| 26B A4B in Q8_0 | |
+| --- | --- |
+| experts | 24 GB, about half on the card and half beside it |
+| logit head | on the processor, because the kernel wants a Q6_K embedding and this one is Q8_0 |
+| tokens a second *here* | 2.4 |
+
+**That last row is this machine's and travels worse than any other number in
+this repository.** The card sits behind a switch on a PCIe 3.0 x8 host, so a
+missed expert crosses at 6.37 GB/s where a 5.0 x16 machine would carry it at
+eight times that. The addressable host heap is about half of RAM, so a machine
+with sixty-four gigabytes would hold this pool entirely beside the card with no
+split at all. What is being shown is that the two ceilings can be used
+together. The rate is whatever the bus underneath happens to be.
+
+For scale: what separates a resident token from a fully absent one is 802.9 MB
+of experts at 6.37 GB/s, which is the figure a mat-vec reads host memory at in
+isolation and 95 % of what the copy engine manages across the same link.
+
+### The answers do not change
+
+A cache of twelve slots and one of forty put different numbers of blocks on the
+card and answer the same twenty-four tokens, exactly.
+`TestVulkanSameWhereverTheExpertsLive` is that control, down to the three
+logged tie margins being identical to the resident run's.
+
+This is the control the processor cannot give. A mixture routes on logits that
+the two paths compute differently, so a near-tie sends the router to another
+expert, and the two agree on most tokens and never on all.
+
+### Q4_0 and Q8_0 both go through this
+
+A Q8_0 mixture is eight and a half bits a weight against four and a half, which
+makes it the smallest form that puts a pool past what a card can address, and
+therefore the reason to read it at all. A Q8_0 weight is a signed byte against
+an activation that is already signed bytes, so the packed dot takes both as
+they are with no nibbles to unpack and no correction term. The two routed
+kernels and `vk/quantproduct.go`'s door read it, and the Q4_0 binaries they
+share a source with are unchanged instruction for instruction.
+
+The pool has to fit in the memory the card can address, sixteen gibibytes here
+against the 26B A4B's 12.85. That model fits and a much larger one does not.
+Past that the source is the mapped file and the rate is the disk's.
 
 ## How it is known to be right
 
