@@ -272,10 +272,11 @@ func (m *Model) UseVulkanStack() error {
 				v = bw.V.Data
 			}
 		}
-		capacity := m.SlotContext()
-		if bc.Window && bc.WindowSize < capacity {
-			capacity = bc.WindowSize
+		if vk.Columns() > MaxPass {
+			stack.Close()
+			return fmt.Errorf("gemma: a pass of %d columns is wider than the %d the window rings are sized for", vk.Columns(), MaxPass)
 		}
+		capacity := ringCapacity(bc, m.SlotContext())
 		shape := vk.BlockShape{
 			Heads: bc.Heads, KVHeads: bc.KVHeads, HeadDim: bc.HeadDim,
 			RoPEDims: bc.RoPEDims, Capacity: capacity, Rotation: index[bc.RoPEBase],

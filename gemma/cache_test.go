@@ -35,8 +35,9 @@ func TestCacheAliasesSharedLayers(t *testing.T) {
 			t.Fatalf("block %d does not read block %d's cache", i, want)
 		}
 	}
-	// A window block keeps its window, a global one the whole context.
-	if c.Layers[0].Capacity != 512 || c.Layers[4].Capacity != 4096 {
+	// A window block keeps its window and one pass more, rounded to a power of
+	// two; a global one the whole context.
+	if c.Layers[0].Capacity != 1024 || c.Layers[4].Capacity != 4096 {
 		t.Fatalf("capacities %d and %d", c.Layers[0].Capacity, c.Layers[4].Capacity)
 	}
 }

@@ -166,7 +166,17 @@ func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32,
 	// stretches of that width. What each stretch buys is the one thing a batch
 	// was ever for: every matrix of the model read once for all of the
 	// positions in it.
-	if width := m.stackColumns(); width > 0 && len(tokens) > width {
+	//
+	// The processor has no such ceiling of its own, but the window rings do:
+	// they hold one pass beyond the window and no more, so a text batch is cut
+	// to that width here too. A batch carrying pictures is left whole, because
+	// a picture's tokens see each other both ways and cannot be split across
+	// passes; the server already cuts those at picture boundaries.
+	width := m.stackColumns()
+	if width == 0 && embeds == nil {
+		width = MaxPass
+	}
+	if width > 0 && len(tokens) > width {
 		out := make([][]float32, len(tokens))
 		for from := 0; from < len(tokens); from += width {
 			to := min(from+width, len(tokens))

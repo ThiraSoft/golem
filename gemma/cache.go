@@ -105,13 +105,40 @@ func NewCache(cfg *Config) *Cache {
 			c.Layers[i] = c.Layers[b.KVSource]
 			continue
 		}
-		capacity := cfg.MaxContext
-		if b.Window && b.WindowSize < capacity {
-			capacity = b.WindowSize
-		}
-		c.Layers[i] = newLayerCache(b.KVHeads, b.HeadDim, capacity)
+		c.Layers[i] = newLayerCache(b.KVHeads, b.HeadDim, ringCapacity(b, cfg.MaxContext))
 	}
 	return c
+}
+
+// MaxPass is the most positions one pass writes to a cache before it scores
+// any of them: the card's widest pass, and the width ForwardEmbedded cuts a
+// long text batch into on the processor.
+const MaxPass = 512
+
+// ringCapacity is how many positions a block's cache holds.
+//
+// A window block used to hold exactly its window, on the reasoning that a
+// position fallen out of the ring is one the mask hides anyway. That is true
+// one token at a time and false for a batch: every key of a pass is stored
+// before any score is computed, so the last positions of a pass overwrite the
+// oldest keys its first positions still see, and those queries read keys from
+// their own future. Nothing showed it until a prompt crossed the window — a
+// village conversation of thirteen hundred positions against the 26B's window
+// of 1024 — where the output after the first window block drifted by a tenth
+// and the model answered by copying its previous line. llama.cpp sizes the
+// same cache n_swa + n_ubatch for the same reason.
+//
+// So a window block holds its window and one pass more, rounded up to a power
+// of two so the ring keeps its mask, and never more than the context.
+func ringCapacity(b BlockConfig, context int) int {
+	if !b.Window || b.WindowSize >= context {
+		return context
+	}
+	capacity := 1
+	for capacity < b.WindowSize+MaxPass {
+		capacity <<= 1
+	}
+	return min(capacity, context)
 }
 
 // Visible gives the inclusive range of positions a block may attend to from
