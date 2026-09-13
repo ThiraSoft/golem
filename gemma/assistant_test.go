@@ -37,6 +37,9 @@ type draftFixture struct {
 	*fixture
 	Assistant string  `json:"assistant"`
 	Drafts    []int32 `json:"drafts"`
+	// Drafts2 is the second guess of each step: the first fed back with the
+	// assistant's own projected state, at the same position.
+	Drafts2 []int32 `json:"drafts2"`
 }
 
 func loadDraftFixture(t *testing.T, name string) *draftFixture {
@@ -201,6 +204,10 @@ func TestAssistantWaypoints12B(t *testing.T) {
 			if got := Argmax(logits); got != f.Argmax {
 				t.Fatalf("the assistant guesses %d, the reference guessed %d", got, f.Argmax)
 			}
+			// The state a second guess is fed: the normed state taken back to
+			// the target's width.
+			a.ownState()
+			compareRelative(t, "h_nextn", a.own, f.tensor(t, "h_nextn"), 2e-3)
 		})
 	}
 }
@@ -260,6 +267,17 @@ func replayDrafts(t *testing.T, f *draftFixture, m *Model, a *Assistant) {
 		}
 		if step+1 < len(f.Greedy) && want == f.Greedy[step+1] {
 			kept++
+		}
+		// The second guess, from the reference's first so that one tie does
+		// not carry into the next comparison.
+		a.DraftNext(want, pos, logits)
+		if want2 := f.Drafts2[step]; Argmax(logits) != want2 {
+			got := Argmax(logits)
+			if margin := logits[got] - logits[want2]; margin > tie {
+				t.Fatalf("step %d: second guess %d over the reference's %d by %v, past a tie", step, got, want2, margin)
+			} else {
+				t.Logf("step %d: second guess %d over %d by %v, a tie", step, got, want2, margin)
+			}
 		}
 		copy(hidden, m.Forward(token, pos))
 		pos++

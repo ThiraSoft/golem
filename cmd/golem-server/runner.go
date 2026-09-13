@@ -87,6 +87,8 @@ type pass struct {
 // for gemma's assistant; the tests have their own.
 type speculator interface {
 	Step(token int32, hidden []float32, pos int, pick func([]float32) int32) ([]int32, []float32, error)
+	// Span is the most positions a step writes.
+	Span() int
 }
 
 // aside is anything else the model has to do, which cannot overlap a pass:
@@ -174,6 +176,15 @@ func (r *Runner) UseDrafter(s speculator, reset func()) {
 // carries both is the better bargain by far: drafting turns one read of the
 // weights into two, and batching turns two into one.
 func (r *Runner) CanDraft() bool { return r.draft != nil && r.inFlight() <= 1 }
+
+// DraftSpan is the most positions a drafting step writes, or zero without a
+// drafter.
+func (r *Runner) DraftSpan() int {
+	if r.draft == nil {
+		return 0
+	}
+	return r.draft.Span()
+}
 
 // Draft advances one conversation by the token just decided and, when the
 // prediction block guessed right, by the one after it. It returns the tokens

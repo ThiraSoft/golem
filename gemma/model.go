@@ -44,8 +44,10 @@ type Model struct {
 	rotations []rotation
 	headDev   *vk.Device
 
-	// The drafter, when OpenAssistant was given one. gemma/speculate.go.
-	assistant *Assistant
+	// The drafter, when OpenAssistant was given one, and how many tokens it
+	// guesses a step. gemma/speculate.go.
+	assistant  *Assistant
+	draftDepth int
 }
 
 // Open maps a GGUF file and binds it. maxContext caps the cache; the file

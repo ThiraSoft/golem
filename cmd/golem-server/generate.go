@@ -152,7 +152,7 @@ func (g *Generator) GeneratePrompt(ctx context.Context, prompt engine.Prompt, p 
 		// carries a prediction block and no other conversation is waiting for
 		// a pass — a pass carrying two of them is the better bargain, and
 		// Runner.CanDraft is what weighs the two.
-		if g.ctx.CanDraft(state) && answer.Generated+1 < g.maxTokens && g.ctx.Room(2) {
+		if span := g.ctx.DraftSpan(); g.ctx.CanDraft(state) && answer.Generated+span-1 < g.maxTokens && g.ctx.Room(span) {
 			next, err := g.ctx.Draft(id, &state, sampler.Pick)
 			if err != nil {
 				return answer, err

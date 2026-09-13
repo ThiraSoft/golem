@@ -237,6 +237,17 @@ func Open(path string, maxContext int, slots ...int) (*Model, error) {
 type Speculator interface {
 	Step(token int32, hidden []float32, pos int, pick func([]float32) int32) ([]int32, []float32, error)
 	Rate() (accepted, drafted int)
+	// Span is the most positions a step writes, which is the room a caller
+	// has to leave in the context before asking for one.
+	Span() int
+}
+
+// SetDraftDepth says how many tokens a Gemma assistant guesses a step, and is
+// ignored by an engine whose drafter guesses one.
+func (m *Model) SetDraftDepth(n int) {
+	if g, ok := m.Forward.(*gemma.Model); ok {
+		g.SetDraftDepth(n)
+	}
 }
 
 // NewSpeculator is the model's way of drafting, or nil when it has none, which

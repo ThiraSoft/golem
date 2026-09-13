@@ -28,7 +28,10 @@ import (
 type AssistantWeights struct {
 	// PreProj takes the target's embedding and state, concatenated, to the
 	// assistant's width.
-	PreProj    nn.Matrix
+	PreProj nn.Matrix
+	// PostProj takes the assistant's normed state back to the target's width,
+	// which is what a second guess is fed in place of the target's state.
+	PostProj   nn.Matrix
 	Blocks     []BlockWeights
 	OutputNorm []float32
 	// TokenEmbd is only ever read as the head: the input embedding is the
@@ -53,6 +56,8 @@ type Assistant struct {
 	outputs [][]float32 // one per block, for the tests
 	hidden  []float32
 	head    *nn.Batch
+	post    *nn.Batch // the normed state, for the post-projection
+	own     []float32 // what the post-projection made of it
 
 	// The card, when the model's blocks are on one: gemma/assistant_vulkan.go.
 	stack *vk.Stack
@@ -97,6 +102,8 @@ func newAssistant(g *tensors.GGUF, target *Model) (*Assistant, error) {
 		outputs: rows(len(cfg.Blocks), cfg.Dim),
 		hidden:  make([]float32, cfg.Dim),
 		head:    nn.NewBatch(cfg.Dim, 1),
+		post:    nn.NewBatch(cfg.Dim, 1),
+		own:     make([]float32, target.Cfg.Dim),
 	}
 	return a, nil
 }
@@ -125,6 +132,23 @@ func (a *Assistant) Draft(token int32, hidden []float32, pos int, out []float32)
 		a.block(i, pos)
 	}
 	a.score(out)
+}
+
+// DraftNext writes the scores for the token after guess, the one the last Draft
+// chose. It is fed the assistant's own state projected back to the target's
+// width, at the same position: nothing has been written at pos, so the cache it
+// reads is the one the first guess read. llama.cpp's draft-mtp drafts a second
+// token the same way (common/speculative.cpp, the is_mem_shared branch).
+func (a *Assistant) DraftNext(guess int32, pos int, out []float32) {
+	a.ownState()
+	a.Draft(guess, a.own, pos, out)
+}
+
+// ownState projects the last draft's normed state to the target's width.
+func (a *Assistant) ownState() {
+	copy(a.post.F[0], a.hidden)
+	a.post.QuantizeColumnRange(0, 0, a.Cfg.Dim)
+	a.W.PostProj.MatVec(a.post, a.own)
 }
 
 // project seeds the stream: the target's embedding of token and its state,
@@ -325,6 +349,12 @@ func loadAssistantWeights(g *tensors.GGUF, cfg *Config, target *Config) (*Assist
 	if w.RoPEFreqs, err = floats(g, "rope_freqs.weight"); err != nil {
 		return nil, err
 	}
+	if w.PostProj, err = matrix(g, "nextn.post_projection.weight"); err != nil {
+		return nil, err
+	}
+	if w.PostProj.Rows != target.Dim || w.PostProj.Cols != cfg.Dim {
+		return nil, fmt.Errorf("the post-projection is %dx%d, expected %dx%d", w.PostProj.Rows, w.PostProj.Cols, target.Dim, cfg.Dim)
+	}
 
 	for i, bc := range cfg.Blocks {
 		p := fmt.Sprintf("blk.%d.", i)
@@ -371,7 +401,7 @@ func loadAssistantWeights(g *tensors.GGUF, cfg *Config, target *Config) (*Assist
 		w.Blocks[i] = b
 	}
 
-	all := []*nn.Matrix{&w.PreProj}
+	all := []*nn.Matrix{&w.PreProj, &w.PostProj}
 	for i := range w.Blocks {
 		b := &w.Blocks[i]
 		all = append(all, &b.Q, &b.O, &b.Gate, &b.Up, &b.Down)

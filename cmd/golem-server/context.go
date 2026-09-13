@@ -175,6 +175,9 @@ func (c *Context) CanDraft(state []float32) bool {
 	return len(state) > 0 && c.runner.CanDraft()
 }
 
+// DraftSpan is the most positions a drafting step writes: the room to leave.
+func (c *Context) DraftSpan() int { return c.runner.DraftSpan() }
+
 // Draft feeds the token just drawn and draws whatever the prediction block got
 // right after it, in one reading of the weights.
 //

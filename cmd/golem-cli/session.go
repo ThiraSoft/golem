@@ -55,6 +55,7 @@ const devicePassWidth = 512
 type speculator interface {
 	Step(token int32, hidden []float32, pos int, pick func([]float32) int32) ([]int32, []float32, error)
 	Rate() (accepted, drafted int)
+	Span() int
 }
 
 // vocabulary is the part of engine.Vocabulary a conversation uses — Gemma's
@@ -337,7 +338,7 @@ func (s *Session) AskWithMedia(text string, images, audio [][]byte, w io.Writer)
 			return turn, err
 		}
 
-		if draft != nil && turn.Generated+1 < s.maxTokens && len(s.held)+2 <= s.maxContext {
+		if draft != nil && turn.Generated+draft.Span()-1 < s.maxTokens && len(s.held)+draft.Span() <= s.maxContext {
 			next, h, err := draft.Step(id, hidden, len(s.held), s.sampler.Pick)
 			if err != nil {
 				return turn, err

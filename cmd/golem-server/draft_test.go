@@ -34,6 +34,9 @@ func (d *scriptedDrafter) Step(token int32, hidden []float32, pos int, pick func
 	return []int32{first, pick(out)}, []float32{0}, nil
 }
 
+// Span is the token and its one guess.
+func (d *scriptedDrafter) Span() int { return 2 }
+
 func drafting(tb testing.TB, script []string, maxTokens int, right bool) (*Generator, *wordVocab, *scriptedDrafter, *scriptedEngine) {
 	v := newWordVocab()
 	e := &scriptedEngine{vocab: v, script: script}

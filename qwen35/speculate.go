@@ -88,6 +88,9 @@ type Speculator struct {
 // Rate is what the run has drafted and what it kept.
 func (s *Speculator) Rate() (accepted, drafted int) { return s.Accepted, s.Drafted }
 
+// Span is the most positions a step writes: the token and the one guess.
+func (s *Speculator) Span() int { return 2 }
+
 // Speculate reports whether the model can draft: it needs the prediction block
 // and a card, because a draft made on the processor costs half a token and
 // cannot save one.

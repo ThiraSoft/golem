@@ -68,6 +68,7 @@ func main() {
 	presPenalty := flag.Float64("presence-penalty", -1, "subtract this once for any appearance at all; negative takes the file's own value")
 	mmproj := flag.String("mmproj", os.Getenv("GOLEM_MMPROJ"), "projector GGUF, which is what lets a model see (or GOLEM_MMPROJ)")
 	assistant := flag.String("assistant", os.Getenv("GOLEM_ASSISTANT"), "gemma4-assistant GGUF that drafts for a Gemma 4 model (or GOLEM_ASSISTANT)")
+	draftN := flag.Int("draft-n", 0, "tokens the assistant guesses a step, 1 to 3; 0 takes the default")
 	var images stringList
 	flag.Var(&images, "image", "a picture to put in the first turn; repeat for several")
 	var recordings stringList
@@ -141,6 +142,7 @@ func main() {
 			fail(err)
 		}
 	}
+	m.SetDraftDepth(*draftN)
 	if !*draft {
 		// Before the upload, not after: what a checkpoint's prediction block
 		// costs on the card is decided when the weights go over, and on the

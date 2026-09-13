@@ -36,6 +36,7 @@ func main() {
 	sttDir := flag.String("stt", os.Getenv("GOLEM_STT"), "directory holding a Kyutai STT checkpoint (or GOLEM_STT)")
 	mmproj := flag.String("mmproj", os.Getenv("GOLEM_MMPROJ"), "projector GGUF, which is what lets a model see (or GOLEM_MMPROJ)")
 	assistant := flag.String("assistant", os.Getenv("GOLEM_ASSISTANT"), "gemma4-assistant GGUF that drafts for a Gemma 4 model (or GOLEM_ASSISTANT)")
+	draftN := flag.Int("draft-n", 0, "tokens the assistant guesses a step, 1 to 3; 0 takes the default")
 	addr := flag.String("addr", "127.0.0.1:8080", "address to listen on")
 	context := flag.Int("context", 4096, "positions to keep; the files declare far more than any machine here would survive")
 	maxTokens := flag.Int("n", 1024, "most tokens to draw for one answer, when the request names no limit")
@@ -77,6 +78,7 @@ func main() {
 			fail(err)
 		}
 	}
+	m.SetDraftDepth(*draftN)
 	if *vulkan {
 		if err := m.UseVulkan(); err != nil {
 			fail(err)

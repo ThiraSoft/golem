@@ -271,16 +271,27 @@ int main(int argc, char ** argv) {
     draft.token = (llama_token *) malloc(sizeof(llama_token));
 
     std::vector<float> h(n_embd_out);
-    auto guess = [&](llama_token id, int pos) -> llama_token {
+    auto guess_from = [&](llama_token id, int pos, const float * row) -> llama_token {
         draft.n_tokens     = 1;
         draft.token[0]     = id;
         draft.pos[0]       = pos;
         draft.n_seq_id[0]  = 1;
         draft.seq_id[0][0] = 0;
         draft.logits[0]    = 1;
-        std::memcpy(draft.embd, h.data(), h.size() * sizeof(float));
+        std::memcpy(draft.embd, row, h.size() * sizeof(float));
         if (llama_decode(ctx_dft, draft)) die("the assistant's decode failed");
         return argmax(llama_get_logits_ith(ctx_dft, 0), n_vocab);
+    };
+    auto guess = [&](llama_token id, int pos) { return guess_from(id, pos, h.data()); };
+
+    // The second guess of a step, which is how draft-mtp drafts two: the first
+    // guess fed back with the assistant's own projected state, at the same
+    // position — the cache is shared and nothing was written at it
+    // (common/speculative.cpp, the is_mem_shared branch of draft()).
+    std::vector<float> own(n_embd_out);
+    auto second = [&](llama_token first, int pos) -> llama_token {
+        std::memcpy(own.data(), llama_get_embeddings_nextn_ith(ctx_dft, 0), own.size() * sizeof(float));
+        return guess_from(first, pos, own.data());
     };
 
     if (llama_decode(ctx_tgt, llama_batch_get_one(tokens.data(), n))) die("the target's decode failed");
@@ -323,10 +334,11 @@ int main(int argc, char ** argv) {
     // The greedy run. Each step drafts before the target reads the token, so
     // the assistant sees the target's cache as the speculation would: every
     // position before the one it drafts from.
-    std::vector<llama_token> greedy, drafts;
+    std::vector<llama_token> greedy, drafts, drafts2;
     int pos = n;
     for (int step = 0; step < run.steps; ++step) {
         drafts.push_back(step == 0 ? first_guess : guess(id, pos));
+        drafts2.push_back(second(drafts.back(), pos));
         greedy.push_back(id);
         if (llama_decode(ctx_tgt, llama_batch_get_one(&id, 1))) die("the target's decode failed");
         std::memcpy(h.data(), llama_get_embeddings_nextn_ith(ctx_tgt, 0), h.size() * sizeof(float));
@@ -361,7 +373,8 @@ int main(int argc, char ** argv) {
     fprintf(f, "],\n");
     fprintf(f, "  \"argmax\": %d,\n", top[0].first);
     write_ids(f, "greedy", greedy, false);
-    write_ids(f, "drafts", drafts, true);
+    write_ids(f, "drafts", drafts, false);
+    write_ids(f, "drafts2", drafts2, true);
     fprintf(f, "}\n");
     fclose(f);
 
