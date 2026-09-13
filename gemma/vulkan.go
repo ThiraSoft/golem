@@ -327,6 +327,13 @@ func (m *Model) UseVulkanStack() error {
 	if err := m.useVulkanEmbedding(); err != nil {
 		return err
 	}
+	// The assistant reads the caches this has just put on the card, so it
+	// follows them there.
+	if m.assistant != nil {
+		if err := m.assistant.useVulkan(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

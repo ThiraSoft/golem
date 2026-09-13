@@ -44,6 +44,18 @@ target_link_libraries(dump_layers PRIVATE llama ggml ggml-base ggml-cpu)
 set_target_properties(dump_layers PROPERTIES
     BUILD_RPATH ${LLAMA_DIR}/build/bin)
 
+# A drafter sharing its target's cache is reached through llama-ext.h, which
+# lives beside the sources rather than among the public headers.
+add_executable(dump_assistant dump_assistant.cpp)
+target_include_directories(dump_assistant PRIVATE
+    ${LLAMA_DIR}/include
+    ${LLAMA_DIR}/src
+    ${LLAMA_DIR}/ggml/include)
+target_link_directories(dump_assistant PRIVATE ${LLAMA_DIR}/build/bin)
+target_link_libraries(dump_assistant PRIVATE llama ggml ggml-base ggml-cpu)
+set_target_properties(dump_assistant PROPERTIES
+    BUILD_RPATH ${LLAMA_DIR}/build/bin)
+
 add_executable(dump_tokens dump_tokens.cpp)
 target_include_directories(dump_tokens PRIVATE
     ${LLAMA_DIR}/include

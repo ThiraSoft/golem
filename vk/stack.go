@@ -450,6 +450,10 @@ func (s *Stack) SetGeometry(i, dims int, base float64, factors []float32) error 
 // Columns is how many positions one pass may carry.
 func (s *Stack) Columns() int { return maxColumns }
 
+// Cache is Attention.Cache on the stack's attention: what another stack reads
+// to attend over this one's keys.
+func (s *Stack) Cache(block int) (k, v *Buffer, capacity int, err error) { return s.attn.Cache(block) }
+
 // Stream is the buffer the caller seeds with the embeddings and reads the last
 // hidden states back from, one column after another, dim floats each.
 func (s *Stack) Stream() *Buffer { return s.stage }

@@ -105,6 +105,9 @@ func Attention(
 			lc := at[t].Cache.Layers[bc.Index]
 			pos := at[t].Pos
 			first, last := at[t].Cache.Visible(bc, pos, at[t].Until)
+			if bc.Behind {
+				last--
+			}
 			n := last - first + 1
 			scores := s.scores[t*s.maxHeads+h][:n]
 			query := qh[t][h*bc.HeadDim : (h+1)*bc.HeadDim]

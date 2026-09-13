@@ -1,0 +1,35 @@
+# The waypoints of one draft by the 12B's assistant, recorded by
+# dump_assistant. The four blocks are all of them: three read the target's last
+# window block, one its last global block, and none computes keys of its own.
+prompt      The capital of France is
+add_special 1
+steps       16
+
+# The target's input to the two blocks the assistant reads, 46 a window block
+# and 47 the last global one, at every position of the prompt.
+target l_out-45
+target l_out-46
+target Kcur_pos-46
+target Vcur_normed-46
+target Kcur_pos-47
+target Vcur_normed-47
+
+global inp_embd_target
+global inp_xh
+global pre_proj
+global result_norm
+global result_output
+global_opt h_nextn
+
+require attn_norm
+require Qcur_normed
+require Qcur_pos
+require kqv_out
+require attn_post_norm
+require attn_out
+require ffn_norm
+require ffn_out
+require ffn_post_norm
+require out_scaled
+require kq
+require kq_soft_max

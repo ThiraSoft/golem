@@ -230,6 +230,55 @@ func Open(path string, maxContext int, slots ...int) (*Model, error) {
 	return m, nil
 }
 
+// Speculator is a drafting step, whichever engine drafts: qwen35 with the
+// prediction block its checkpoint carries, gemma with an assistant opened
+// beside the model. Step's contract is the same for both — qwen35's
+// Speculator.Step says it in full.
+type Speculator interface {
+	Step(token int32, hidden []float32, pos int, pick func([]float32) int32) ([]int32, []float32, error)
+	Rate() (accepted, drafted int)
+}
+
+// NewSpeculator is the model's way of drafting, or nil when it has none, which
+// is not an error: such a model draws a token at a time. reset forgets what the
+// drafter keeps between conversations, and is never nil when s is not.
+//
+// f is a Model's Forward, taken as any so that a command holding it under a
+// narrower interface of its own can ask too.
+func NewSpeculator(f any) (s Speculator, reset func(), err error) {
+	switch e := f.(type) {
+	case *qwen35.Model:
+		if !e.Speculate() {
+			return nil, nil, nil
+		}
+		sp, err := e.NewSpeculator()
+		if err != nil {
+			return nil, nil, err
+		}
+		return sp, e.ResetMTP, nil
+	case *gemma.Model:
+		if !e.Speculate() {
+			return nil, nil, nil
+		}
+		sp, err := e.NewSpeculator()
+		if err != nil {
+			return nil, nil, err
+		}
+		// The assistant keeps nothing: it reads the target's cache.
+		return sp, func() {}, nil
+	}
+	return nil, nil, nil
+}
+
+// OpenAssistant gives a Gemma 4 model the drafter Google publishes beside it.
+func (m *Model) OpenAssistant(path string) error {
+	g, ok := m.Forward.(*gemma.Model)
+	if !ok {
+		return fmt.Errorf("%s takes no assistant: only gemma4 is published with one", m.Name)
+	}
+	return g.OpenAssistant(path)
+}
+
 func openGemma(g *tensors.GGUF, maxContext int) (*Model, error) {
 	inner, err := gemma.New(g, maxContext)
 	if err != nil {

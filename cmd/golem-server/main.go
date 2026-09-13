@@ -35,6 +35,7 @@ func main() {
 	model := flag.String("model", os.Getenv("GOLEM_MODEL"), "GGUF file, gemma4, qwen3 or qwen35 (or GOLEM_MODEL)")
 	sttDir := flag.String("stt", os.Getenv("GOLEM_STT"), "directory holding a Kyutai STT checkpoint (or GOLEM_STT)")
 	mmproj := flag.String("mmproj", os.Getenv("GOLEM_MMPROJ"), "projector GGUF, which is what lets a model see (or GOLEM_MMPROJ)")
+	assistant := flag.String("assistant", os.Getenv("GOLEM_ASSISTANT"), "gemma4-assistant GGUF that drafts for a Gemma 4 model (or GOLEM_ASSISTANT)")
 	addr := flag.String("addr", "127.0.0.1:8080", "address to listen on")
 	context := flag.Int("context", 4096, "positions to keep; the files declare far more than any machine here would survive")
 	maxTokens := flag.Int("n", 1024, "most tokens to draw for one answer, when the request names no limit")
@@ -71,6 +72,11 @@ func main() {
 		fail(err)
 	}
 	defer m.Close()
+	if *assistant != "" {
+		if err := m.OpenAssistant(*assistant); err != nil {
+			fail(err)
+		}
+	}
 	if *vulkan {
 		if err := m.UseVulkan(); err != nil {
 			fail(err)
@@ -96,18 +102,18 @@ func main() {
 	if v, ok := m.Media(); ok {
 		runner.SetVision(v)
 	}
-	// The checkpoint's own prediction block, when it carries one and the card
-	// holds the blocks it needs. It draws a second token out of the same
+	// A drafter, when the model has one where its caches are: the checkpoint's
+	// own prediction block (qwen35), or the assistant -assistant opened (gemma). It draws a second token out of the same
 	// reading of the weights, for a conversation drawing alone; two of them are
 	// better served by the pass that carries both, and Runner.CanDraft is what
 	// weighs the two. qwen35/speculate.go says what the bargain is.
 	drafting := false
-	if d, ok := m.Forward.(drafter); ok && d.Speculate() {
-		sp, err := d.NewSpeculator()
-		if err != nil {
-			fail(err)
-		}
-		runner.UseDrafter(sp, d.ResetMTP)
+	sp, reset, err := engine.NewSpeculator(m.Forward)
+	if err != nil {
+		fail(err)
+	}
+	if sp != nil {
+		runner.UseDrafter(sp, reset)
 		drafting = true
 	}
 	stop := make(chan struct{})
@@ -151,7 +157,7 @@ func main() {
 	head := vulkanLine(m.Vulkan())
 	draft := ""
 	if drafting {
-		draft = ", drafting with the prediction block"
+		draft = ", drafting"
 	}
 	fmt.Fprintf(os.Stderr, "%s: %s, %d blocks, %d positions in %d slot(s) of %d, %s%s, loaded in %s on %d cores\n",
 		name, m.Name, m.Blocks, *context, m.Slots(), m.SlotContext(), head, draft,

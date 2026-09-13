@@ -38,6 +38,10 @@ type BlockConfig struct {
 	KVSource   int  // the block whose cache this one reads; Index when OwnsKV
 	ValueIsKey bool // no value projection: the key projection serves as both
 	MoE        bool // a router, and a second feed forward beside the dense one
+	// Behind says the block's query sits one position past the cache it reads:
+	// a drafter attending over its target's keys at the position the target
+	// has not written yet. It sees up to the position before its own.
+	Behind bool
 }
 
 type Config struct {

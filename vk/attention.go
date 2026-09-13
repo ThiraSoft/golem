@@ -104,7 +104,12 @@ type BlockShape struct {
 	// projection straight over, which is what llama.cpp's graph shows.
 	NormValue bool
 	KVSource  int
-	Eps       float32
+	// Cache is a cache that belongs to another Attention, for a block that
+	// reads keys and values where they already are: a drafter attending over
+	// its target's. It stands in for OwnsKV and KVSource, and the caller keeps
+	// the other Attention alive for as long as this one runs.
+	Cache [2]*Buffer
+	Eps   float32
 	// Scale multiplies the scores before the softmax. Gemma 4 scales by one
 	// and lets its query norm hold them in range; Qwen3 passes 1/sqrt(head_dim)
 	// the way llama.cpp does.
@@ -470,7 +475,17 @@ func (a *Attention) AddBlock(shape BlockShape, q, k, v, o []byte, qnorm, knorm [
 	if heads%nn.QuantBlock != 0 {
 		return fmt.Errorf("vk: a block's heads must come to a multiple of %d, given %d", nn.QuantBlock, heads)
 	}
-	if !shape.OwnsKV && (shape.KVSource < 0 || shape.KVSource >= len(a.blocks)) {
+	borrowed := shape.Cache[0] != nil || shape.Cache[1] != nil
+	if borrowed {
+		if shape.OwnsKV || shape.Cache[0] == nil || shape.Cache[1] == nil {
+			return fmt.Errorf("vk: block %d borrows a cache, and has to borrow both halves and own none", len(a.blocks))
+		}
+		if need := a.slots * shape.Capacity * shape.KVHeads * shape.HeadDim * 2; int(shape.Cache[0].size) < need || int(shape.Cache[1].size) < need {
+			return fmt.Errorf("vk: block %d borrows a cache of %d bytes and reads %d of it",
+				len(a.blocks), min(shape.Cache[0].size, shape.Cache[1].size), need)
+		}
+	}
+	if !shape.OwnsKV && !borrowed && (shape.KVSource < 0 || shape.KVSource >= len(a.blocks)) {
 		return fmt.Errorf("vk: block %d reads block %d's cache, which is not there yet", len(a.blocks), shape.KVSource)
 	}
 	if shape.Capacity > a.slotContext {
@@ -546,7 +561,10 @@ func (a *Attention) AddBlock(shape BlockShape, q, k, v, o []byte, qnorm, knorm [
 	// from, not a copy: there is one cache and many blocks on it, which is what
 	// gemma/cache.go does on the other side and for the same reason.
 	var ck, cv *Buffer
-	if shape.OwnsKV {
+	if borrowed {
+		// Neither is the block's to free: b.ck and b.cv stay nil.
+		ck, cv = shape.Cache[0], shape.Cache[1]
+	} else if shape.OwnsKV {
 		n := a.slots * shape.Capacity * shape.KVHeads * shape.HeadDim * 2 // fp16, one ring a slot
 		if b.ck, err = a.d.Local(n, bufferUsageStorage); err != nil {
 			return fail(err)
@@ -600,6 +618,25 @@ func (a *Attention) AddBlock(shape BlockShape, q, k, v, o []byte, qnorm, knorm [
 
 // caches is the pair this block reads, which is its own or an earlier one's.
 func (b *attentionBlock) caches() (*Buffer, *Buffer) { return b.ck, b.cv }
+
+// Cache is the pair of buffers a block reads its keys and values from — its
+// own, or the one it shares — for another Attention to borrow through
+// BlockShape.Cache. Capacity is its ring, which the borrower has to use too:
+// a position's place in the buffer is its remainder by it.
+func (a *Attention) Cache(block int) (k, v *Buffer, capacity int, err error) {
+	if block < 0 || block >= len(a.blocks) {
+		return nil, nil, 0, fmt.Errorf("vk: block %d of %d", block, len(a.blocks))
+	}
+	b := a.blocks[block]
+	if b.ck == nil && !b.shape.OwnsKV && b.shape.Cache[0] == nil {
+		b = a.blocks[b.shape.KVSource]
+	}
+	k, v = b.ck, b.cv
+	if b.ck == nil {
+		k, v = b.shape.Cache[0], b.shape.Cache[1]
+	}
+	return k, v, b.shape.Capacity, nil
+}
 
 // Profile is Stack.Profile, forwarded: the stamps the attention writes are
 // the four products, the cache and the scores.

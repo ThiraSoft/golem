@@ -1,0 +1,34 @@
+# The same draft as assistant.run, on a chat turn. The raw prompt runs the
+# 12B into a repetition within two tokens, which a drafter guesses by copying;
+# a turn gives it a real continuation to guess.
+prompt        <|turn>user\nWrite two sentences about the sea.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>
+add_special   1
+parse_special 1
+steps         32
+
+target l_out-45
+target l_out-46
+target Kcur_pos-46
+target Vcur_normed-46
+target Kcur_pos-47
+target Vcur_normed-47
+
+global inp_embd_target
+global inp_xh
+global pre_proj
+global result_norm
+global result_output
+global_opt h_nextn
+
+require attn_norm
+require Qcur_normed
+require Qcur_pos
+require kqv_out
+require attn_post_norm
+require attn_out
+require ffn_norm
+require ffn_out
+require ffn_post_norm
+require out_scaled
+require kq
+require kq_soft_max

@@ -175,7 +175,12 @@ func (b *Batch) QuantizeK() {
 			into := q[block*SuperBlock : (block+1)*SuperBlock]
 
 			// ggml takes its scale from the signed extremum rather than the
-			// absolute one, so the extreme value lands on -128 instead of 127.
+			// absolute one, and maps it to -127: quantize_row_q8_K_ref has
+			// used -127/max since IQ2_XXS wanted it, and x86 calls the
+			// reference. The -128 this used to have left every Q6_K product
+			// a step's worth of rounding away from ggml's — two tenths of a
+			// logit on the 12B assistant's head, from an input that matched
+			// to the bit.
 			var peak, extreme float32
 			for _, f := range values {
 				a := f
@@ -192,7 +197,7 @@ func (b *Batch) QuantizeK() {
 				clear(sums[block*(SuperBlock/16) : (block+1)*(SuperBlock/16)])
 				continue
 			}
-			inverse := -128 / extreme
+			inverse := -127 / extreme
 			for i, f := range values {
 				n := nearestInt(f * inverse)
 				if n > 127 {

@@ -56,7 +56,7 @@ func main() {
 	context := flag.Int("context", 4096, "positions to keep; the files declare far more than any machine here would survive")
 	system := flag.String("system", "", "system message opening the conversation")
 	think := flag.Bool("think", false, "open the system turn with the thinking marker")
-	draft := flag.Bool("draft", true, "let a checkpoint that carries a prediction block draft with it; -draft=false generates a token at a time, which is what the block is worth measured against")
+	draft := flag.Bool("draft", true, "let a model that can draft — a checkpoint carrying a prediction block, or one given -assistant — draft; -draft=false generates a token at a time, which is what drafting is worth measured against")
 	maxTokens := flag.Int("n", 512, "most tokens to draw for one answer")
 	temp := flag.Float64("temp", -1, "temperature; 0 is greedy, negative takes the file's own value")
 	topK := flag.Int("top-k", -1, "candidates kept; 0 keeps all, negative takes the file's own value")
@@ -67,6 +67,7 @@ func main() {
 	freqPenalty := flag.Float64("frequency-penalty", -1, "subtract this once per appearance in that window; negative takes the file's own value")
 	presPenalty := flag.Float64("presence-penalty", -1, "subtract this once for any appearance at all; negative takes the file's own value")
 	mmproj := flag.String("mmproj", os.Getenv("GOLEM_MMPROJ"), "projector GGUF, which is what lets a model see (or GOLEM_MMPROJ)")
+	assistant := flag.String("assistant", os.Getenv("GOLEM_ASSISTANT"), "gemma4-assistant GGUF that drafts for a Gemma 4 model (or GOLEM_ASSISTANT)")
 	var images stringList
 	flag.Var(&images, "image", "a picture to put in the first turn; repeat for several")
 	var recordings stringList
@@ -132,6 +133,11 @@ func main() {
 	defer m.Close()
 	if *mmproj != "" {
 		if err := m.OpenProjector(*mmproj); err != nil {
+			fail(err)
+		}
+	}
+	if *assistant != "" {
+		if err := m.OpenAssistant(*assistant); err != nil {
 			fail(err)
 		}
 	}

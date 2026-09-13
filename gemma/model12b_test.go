@@ -155,10 +155,12 @@ func TestLogits12BMatchTheReference(t *testing.T) {
 	for i, probe := range f.LogitsTop {
 		ids[i], want[i] = probe.ID, probe.Logit
 	}
-	// A logit of the 12B is further from the reference's than E2B's is — 0.86
-	// measured here against 0.33 there, on values around fifteen. Thirteen more
-	// blocks of Q4_0 products accumulate that much more rounding, and every
-	// waypoint above is inside the tolerances E2B holds to.
+	// A logit of the 12B is further from the reference's than E2B's is — 0.59
+	// measured here, on values around fifteen. Thirteen more blocks of Q4_0
+	// products accumulate that much more rounding, and every waypoint above is
+	// inside the tolerances E2B holds to. It was 0.86 while the head's Q8_K
+	// form scaled to -128 where ggml scales to -127; the assistant's head,
+	// driven by the reference's own state, now matches to 4e-6.
 	got := make([]float32, len(ids))
 	m.LogitsAt(hidden, ids, got)
 	compare(t, "the top 64 logits", got, want, 1.0)

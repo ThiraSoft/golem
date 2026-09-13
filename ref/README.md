@@ -78,6 +78,11 @@ build/ref/dump_layers "$GOLEM_MODEL_26B" testdata/gemma/moe26     ref/gemma/moe.
 build/ref/dump_tokens "$GOLEM_MODEL"     testdata/gemma/tokenizer ref/gemma/corpus.tsv
 build/ref/dump_quants "$GOLEM_MODEL"     testdata/gemma/quants
 
+# The 12B's assistant (gemma4-assistant), drafting over the 12B's cache.
+mkdir -p testdata/gemma/{assistant12,assistant12chat}
+build/ref/dump_assistant "$GOLEM_MODEL_12B" "$GOLEM_ASSISTANT_12B" testdata/gemma/assistant12     ref/gemma/assistant.run
+build/ref/dump_assistant "$GOLEM_MODEL_12B" "$GOLEM_ASSISTANT_12B" testdata/gemma/assistant12chat ref/gemma/assistant_chat.run
+
 mkdir -p testdata/qwen35/mrope
 build/ref/dump_mrope testdata/qwen35/mrope
 

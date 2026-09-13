@@ -31,7 +31,6 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/engine"
-	"github.com/ThiraSoft/golem/qwen35"
 )
 
 // debugBatches says what went into each pass, for measuring how well the
@@ -83,20 +82,11 @@ type pass struct {
 }
 
 // speculator draws the token after the one just decided, and the one after
-// that when the checkpoint's prediction block guessed it right — two tokens out
-// of one reading of the weights. qwen35.Speculator is the only implementation;
-// the tests have their own.
+// that when the drafter guessed it right — two tokens out of one reading of the
+// weights. engine.NewSpeculator builds one for qwen35's prediction block and
+// for gemma's assistant; the tests have their own.
 type speculator interface {
 	Step(token int32, hidden []float32, pos int, pick func([]float32) int32) ([]int32, []float32, error)
-}
-
-// drafter is the part of an engine that can build one. Nothing outside qwen35
-// implements it, and a model that does not draws a token at a time — which is
-// not a failure and is not reported as one.
-type drafter interface {
-	Speculate() bool
-	NewSpeculator() (*qwen35.Speculator, error)
-	ResetMTP()
 }
 
 // aside is anything else the model has to do, which cannot overlap a pass:

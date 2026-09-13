@@ -19,7 +19,6 @@ import (
 	"github.com/ThiraSoft/golem/chat"
 	"github.com/ThiraSoft/golem/engine"
 	"github.com/ThiraSoft/golem/grammar"
-	"github.com/ThiraSoft/golem/qwen35"
 	"github.com/ThiraSoft/golem/sample"
 )
 
@@ -50,14 +49,9 @@ const promptBatch = 32
 // devicePassWidth is that width, for a model on a card.
 const devicePassWidth = 512
 
-// speculative is the part of a model that can draft with a prediction block,
-// and speculator is one prepared to. Nothing outside qwen35 implements either
-// yet, and a model that does not simply generates a token at a time.
-type speculative interface {
-	Speculate() bool
-	NewSpeculator() (*qwen35.Speculator, error)
-}
-
+// speculator is a model prepared to draft, which engine.NewSpeculator builds
+// for qwen35's prediction block and gemma's assistant. A model with neither
+// simply generates a token at a time.
 type speculator interface {
 	Step(token int32, hidden []float32, pos int, pick func([]float32) int32) ([]int32, []float32, error)
 	Rate() (accepted, drafted int)
@@ -301,13 +295,13 @@ func (s *Session) AskWithMedia(text string, images, audio [][]byte, w io.Writer)
 	start = time.Now()
 	last := int32(-1)
 
-	// A checkpoint that carries a prediction block drafts with it. Two tokens
-	// then come out of one reading of the weights, which is what a token
-	// actually costs; qwen35/speculate.go says how, and what a refused draft
-	// has to undo.
+	// A model that can draft does: a checkpoint carrying a prediction block,
+	// or a Gemma given its assistant. Two tokens then come out of one reading
+	// of the weights, which is what a token actually costs; qwen35/speculate.go
+	// says how, and what a refused draft has to undo.
 	var draft speculator
-	if sp, ok := s.model.(speculative); ok && sp.Speculate() && !s.noDraft {
-		if d, err := sp.NewSpeculator(); err == nil {
+	if !s.noDraft {
+		if d, _, err := engine.NewSpeculator(s.model); err == nil && d != nil {
 			draft = d
 		}
 	}

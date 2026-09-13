@@ -43,6 +43,9 @@ type Model struct {
 	stack     *vk.Stack
 	rotations []rotation
 	headDev   *vk.Device
+
+	// The drafter, when OpenAssistant was given one. gemma/speculate.go.
+	assistant *Assistant
 }
 
 // Open maps a GGUF file and binds it. maxContext caps the cache; the file
@@ -106,6 +109,10 @@ func (m *Model) reserve(batch int) {
 }
 
 func (m *Model) Close() error {
+	if m.assistant != nil {
+		m.assistant.Close()
+		m.assistant = nil
+	}
 	m.closeVulkanHead()
 	if m.projFile != nil {
 		m.projFile.Close()
