@@ -65,9 +65,10 @@ const maxColumns = wideColumns
 // what is left is the tiling that divides the cache traffic.
 const scoreColumns = 32
 
-// passWidth is the widest binary that answers a pass of that many columns.
-// There are four: the tiled product at a hundred and twenty-eight and at
-// thirty-two, the mat-vec at eight, and the mat-vec at one, which is a token.
+// passWidth is the widest binary that answers a pass of that many columns:
+// the tiled products from thirty-two up, the mat-vec at eight, four and two,
+// and the mat-vec at one, which is a token. Two and four are a token with one
+// or two guesses beside it, which is what speculation runs.
 // A pass shorter than the binary it runs computes the columns above it too,
 // out of buffers that are allocated for them and out of positions the
 // per-column kernels never dispatch — so the answer is right and the cost is
@@ -770,8 +771,17 @@ func (a *Attention) Record(r *Recorder, block, columns int, runs []span) {
 		// A run of one column is a token being drawn, and it takes the kernel
 		// written for that: the tiled one would spend a workgroup's whole
 		// shape on thirty-one columns that are not there.
-		if run.count == 1 {
-			r.Dispatch(b.setOne, uint32(s.Heads), unsafe.Pointer(&score))
+		//
+		// Up to four columns take it too, once each: a token and its guesses
+		// are short ranges, and a tile of thirty-two spends its shape on the
+		// columns that are not there — measured, the scores of a pass of two
+		// cost 1.74 of a pass of one that way.
+		if run.count <= 4 {
+			for c := 0; c < run.count; c++ {
+				score.col0 = uint32(run.first + c)
+				score.columns = score.col0 + 1
+				r.Dispatch(b.setOne, uint32(s.Heads), unsafe.Pointer(&score))
+			}
 			continue
 		}
 		tiles := uint32((run.count + scoreColumns - 1) / scoreColumns)

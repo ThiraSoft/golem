@@ -26,22 +26,22 @@ func TestFusedWidthsAreTheirOwnBinaries(t *testing.T) {
 		spirv map[string][]byte
 	}{
 		{"Q4_0", map[string][]byte{
-			"1": moeGateUpSPIRV, "8": moeGateUpWideSPIRV, "16": moeGateUpMidSPIRV,
+			"1": moeGateUpSPIRV, "2": moeGateUpTwoSPIRV, "4": moeGateUpFourSPIRV, "8": moeGateUpWideSPIRV, "16": moeGateUpMidSPIRV,
 		}},
 		{"Q4_K", map[string][]byte{
-			"1": moeGateUpQ4KSPIRV, "8": moeGateUpQ4KWideSPIRV,
+			"1": moeGateUpQ4KSPIRV, "2": moeGateUpQ4KTwoSPIRV, "4": moeGateUpQ4KFourSPIRV, "8": moeGateUpQ4KWideSPIRV,
 			"16": moeGateUpQ4KMidSPIRV, "32": moeGateUpQ4KWidestSPIRV,
 		}},
 		{"Q2_K", map[string][]byte{
-			"1": moeGateUpQ2KSPIRV, "8": moeGateUpQ2KWideSPIRV,
+			"1": moeGateUpQ2KSPIRV, "2": moeGateUpQ2KTwoSPIRV, "4": moeGateUpQ2KFourSPIRV, "8": moeGateUpQ2KWideSPIRV,
 			"16": moeGateUpQ2KMidSPIRV, "32": moeGateUpQ2KWidestSPIRV,
 		}},
 		{"Q3_K", map[string][]byte{
-			"1": moeGateUpQ3KSPIRV, "8": moeGateUpQ3KWideSPIRV,
+			"1": moeGateUpQ3KSPIRV, "2": moeGateUpQ3KTwoSPIRV, "4": moeGateUpQ3KFourSPIRV, "8": moeGateUpQ3KWideSPIRV,
 			"16": moeGateUpQ3KMidSPIRV, "32": moeGateUpQ3KWidestSPIRV,
 		}},
 		{"Q8_0", map[string][]byte{
-			"1": moeGateUpQ80SPIRV, "8": moeGateUpQ80WideSPIRV,
+			"1": moeGateUpQ80SPIRV, "2": moeGateUpQ80TwoSPIRV, "4": moeGateUpQ80FourSPIRV, "8": moeGateUpQ80WideSPIRV,
 			"16": moeGateUpQ80MidSPIRV, "32": moeGateUpQ80WidestSPIRV,
 		}},
 	} {

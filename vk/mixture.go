@@ -107,6 +107,52 @@ var moeGateUpWideSPIRV []byte
 //go:embed shaders/moe_gateup16.spv
 var moeGateUpMidSPIRV []byte
 
+// The same kernel at two and four columns, in every format it reads. They are
+// widths of their own because speculation lives there — a token and one or two
+// guesses — and the eight-column binary made a pass of two cost 1.54 of a pass
+// of one, where the weights are read once either way.
+//
+//go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup2.spv
+//go:generate glslc -O -DQ4K -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q4k2.spv
+//go:generate glslc -O -DQ3K -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q3k2.spv
+//go:generate glslc -O -DQ2K -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q2k2.spv
+//go:generate glslc -O -DQ80 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q802.spv
+//go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup4.spv
+//go:generate glslc -O -DQ4K -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q4k4.spv
+//go:generate glslc -O -DQ3K -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q3k4.spv
+//go:generate glslc -O -DQ2K -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q2k4.spv
+//go:generate glslc -O -DQ80 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/moe_gateup.comp -o shaders/moe_gateup_q804.spv
+
+//go:embed shaders/moe_gateup4.spv
+var moeGateUpFourSPIRV []byte
+
+//go:embed shaders/moe_gateup_q4k4.spv
+var moeGateUpQ4KFourSPIRV []byte
+
+//go:embed shaders/moe_gateup_q3k4.spv
+var moeGateUpQ3KFourSPIRV []byte
+
+//go:embed shaders/moe_gateup_q2k4.spv
+var moeGateUpQ2KFourSPIRV []byte
+
+//go:embed shaders/moe_gateup_q804.spv
+var moeGateUpQ80FourSPIRV []byte
+
+//go:embed shaders/moe_gateup2.spv
+var moeGateUpTwoSPIRV []byte
+
+//go:embed shaders/moe_gateup_q4k2.spv
+var moeGateUpQ4KTwoSPIRV []byte
+
+//go:embed shaders/moe_gateup_q3k2.spv
+var moeGateUpQ3KTwoSPIRV []byte
+
+//go:embed shaders/moe_gateup_q2k2.spv
+var moeGateUpQ2KTwoSPIRV []byte
+
+//go:embed shaders/moe_gateup_q802.spv
+var moeGateUpQ80TwoSPIRV []byte
+
 // The same fused kernel over Q4_K weights, which is what every K-quant mix
 // stores its gate and up in. shaders/moe_gateup.comp under -DQ4K.
 //
@@ -663,11 +709,25 @@ func NewMixture(d *Device, dim, ffn, dense, experts, used int, act Activation) (
 		columns int
 		spirv   []byte
 	}{
+		{&m.gateUp, 2, moeGateUpTwoSPIRV},
+		{&m.gateUp, 4, moeGateUpFourSPIRV},
 		{&m.gateUp, smallColumns, moeGateUpWideSPIRV},
 		{&m.gateUp, 16, moeGateUpMidSPIRV},
 		{&m.gateUp, 32, moeGateUpWidestSPIRV},
 	} {
 		if err := (*spec.pipe).Wide(spec.columns, spec.spirv); err != nil {
+			m.Close()
+			return nil, err
+		}
+	}
+	// Two and four columns before either ladder: the mat-vec at those widths
+	// is the pass a speculative step makes, whichever product the wider
+	// passes take.
+	for _, spec := range []struct {
+		columns int
+		spirv   []byte
+	}{{2, matvec2SPIRV}, {4, matvec4SPIRV}} {
+		if err := m.denseDown.Wide(spec.columns, spec.spirv); err != nil {
 			m.Close()
 			return nil, err
 		}
@@ -1894,6 +1954,8 @@ func (m *Mixture) buildQ80Experts() error {
 		columns int
 		spirv   []byte
 	}{
+		{2, moeGateUpQ80TwoSPIRV},
+		{4, moeGateUpQ80FourSPIRV},
 		{smallColumns, moeGateUpQ80WideSPIRV},
 		{16, moeGateUpQ80MidSPIRV},
 		{32, moeGateUpQ80WidestSPIRV},
@@ -1937,7 +1999,7 @@ func (m *Mixture) fusedFor(q nn.Quant) (*Pipeline, error) {
 		if m.gateUpQ2K != nil {
 			return m.gateUpQ2K, nil
 		}
-		p, err := m.fusedPipeline(moeGateUpQ2KSPIRV,
+		p, err := m.fusedPipeline(moeGateUpQ2KSPIRV, moeGateUpQ2KTwoSPIRV, moeGateUpQ2KFourSPIRV,
 			moeGateUpQ2KWideSPIRV, moeGateUpQ2KMidSPIRV, moeGateUpQ2KWidestSPIRV)
 		if err != nil {
 			return nil, err
@@ -1949,7 +2011,7 @@ func (m *Mixture) fusedFor(q nn.Quant) (*Pipeline, error) {
 		if m.gateUpQ3K != nil {
 			return m.gateUpQ3K, nil
 		}
-		p, err := m.fusedPipeline(moeGateUpQ3KSPIRV,
+		p, err := m.fusedPipeline(moeGateUpQ3KSPIRV, moeGateUpQ3KTwoSPIRV, moeGateUpQ3KFourSPIRV,
 			moeGateUpQ3KWideSPIRV, moeGateUpQ3KMidSPIRV, moeGateUpQ3KWidestSPIRV)
 		if err != nil {
 			return nil, err
@@ -1963,7 +2025,7 @@ func (m *Mixture) fusedFor(q nn.Quant) (*Pipeline, error) {
 	if m.gateUpQ4K != nil {
 		return m.gateUpQ4K, nil
 	}
-	p, err := m.fusedPipeline(moeGateUpQ4KSPIRV,
+	p, err := m.fusedPipeline(moeGateUpQ4KSPIRV, moeGateUpQ4KTwoSPIRV, moeGateUpQ4KFourSPIRV,
 		moeGateUpQ4KWideSPIRV, moeGateUpQ4KMidSPIRV, moeGateUpQ4KWidestSPIRV)
 	if err != nil {
 		return nil, err
@@ -1973,15 +2035,15 @@ func (m *Mixture) fusedFor(q nn.Quant) (*Pipeline, error) {
 }
 
 // fusedPipeline builds one format's fused gate-and-up: the one-column binary,
-// then the three wide ones a pass takes.
+// then the five wide ones a pass takes.
 //
-// The four are a format's whole set and they are passed together, because the
+// The six are a format's whole set and they are passed together, because the
 // failure they are guarding against is silent. A wide entry built at one column
 // answers the right shape and fills only the first of its columns, and every
 // binary here is a file on disk with a name that says nothing about what is in
 // it — vk/mixture_test.go's TestFusedWidthsAreTheirOwnBinaries is what actually
 // holds them apart.
-func (m *Mixture) fusedPipeline(base, wide, mid, widest []byte) (*Pipeline, error) {
+func (m *Mixture) fusedPipeline(base, two, four, wide, mid, widest []byte) (*Pipeline, error) {
 	p, err := m.d.NewPipeline(base, 7, uint32(unsafe.Sizeof(moePush{})))
 	if err != nil {
 		return nil, err
@@ -1990,6 +2052,8 @@ func (m *Mixture) fusedPipeline(base, wide, mid, widest []byte) (*Pipeline, erro
 		columns int
 		spirv   []byte
 	}{
+		{2, two},
+		{4, four},
 		{smallColumns, wide},
 		{16, mid},
 		{32, widest},

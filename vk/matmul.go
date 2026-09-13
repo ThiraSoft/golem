@@ -50,7 +50,7 @@ const (
 // hundred-and-twenty-eight column binary computes sixty-four columns nobody
 // asked for, and measured that is a third of the rate the right binary gives
 // it.
-var matmulWidths = []int{1, smallColumns, tiledColumns, 64, 128, 256, wideColumns}
+var matmulWidths = []int{1, 2, 4, smallColumns, tiledColumns, 64, 128, 256, wideColumns}
 
 // matmulRows is shaders/matmul.comp's BM: how many rows one workgroup writes.
 const matmulRows = 32
