@@ -24,7 +24,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"sync"
 
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/tensors"
@@ -144,7 +143,9 @@ type Model struct {
 	// that locate a divergence.
 	trace func(name string, rows [][]float32)
 
-	mu      sync.Mutex // one pass at a time: the scratch is one
+	// turn holds one token, taken for a pass: the scratch is one. A channel
+	// rather than a mutex so that a caller whose context ends stops waiting.
+	turn    chan struct{}
 	scratch *scratch
 
 	// The card, when UseVulkan was called. nomic/vulkan.go.
@@ -180,7 +181,7 @@ func New(g *tensors.GGUF) (*Model, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Model{Cfg: cfg, W: w, Vocab: vocab, file: g}, nil
+	return &Model{Cfg: cfg, W: w, Vocab: vocab, file: g, turn: make(chan struct{}, 1)}, nil
 }
 
 func (m *Model) Close() error {

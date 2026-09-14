@@ -22,8 +22,8 @@ import (
 // is not what ggml computes for that format — it quantizes the activation
 // instead — and is the same model to within that format's own noise.
 func (m *Model) UseVulkan() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.turn <- struct{}{}
+	defer m.release()
 	if m.gpu != nil {
 		return nil
 	}

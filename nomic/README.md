@@ -142,5 +142,9 @@ The checkpoint wants its task prefixes, `search_query: ` and
 `Tokenize` cuts a text to the 512 positions the model was trained on and keeps
 the closing `</s>`.
 
+`EmbedContext` is the same with a context: a caller gives up waiting for the
+model when it ends, and a batch of several passes stops between two of them.
+A pass that has started runs to its end.
+
 The tests want `GOLEM_MODEL_NOMIC` naming an f16 or a Q8_0 file; the benchmark
 takes `GOLEM_NOMIC_CORPUS`, one text a line.

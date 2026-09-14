@@ -13,6 +13,7 @@ package nomic
 // zeroed memory and normed rows.
 
 import (
+	"context"
 	"fmt"
 	"math"
 
@@ -46,10 +47,24 @@ func (m *Model) Tokenize(text string) []int32 {
 // normalized: that is the caller's choice, and Normalize is the usual one.
 // It is safe to call from several goroutines; the passes take turns.
 func (m *Model) Embed(texts [][]int32) ([][]float32, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	return m.EmbedContext(context.Background(), texts)
+}
+
+// EmbedContext is Embed with a context, looked at while waiting for the
+// model and between two passes. A pass that has started runs to its end: it
+// is milliseconds, and cutting one short would save nothing a caller notices.
+// Checking costs nanoseconds against those milliseconds, and the passes are
+// the same, so the vectors are the same floats.
+func (m *Model) EmbedContext(ctx context.Context, texts [][]int32) ([][]float32, error) {
+	if err := m.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer m.release()
 	out := make([][]float32, len(texts))
 	for from := 0; from < len(texts); {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		to, width := from, 0
 		for to < len(texts) && (to == from || width+len(texts[to]) <= passTokens) {
 			width += len(texts[to])
@@ -71,10 +86,25 @@ func (m *Model) Embed(texts [][]int32) ([][]float32, error) {
 // row a position. The rows are the model's own and the next pass overwrites
 // them; copy them to keep them.
 func (m *Model) Hidden(texts [][]int32) ([][][]float32, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.turn <- struct{}{}
+	defer m.release()
 	return m.hidden(texts)
 }
+
+// acquire takes the model's turn, or gives up when ctx ends first.
+func (m *Model) acquire(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case m.turn <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Model) release() { <-m.turn }
 
 // span is one text's stretch of the pass.
 type span struct{ start, length int }
