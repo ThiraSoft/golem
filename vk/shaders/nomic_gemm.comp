@@ -1,0 +1,121 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// shaders/vision_gemm.comp's product with shaders/nomic_mm.comp's interface,
+// for a device without matrix cores: the same bindings, the same push, the
+// same GROUPED table — nomic_mm.comp says what it holds — in float32 scalar
+// arithmetic.
+
+#define THREADS 256
+#define BM 64
+#define BN 64
+#define BK 32
+#define TM 4
+#define TN 4
+#define STRIDE (BK + 1)
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer W     { uint  w[];     };
+layout(std430, binding = 1) readonly  buffer X     { float x[];     };
+layout(std430, binding = 2) readonly  buffer PAR   { float par[];   };
+layout(std430, binding = 3) writeonly buffer Y     { float y[];     };
+layout(std430, binding = 4) readonly  buffer IDX   { uint  idx[];   };
+layout(std430, binding = 5) readonly  buffer TABLE { uint  table[]; };
+
+layout(push_constant) uniform Push {
+    uint outputs;
+    uint inputs;
+    uint patches;
+    uint base;
+    uint bias;
+    uint index;
+} p;
+
+shared float sw[BM * STRIDE];
+shared float sx[BN * STRIDE];
+
+void main() {
+    uint t  = gl_LocalInvocationID.x;
+    uint tr = t / (BN / TN);
+    uint tc = t % (BN / TN);
+
+#ifdef GROUPED
+    uint entry  = (p.patches + gl_WorkGroupID.y) * 8u;
+    uint base   = table[entry + p.index];
+    uint offset = table[entry + 2u];
+    uint cols   = table[entry + 3u];
+    uint col0   = table[entry + 4u];
+    uint row0   = gl_WorkGroupID.x * uint(BM);
+    // An entry past the last one the routing filled is empty, and the whole
+    // workgroup leaves before its first barrier.
+    if (col0 >= cols) return;
+#else
+    uint base   = p.base;
+    uint cols   = p.patches;
+    uint tiles  = (p.outputs + uint(BM) - 1u) / uint(BM);
+    uint row0   = (gl_WorkGroupID.x % tiles) * uint(BM);
+    uint col0   = (gl_WorkGroupID.x / tiles) * uint(BN);
+#endif
+
+    float acc[TM][TN];
+    [[unroll]] for (uint r = 0u; r < TM; r++) {
+        [[unroll]] for (uint c = 0u; c < TN; c++) acc[r][c] = 0.0;
+    }
+
+    for (uint k0 = 0u; k0 < p.inputs; k0 += uint(BK)) {
+        for (uint e = t; e < uint(BM) * uint(BK) / 2u; e += uint(THREADS)) {
+            uint r  = e / (uint(BK) / 2u);
+            uint kk = (e % (uint(BK) / 2u)) * 2u;
+            uint srow = row0 + r;
+            vec2 v = vec2(0.0);
+            if (srow < p.outputs && k0 + kk < p.inputs) {
+                v = unpackHalf2x16(w[(base + srow * p.inputs + k0 + kk) >> 1u]);
+            }
+            sw[r * uint(STRIDE) + kk]      = v.x;
+            sw[r * uint(STRIDE) + kk + 1u] = v.y;
+        }
+        for (uint e = t; e < uint(BN) * uint(BK); e += uint(THREADS)) {
+            uint c  = e / uint(BK);
+            uint kk = e % uint(BK);
+            uint scol = col0 + c;
+            float v = 0.0;
+            if (scol < cols && k0 + kk < p.inputs) {
+#ifdef GROUPED
+                uint from = (p.index == 0u) ? idx[offset + scol] : offset + scol;
+#else
+                uint from = scol;
+#endif
+                v = x[from * p.inputs + k0 + kk];
+            }
+            sx[c * uint(STRIDE) + kk] = v;
+        }
+        barrier();
+
+        [[unroll]] for (uint kk = 0u; kk < uint(BK); kk++) {
+            float a[TM], b[TN];
+            [[unroll]] for (uint r = 0u; r < TM; r++) a[r] = sw[(tr * uint(TM) + r) * uint(STRIDE) + kk];
+            [[unroll]] for (uint c = 0u; c < TN; c++) b[c] = sx[(tc * uint(TN) + c) * uint(STRIDE) + kk];
+            [[unroll]] for (uint r = 0u; r < TM; r++) {
+                [[unroll]] for (uint c = 0u; c < TN; c++) acc[r][c] += a[r] * b[c];
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint r = 0u; r < TM; r++) {
+        uint row = row0 + tr * uint(TM) + r;
+        if (row >= p.outputs) continue;
+        float add = (p.bias == ~0u) ? 0.0 : par[p.bias + row];
+        [[unroll]] for (uint c = 0u; c < TN; c++) {
+            uint col = col0 + tc * uint(TN) + c;
+            if (col >= cols) continue;
+#ifdef GROUPED
+            uint to = (p.index == 0u) ? offset + col : idx[offset + col];
+#else
+            uint to = col;
+#endif
+            y[to * p.outputs + row] = acc[r][c] + add;
+        }
+    }
+}

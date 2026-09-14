@@ -1,0 +1,145 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+// shaders/nomic_flash.comp on the matrix cores: sixty-four queries of one head
+// against its text's keys, sixty-four at a time, both products as cooperative
+// sixteen-squares — the queries against the keys, the probabilities against
+// the values.
+//
+// The online softmax rescales its accumulator by the row every time a row's
+// maximum moves, and a cooperative accumulator has no rows to scale. So this
+// takes the keys twice: the first walk only finds each query's maximum, and
+// the second, knowing it, exponentiates once and accumulates without ever
+// rescaling. The first walk is a sixth of the second's work and a text has at
+// most eight tiles of keys.
+//
+// Everything that meets the cores is fp16 — the queries, keys, values and the
+// probabilities — which is what llama.cpp's own flash attention on this card
+// does; the sums are float32.
+
+#define THREADS 256
+#define BR 64
+#define BC 64
+#define HD 64
+#define SH (HD + 8)
+#define SS (BC + 4)
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer Q     { float q[];     };
+layout(std430, binding = 1) readonly  buffer K     { float k[];     };
+layout(std430, binding = 2) readonly  buffer QKV   { float qkv[];   };
+layout(std430, binding = 3) writeonly buffer MIXED { float mixed[]; };
+layout(std430, binding = 4) readonly  buffer UNITS { uvec4 units[]; };
+
+layout(push_constant) uniform Push {
+    uint dim;
+    uint head;
+    float scale;
+} p;
+
+shared float16_t sq[BR * SH];
+shared float16_t sk[BC * SH];
+shared float16_t sv[BC * SH];
+shared float16_t sp[BR * SH];
+shared float ss[BR * SS];
+shared float rowMax[BR], rowSum[BR];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint wave = gl_SubgroupID;
+    uvec4 u = units[gl_WorkGroupID.x];
+    uint start = u.x, length = u.y, q0 = u.z;
+    uint off = gl_WorkGroupID.y * uint(HD);
+    // Four lanes a row for the softmax, sixteen columns each.
+    uint r = t >> 2, part = t & 3u;
+
+    for (uint e = t; e < uint(BR * HD); e += uint(THREADS)) {
+        uint row = e / uint(HD), d = e % uint(HD);
+        sq[row * uint(SH) + d] = float16_t((q0 + row < length) ? q[(start + q0 + row) * p.dim + off + d] : 0.0);
+    }
+
+    float peak = -1.0e30;
+    for (uint pass = 0u; pass < 2u; pass++) {
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> o[4];
+        [[unroll]] for (uint j = 0u; j < 4u; j++) o[j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        float sum = 0.0;
+
+        for (uint c0 = 0u; c0 < length; c0 += uint(BC)) {
+            barrier();
+            for (uint e = t; e < uint(BC * HD); e += uint(THREADS)) {
+                uint row = e / uint(HD), d = e % uint(HD);
+                bool live = c0 + row < length;
+                uint key = start + c0 + row;
+                sk[row * uint(SH) + d] = float16_t(live ? k[key * p.dim + off + d] : 0.0);
+                if (pass == 1u) sv[row * uint(SH) + d] = float16_t(live ? qkv[key * 3u * p.dim + 2u * p.dim + off + d] : 0.0);
+            }
+            barrier();
+
+            // The scores of this wave's sixteen queries against the tile.
+            [[unroll]] for (uint j = 0u; j < 4u; j++) {
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> s =
+                    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+                [[unroll]] for (uint kk = 0u; kk < uint(HD); kk += 16u) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+                    coopMatLoad(a, sq, wave * 16u * uint(SH) + kk, uint(SH), gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(b, sk, j * 16u * uint(SH) + kk, uint(SH), gl_CooperativeMatrixLayoutColumnMajor);
+                    s = coopMatMulAdd(a, b, s);
+                }
+                coopMatStore(s, ss, wave * 16u * uint(SS) + j * 16u, uint(SS), gl_CooperativeMatrixLayoutRowMajor);
+            }
+            barrier();
+
+            if (pass == 0u) {
+                [[unroll]] for (uint c = 0u; c < 16u; c++) {
+                    uint col = part * 16u + c;
+                    if (c0 + col < length) peak = max(peak, ss[r * uint(SS) + col] * p.scale);
+                }
+                continue;
+            }
+
+            [[unroll]] for (uint c = 0u; c < 16u; c++) {
+                uint col = part * 16u + c;
+                float e = (c0 + col < length) ? exp(ss[r * uint(SS) + col] * p.scale - peak) : 0.0;
+                sum += e;
+                sp[r * uint(SH) + col] = float16_t(e);
+            }
+            barrier();
+
+            [[unroll]] for (uint j = 0u; j < 4u; j++) {
+                [[unroll]] for (uint kk = 0u; kk < uint(BC); kk += 16u) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+                    coopMatLoad(a, sp, wave * 16u * uint(SH) + kk, uint(SH), gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(b, sv, kk * uint(SH) + j * 16u, uint(SH), gl_CooperativeMatrixLayoutRowMajor);
+                    o[j] = coopMatMulAdd(a, b, o[j]);
+                }
+            }
+        }
+
+        if (pass == 0u) {
+            peak = subgroupClusteredMax(peak, 4u);
+            continue;
+        }
+
+        sum = subgroupClusteredAdd(sum, 4u);
+        if (part == 0u) rowSum[r] = sum;
+        barrier();
+        [[unroll]] for (uint j = 0u; j < 4u; j++) {
+            coopMatStore(o[j], ss, wave * 16u * uint(SS) + j * 16u, uint(SS), gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+        for (uint e = t; e < uint(BR * HD); e += uint(THREADS)) {
+            uint row = e / uint(HD), d = e % uint(HD);
+            if (q0 + row < length) {
+                mixed[(start + q0 + row) * p.dim + off + d] = ss[row * uint(SS) + d] / rowSum[row];
+            }
+        }
+    }
+}

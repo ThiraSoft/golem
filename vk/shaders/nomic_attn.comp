@@ -1,0 +1,103 @@
+#version 450
+
+// shaders/vision_attn.comp for a pass that carries several texts: a position
+// sees the positions of its own text and no other. seg holds, for every
+// position, where its text starts and how long it is, and the walk over the
+// keys is bounded by that instead of by the whole pass. Everything else — one
+// workgroup a query and a head, the online softmax — is vision_attn's, and
+// that file says why.
+
+#define THREADS 128
+#define MAXHEAD 128
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer Q     { float q[];     };
+layout(std430, binding = 1) readonly  buffer K     { float k[];     };
+layout(std430, binding = 2) readonly  buffer QKV   { float qkv[];   };
+layout(std430, binding = 3) writeonly buffer MIXED { float mixed[]; };
+layout(std430, binding = 4) readonly  buffer SEG   { uint  seg[];   };
+
+layout(push_constant) uniform Push {
+    uint dim;
+    uint head;
+    float scale;
+} p;
+
+shared float sq[MAXHEAD];
+shared float sacc[MAXHEAD];
+shared float ss[THREADS];
+shared float red[THREADS];
+
+float reduceMax(uint t, float v) {
+    red[t] = v;
+    barrier();
+    for (uint s = THREADS / 2u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] = max(red[t], red[t + s]);
+        barrier();
+    }
+    float all = red[0];
+    barrier();
+    return all;
+}
+
+float reduceAdd(uint t, float v) {
+    red[t] = v;
+    barrier();
+    for (uint s = THREADS / 2u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    float all = red[0];
+    barrier();
+    return all;
+}
+
+void main() {
+    uint t  = gl_LocalInvocationID.x;
+    uint pt = gl_WorkGroupID.x;
+    uint h  = gl_WorkGroupID.y;
+    uint hd = p.head;
+    uint start  = seg[2u * pt];
+    uint length = seg[2u * pt + 1u];
+
+    if (t < hd) {
+        sq[t]   = q[pt * p.dim + h * hd + t];
+        sacc[t] = 0.0;
+    }
+    barrier();
+
+    float m = -1.0e30;
+    float total = 0.0;
+
+    for (uint c0 = 0u; c0 < length; c0 += uint(THREADS)) {
+        uint j = start + c0 + t;
+        bool live = c0 + t < length;
+        float score = -1.0e30;
+        if (live) {
+            float d = 0.0;
+            for (uint i = 0u; i < hd; i++) d += sq[i] * k[j * p.dim + h * hd + i];
+            score = d * p.scale;
+        }
+
+        float mine = max(m, reduceMax(t, score));
+        float e    = live ? exp(score - mine) : 0.0;
+        ss[t] = e;
+        float chunk = reduceAdd(t, e);
+
+        float bring = exp(m - mine);
+        total = total * bring + chunk;
+
+        uint n = min(uint(THREADS), length - c0);
+        if (t < hd) {
+            float a = sacc[t] * bring;
+            for (uint jj = 0u; jj < n; jj++) {
+                a += ss[jj] * qkv[(start + c0 + jj) * 3u * p.dim + 2u * p.dim + h * hd + t];
+            }
+            sacc[t] = a;
+        }
+        m = mine;
+        barrier();
+    }
+
+    if (t < hd) mixed[pt * p.dim + h * hd + t] = sacc[t] / total;
+}

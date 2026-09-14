@@ -1,0 +1,29 @@
+# nomic-embed-text-v2-moe: a post-norm BERT of twelve blocks, every odd one a
+# mixture of eight experts of which two answer. Every block is kept, because
+# the two kinds alternate and there are only twelve.
+prompt      search_query: What is the capital of France? Paris sits on the Seine, and ① ﬁne café.
+embedding   1
+
+blocks 0 1 2 3 4 5 6 7 8 9 10 11
+
+# The embedding before and after its norm. inp_norm is named with block 0's
+# index by src/models/bert.cpp, so it is a whole-model name that ends in -0.
+global inp_embd
+global inp_norm-0
+global result_embd
+
+# The names are llama.cpp's, from src/models/bert.cpp. The queries and keys are
+# recorded after the rotation, under the same name they had before it. There is
+# no name on a block's output: build_norm names its node before the gain and
+# the bias, and every norm of the block writes the same name. So the test
+# rebuilds a block's output from ffn_inp and the feed forward, which is the
+# layer_output_norm of their sum.
+require Qcur
+require Kcur
+require Vcur
+require kqv_out
+require ffn_inp
+optional ffn_out
+optional ffn_moe_out
+optional ffn_moe_logits
+optional ffn_moe_weights

@@ -26,6 +26,8 @@
 //   global        <name>        a whole-model name that must appear
 //   global_opt    <name>        a whole-model name that may be absent
 //   last_column   <0|1>         keep only the last column of each recording
+//   embedding     <0|1>         run the context in embedding mode and record
+//                               the pooled vector instead of logits (default 0)
 //
 // A per-block name is expanded to "<name>-<index>" for each block listed. A
 // name that is required and never appears in the graph is an error: it means
@@ -80,14 +82,28 @@ static bool on_node(struct ggml_tensor * t, bool ask, void * user_data) {
     if (ask) return true;   // yes, please compute this one and call me back
 
     if (t->type != GGML_TYPE_F32) die((name + " is not F32").c_str());
-    if (!ggml_is_contiguous(t))   die((name + " is not contiguous").c_str());
 
     const int64_t n0 = t->ne[0];
     const int64_t n1 = t->ne[1];
     const int64_t rest = t->ne[2] * t->ne[3];
 
     std::vector<float> all(ggml_nelements(t));
-    ggml_backend_tensor_get(t, all.data(), 0, ggml_nbytes(t));
+    if (ggml_is_contiguous(t)) {
+        ggml_backend_tensor_get(t, all.data(), 0, ggml_nbytes(t));
+    } else {
+        // A view, which is what a fused projection's queries are before they
+        // are rotated. It is read through its strides; the graph is kept on
+        // the CPU, so the bytes are the host's. When the same name fires again
+        // on the rotated tensor, that recording replaces this one.
+        const char * base = (const char *) t->data;
+        size_t k = 0;
+        for (int64_t i3 = 0; i3 < t->ne[3]; ++i3)
+        for (int64_t i2 = 0; i2 < t->ne[2]; ++i2)
+        for (int64_t i1 = 0; i1 < t->ne[1]; ++i1)
+        for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+            all[k++] = *(const float *) (base + i0*t->nb[0] + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3]);
+        }
+    }
 
     dumped d;
     d.file = name + ".bin";
@@ -118,6 +134,7 @@ struct run_spec {
     bool add_special = true;
     int  min_tokens  = 0;
     bool last_column = false;
+    bool embedding   = false;
     std::vector<int>         blocks;
     std::vector<std::string> all_blocks;
     std::vector<std::string> require_names;
@@ -170,6 +187,7 @@ static run_spec read_run(const std::string & path) {
         else if (key == "add_special") r.add_special = atoi(val.c_str()) != 0;
         else if (key == "min_tokens")  r.min_tokens  = atoi(val.c_str());
         else if (key == "last_column") r.last_column = atoi(val.c_str()) != 0;
+        else if (key == "embedding")   r.embedding   = atoi(val.c_str()) != 0;
         else if (key == "require")     r.require_names.push_back(val);
         else if (key == "optional")    r.optional_names.push_back(val);
         else if (key == "global")      r.global_names.push_back(val);
@@ -308,6 +326,9 @@ int main(int argc, char ** argv) {
     cparams.n_threads_batch   = 8;
     // Flash attention fuses the waypoints away; the graph has to stay legible.
     cparams.flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    // An encoder has no logits to read. It pools what the last block wrote
+    // the way the file asks, and that one vector is the answer.
+    cparams.embeddings        = run.embedding;
     cparams.cb_eval           = on_node;
     cparams.cb_eval_user_data = &st;
 
@@ -323,6 +344,28 @@ int main(int argc, char ** argv) {
         if (optional.find(name) != optional.end()) continue;
         fprintf(stderr, "dump_layers: %s never appeared in the graph\n", name.c_str());
         return 1;
+    }
+
+    const size_t slash = model_path.find_last_of('/');
+    const std::string model_name = slash == std::string::npos ? model_path : model_path.substr(slash + 1);
+
+    if (run.embedding) {
+        // Recorded as a waypoint of its own, so a test reads it like any
+        // other. It is the pooled vector before any normalization: that is
+        // the caller's to choose, and llama-embedding's -embd-normalize is
+        // not part of the model.
+        const int n_embd = llama_model_n_embd_out(model);
+        const float * e = llama_get_embeddings_seq(ctx, 0);
+        if (!e) die("the context pooled nothing");
+        write_floats(out_dir + "/embedding.bin", std::vector<float>(e, e + n_embd));
+        st.written["embedding"] = dumped{"embedding.bin", {n_embd, 1, 1, 1}};
+        write_index(st, run.label, model_name, tokens, {}, {},
+                    llama_model_n_embd(model), llama_model_n_layer(model), 0);
+        llama_free(ctx);
+        llama_model_free(model);
+        llama_backend_free();
+        fprintf(stderr, "dump_layers: wrote %zu tensors to %s\n", st.written.size(), out_dir.c_str());
+        return 0;
     }
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
@@ -347,10 +390,7 @@ int main(int argc, char ** argv) {
         next = best;
     }
 
-    const size_t slash = model_path.find_last_of('/');
-    write_index(st, run.label,
-                slash == std::string::npos ? model_path : model_path.substr(slash + 1),
-                tokens, top, greedy,
+    write_index(st, run.label, model_name, tokens, top, greedy,
                 llama_model_n_embd(model), llama_model_n_layer(model),
                 st.written.count("inp_per_layer")
                     ? (int) st.written["inp_per_layer"].ne[0] : 0);
