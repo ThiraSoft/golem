@@ -99,6 +99,13 @@ build/ref/dump_vision "$GOLEM_MODEL_QWEN35" "$GOLEM_MMPROJ_QWEN35" testdata/qwen
 build/ref/dump_audio  "$GOLEM_MODEL"     "$GOLEM_MMPROJ"     testdata/gemma/audio    ref/gemma/audio.run
 build/ref/dump_audio  "$GOLEM_MODEL_12B" "$GOLEM_MMPROJ_12B" testdata/gemma/audio12  ref/gemma/audio12.run
 
+# nomic-embed-text-v2-moe, with GOLEM_MODEL_NOMIC naming the f16 file and
+# GOLEM_MODEL_NOMIC_Q8 the Q8_0 one.
+mkdir -p testdata/nomic/{layers,layers_q8,tokenizer}
+build/ref/dump_layers "$GOLEM_MODEL_NOMIC"    testdata/nomic/layers    ref/nomic/short.run
+build/ref/dump_layers "$GOLEM_MODEL_NOMIC_Q8" testdata/nomic/layers_q8 ref/nomic/short.run
+build/ref/dump_tokens "$GOLEM_MODEL_NOMIC"    testdata/nomic/tokenizer ref/nomic/corpus.tsv
+
 python3 ref/gemma/dump_chats.py "$GOLEM_MODEL"      testdata/gemma/chat/cases.json
 python3 ref/gemma/dump_chats.py "$GOLEM_MODEL_12B"  testdata/gemma/chat12/cases.json
 python3 ref/qwen/dump_chats.py  "$GOLEM_MODEL_QWEN" testdata/qwen/chat/cases.json
@@ -137,6 +144,7 @@ One directive per line, `#` starts a comment, a blank line is ignored.
 | `global <name>` | a whole-model name that must appear |
 | `global_opt <name>` | a whole-model name that may be absent |
 | `last_column <0\|1>` | keep only the last column of each recording |
+| `embedding <0\|1>` | run the context in embedding mode and record the pooled vector, as `embedding`, instead of logits and a greedy continuation — for an encoder, which has neither |
 
 A per-block name is expanded to `<name>-<index>` for each block listed.
 

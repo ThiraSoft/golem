@@ -1,0 +1,37 @@
+# nomic-embed-text-v2-moe: XLM-RoBERTa's SentencePiece unigram, which
+# llama.cpp reads as "t5" and runs through its precompiled character map.
+# The cases that matter are the ones that map: NFKC folds, the full-width
+# forms, the spaces the map rewrites, and characters absent from the
+# vocabulary, which come back as one <unk> however many there are.
+empty		1	0
+ascii	The capital of France is	1	0
+french	L'élève a mangé une crêpe à Nîmes.	1	0
+leading_space	\sleading	1	0
+trailing_space	trailing\s	1	0
+double_space	two  spaces	1	0
+only_spaces	\s\s\s	1	0
+newline	one\ntwo	1	0
+tab	one\ttwo	1	0
+nbsp	prix\xC2\xA0: 12\xC2\xA0€	1	0
+ligature	\xEF\xAC\x81n de la \xEF\xAC\x82otte	1	0
+circled	\xE2\x91\xA0 \xE2\x91\xA1 \xE2\x91\xA2	1	0
+fraction	\xC2\xBD litre	1	0
+fullwidth	\xEF\xBC\xA1\xEF\xBC\xA2\xEF\xBC\xA3\xEF\xBC\x91\xEF\xBC\x92\xEF\xBC\x93	1	0
+combining	e\xCC\x81cole	1	0
+query_prefix	search_query: What is TSNE?	1	0
+document_prefix	search_document: TSNE is a dimensionality reduction algorithm created by Laurens van Der Maaten	1	0
+chinese	我们今天去公园散步。	1	0
+japanese	東京は日本の首都です。	1	0
+russian	Москва — столица России.	1	0
+arabic	القاهرة عاصمة مصر	1	0
+hindi	नई दिल्ली भारत की राजधानी है	1	0
+emoji	ok 👍🏽 merci 🙏	1	0
+unknown_run	a \xF0\x9F\x80\x80\xF0\x9F\x80\x81\xF0\x9F\x80\x82 b	1	0
+code	func main() { fmt.Println("hi") }	1	0
+digits	3.14159 and 2,718	1	0
+special_text	<s> hello </s>	1	0
+special_parsed	<s> hello </s>	1	1
+no_special	hello world	0	0
+long_word	anticonstitutionnellement	1	0
+mixed_case	McDonald's iPhone eBay	1	0
+punctuation	!!! ??? ... ---	1	0

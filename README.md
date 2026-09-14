@@ -206,7 +206,7 @@ Judge it the way you would judge any dependency you did not write: run the tests
 
 - `cmd/golem-cli`, `cmd/golem-server`, `cmd/pocket-tts`, `cmd/golemquant`, `cmd/golemtune` are the commands.
 - `engine/` reads the architecture out of a GGUF and opens the engine that implements it.
-- `gemma/`, `qwen/`, `qwen35/`, `pockettts/`, `stt/` are standalone engines. They do not import one another.
+- `gemma/`, `qwen/`, `qwen35/`, `pockettts/`, `stt/`, `nomic/` are standalone engines. They do not import one another.
 - `nn/` and `vk/` are the shared kernels: quantized AVX2 and NEON, and Vulkan compute.
 - `compress/` is the `.golem` format: calibration, the trellis codec, and the conversion pipeline.
 - `grammar/` is GBNF and the JSON Schema converter that feeds it.
