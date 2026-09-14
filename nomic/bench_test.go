@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func benchTexts(b *testing.B, m *Model, long bool) [][]int32 {
@@ -53,6 +54,13 @@ func benchEmbed(b *testing.B, long bool) {
 		b.Fatal(err)
 	}
 	defer m.Close()
+	// GOLEM_NOMIC_VULKAN puts the blocks on the card, so the same two
+	// benchmarks measure either side.
+	if os.Getenv("GOLEM_NOMIC_VULKAN") != "" {
+		if err := m.UseVulkan(); err != nil {
+			b.Fatal(err)
+		}
+	}
 	texts := benchTexts(b, m, long)
 	positions := 0
 	for _, t := range texts {
@@ -66,6 +74,22 @@ func benchEmbed(b *testing.B, long bool) {
 		if _, err := m.Embed(texts); err != nil {
 			b.Fatal(err)
 		}
+	}
+	b.StopTimer()
+	// GOLEM_NOMIC_PROFILE says where one more pass spent the card's time.
+	if m.gpu != nil && os.Getenv("GOLEM_NOMIC_PROFILE") != "" {
+		if err := m.gpu.Profile(); err != nil {
+			b.Fatal(err)
+		}
+		start := time.Now()
+		if _, err := m.Embed(texts); err != nil {
+			b.Fatal(err)
+		}
+		report, err := m.gpu.Report(time.Since(start))
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Log("\n" + report)
 	}
 	b.ReportMetric(float64(positions*b.N)/b.Elapsed().Seconds(), "pos/s")
 	b.ReportMetric(float64(len(texts)*b.N)/b.Elapsed().Seconds(), "texts/s")

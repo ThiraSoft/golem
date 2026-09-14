@@ -150,6 +150,16 @@ func (m *Model) hidden(texts [][]int32) ([][][]float32, error) {
 		}
 	})
 	m.emit("inp_embd", x)
+	if m.gpu != nil {
+		if err := m.hiddenVulkan(x, pos, spans); err != nil {
+			return nil, err
+		}
+		out := make([][][]float32, len(texts))
+		for i, sp := range spans {
+			out[i] = x[sp.start : sp.start+sp.length]
+		}
+		return out, nil
+	}
 	normRows(x, w.EmbNorm)
 	m.emit("inp_norm-0", x)
 
@@ -311,23 +321,7 @@ func (m *Model) mixture(b *BlockWeights, s *scratch, in, out [][]float32, suffix
 	weight := rows(n, k)
 	probs := make([]float32, cfg.Experts)
 	for t := range logits {
-		copy(probs, logits[t])
-		nn.SoftmaxGGML(probs)
-		// The k best, the lower index first between equals.
-		for slot := 0; slot < k; slot++ {
-			best := -1
-			for e, p := range probs {
-				if p < 0 {
-					continue
-				}
-				if best < 0 || p > probs[best] {
-					best = e
-				}
-			}
-			choice[t*k+slot] = best
-			weight[t][slot] = probs[best]
-			probs[best] = -1
-		}
+		pick(logits[t], probs, choice[t*k:(t+1)*k], weight[t])
 	}
 	m.emit("ffn_moe_weights"+suffix, weight)
 
@@ -364,6 +358,28 @@ func (m *Model) mixture(b *BlockWeights, s *scratch, in, out [][]float32, suffix
 			}
 		}
 	})
+}
+
+// pick is the router's choice for one position: ggml's softmax over its
+// logits, then the len(choice) best, the lower index first between equals,
+// with the probability each was given. probs is scratch as wide as logits.
+func pick(logits, probs []float32, choice []int, weight []float32) {
+	copy(probs, logits)
+	nn.SoftmaxGGML(probs)
+	for slot := range choice {
+		best := -1
+		for e, p := range probs {
+			if p < 0 {
+				continue
+			}
+			if best < 0 || p > probs[best] {
+				best = e
+			}
+		}
+		choice[slot] = best
+		weight[slot] = probs[best]
+		probs[best] = -1
+	}
 }
 
 // pool makes one vector of a text's rows.

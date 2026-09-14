@@ -90,6 +90,45 @@ the kernels and not an accident: every entry of a product comes out of the tile
 kernel, the ragged edges included, and each of its accumulators depends on its
 own row and column only.
 
+## On the card
+
+`UseVulkan` — `golem-server -embed … -vulkan` — puts the blocks on the card;
+`vk/nomic.go` is the pipeline. The same requests, the same file, llama.cpp's
+Vulkan build with every layer on the card, the same sitting:
+
+| positions a second | golem | llama.cpp |
+|---|---:|---:|
+| 64 texts in one request, 3394 positions | **62462** | 25381 |
+| one text of 400 positions | 29653 | 29605 |
+| 64 one-text requests, eight at a time | 22420 | **24308** |
+
+Against llama.cpp's recording the card is at 0.99999985 on the pooled vector,
+and a text's vector is the same float alone and in a batch, as on the
+processor. A Q8_0 file goes up widened to fp16, which is not what ggml
+computes for that format; it lands 0.99977 from llama.cpp's own Q8_0 run, and
+llama.cpp's f16 and Q8_0 runs are 0.99952 apart.
+
+What it took, each measured before it was done:
+
+- **The products on the matrix cores**, two tiles: sixty-four square for a
+  narrow pass, a hundred and twenty-eight for a wide one, which is what took
+  the 64 texts from 36000 to 75000. A pass too narrow to fill the card even
+  with the small tile is split along the shared dimension, a chunk of 256 to a
+  slice; the kernels sum every product in those chunks whether it is split or
+  not, which is what keeps the floats the same.
+- **Every expert in one dispatch.** A dispatch per expert gave the card two
+  dozen workgroups; a table of every expert's tiles gives it all of them, and
+  each position's two answers are summed afterwards in slot order.
+- **The routing on the card** as well, so that a pass is one submission.
+- **The attention on the matrix cores**, sixty-four queries against sixty-four
+  keys a tile, in two walks over the keys so that nothing has to be rescaled.
+- **A pass of one sentence costs six milliseconds** whatever else it carries,
+  so the server holds a small pass up to three milliseconds for company.
+
+The one row it loses is the one that is all fixed cost: eight clients sending a
+sentence each. A pass there is a couple of hundred dispatches with a barrier
+between each, and fusing them is what is left.
+
 ## Using it
 
 ```go

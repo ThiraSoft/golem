@@ -29,6 +29,7 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/tensors"
 	"github.com/ThiraSoft/golem/token/ugm"
+	"github.com/ThiraSoft/golem/vk"
 )
 
 // Pooling is how the positions of a text become one vector: llama.cpp's
@@ -145,6 +146,10 @@ type Model struct {
 
 	mu      sync.Mutex // one pass at a time: the scratch is one
 	scratch *scratch
+
+	// The card, when UseVulkan was called. nomic/vulkan.go.
+	dev *vk.Device
+	gpu *vk.NomicPipeline
 }
 
 func Open(path string) (*Model, error) {
@@ -178,7 +183,10 @@ func New(g *tensors.GGUF) (*Model, error) {
 	return &Model{Cfg: cfg, W: w, Vocab: vocab, file: g}, nil
 }
 
-func (m *Model) Close() error { return m.file.Close() }
+func (m *Model) Close() error {
+	m.closeVulkan()
+	return m.file.Close()
+}
 
 // Encode is the text framed by <s> and </s> and not cut; Tokenize is the same
 // cut to the context.

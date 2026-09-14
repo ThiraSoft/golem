@@ -158,7 +158,7 @@ func main() {
 		}
 	}
 	if *embedPath != "" {
-		e := openEmbedder(*embedPath)
+		e := openEmbedder(*embedPath, *vulkan)
 		defer e.Close()
 		server.SetEmbedder(e)
 	}
@@ -261,7 +261,7 @@ func serveWithoutConversation(dir, embedPath, addr string, streams int, vulkan b
 		fmt.Fprintf(os.Stderr, "%s: speech to text, trunk in %s\n", name, model.Quant())
 	}
 	if embedPath != "" {
-		e := openEmbedder(embedPath)
+		e := openEmbedder(embedPath, vulkan)
 		defer e.Close()
 		server.SetEmbedder(e)
 		if name == "" {
@@ -282,16 +282,24 @@ func serveWithoutConversation(dir, embedPath, addr string, streams int, vulkan b
 	}
 }
 
-// openEmbedder opens the embedding model and says so.
-func openEmbedder(path string) *nomic.Model {
+// openEmbedder opens the embedding model, on the card when -vulkan says so,
+// and says where it ended up.
+func openEmbedder(path string, vulkan bool) *nomic.Model {
 	start := time.Now()
 	e, err := nomic.Open(path)
 	if err != nil {
 		fail(fmt.Errorf("embedder: %w", err))
 	}
-	fmt.Fprintf(os.Stderr, "%s: %d blocks, %d-wide vectors, context %d, loaded in %s\n",
+	where := "on cpu"
+	if vulkan {
+		if err := e.UseVulkan(); err != nil {
+			fail(fmt.Errorf("embedder on vulkan: %w", err))
+		}
+		where = "on vulkan"
+	}
+	fmt.Fprintf(os.Stderr, "%s: %d blocks, %d-wide vectors, context %d, %s, loaded in %s\n",
 		strings.TrimSuffix(filepath.Base(path), ".gguf"), e.Cfg.Blocks, e.Cfg.Dim, e.Cfg.Context,
-		time.Since(start).Round(time.Millisecond))
+		where, time.Since(start).Round(time.Millisecond))
 	return e
 }
 
