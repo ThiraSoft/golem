@@ -46,7 +46,9 @@ func (s *Server) SetEmbedder(e Embedder) { s.embed = newBatcher(e) }
 // for company: a request that finds the model idle goes at once, and only the
 // ones that arrive during a pass are held — for no longer than that pass —
 // and carried together. It is llama-server's continuous batching, for a model
-// that has no generation to interleave.
+// that has no generation to interleave. The one exception is a pass too
+// small to be worth its fixed cost, which waits a few milliseconds for company:
+// windowPositions says why.
 type batcher struct {
 	Embedder
 	requests chan *embedJob
@@ -63,6 +65,16 @@ type embedJob struct {
 // longer one itself; this only stops one pass from taking every waiting
 // request when a second pass would start sooner.
 const batchPositions = 4096
+
+// A pass that would carry fewer than windowPositions waits up to window for
+// company. On the card a pass of one sentence costs six milliseconds and one
+// of eight costs ten, so eight clients each sending a sentence at a time are
+// served faster by holding the first of them a few milliseconds than by starting
+// it alone and making the other seven wait out its whole pass.
+const (
+	windowPositions = 256
+	window          = 3 * time.Millisecond
+)
 
 func newBatcher(e Embedder) *batcher {
 	b := &batcher{Embedder: e, requests: make(chan *embedJob, 1024)}
@@ -89,23 +101,41 @@ func (b *batcher) run() {
 		for _, t := range jobs[0].texts {
 			positions += len(t)
 		}
+		var wait <-chan time.Time
+		if positions < windowPositions {
+			wait = time.After(window)
+		}
 	gather:
 		for positions < batchPositions {
-			select {
-			case j := <-b.requests:
-				n := 0
-				for _, t := range j.texts {
-					n += len(t)
-				}
-				if positions+n > batchPositions {
-					held = j
+			// Once the pass is worth running, what is already queued goes
+			// with it and nothing more is waited for.
+			if wait != nil && positions >= windowPositions {
+				wait = nil
+			}
+			var j *embedJob
+			if wait != nil {
+				select {
+				case j = <-b.requests:
+				case <-wait:
 					break gather
 				}
-				jobs = append(jobs, j)
-				positions += n
-			default:
+			} else {
+				select {
+				case j = <-b.requests:
+				default:
+					break gather
+				}
+			}
+			n := 0
+			for _, t := range j.texts {
+				n += len(t)
+			}
+			if positions+n > batchPositions {
+				held = j
 				break gather
 			}
+			jobs = append(jobs, j)
+			positions += n
 		}
 
 		var all [][]int32

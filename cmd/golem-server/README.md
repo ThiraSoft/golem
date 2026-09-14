@@ -362,8 +362,11 @@ it: the checkpoint is trained so that a prefix is a vector.
 
 A request's texts go through the model in one pass, and so do the texts of
 requests that arrive while a pass is running: they wait for it, and are carried
-together by the next. `nomic/README.md` has the speed against llama.cpp and
-ollama, and the vectors against both.
+together by the next. A pass that would carry only a few sentences waits up to
+three milliseconds for more, because its cost is mostly fixed. With `-vulkan`
+the embedder's blocks go on the card, beside whatever else is there.
+`nomic/README.md` has the speed against llama.cpp and ollama, on the processor
+and on the card, and the vectors against both.
 
 ## Flags
 
@@ -373,7 +376,7 @@ ollama, and the vectors against both.
 | `-stt` | directory holding the Kyutai STT model, or `GOLEM_STT`; a server may carry it alone, and then answers `/v1/models` and `/v1/audio/transcriptions` and nothing else |
 | `-embed` | a nomic-embed-text-v2-moe GGUF, or `GOLEM_EMBED`, for the embedding endpoints; a server may carry it alone |
 | `-mmproj` | the projector GGUF, which is what lets a model see and hear, or `GOLEM_MMPROJ` |
-| `-vulkan` | put the blocks and the logit head on a Vulkan device; it fails rather than falling back |
+| `-vulkan` | put the blocks and the logit head on a Vulkan device, and the embedder's blocks with `-embed`; it fails rather than falling back |
 | `-addr` | what to listen on; `127.0.0.1:8080` by default |
 | `-context` | positions to keep; 4096 by default, cut between the slots |
 | `-parallel` | conversations at once; 1 by default |
