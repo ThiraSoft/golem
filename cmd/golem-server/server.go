@@ -37,6 +37,7 @@ type Server struct {
 	images   *imageCache
 	stt      *stt.Model
 	sttGroup *stt.Group
+	embed    Embedder
 	// tokens is what a grammar reads the vocabulary through. It is built on
 	// the first request that asks for one and shared by every request after:
 	// a quarter of a million pieces is not something to decode twice, nor to
@@ -127,6 +128,11 @@ func (s *Server) Handler() http.Handler {
 	}
 	if s.stt != nil {
 		mux.HandleFunc("POST /v1/audio/transcriptions", s.transcriptions)
+	}
+	if s.embed != nil {
+		mux.HandleFunc("POST /v1/embeddings", s.embeddings)
+		mux.HandleFunc("POST /api/embed", s.ollamaEmbed)
+		mux.HandleFunc("POST /api/embeddings", s.ollamaEmbeddings)
 	}
 	return mux
 }

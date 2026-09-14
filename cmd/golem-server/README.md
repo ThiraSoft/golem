@@ -15,12 +15,14 @@ One model per server, and the request's `model` field routes nothing: there is
 one set of weights, so there is nothing to route to. `-model`
 names the file; `/v1/models` reports it.
 
-Three endpoints:
+The endpoints:
 
 | | |
 |---|---|
 | `POST /v1/chat/completions` | a conversation, streamed or not, tool declarations included |
 | `POST /v1/audio/transcriptions` | audio transcription (WAV, MP3, FLAC), streamed or not, using Kyutai STT (requires `-stt`) |
+| `POST /v1/embeddings` | OpenAI's embeddings, float or base64 (requires `-embed`) |
+| `POST /api/embed`, `POST /api/embeddings` | ollama's two embedding endpoints, so a client pointed at ollama needs only the port changed (requires `-embed`) |
 | `GET /v1/models` | the loaded models, for clients that probe at startup |
 
 ## Tools
@@ -331,12 +333,45 @@ curl -s http://localhost:8080/v1/audio/transcriptions \
   -F "stream=true"
 ```
 
+## Embeddings
+
+With `-embed <file>` (or `GOLEM_EMBED`), a nomic-embed-text-v2-moe GGUF — the
+one ollama pulls as `nomic-embed-text-v2-moe` — answers three endpoints. It may
+sit beside a conversation model and an STT, or alone:
+
+```bash
+./golem-server -embed nomic-embed-text-v2-moe.f16.gguf -addr 127.0.0.1:11434
+
+curl -s localhost:11434/v1/embeddings -d '{"input": ["search_query: golem", "search_document: a Go engine"]}'
+curl -s localhost:11434/api/embed     -d '{"model": "nomic-embed-text-v2-moe", "input": "search_query: golem"}'
+```
+
+Each keeps the manners of the API it copies, because clients depend on them:
+
+- `/v1/embeddings` answers unit vectors, as floats or — what OpenAI's own
+  client asks for unless told otherwise — as base64 of little-endian float32.
+  A text past the model's 512 positions is refused, as OpenAI and llama-server
+  refuse it.
+- `/api/embed` answers unit vectors and cuts a text that is too long, unless
+  the request says `"truncate": false`.
+- `/api/embeddings`, ollama's older endpoint, answers one vector, not
+  normalized, as ollama does.
+
+`dimensions`, on the first two, keeps a prefix of the vector and renormalizes
+it: the checkpoint is trained so that a prefix is a vector.
+
+A request's texts go through the model in one pass, and so do the texts of
+requests that arrive while a pass is running: they wait for it, and are carried
+together by the next. `nomic/README.md` has the speed against llama.cpp and
+ollama, and the vectors against both.
+
 ## Flags
 
 | | |
 |---|---|
-| `-model` | the GGUF, or `GOLEM_MODEL`; not required when `-stt` is given |
+| `-model` | the GGUF, or `GOLEM_MODEL`; not required when `-stt` or `-embed` is given |
 | `-stt` | directory holding the Kyutai STT model, or `GOLEM_STT`; a server may carry it alone, and then answers `/v1/models` and `/v1/audio/transcriptions` and nothing else |
+| `-embed` | a nomic-embed-text-v2-moe GGUF, or `GOLEM_EMBED`, for the embedding endpoints; a server may carry it alone |
 | `-mmproj` | the projector GGUF, which is what lets a model see and hear, or `GOLEM_MMPROJ` |
 | `-vulkan` | put the blocks and the logit head on a Vulkan device; it fails rather than falling back |
 | `-addr` | what to listen on; `127.0.0.1:8080` by default |

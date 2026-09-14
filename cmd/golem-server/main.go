@@ -27,6 +27,7 @@ import (
 
 	"github.com/ThiraSoft/golem/engine"
 	"github.com/ThiraSoft/golem/internal/version"
+	"github.com/ThiraSoft/golem/nomic"
 	"github.com/ThiraSoft/golem/sample"
 	"github.com/ThiraSoft/golem/stt"
 )
@@ -34,6 +35,7 @@ import (
 func main() {
 	model := flag.String("model", os.Getenv("GOLEM_MODEL"), "GGUF file, gemma4, qwen3 or qwen35 (or GOLEM_MODEL)")
 	sttDir := flag.String("stt", os.Getenv("GOLEM_STT"), "directory holding a Kyutai STT checkpoint (or GOLEM_STT)")
+	embedPath := flag.String("embed", os.Getenv("GOLEM_EMBED"), "nomic-bert-moe GGUF to answer /v1/embeddings and ollama's /api/embed with (or GOLEM_EMBED)")
 	mmproj := flag.String("mmproj", os.Getenv("GOLEM_MMPROJ"), "projector GGUF, which is what lets a model see (or GOLEM_MMPROJ)")
 	assistant := flag.String("assistant", os.Getenv("GOLEM_ASSISTANT"), "gemma4-assistant GGUF that drafts for a Gemma 4 model (or GOLEM_ASSISTANT)")
 	draftN := flag.Int("draft-n", 0, "tokens the assistant guesses a step, 1 to 3; 0 takes the default")
@@ -56,15 +58,15 @@ func main() {
 		return
 	}
 
-	if *model == "" && *sttDir == "" {
-		fail(fmt.Errorf("no model: pass -model or -stt, or set GOLEM_MODEL or GOLEM_STT"))
+	if *model == "" && *sttDir == "" && *embedPath == "" {
+		fail(fmt.Errorf("no model: pass -model, -stt or -embed, or set GOLEM_MODEL, GOLEM_STT or GOLEM_EMBED"))
 	}
-	// A transcriber alone is a whole server. It holds no conversation, so
-	// nothing below this — the runner, the slots, the generators — has anything
-	// to own, and building them around a model that was never opened would only
-	// be a longer way of writing nil.
+	// A transcriber or an embedder alone is a whole server. It holds no
+	// conversation, so nothing below this — the runner, the slots, the
+	// generators — has anything to own, and building them around a model that
+	// was never opened would only be a longer way of writing nil.
 	if *model == "" {
-		serveTranscriptionsOnly(*sttDir, *addr, *sttStreams, *vulkan)
+		serveWithoutConversation(*sttDir, *embedPath, *addr, *sttStreams, *vulkan)
 		return
 	}
 	start := time.Now()
@@ -155,6 +157,11 @@ func main() {
 			server.SetSTTGroup(group)
 		}
 	}
+	if *embedPath != "" {
+		e := openEmbedder(*embedPath)
+		defer e.Close()
+		server.SetEmbedder(e)
+	}
 
 	head := vulkanLine(m.Vulkan())
 	draft := ""
@@ -219,44 +226,73 @@ func sttOnVulkan(m *stt.Model, vulkan bool, streams int) {
 	fmt.Fprintf(os.Stderr, "stt trunk on vulkan in %s, passes of %d\n", m.Quant(), streams)
 }
 
-// serveTranscriptionsOnly runs a server carrying an STT and nothing else.
-// Server.Handler registers the conversation route only when there is a pool,
-// so what this listens on is /v1/models and /v1/audio/transcriptions.
-func serveTranscriptionsOnly(dir, addr string, streams int, vulkan bool) {
+// serveWithoutConversation runs a server carrying an STT, an embedder, or
+// both, and no conversation. Server.Handler registers the conversation route
+// only when there is a pool, so what this listens on is /v1/models and the
+// routes of what it carries.
+func serveWithoutConversation(dir, embedPath, addr string, streams int, vulkan bool) {
 	start := time.Now()
-	opts, err := stt.Locate(dir)
-	if err != nil {
-		fail(err)
-	}
-	model, err := stt.Open(opts)
-	if err != nil {
-		fail(err)
-	}
-	defer model.Close()
+	var name string
+	var carries []string
+	server := NewServer(nil, nil, "", nil, sample.Params{})
 
-	name := filepath.Base(filepath.Clean(dir))
-	server := NewServer(nil, nil, name, nil, sample.Params{})
-	sttOnVulkan(model, vulkan, streams)
-	server.SetSTT(model)
-	if group := sttGroupFor(model, streams); group != nil {
-		defer group.Close()
-		server.SetSTTGroup(group)
+	if dir != "" {
+		opts, err := stt.Locate(dir)
+		if err != nil {
+			fail(err)
+		}
+		model, err := stt.Open(opts)
+		if err != nil {
+			fail(err)
+		}
+		defer model.Close()
+		name = filepath.Base(filepath.Clean(dir))
+		sttOnVulkan(model, vulkan, streams)
+		server.SetSTT(model)
+		if group := sttGroupFor(model, streams); group != nil {
+			defer group.Close()
+			server.SetSTTGroup(group)
+		}
+		carrying := "one at a time"
+		if streams > 1 {
+			carrying = fmt.Sprintf("%d at a time, stepped together", streams)
+		}
+		carries = append(carries, "transcriptions "+carrying)
+		fmt.Fprintf(os.Stderr, "%s: speech to text, trunk in %s\n", name, model.Quant())
 	}
+	if embedPath != "" {
+		e := openEmbedder(embedPath)
+		defer e.Close()
+		server.SetEmbedder(e)
+		if name == "" {
+			name = strings.TrimSuffix(filepath.Base(embedPath), ".gguf")
+		}
+		carries = append(carries, "embeddings")
+	}
+	server.name = name
 
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		fail(err)
 	}
-	fmt.Fprintf(os.Stderr, "%s: speech to text, trunk in %s, loaded in %s on %d cores\n",
-		name, model.Quant(), time.Since(start).Round(time.Millisecond), runtime.NumCPU())
-	carrying := "one at a time"
-	if streams > 1 {
-		carrying = fmt.Sprintf("%d at a time, stepped together", streams)
-	}
-	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 — transcriptions only, %s\n", listener.Addr(), carrying)
+	fmt.Fprintf(os.Stderr, "loaded in %s on %d cores\n", time.Since(start).Round(time.Millisecond), runtime.NumCPU())
+	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 — %s only\n", listener.Addr(), strings.Join(carries, " and "))
 	if err := http.Serve(listener, logging(os.Stderr, server.Handler())); err != nil {
 		fail(err)
 	}
+}
+
+// openEmbedder opens the embedding model and says so.
+func openEmbedder(path string) *nomic.Model {
+	start := time.Now()
+	e, err := nomic.Open(path)
+	if err != nil {
+		fail(fmt.Errorf("embedder: %w", err))
+	}
+	fmt.Fprintf(os.Stderr, "%s: %d blocks, %d-wide vectors, context %d, loaded in %s\n",
+		strings.TrimSuffix(filepath.Base(path), ".gguf"), e.Cfg.Blocks, e.Cfg.Dim, e.Cfg.Context,
+		time.Since(start).Round(time.Millisecond))
+	return e
 }
 
 func fail(err error) {
