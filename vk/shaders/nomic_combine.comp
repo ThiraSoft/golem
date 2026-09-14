@@ -1,0 +1,31 @@
+#version 450
+
+// A mixture's answer: each position's experts' answers, weighted by the
+// probability the router gave each and summed in slot order. That is the
+// order ggml adds its views in, and the processor's path too; from zero, the
+// first term is itself exactly.
+
+#define THREADS 256
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer ANS { float ans[]; };
+layout(std430, binding = 1) readonly  buffer WT  { float wt[];  };
+layout(std430, binding = 2) writeonly buffer OUT { float o[];   };
+
+layout(push_constant) uniform Push {
+    uint dim;
+    uint used;    // experts a position
+    uint count;   // positions times dim
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.count) return;
+    uint t = i / p.dim, j = i % p.dim;
+    float v = 0.0;
+    for (uint s = 0u; s < p.used; s++) {
+        uint slot = t * p.used + s;
+        v += ans[slot * p.dim + j] * wt[slot];
+    }
+    o[i] = v;
+}

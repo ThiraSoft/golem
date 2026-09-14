@@ -1,0 +1,53 @@
+#version 450
+
+// The NeoX rotation of nomic-bert-moe's queries and keys: element i of a head
+// turns against element i + half, by the position times base^(-2i/head).
+//
+// Positions count from each text's own start, and a pass carries several
+// texts, so the position is read from a buffer rather than taken from the
+// workgroup. Like shaders/vision_rope.comp it writes the rotated queries and
+// keys apart from the fused buffer, which the attention still reads the
+// values from.
+
+#define THREADS 256
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer QKV { float qkv[]; };
+layout(std430, binding = 1) readonly  buffer POS { uint  pos[]; };
+layout(std430, binding = 2) writeonly buffer Q   { float q[];   };
+layout(std430, binding = 3) writeonly buffer K   { float k[];   };
+
+layout(push_constant) uniform Push {
+    uint dim;
+    uint heads;
+    uint head;
+    float base;
+} p;
+
+void main() {
+    uint pt    = gl_WorkGroupID.x;
+    uint half_ = p.head / 2u;
+    uint pairs = p.heads * half_;
+    float at   = float(pos[pt]);
+
+    uint src = pt * 3u * p.dim;
+    uint dst = pt * p.dim;
+
+    for (uint e = gl_LocalInvocationID.x; e < pairs; e += THREADS) {
+        uint h = e / half_;
+        uint i = e % half_;
+        float theta = at * pow(p.base, -2.0 * float(i) / float(p.head));
+        float c = cos(theta), s = sin(theta);
+
+        uint lo = h * p.head + i;
+        uint hi = lo + half_;
+
+        float qre = qkv[src + lo],         qim = qkv[src + hi];
+        float kre = qkv[src + p.dim + lo], kim = qkv[src + p.dim + hi];
+
+        q[dst + lo] = qre * c - qim * s;
+        q[dst + hi] = qre * s + qim * c;
+        k[dst + lo] = kre * c - kim * s;
+        k[dst + hi] = kre * s + kim * c;
+    }
+}

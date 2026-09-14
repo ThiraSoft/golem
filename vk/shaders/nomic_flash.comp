@@ -1,0 +1,117 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// The encoder's attention, a tile of queries at a time.
+//
+// shaders/nomic_attn.comp takes one query a workgroup and reads every key of
+// its text from the card's memory for it, so a text of five hundred positions
+// reads its keys five hundred times over. Here a workgroup takes thirty-two
+// queries of one head, stages thirty-two keys and their values in shared
+// memory, and every query of the tile meets them there: the online softmax of
+// that kernel, over tiles instead of over single keys.
+//
+// A unit is a stretch of one text's queries: where the text starts, how long
+// it is, and the first query of the stretch. Eight lanes own a query — four of
+// the tile's keys each for the scores, eight of the head's dimensions each for
+// the answer — and they are neighbours in a wave, so a row's maximum and sum
+// are clustered reductions over eight lanes rather than trips through shared
+// memory. Written for a head of sixty-four.
+//
+// The tiles are held four floats to an element, so that a product reads its
+// operands from shared memory a quarter as often; every row is one element
+// longer than a head, so that the rows of a wave land on different banks.
+
+#define THREADS 256
+#define BR 32
+#define BC 32
+#define HD 64
+#define H4 (HD / 4)
+#define S4 (H4 + 1)
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer Q     { vec4  q[];     };
+layout(std430, binding = 1) readonly  buffer K     { vec4  k[];     };
+layout(std430, binding = 2) readonly  buffer QKV   { vec4  qkv[];   };
+layout(std430, binding = 3) writeonly buffer MIXED { vec4  mixed[]; };
+layout(std430, binding = 4) readonly  buffer UNITS { uvec4 units[]; };
+
+layout(push_constant) uniform Push {
+    uint dim;
+    uint head;
+    float scale;
+} p;
+
+shared vec4 sq[BR * S4];
+shared vec4 sk[BC * S4];
+shared vec4 sv[BC * S4];
+shared float sp[BR * (BC + 1)];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint r = t >> 3, l = t & 7u;
+    uvec4 u = units[gl_WorkGroupID.x];
+    uint start = u.x, length = u.y, q0 = u.z;
+    uint h = gl_WorkGroupID.y;
+    uint dim4 = p.dim / 4u;
+    uint off4 = h * uint(H4);
+
+    for (uint e = t; e < uint(BR * H4); e += uint(THREADS)) {
+        uint row = e / uint(H4), d = e % uint(H4);
+        sq[row * uint(S4) + d] = (q0 + row < length) ? q[(start + q0 + row) * dim4 + off4 + d] : vec4(0.0);
+    }
+
+    float m = -1.0e30, total = 0.0;
+    vec4 acc0 = vec4(0.0), acc1 = vec4(0.0);
+
+    for (uint c0 = 0u; c0 < length; c0 += uint(BC)) {
+        barrier();
+        for (uint e = t; e < uint(BC * H4); e += uint(THREADS)) {
+            uint row = e / uint(H4), d = e % uint(H4);
+            bool live = c0 + row < length;
+            uint key = start + c0 + row;
+            sk[row * uint(S4) + d] = live ? k[key * dim4 + off4 + d] : vec4(0.0);
+            sv[row * uint(S4) + d] = live ? qkv[key * 3u * dim4 + 2u * dim4 + off4 + d] : vec4(0.0);
+        }
+        barrier();
+
+        float s[4];
+        float peak = -1.0e30;
+        [[unroll]] for (uint j = 0u; j < 4u; j++) {
+            uint kk = l * 4u + j;
+            float d = 0.0;
+            [[unroll]] for (uint i = 0u; i < uint(H4); i++) d += dot(sq[r * uint(S4) + i], sk[kk * uint(S4) + i]);
+            s[j] = (c0 + kk < length) ? d * p.scale : -1.0e30;
+            peak = max(peak, s[j]);
+        }
+        peak = subgroupClusteredMax(peak, 8u);
+        float mine  = max(m, peak);
+        float bring = exp(m - mine);
+        float sum = 0.0;
+        [[unroll]] for (uint j = 0u; j < 4u; j++) {
+            uint kk = l * 4u + j;
+            float e = (c0 + kk < length) ? exp(s[j] - mine) : 0.0;
+            sp[r * uint(BC + 1) + kk] = e;
+            sum += e;
+        }
+        total = total * bring + subgroupClusteredAdd(sum, 8u);
+        m = mine;
+        barrier();
+
+        acc0 *= bring;
+        acc1 *= bring;
+        for (uint kk = 0u; kk < uint(BC); kk++) {
+            float w = sp[r * uint(BC + 1) + kk];
+            acc0 += w * sv[kk * uint(S4) + l * 2u];
+            acc1 += w * sv[kk * uint(S4) + l * 2u + 1u];
+        }
+    }
+
+    if (q0 + r < length) {
+        uint at = (start + q0 + r) * dim4 + off4 + l * 2u;
+        mixed[at]      = acc0 / total;
+        mixed[at + 1u] = acc1 / total;
+    }
+}

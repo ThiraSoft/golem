@@ -1,0 +1,39 @@
+#version 450
+
+// A mixture's router: eight float32 dot products a position, which is all it
+// is. The softmax and the choice of two are the host's, which reads these
+// logits back anyway to know how many positions each expert gets — that count
+// sizes the next dispatches — and which then picks exactly as the processor's
+// path picks.
+
+#define THREADS 256
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer PAR { float par[]; };
+layout(std430, binding = 1) readonly  buffer X   { float x[];   };
+layout(std430, binding = 2) writeonly buffer Y   { float y[];   };
+
+layout(push_constant) uniform Push {
+    uint dim;
+    uint experts;
+    uint at;      // where the router's rows start in par
+} p;
+
+shared float red[THREADS];
+
+void main() {
+    uint t  = gl_LocalInvocationID.x;
+    uint pt = gl_WorkGroupID.x;
+    for (uint e = 0u; e < p.experts; e++) {
+        float s = 0.0;
+        for (uint i = t; i < p.dim; i += THREADS) s += par[p.at + e * p.dim + i] * x[pt * p.dim + i];
+        red[t] = s;
+        barrier();
+        for (uint k = THREADS / 2u; k > 0u; k >>= 1u) {
+            if (t < k) red[t] += red[t + k];
+            barrier();
+        }
+        if (t == 0u) y[pt * p.experts + e] = red[0];
+        barrier();
+    }
+}

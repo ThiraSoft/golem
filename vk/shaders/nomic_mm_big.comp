@@ -1,0 +1,174 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// shaders/nomic_mm.comp at four times the tile, for a pass wide enough to fill
+// the card with them: a hundred and twenty-eight outputs by a hundred and
+// twenty-eight columns, each wave owning sixty-four by sixty-four, sixteen
+// accumulators. The small tile meets four cooperative products a wave for
+// every shared load; this meets sixteen, and that ratio is the whole of what
+// the card was waiting on in the small one — its products ran at a tenth of
+// what the matrix cores do.
+//
+// The loads are wide as well: eight halves of weight in one uvec4, four floats
+// of operand in one vec4, which asks every width to be a whole number of
+// thirty-twos and every matrix to start on eight halves. Both are checked
+// before this kernel is chosen.
+//
+// The answer leaves one sixteen-square at a time through a small stage of
+// each wave's own, so that GROUPED — nomic_mm.comp says what it is — can
+// still pick each column's destination. Here p.patches carries, under GROUPED,
+// where this dispatch's entries start in the table, because the up and the
+// down half of an expert may take different tiles.
+
+#define THREADS 256
+#define BM 128
+#define BN 128
+#define BK 32
+#define SA (BK + 8)
+#define ST 20
+// Chunks of the shared dimension, as in shaders/nomic_mm.comp, so that the
+// large tile, the small one and a split product all land on the same floats.
+#define CHUNK 256u
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer W     { uvec4 w[];     };
+layout(std430, binding = 1) readonly  buffer X     { vec4  x[];     };
+layout(std430, binding = 2) readonly  buffer PAR   { float par[];   };
+layout(std430, binding = 3) writeonly buffer Y     { float y[];     };
+layout(std430, binding = 4) readonly  buffer IDX   { uint  idx[];   };
+layout(std430, binding = 5) readonly  buffer TABLE { uint  table[]; };
+
+layout(push_constant) uniform Push {
+    uint outputs;
+    uint inputs;
+    uint patches;
+    uint base;
+    uint bias;
+    uint index;
+} p;
+
+shared float16_t sa[BM * SA];
+shared float16_t sb[BN * SA];
+shared float stage[4 * 16 * ST];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+#ifdef GROUPED
+    uint entry  = (p.patches + gl_WorkGroupID.y) * 8u;
+    uint base   = table[entry + p.index];
+    uint offset = table[entry + 2u];
+    uint cols   = table[entry + 3u];
+    uint col0   = table[entry + 4u];
+    uint row0   = gl_WorkGroupID.x * uint(BM);
+    // An entry past the last one the routing filled is empty, and the whole
+    // workgroup leaves before its first barrier.
+    if (col0 >= cols) return;
+#else
+    uint base   = p.base;
+    uint cols   = p.patches;
+    uint tiles  = (p.outputs + uint(BM) - 1u) / uint(BM);
+    uint row0   = (gl_WorkGroupID.x % tiles) * uint(BM);
+    uint col0   = (gl_WorkGroupID.x / tiles) * uint(BN);
+#endif
+    uint wave = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint wr = (wave & 1u) * 64u, wc = (wave >> 1) * 64u;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[4][4], sum[4][4];
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        [[unroll]] for (uint j = 0u; j < 4u; j++) {
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            sum[i][j] = acc[i][j];
+        }
+    }
+
+    for (uint k0 = 0u; k0 < p.inputs; k0 += uint(BK)) {
+        if (k0 != 0u && (k0 % CHUNK) == 0u) {
+            [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                [[unroll]] for (uint j = 0u; j < 4u; j++) {
+                    sum[i][j] = sum[i][j] + acc[i][j];
+                    acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+                }
+            }
+        }
+        // The weights: a hundred and twenty-eight rows of thirty-two halves,
+        // four uvec4 a row, two a thread.
+        [[unroll]] for (uint i = 0u; i < 2u; i++) {
+            uint e = t + i * uint(THREADS);
+            uint r = e >> 2, q = (e & 3u) * 8u;
+            uint srow = row0 + r;
+            uvec4 v = uvec4(0u);
+            if (srow < p.outputs) v = w[(base + srow * p.inputs + k0 + q) >> 3];
+            f16vec2 a = unpackFloat2x16(v.x), b = unpackFloat2x16(v.y);
+            f16vec2 c = unpackFloat2x16(v.z), d = unpackFloat2x16(v.w);
+            uint at = r * uint(SA) + q;
+            sa[at]      = a.x; sa[at + 1u] = a.y; sa[at + 2u] = b.x; sa[at + 3u] = b.y;
+            sa[at + 4u] = c.x; sa[at + 5u] = c.y; sa[at + 6u] = d.x; sa[at + 7u] = d.y;
+        }
+        // The operand: a hundred and twenty-eight columns of thirty-two
+        // floats, eight vec4 a column, four a thread, rounded to fp16 here.
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            uint e = t + i * uint(THREADS);
+            uint c = e >> 3, q = (e & 7u) * 4u;
+            uint scol = col0 + c;
+            vec4 v = vec4(0.0);
+            if (scol < cols) {
+#ifdef GROUPED
+                uint from = (p.index == 0u) ? idx[offset + scol] : offset + scol;
+#else
+                uint from = scol;
+#endif
+                v = x[(from * p.inputs + k0 + q) >> 2];
+            }
+            uint at = c * uint(SA) + q;
+            sb[at]      = float16_t(v.x); sb[at + 1u] = float16_t(v.y);
+            sb[at + 2u] = float16_t(v.z); sb[at + 3u] = float16_t(v.w);
+        }
+        barrier();
+
+        [[unroll]] for (uint kk = 0u; kk < uint(BK); kk += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a[4];
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b[4];
+            [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                coopMatLoad(a[i], sa, (wr + i * 16u) * uint(SA) + kk, uint(SA), gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(b[i], sb, (wc + i * 16u) * uint(SA) + kk, uint(SA), gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                [[unroll]] for (uint j = 0u; j < 4u; j++) acc[i][j] = coopMatMulAdd(a[i], b[j], acc[i][j]);
+            }
+        }
+        barrier();
+    }
+
+    uint mine = wave * 16u * uint(ST);
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        [[unroll]] for (uint j = 0u; j < 4u; j++) {
+            coopMatStore(sum[i][j] + acc[i][j], stage, mine, uint(ST), gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            // Sixty-four lanes, two hundred and fifty-six values: four a lane,
+            // a lane a row of four columns so that consecutive lanes write
+            // consecutive rows of Y.
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                uint r = lane & 15u, c = (lane >> 4) + u * 4u;
+                uint row = row0 + wr + i * 16u + r;
+                uint col = col0 + wc + j * 16u + c;
+                if (row < p.outputs && col < cols) {
+                    float v = stage[mine + r * uint(ST) + c] + ((p.bias == ~0u) ? 0.0 : par[p.bias + row]);
+#ifdef GROUPED
+                    uint to = (p.index == 0u) ? offset + col : idx[offset + col];
+#else
+                    uint to = col;
+#endif
+                    y[to * p.outputs + row] = v;
+                }
+            }
+            subgroupBarrier();
+        }
+    }
+}

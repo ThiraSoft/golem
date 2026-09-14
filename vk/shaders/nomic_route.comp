@@ -1,0 +1,133 @@
+#version 450
+
+// A mixture's routing on the card, so that a pass never waits on the host.
+//
+// One workgroup does all of it, because the positions have to be counted
+// before any can be placed, and a pass of four thousand positions is eight
+// thousand choices — a few microseconds of one workgroup's time, against the
+// round trip through the host it replaces.
+//
+//   1. Each position's softmax over its router's logits, and its Used best,
+//      the lower index first between equals, as the processor picks. The
+//      weights go straight to wt, Used a position in slot order.
+//   2. Each lane counts the choices of its own stretch of slots per expert;
+//      a scan over the lanes and then over the experts says where every
+//      expert's list starts and where each lane writes into it.
+//   3. Each lane writes its choices into those lists, in slot order — which
+//      is position order within an expert, as the host wrote them.
+//   4. The two tables the grouped products walk, one entry per tile's worth
+//      of one expert's choices, and every entry past the last one empty.
+
+#define THREADS 256
+#define MAXE 16
+#define MAXSLOTS 8192
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer LOGITS { float logits[]; };
+layout(std430, binding = 1) readonly  buffer PAR    { float par[];    };
+layout(std430, binding = 2) writeonly buffer IDX    { uint  idx[];    };
+layout(std430, binding = 3) writeonly buffer DEST   { uint  dest[];   };
+layout(std430, binding = 4) writeonly buffer WT     { float wt[];     };
+layout(std430, binding = 5) writeonly buffer TABLE  { uint  table[];  };
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint experts;
+    uint used;
+    uint bases;     // where each expert's two matrix bases sit in par, as bits
+    uint widthUp;   // the columns of one entry of the up table
+    uint widthDn;
+    uint maxUp;     // how many entries each table has room for
+    uint maxDn;
+} p;
+
+shared uint choice[MAXSLOTS];
+shared uint cnt[THREADS * MAXE];
+shared uint total[MAXE], first[MAXE], upAt[MAXE], dnAt[MAXE];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint slots = p.n * p.used;
+
+    for (uint pos = t; pos < p.n; pos += THREADS) {
+        float pr[MAXE];
+        float peak = -1.0e30;
+        for (uint e = 0u; e < p.experts; e++) peak = max(peak, logits[pos * p.experts + e]);
+        float sum = 0.0;
+        for (uint e = 0u; e < p.experts; e++) {
+            pr[e] = exp(logits[pos * p.experts + e] - peak);
+            sum += pr[e];
+        }
+        float inv = 1.0 / sum;
+        for (uint e = 0u; e < p.experts; e++) pr[e] *= inv;
+        for (uint s = 0u; s < p.used; s++) {
+            uint best = 0u;
+            float top = -1.0;
+            for (uint e = 0u; e < p.experts; e++) {
+                if (pr[e] > top) { top = pr[e]; best = e; }
+            }
+            choice[pos * p.used + s] = best;
+            wt[pos * p.used + s] = top;
+            pr[best] = -2.0;
+        }
+    }
+    barrier();
+
+    uint chunk = (slots + THREADS - 1u) / THREADS;
+    uint lo = min(t * chunk, slots), hi = min(lo + chunk, slots);
+    for (uint e = 0u; e < p.experts; e++) cnt[t * MAXE + e] = 0u;
+    for (uint i = lo; i < hi; i++) cnt[t * MAXE + choice[i]]++;
+    barrier();
+
+    if (t < p.experts) {
+        uint running = 0u;
+        for (uint lane = 0u; lane < THREADS; lane++) {
+            uint c = cnt[lane * MAXE + t];
+            cnt[lane * MAXE + t] = running;
+            running += c;
+        }
+        total[t] = running;
+    }
+    barrier();
+    if (t == 0u) {
+        uint at = 0u, u = 0u, d = 0u;
+        for (uint e = 0u; e < p.experts; e++) {
+            first[e] = at;
+            upAt[e] = u;
+            dnAt[e] = d;
+            at += total[e];
+            u += (total[e] + p.widthUp - 1u) / p.widthUp;
+            d += (total[e] + p.widthDn - 1u) / p.widthDn;
+        }
+    }
+    barrier();
+
+    uint mine[MAXE];
+    for (uint e = 0u; e < p.experts; e++) mine[e] = first[e] + cnt[t * MAXE + e];
+    for (uint i = lo; i < hi; i++) {
+        uint e = choice[i];
+        uint at = mine[e]++;
+        idx[at]  = i / p.used;
+        dest[at] = i;
+    }
+
+    for (uint j = t; j < p.maxUp + p.maxDn; j += THREADS) {
+        bool down = j >= p.maxUp;
+        uint k = down ? j - p.maxUp : j;
+        uint width = down ? p.widthDn : p.widthUp;
+        uint o = j * 8u;
+        table[o + 3u] = 0u;
+        table[o + 4u] = 0u;
+        for (uint e = 0u; e < p.experts; e++) {
+            uint at = down ? dnAt[e] : upAt[e];
+            uint n = (total[e] + width - 1u) / width;
+            if (k >= at && k < at + n) {
+                table[o]      = floatBitsToUint(par[p.bases + 2u * e]);
+                table[o + 1u] = floatBitsToUint(par[p.bases + 2u * e + 1u]);
+                table[o + 2u] = first[e];
+                table[o + 3u] = total[e];
+                table[o + 4u] = (k - at) * width;
+            }
+        }
+    }
+}

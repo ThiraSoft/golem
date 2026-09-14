@@ -1,0 +1,188 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// The encoder's product on the matrix cores: Y = X * W' + bias, W in fp16, the
+// operand rounded to fp16 on its way into shared memory, the sums in float32.
+//
+// That rounding is not a shortcut. ggml's processor path rounds an activation
+// to fp16 before an fp16 product, so this lands nearer the reference than
+// shaders/nomic_gemm.comp, which multiplies float32 by the widened weight.
+//
+// A tile is sixty-four outputs by sixty-four columns, walked thirty-two of the
+// shared dimension at a time; each of the four waves owns a thirty-two square
+// of it, four sixteen-square accumulators. The answer goes through shared
+// memory on its way out, because the columns of Y are where it is written by
+// the row, and because GROUPED needs to choose each column's destination.
+//
+// GROUPED is every expert of a mixture in one dispatch. The second axis of the
+// grid walks a table, one entry per sixty-four positions of one expert: where
+// that expert's up and down matrices start, where its positions start in the
+// compact order, how many it has, and which sixty-four of them this entry is.
+// p.index says which half of the expert runs:
+//
+//   0  up:   column c is the position idx[offset + c] of the stream, and the
+//            answer is written compact, at row offset + c.
+//   1  down: column c is compact row offset + c, and the answer is written at
+//            row idx[offset + c] — which is the position and the slot, one row
+//            each, so no two experts ever write the same place and the slots
+//            are summed afterwards in their own order.
+//
+// A pass of a few dozen positions makes a dozen tiles of a matrix of 768
+// outputs, and a dozen workgroups each walking three thousand of the shared
+// dimension leave the card idle: a one-sentence request spent nine
+// milliseconds that way. So a product may be split along the shared dimension
+// into p.slices, each workgroup taking kper of it and writing its partial sums
+// to its own stretch of Y, stride floats apart, for shaders/nomic_reduce.comp
+// to add in order and bias.
+
+#define THREADS 256
+#define BM 64
+#define BN 64
+#define BK 32
+#define SA (BK + 8)
+#define SO (BN + 4)
+// The shared dimension is summed in chunks of CHUNK: each chunk in its own
+// accumulators, then added to the running total in order. A split product's
+// slices are whole chunks and shaders/nomic_reduce.comp adds them in the same
+// order, so the answer is the same float whether the product was split or
+// not — and a text's vector does not depend on how wide its pass was.
+#define CHUNK 256u
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer W     { uint  w[];     };
+layout(std430, binding = 1) readonly  buffer X     { float x[];     };
+layout(std430, binding = 2) readonly  buffer PAR   { float par[];   };
+layout(std430, binding = 3) writeonly buffer Y     { float y[];     };
+layout(std430, binding = 4) readonly  buffer IDX   { uint  idx[];   };
+layout(std430, binding = 5) readonly  buffer TABLE { uint  table[]; };
+
+layout(push_constant) uniform Push {
+    uint outputs;
+    uint inputs;
+    uint patches;
+    uint base;
+    uint bias;
+    uint index;
+    uint slices;  // 0 or 1 for a product that is not split
+    uint stride;  // floats between two slices' partial sums
+    uint kper;    // the shared dimension one slice walks, a whole number of BK
+} p;
+
+shared float16_t sa[BM * SA];
+shared float16_t sb[BN * SA];
+shared float so[BM * SO];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint slices = max(p.slices, 1u);
+    uint rowTiles = (p.outputs + uint(BM) - 1u) / uint(BM);
+#ifdef GROUPED
+    // p.patches is where this dispatch's entries start in the table: the up
+    // and the down half of an expert may take different tiles, and so
+    // different tables, laid one after the other.
+    uint entry  = (p.patches + gl_WorkGroupID.y) * 8u;
+    uint base   = table[entry + p.index];
+    uint offset = table[entry + 2u];
+    uint cols   = table[entry + 3u];
+    uint col0   = table[entry + 4u];
+    uint slice  = gl_WorkGroupID.x / rowTiles;
+    uint row0   = (gl_WorkGroupID.x % rowTiles) * uint(BM);
+    // An entry past the last one the routing filled is empty, and the whole
+    // workgroup leaves before its first barrier.
+    if (col0 >= cols) return;
+#else
+    uint base   = p.base;
+    uint cols   = p.patches;
+    uint per    = rowTiles * ((cols + uint(BN) - 1u) / uint(BN));
+    uint slice  = gl_WorkGroupID.x / per;
+    uint local_ = gl_WorkGroupID.x % per;
+    uint row0   = (local_ % rowTiles) * uint(BM);
+    uint col0   = (local_ / rowTiles) * uint(BN);
+#endif
+    uint kbeg = (slices > 1u) ? slice * p.kper : 0u;
+    uint kend = (slices > 1u) ? min(p.inputs, kbeg + p.kper) : p.inputs;
+
+    uint wave  = gl_SubgroupID;
+    uint wr = (wave & 1u) * 32u, wc = (wave >> 1) * 32u;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> zero =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c00 = zero, c01 = zero, c10 = zero, c11 = zero;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> t00 = zero, t01 = zero, t10 = zero, t11 = zero;
+
+    for (uint k0 = kbeg; k0 < kend; k0 += uint(BK)) {
+        if (k0 != kbeg && (k0 % CHUNK) == 0u) {
+            t00 = t00 + c00; t01 = t01 + c01; t10 = t10 + c10; t11 = t11 + c11;
+            c00 = zero; c01 = zero; c10 = zero; c11 = zero;
+        }
+        for (uint e = t; e < uint(BM) * uint(BK) / 2u; e += uint(THREADS)) {
+            uint r  = e / (uint(BK) / 2u);
+            uint kk = (e % (uint(BK) / 2u)) * 2u;
+            uint srow = row0 + r;
+            vec2 v = vec2(0.0);
+            if (srow < p.outputs && k0 + kk < kend) {
+                v = unpackHalf2x16(w[(base + srow * p.inputs + k0 + kk) >> 1u]);
+            }
+            sa[r * uint(SA) + kk]      = float16_t(v.x);
+            sa[r * uint(SA) + kk + 1u] = float16_t(v.y);
+        }
+        for (uint e = t; e < uint(BN) * uint(BK); e += uint(THREADS)) {
+            uint c  = e / uint(BK);
+            uint kk = e % uint(BK);
+            uint scol = col0 + c;
+            float v = 0.0;
+            if (scol < cols && k0 + kk < kend) {
+#ifdef GROUPED
+                uint from = (p.index == 0u) ? idx[offset + scol] : offset + scol;
+#else
+                uint from = scol;
+#endif
+                v = x[from * p.inputs + k0 + kk];
+            }
+            sb[c * uint(SA) + kk] = float16_t(v);
+        }
+        barrier();
+
+        [[unroll]] for (uint kk = 0u; kk < uint(BK); kk += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a0, a1;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b0, b1;
+            coopMatLoad(a0, sa, wr * uint(SA) + kk, uint(SA), gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a1, sa, (wr + 16u) * uint(SA) + kk, uint(SA), gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b0, sb, wc * uint(SA) + kk, uint(SA), gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(b1, sb, (wc + 16u) * uint(SA) + kk, uint(SA), gl_CooperativeMatrixLayoutColumnMajor);
+            c00 = coopMatMulAdd(a0, b0, c00);
+            c01 = coopMatMulAdd(a0, b1, c01);
+            c10 = coopMatMulAdd(a1, b0, c10);
+            c11 = coopMatMulAdd(a1, b1, c11);
+        }
+        barrier();
+    }
+
+    t00 = t00 + c00; t01 = t01 + c01; t10 = t10 + c10; t11 = t11 + c11;
+    coopMatStore(t00, so, wr * uint(SO) + wc, uint(SO), gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(t01, so, wr * uint(SO) + wc + 16u, uint(SO), gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(t10, so, (wr + 16u) * uint(SO) + wc, uint(SO), gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(t11, so, (wr + 16u) * uint(SO) + wc + 16u, uint(SO), gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    for (uint e = t; e < uint(BM) * uint(BN); e += uint(THREADS)) {
+        uint r = e % uint(BM), c = e / uint(BM);
+        uint row = row0 + r, col = col0 + c;
+        if (row >= p.outputs || col >= cols) continue;
+#ifdef GROUPED
+        uint to = (p.index == 0u) ? offset + col : idx[offset + col];
+#else
+        uint to = col;
+#endif
+        if (slices > 1u) {
+            y[slice * p.stride + to * p.outputs + row] = so[r * uint(SO) + c];
+        } else {
+            y[to * p.outputs + row] = so[r * uint(SO) + c] + ((p.bias == ~0u) ? 0.0 : par[p.bias + row]);
+        }
+    }
+}
