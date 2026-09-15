@@ -243,6 +243,25 @@ func TestSamplingReadsThePenaltyFields(t *testing.T) {
 	}
 }
 
+// Two requests that name no seed draw from two different ones. The seed used
+// to be chosen once at startup and handed to every sampler, so the same prompt
+// at a temperature of one came back with the same answer every time.
+func TestSamplingDrawsASeedPerRequest(t *testing.T) {
+	s := newTestServer(t, []string{"a", "<turn|>"})
+	s.defaults = sample.Params{Temperature: 1, Seed: 42}
+	if a, b := s.sampling(&completionRequest{}), s.sampling(&completionRequest{}); a.Seed == b.Seed {
+		t.Fatalf("two requests without a seed drew the same one: %d", a.Seed)
+	}
+	minP := 0.1
+	if got := s.sampling(&completionRequest{MinP: &minP}); got.MinP != 0.1 {
+		t.Fatalf("a request asking for min_p 0.1 was given %v", got.MinP)
+	}
+	seed := uint64(7)
+	if got := s.sampling(&completionRequest{Seed: &seed}); got.Seed != 7 {
+		t.Fatalf("a request asking for seed 7 was given %d", got.Seed)
+	}
+}
+
 // answerOf reads the assistant's text out of a completion.
 func answerOf(t *testing.T, w *httptest.ResponseRecorder) string {
 	t.Helper()

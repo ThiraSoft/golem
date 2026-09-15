@@ -170,8 +170,45 @@ func TestASeedDeterminesTheRun(t *testing.T) {
 // The defaults are the ones Gemma's own file carries.
 func TestDefaults(t *testing.T) {
 	d := Defaults()
-	if d.Temperature != 1 || d.TopK != 64 || d.TopP != 0.95 {
+	if d.Temperature != 1 || d.TopK != 64 || d.TopP != 0.95 || d.MinP != 0.05 {
 		t.Fatalf("%+v", d)
+	}
+}
+
+// min_p drops every candidate less than that share as likely as the best one.
+// Top-k and top-p alone left a quarter of a million tokens' tail in reach at a
+// temperature of one: a French village drew "pointLoose" and "épκrané" out of
+// it a few times in a hundred answers, and llama.cpp, whose default is 0.05,
+// did not.
+func TestMinPDropsTheTail(t *testing.T) {
+	row := []float32{5, 5 - float32(math.Log(10)), 5 - float32(math.Log(40))}
+	for _, p := range []Params{
+		{Temperature: 1, TopP: 1, MinP: 0.05, Seed: 3},
+		// The penalty shortcut goes through its own candidate list.
+		{Temperature: 1, TopP: 1, MinP: 0.05, Seed: 3, PenaltyLastN: 64, PenaltyRepeat: 1, PenaltyFreq: 0.01},
+	} {
+		s := New(p)
+		seen := map[int32]int{}
+		for i := 0; i < 20000; i++ {
+			seen[s.draw(row)]++
+		}
+		if seen[2] != 0 {
+			t.Fatalf("%+v: a token one fortieth as likely as the best was drawn %d times", p, seen[2])
+		}
+		if seen[1] == 0 {
+			t.Fatalf("%+v: a token one tenth as likely as the best was never drawn", p)
+		}
+	}
+	// Zero keeps the tail, as before.
+	s := New(Params{Temperature: 1, TopP: 1, Seed: 3})
+	tail := 0
+	for i := 0; i < 20000; i++ {
+		if s.draw(row) == 2 {
+			tail++
+		}
+	}
+	if tail == 0 {
+		t.Fatal("without min_p the tail must stay in reach")
 	}
 }
 

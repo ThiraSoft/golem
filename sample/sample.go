@@ -23,6 +23,9 @@ type Params struct {
 	// TopP keeps the shortest prefix of the sorted candidates whose
 	// probabilities reach it. One or more keeps all of them.
 	TopP float32
+	// MinP keeps the candidates at least that share as likely as the best
+	// one. Zero or less keeps all of them.
+	MinP float32
 	// Seed fixes the run: the same seed over the same logits draws the same
 	// tokens.
 	Seed uint64
@@ -46,9 +49,12 @@ type Params struct {
 }
 
 // Defaults are the values Gemma 4's own file declares under general.sampling,
-// with llama.cpp's own defaults for the penalties it does not declare.
+// with llama.cpp's own defaults for what it does not declare: the penalties,
+// and a min_p of 0.05. The file's top-k and top-p leave a tail that a
+// temperature of one still reaches, and a 12B writing French drew broken
+// words out of it a few times in a hundred answers without it.
 func Defaults() Params {
-	return Params{Temperature: 1, TopK: 64, TopP: 0.95,
+	return Params{Temperature: 1, TopK: 64, TopP: 0.95, MinP: 0.05,
 		PenaltyLastN: 64, PenaltyRepeat: 1}
 }
 
@@ -204,7 +210,7 @@ func (s *Sampler) pickFrom(kept []candidate) int32 {
 	if s.p.Temperature <= 0 {
 		return kept[0].id
 	}
-	kept = s.topP(kept)
+	kept = s.minP(s.topP(kept))
 	if len(kept) == 1 {
 		return kept[0].id
 	}
@@ -229,6 +235,27 @@ func (s *Sampler) pickFrom(kept []candidate) int32 {
 		}
 	}
 	return kept[len(kept)-1].id
+}
+
+// minP keeps the candidates whose probability reaches MinP times the best
+// one's, which on logits is a fixed distance below the highest. It runs after
+// top-p and before the temperature, where llama.cpp runs it.
+func (s *Sampler) minP(kept []candidate) []candidate {
+	if s.p.MinP <= 0 || len(kept) < 2 {
+		return kept
+	}
+	best := kept[0].logit
+	for _, c := range kept[1:] {
+		best = max(best, c.logit)
+	}
+	floor := best + float32(math.Log(float64(s.p.MinP)))
+	out := kept[:0]
+	for _, c := range kept {
+		if c.logit >= floor {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // topK returns the k candidates worth keeping, highest logit first, ties to the

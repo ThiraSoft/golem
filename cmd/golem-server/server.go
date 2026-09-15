@@ -11,6 +11,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"sync"
@@ -316,6 +317,13 @@ func (s *Server) sampling(req *completionRequest) sample.Params {
 	if req.TopK != nil {
 		p.TopK = *req.TopK
 	}
+	if req.MinP != nil {
+		p.MinP = float32(*req.MinP)
+	}
+	// A seed of its own for every request that names none. One drawn at
+	// startup and shared made the draw a function of the prompt: the same
+	// question came back with the same answer at any temperature.
+	p.Seed = rand.Uint64()
 	if req.Seed != nil {
 		p.Seed = *req.Seed
 	}

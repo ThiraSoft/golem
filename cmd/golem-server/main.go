@@ -16,7 +16,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -88,7 +87,6 @@ func main() {
 	}
 
 	params := m.Sampling
-	params.Seed = rand.Uint64()
 
 	// One goroutine owns the model; every conversation asks it for its passes,
 	// and what is waiting at the moment a pass is built goes into it together.
