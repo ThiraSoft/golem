@@ -8,12 +8,21 @@ package main
 // cache, and a request only pays for what its prompt does not share with them.
 //
 // One rule earns its own paragraph. A sliding-window block stores its keys in a
-// ring of exactly the window, so writing past position P and then rewinding to
-// P overwrites the slots of positions P-W+1 … Q-W, which are still visible from
-// P. Rewinding therefore restarts a window early rather than at P. Rewriting
-// those positions is idempotent for the global blocks. Appending — which is
-// what a conversation growing by one exchange does — rewinds nothing and costs
-// nothing.
+// ring of C slots, position p in slot p mod C, and C is the window and one pass
+// more (gemma/cache.go says why). A conversation that wrote up to Q and is
+// rewound to a shared prefix P has overwritten the slots of positions Q-C and
+// below, and some of them can still be inside the window of P. Resuming at P
+// would read the keys of the other conversation in their place. So the context
+// remembers which position each slot last received, and a prefill starts at
+// the first position whose window is intact, feeding again everything after
+// it. Rewriting positions is idempotent for the global blocks. Appending,
+// which is what a conversation growing by one exchange does, overwrites
+// nothing still visible and costs nothing.
+//
+// This used to restart a window early, P-W+1, reasoning on a ring of exactly
+// the window. Once the ring grew by a pass that stopped being enough: a
+// village whose characters share a long lore and take turns on a slot read the
+// keys of the previous character, and answered as someone else.
 
 import (
 	"fmt"
@@ -53,9 +62,15 @@ const promptBatch = 32
 const devicePassWidth = 512
 
 type Context struct {
-	runner     *Runner
-	slot       int // which of the model's caches this context is
-	window     int // the largest sliding window; 0 when every block is global
+	runner *Runner
+	slot   int // which of the model's caches this context is
+	window int // the largest sliding window; 0 when every block is global
+	ring   int // slots in that window's ring; the window itself when unset
+
+	// owner is, for each slot of the window ring, the position it last
+	// received, or -1. A slot whose owner is not the position read from it
+	// holds some other position's keys.
+	owner      []int
 	maxContext int
 	now        func() time.Time
 	ttl        time.Duration
@@ -73,6 +88,59 @@ func NewSlotContext(r *Runner, slot, window, maxContext int, now func() time.Tim
 	c := NewContext(r, window, maxContext, now, ttl)
 	c.slot = slot
 	return c
+}
+
+// SetRing gives the size of the window ring, which main.go reads from the
+// model. Without it the ring is taken to be the window.
+func (c *Context) SetRing(n int) { c.ring = n; c.owner = nil }
+
+// wrote records that positions from … from+n-1 have been written to the ring.
+func (c *Context) wrote(from, n int) {
+	if c.window == 0 {
+		return
+	}
+	ring := c.ringSize()
+	if c.owner == nil {
+		c.owner = make([]int, ring)
+		for i := range c.owner {
+			c.owner[i] = -1
+		}
+	}
+	for p := from; p < from+n; p++ {
+		c.owner[p%ring] = p
+	}
+}
+
+func (c *Context) ringSize() int {
+	if c.ring > 0 {
+		return c.ring
+	}
+	return c.window
+}
+
+// intactFrom is the latest position at or before from where a prefill can
+// resume: every position its window sees still sits in its own slot. A
+// position found overwritten is fed again, so the search moves to it and
+// checks its window in turn.
+func (c *Context) intactFrom(from int) int {
+	if c.window == 0 {
+		return from
+	}
+	ring := c.ringSize()
+	for from > 0 {
+		bad := -1
+		for p := max(0, from-c.window+1); p < from; p++ {
+			if c.owner == nil || c.owner[p%ring] != p {
+				bad = p
+				break
+			}
+		}
+		if bad < 0 {
+			return from
+		}
+		from = bad
+	}
+	return 0
 }
 
 // Pos is the position the next token would be fed at.
@@ -113,14 +181,9 @@ func (c *Context) PrefillPromptState(p engine.Prompt, logits []float32, state *[
 	if from >= len(ids) {
 		from = len(ids) - 1
 	}
-	// A rewind past what was written corrupts the ring of a window block.
-	if len(c.held) > from && c.window > 0 {
-		if early := from - c.window + 1; early > 0 {
-			from = early
-		} else {
-			from = 0
-		}
-	}
+	// A window block's ring may hold another conversation's keys where this
+	// one's window still looks.
+	from = c.intactFrom(from)
 
 	for at := from; at < len(ids); {
 		// A batch may not be cut inside a picture: every key of a span has to
@@ -148,6 +211,7 @@ func (c *Context) PrefillPromptState(p engine.Prompt, logits []float32, state *[
 				*keep = (*keep)[:0]
 			}
 		}
+		c.wrote(at, to-at)
 		at = to
 	}
 	c.held = append(c.held[:0], ids...)
@@ -163,6 +227,7 @@ func (c *Context) Advance(id int32, logits []float32) {
 // AdvanceState is Advance that also keeps the hidden state the token produced.
 func (c *Context) AdvanceState(id int32, logits []float32, state *[]float32) {
 	c.runner.ForwardState(c.slot, []int32{id}, span(len(c.held), 1), logits, state)
+	c.wrote(len(c.held), 1)
 	c.held = append(c.held, id)
 	c.last = c.now()
 }
@@ -186,6 +251,8 @@ func (c *Context) DraftSpan() int { return c.runner.DraftSpan() }
 // cache. state is replaced by the hidden state of the last of them.
 func (c *Context) Draft(id int32, state *[]float32, pick func([]float32) int32) ([]int32, error) {
 	next, h, err := c.runner.Draft(c.slot, id, *state, len(c.held), pick)
+	// The refused guesses were written too, at positions past what is held.
+	c.wrote(len(c.held), c.runner.DraftSpan())
 	if err != nil {
 		return nil, err
 	}
@@ -224,4 +291,5 @@ func (c *Context) expire() {
 	}
 	c.runner.Reset(c.slot)
 	c.held = nil
+	c.owner = nil
 }

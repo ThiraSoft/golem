@@ -130,6 +130,7 @@ func main() {
 	slots := make([]*slot, m.Slots())
 	for i := range slots {
 		ctx := NewSlotContext(runner, i, m.Window, m.SlotContext(), time.Now, *ttl)
+		ctx.SetRing(m.WindowRing())
 		gen := NewGenerator(ctx, m.Vocab, m.Template, m.Vocabulary, *maxTokens)
 		gen.calls = &calls
 		slots[i] = &slot{index: i, ctx: ctx, gen: gen}

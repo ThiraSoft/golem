@@ -87,6 +87,15 @@ func (m *Model) SlotContext() int { return m.Forward.SlotContext() }
 // Close releases the model and the file behind it.
 func (m *Model) Close() error { return m.closer.Close() }
 
+// WindowRing is how many slots a sliding-window block's ring holds for one
+// conversation, which can be more than Window; 0 when the model does not say.
+func (m *Model) WindowRing() int {
+	if r, ok := m.Forward.(interface{ WindowRing() int }); ok {
+		return r.WindowRing()
+	}
+	return 0
+}
+
 // vulkanHead is implemented by the engines whose logit head can move to a
 // device. It is not part of Forward: an engine that cannot do it is not
 // broken, and a caller that never asks should not have to know the method
