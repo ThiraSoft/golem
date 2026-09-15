@@ -64,6 +64,20 @@ func (m *Model) SlotContext() int {
 	return m.slotContext
 }
 
+// WindowRing is how many slots the ring of the widest sliding-window block
+// holds in one conversation's cache, or 0 when every block is global. A server
+// rewinding a cache needs it: a position overwrites the slot of the one a ring
+// earlier, and that one can still be visible.
+func (m *Model) WindowRing() int {
+	ring, window := 0, 0
+	for _, b := range m.Cfg.Blocks {
+		if b.Window && b.WindowSize > window {
+			window, ring = b.WindowSize, ringCapacity(b, m.SlotContext())
+		}
+	}
+	return ring
+}
+
 // Slot is one of the caches, for a caller building a batch out of several
 // conversations at once.
 func (m *Model) Slot(i int) *Cache {

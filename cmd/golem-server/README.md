@@ -225,10 +225,13 @@ the cache, compares them with the prompt it just rendered, and prefills only the
 divergence. A conversation growing by one exchange costs one exchange.
 
 Rewinding is where it gets particular. A sliding-window block keeps its keys in
-a ring of exactly the window, so writing up to position Q and then going back to
-P overwrites the slots of positions `P-W+1 … Q-W`, which are still visible from
-P. A rewind therefore restarts a window early rather than at P; its cost is
-bounded by the window, and appending — the common case — rewinds nothing.
+a ring of C slots, the window and one pass more, position p in slot `p mod C`.
+Writing up to position Q and then going back to P has overwritten the slots of
+positions up to `Q-C`, and some of them can still be visible from P. The server
+remembers which position each slot last received and resumes at the latest
+position whose window is intact, feeding everything after it again. A rewind
+that wrapped nothing feeds only the divergence, and appending, the common case,
+rewinds nothing.
 
 `-cache-ttl` bounds how long a conversation's tokens stay in memory. Say plainly
 what it does not do: the cache is allocated once at startup and this frees none

@@ -131,9 +131,11 @@ func TestPrefillFeedsFromTheDivergence(t *testing.T) {
 	}
 }
 
-// Rewinding a ring: the positions inside the window that the longer run
-// overwrote have to be fed again, so prefill restarts a window early.
-func TestRewindingAWindowRestartsAWindowEarly(t *testing.T) {
+// Rewinding a ring of exactly the window: the longer run wrote positions 4..7
+// over the slots of 0..3. Resuming at 5 would read 2..4 from those slots, and
+// resuming a window early at 2 would still read 0 and 1 from them, so the
+// whole prompt is fed again.
+func TestRewindingAWindowFeedsEveryOverwrittenPosition(t *testing.T) {
 	e := &recordingEngine{}
 	c := NewContext(running(t, e), 4, 4096, time.Now, 0)
 	if _, err := c.Prefill([]int32{1, 2, 3, 4, 5, 6, 7, 8}, scores()); err != nil {
@@ -143,13 +145,75 @@ func TestRewindingAWindowRestartsAWindowEarly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The prefix is 5 long, the window is 4: positions 2..5 have to be fed
-	// again, which is 4 positions counting the one that differs.
-	if fed != 4 {
-		t.Fatalf("fed %d, want the window's worth", fed)
+	if fed != 6 {
+		t.Fatalf("fed %d, want the whole prompt", fed)
 	}
 	if e.posOf[len(e.posOf)-1] != 5 || c.Pos() != 6 {
 		t.Fatalf("positions %v, pos %d", e.posOf, c.Pos())
+	}
+}
+
+// A ring holds the window and a pass more, as gemma's does. Another
+// conversation on the same prefix went to position 13 and overwrote the slots
+// of 0..5. Restarting a window early, at 3, read positions 0..2 from slots that
+// held 8..10: the village's characters, sharing a long lore, answered with the
+// keys of whoever had the slot before them.
+func TestRewindingALargerRingFeedsWhatTheOtherConversationOverwrote(t *testing.T) {
+	e := &recordingEngine{}
+	c := NewContext(running(t, e), 4, 4096, time.Now, 0)
+	c.SetRing(8)
+	first := []int32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+	if _, err := c.Prefill(first, scores()); err != nil {
+		t.Fatal(err)
+	}
+	fed, err := c.Prefill([]int32{1, 2, 3, 4, 5, 6, 99}, scores())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fed != 7 {
+		t.Fatalf("fed %d, want the whole prompt: its window reads slots the other run overwrote", fed)
+	}
+	if e.posOf[len(first)] != 0 {
+		t.Fatalf("the second prompt was fed from position %d", e.posOf[len(first)])
+	}
+}
+
+// The same ring, when the other conversation stopped short of wrapping: every
+// slot still holds its own position, and only what differs is fed.
+func TestRewindingARingThatDidNotWrapFeedsOnlyTheDivergence(t *testing.T) {
+	e := &recordingEngine{}
+	c := NewContext(running(t, e), 4, 4096, time.Now, 0)
+	c.SetRing(8)
+	if _, err := c.Prefill([]int32{1, 2, 3, 4, 5, 6, 7}, scores()); err != nil {
+		t.Fatal(err)
+	}
+	fed, err := c.Prefill([]int32{1, 2, 3, 4, 5, 99}, scores())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fed != 1 {
+		t.Fatalf("fed %d, want the one position that differs", fed)
+	}
+}
+
+// Tokens drawn one at a time are in the ring too: a conversation that grew
+// past the ring by generation is rewound as if it had been prompted that far.
+func TestDrawnTokensCountAsWrittenToTheRing(t *testing.T) {
+	e := &recordingEngine{}
+	c := NewContext(running(t, e), 4, 4096, time.Now, 0)
+	c.SetRing(8)
+	if _, err := c.Prefill([]int32{1, 2, 3, 4, 5, 6}, scores()); err != nil {
+		t.Fatal(err)
+	}
+	for id := int32(7); id <= 14; id++ {
+		c.Advance(id, scores())
+	}
+	fed, err := c.Prefill([]int32{1, 2, 3, 4, 5, 6, 99}, scores())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fed != 7 {
+		t.Fatalf("fed %d, want the whole prompt", fed)
 	}
 }
 
