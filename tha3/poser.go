@@ -27,7 +27,8 @@ func Dir() string {
 }
 
 // Poser holds the five networks and the picture they animate. Pose is not safe
-// for concurrent use because it writes the timings map.
+// for concurrent use: it writes the timings map, and on the card it rewrites the
+// pose buffer.
 type Poser struct {
 	decomposer *eyebrowDecomposer
 	combiner   *eyebrowCombiner
@@ -35,6 +36,7 @@ type Poser struct {
 	rotator    *rotator
 	editor     *editor
 	files      []*weights
+	gpu        *gpuPoser // set by UseVulkan
 
 	image, eyebrow, background Tensor
 	timings                    Timings
@@ -75,6 +77,10 @@ func Open(dir string) (*Poser, error) {
 // Close releases the weight files. The networks hold copies of what they
 // read, so this may be called as soon as Open returns.
 func (p *Poser) Close() error {
+	if p.gpu != nil {
+		p.gpu.close()
+		p.gpu = nil
+	}
 	var first error
 	for _, w := range p.files {
 		if err := w.close(); err != nil && first == nil {
@@ -93,6 +99,9 @@ func (p *Poser) SetImage(img Tensor) error {
 	}
 	// Clone the image so callers cannot mutate the stored picture.
 	p.image = img.Clone()
+	if p.gpu != nil {
+		return p.gpu.setImage(p, p.image)
+	}
 	crop := img.Crop(64, 192, 128, 128)
 	p.trace.emit(netEyebrowDecomposer+".in.0", crop)
 	start := time.Now()
@@ -106,6 +115,9 @@ func (p *Poser) SetImage(img Tensor) error {
 func (p *Poser) Pose(pose [NumParams]float32) (Tensor, error) {
 	if p.image.Data == nil {
 		return Tensor{}, fmt.Errorf("tha3: Pose before SetImage")
+	}
+	if p.gpu != nil {
+		return p.gpu.pose(p, pose)
 	}
 	eyebrowPose := pose[:eyebrowParams]
 	facePose := pose[eyebrowParams:faceParamsEnd]
