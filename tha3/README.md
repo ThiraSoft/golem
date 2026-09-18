@@ -11,6 +11,7 @@ the fixtures the tests compare against.
 
 ```go
 p, err := tha3.Open(tha3.Dir())
+_ = p.UseVulkan() // optional: moves SetImage and Pose to the card
 img, err := tha3.LoadImage("character.png")
 err = p.SetImage(img)
 var pose [tha3.NumParams]float32
@@ -39,3 +40,19 @@ Measured on an Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz using 8 threads
 | two_algo_face_body_rotator | 628.6 |
 | total | 2179.6 |
 | eyebrow_decomposer (once-per-picture cost of SetImage) | 306.9 |
+
+### On the card
+
+Measured on an AMD Radeon RX 9070 (RADV driver, float32). One pose wall clock
+after SetImage is 16.1 ms, and the sustained rate is 54.7 poses/s (18.29 ms each)
+across a 300-pose moving sequence. The 33 ms target is met with comfortable
+margin, and the editor is the slowest network.
+
+| Network | Time (ms) |
+| --- | ---: |
+| editor | 8.1 |
+| eyebrow_morphing_combiner | 2.3 |
+| face_morpher | 3.4 |
+| two_algo_face_body_rotator | 3.7 |
+| pose (without decomposer) | 16.1 |
+| eyebrow_decomposer (once-per-picture cost of SetImage) | 3.8 |

@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"image/png"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -46,6 +47,8 @@ func main() {
 	out := flag.String("out", "frame.png", "where to write the frame")
 	dir := flag.String("weights", tha3.Dir(), "directory of the converted weights")
 	repeat := flag.Int("n", 1, "render the pose this many times and report the last")
+	vulkan := flag.Bool("vulkan", false, "run on the first Vulkan device")
+	bench := flag.Int("bench", 0, "render this many poses of a moving sequence and print poses per second")
 	flag.Parse()
 	if *picture == "" {
 		fail(fmt.Errorf("-image is required"))
@@ -70,12 +73,33 @@ func main() {
 		fail(err)
 	}
 	defer p.Close()
+	if *vulkan {
+		if err := p.UseVulkan(); err != nil {
+			fail(err)
+		}
+	}
 	img, err := tha3.LoadImage(*picture)
 	if err != nil {
 		fail(err)
 	}
 	if err := p.SetImage(img); err != nil {
 		fail(err)
+	}
+	if *bench > 0 {
+		var seq [tha3.NumParams]float32
+		start := time.Now()
+		for i := 0; i < *bench; i++ {
+			phase := float64(i) / 15
+			seq[tha3.MouthAaa] = float32(0.5 + 0.5*math.Sin(phase*3))
+			seq[tha3.HeadY] = float32(0.5 * math.Sin(phase))
+			seq[tha3.Breathing] = float32(0.5 + 0.5*math.Sin(phase/2))
+			if _, err := p.Pose(seq); err != nil {
+				fail(err)
+			}
+		}
+		elapsed := time.Since(start)
+		fmt.Printf("%d poses in %v: %.1f poses/s, %.2f ms each\n", *bench, elapsed.Round(time.Millisecond),
+			float64(*bench)/elapsed.Seconds(), float64(elapsed.Microseconds())/1000/float64(*bench))
 	}
 	var frame tha3.Tensor
 	var total time.Duration
