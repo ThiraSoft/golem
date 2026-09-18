@@ -243,7 +243,3 @@ func (g *THA3Graph) plan() int {
 	}
 	return top
 }
-
-// THA3Runner is declared by Task 2 of the plan; this placeholder keeps the
-// package building until then.
-type THA3Runner struct{}

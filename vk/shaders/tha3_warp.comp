@@ -1,0 +1,46 @@
+#version 450
+
+// GridChangeApplier: the identity grid of affine_grid(align_corners=False)
+// plus an offset field, sampled by grid_sample(bilinear, border,
+// align_corners=False), as tha3/resample.go's applyGridChange. The editor
+// adds the rotator's grid to its own first, which hasAdd does here.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Arena { float a[]; };
+layout(std430, binding = 1) readonly buffer Weights { float w[]; };
+layout(std430, binding = 2) readonly buffer Pose { float pose[]; };
+
+layout(push_constant) uniform Push {
+    uint image, grid, add, hasAdd, dst, h, w, c;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint plane = p.h * p.w;
+    if (i >= plane) return;
+    uint y = i / p.w, x = i % p.w;
+    float gx = a[p.grid + i], gy = a[p.grid + plane + i];
+    if (p.hasAdd != 0u) {
+        gx += a[p.add + i];
+        gy += a[p.add + plane + i];
+    }
+    float fw = float(p.w), fh = float(p.h);
+    float u = (2.0 * float(x) + 1.0) / fw - 1.0 + gx;
+    float v = (2.0 * float(y) + 1.0) / fh - 1.0 + gy;
+    float sx = clamp(((u + 1.0) * fw - 1.0) / 2.0, 0.0, fw - 1.0);
+    float sy = clamp(((v + 1.0) * fh - 1.0) / 2.0, 0.0, fh - 1.0);
+    int x0 = int(floor(sx)), y0 = int(floor(sy));
+    float fx = sx - float(x0), fy = sy - float(y0);
+    int x1 = x0 + 1, y1 = y0 + 1;
+    bool inX = x1 < int(p.w), inY = y1 < int(p.h);
+    for (uint c = 0u; c < p.c; c++) {
+        uint base = p.image + c * plane;
+        float v00 = a[base + uint(y0) * p.w + uint(x0)];
+        float v01 = inX ? a[base + uint(y0) * p.w + uint(x1)] : 0.0;
+        float v10 = inY ? a[base + uint(y1) * p.w + uint(x0)] : 0.0;
+        float v11 = (inX && inY) ? a[base + uint(y1) * p.w + uint(x1)] : 0.0;
+        a[p.dst + c * plane + i] = v00 * (1.0 - fx) * (1.0 - fy) + v01 * fx * (1.0 - fy) +
+            v10 * (1.0 - fx) * fy + v11 * fx * fy;
+    }
+}
