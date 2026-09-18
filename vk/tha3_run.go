@@ -87,6 +87,9 @@ func (g *THA3Graph) Build(d *Device, profile bool) (*THA3Runner, error) {
 	if x.weights, err = d.Upload(floatBytes(weights)); err != nil {
 		return fail(err)
 	}
+	// The card has them now; the graph's copy would only double the host's
+	// share of the weights for the life of the runner.
+	g.weights = nil
 	if x.pose, err = d.Host(256, bufferUsageStorage); err != nil {
 		return fail(err)
 	}

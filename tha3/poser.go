@@ -1,6 +1,7 @@
 package tha3
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,6 +38,13 @@ type Poser struct {
 	editor     *editor
 	files      []*weights
 	gpu        *gpuPoser // set by UseVulkan
+	closed     bool
+
+	// The last pose rendered and its frame, reused while neither changes.
+	lastPose  [NumParams]float32
+	lastFrame Tensor
+	haveLast  bool
+	renders   int // poses actually computed, for the tests
 
 	image, eyebrow, background Tensor
 	timings                    Timings
@@ -46,6 +54,10 @@ type Poser struct {
 
 // Timings is how long each network took on the last call, by network name.
 type Timings map[string]time.Duration
+
+// errClosed is what a poser answers once Close has run: its weights and its
+// card are gone, and answering from what is left would be a silent fallback.
+var errClosed = errors.New("tha3: poser is closed")
 
 // Open loads the five networks from dir, which Dir usually names.
 func Open(dir string) (*Poser, error) {
@@ -74,9 +86,10 @@ func Open(dir string) (*Poser, error) {
 	return p, nil
 }
 
-// Close releases the weight files. The networks hold copies of what they
-// read, so this may be called as soon as Open returns.
+// Close releases the weight files and, after UseVulkan, the card. The poser
+// cannot be used afterwards: SetImage, Pose and UseVulkan return an error.
 func (p *Poser) Close() error {
+	p.closed = true
 	if p.gpu != nil {
 		p.gpu.close()
 		p.gpu = nil
@@ -94,14 +107,24 @@ func (p *Poser) Close() error {
 // SetImage sets the picture to animate and runs the eyebrow decomposer on it,
 // which depends on nothing else and is kept for every pose that follows.
 func (p *Poser) SetImage(img Tensor) error {
+	if p.closed {
+		return errClosed
+	}
 	if img.C != 4 || img.H != Size || img.W != Size {
 		return fmt.Errorf("tha3: picture is %dx%dx%d, want 4x%dx%d", img.C, img.H, img.W, Size, Size)
 	}
-	// Clone the image so callers cannot mutate the stored picture.
-	p.image = img.Clone()
+	// Clone the image so callers cannot mutate the stored picture. It is
+	// stored only once the card, if there is one, holds it too.
+	pic := img.Clone()
+	p.haveLast = false
 	if p.gpu != nil {
-		return p.gpu.setImage(p, p.image)
+		if err := p.gpu.setImage(p, pic); err != nil {
+			return err
+		}
+		p.image = pic
+		return nil
 	}
+	p.image = pic
 	crop := img.Crop(64, 192, 128, 128)
 	p.trace.emit(netEyebrowDecomposer+".in.0", crop)
 	start := time.Now()
@@ -110,15 +133,8 @@ func (p *Poser) SetImage(img Tensor) error {
 	return nil
 }
 
-// Pose renders the picture with the given pose, following
-// FiveStepPoserComputationProtocol in the demo's separable_float.py.
-func (p *Poser) Pose(pose [NumParams]float32) (Tensor, error) {
-	if p.image.Data == nil {
-		return Tensor{}, fmt.Errorf("tha3: Pose before SetImage")
-	}
-	if p.gpu != nil {
-		return p.gpu.pose(p, pose)
-	}
+// poseCPU runs the five networks on the processor, following FiveStepPoserComputationProtocol in the demo's separable_float.py.
+func (p *Poser) poseCPU(pose [NumParams]float32) (Tensor, error) {
 	eyebrowPose := pose[:eyebrowParams]
 	facePose := pose[eyebrowParams:faceParamsEnd]
 	rotationPose := pose[faceParamsEnd:]
@@ -162,6 +178,34 @@ func (p *Poser) Pose(pose [NumParams]float32) (Tensor, error) {
 		frame = p.editor.forward(full, warped, grid, rotationPose, p.trace.sub(netEditor))
 	})
 	return frame, nil
+}
+
+// Pose renders the picture with the given pose. A pose equal to the last one,
+// on the same picture, returns a copy of the last frame without computing
+// anything, so a caller that asks for the same pose again costs nothing.
+func (p *Poser) Pose(pose [NumParams]float32) (Tensor, error) {
+	if p.closed {
+		return Tensor{}, errClosed
+	}
+	if p.image.Data == nil {
+		return Tensor{}, fmt.Errorf("tha3: Pose before SetImage")
+	}
+	if p.haveLast && pose == p.lastPose {
+		return p.lastFrame.Clone(), nil
+	}
+	var frame Tensor
+	var err error
+	if p.gpu != nil {
+		frame, err = p.gpu.pose(p, pose)
+	} else {
+		frame, err = p.poseCPU(pose)
+	}
+	if err != nil {
+		return Tensor{}, err
+	}
+	p.renders++
+	p.lastPose, p.lastFrame, p.haveLast = pose, frame, true
+	return frame.Clone(), nil
 }
 
 // Timings returns how long each network took on the last SetImage and Pose.

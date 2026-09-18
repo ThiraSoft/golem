@@ -30,6 +30,9 @@ func (p *Poser) UseVulkan() error { return p.useVulkan(false) }
 // useVulkan with trace set keeps a copy of every waypoint the processor's
 // tracer would emit, for the parity test.
 func (p *Poser) useVulkan(trace bool) error {
+	if p.closed {
+		return errClosed
+	}
 	if p.gpu != nil {
 		return nil
 	}
@@ -44,10 +47,17 @@ func (p *Poser) useVulkan(trace bool) error {
 		dev.Close()
 		return fmt.Errorf("tha3: %w", err)
 	}
-	p.gpu = &gpuPoser{dev: dev, run: run, image: image}
+	q := &gpuPoser{dev: dev, run: run, image: image}
+	// A picture already set goes to the card before the card is taken: if it
+	// cannot, the poser stays on the processor, whole.
 	if p.image.Data != nil {
-		return p.gpu.setImage(p, p.image)
+		if err := q.setImage(p, p.image); err != nil {
+			q.close()
+			return err
+		}
 	}
+	p.gpu = q
+	p.haveLast = false
 	return nil
 }
 
@@ -70,7 +80,8 @@ func (q *gpuPoser) pose(p *Poser, pose [NumParams]float32) (Tensor, error) {
 		return Tensor{}, err
 	}
 	// The card's clock gives each network's share; the wall clock around the
-	// submission gives the total the shares are scaled to, readback included.
+	// submission gives the total the shares are scaled to. The copy of the
+	// frame out of the readback buffer comes after and is not counted.
 	spans, err := q.run.Spans()
 	if err != nil {
 		return Tensor{}, err

@@ -77,3 +77,48 @@ func TestCardMatchesCPU(t *testing.T) {
 		})
 	}
 }
+
+// The plan UseVulkan builds has no traces, so its tensors live shorter and
+// share more of the arena than in the traced plan TestCardMatchesCPU checks.
+// This runs the shipped plan: the picture set before the card is taken, two
+// poses a picture, SetImage again for every run, frames compared.
+func TestCardShippedPlan(t *testing.T) {
+	dev, err := vk.Open()
+	if err != nil {
+		t.Skipf("no Vulkan device: %v", err)
+	}
+	dev.Close()
+	cpu := openPoserOrSkip(t)
+	defer cpu.Close()
+	card := openPoserOrSkip(t)
+	defer card.Close()
+	for i, run := range runs {
+		f := loadFixtures(t, run)
+		img := f.tensor(t, "image")
+		if err := cpu.SetImage(img); err != nil {
+			t.Fatal(err)
+		}
+		if err := card.SetImage(img); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			if err := card.UseVulkan(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var first, second [NumParams]float32
+		copy(first[:], f.Pose)
+		second[MouthOoo], second[HeadX] = 0.7, -0.4
+		for _, pose := range [][NumParams]float32{first, second} {
+			want, err := cpu.Pose(pose)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := card.Pose(pose)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reference.Compare(t, run+" frame", got.Data, want.Data, tolerance)
+		}
+	}
+}

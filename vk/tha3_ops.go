@@ -153,6 +153,8 @@ func (g *THA3Graph) RGBChange(alpha, change, image THA3Tensor) THA3Tensor {
 // RGBHalfAlpha is RGBChange with alpha = (change's fourth channel + 1) / 2,
 // the eyebrow combiner's output 2.
 func (g *THA3Graph) RGBHalfAlpha(change, image THA3Tensor) THA3Tensor {
+	// Mode 2 reads its alpha from change itself; the alpha handle is change
+	// again only so the op has one.
 	return g.blend(2, change, change, image)
 }
 
