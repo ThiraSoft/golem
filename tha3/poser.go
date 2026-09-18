@@ -41,10 +41,15 @@ type Poser struct {
 	closed     bool
 
 	// The last pose rendered and its frame, reused while neither changes.
+	// The processor also keeps what the first two stages made, for a pose
+	// that changes only what comes after; the card keeps its own.
 	lastPose  [NumParams]float32
 	lastFrame Tensor
 	haveLast  bool
-	renders   int // poses actually computed, for the tests
+	renders   int   // poses actually computed, for the tests
+	started   stage // where the last computed pose started, for the tests
+	eyebrows  Tensor
+	morphed   Tensor
 
 	image, eyebrow, background Tensor
 	timings                    Timings
@@ -133,8 +138,42 @@ func (p *Poser) SetImage(img Tensor) error {
 	return nil
 }
 
-// poseCPU runs the five networks on the processor, following FiveStepPoserComputationProtocol in the demo's separable_float.py.
-func (p *Poser) poseCPU(pose [NumParams]float32) (Tensor, error) {
+// stage is where a pose is computed from. Each stage reads its own share of
+// the pose and what the stage before it made, so a pose that changes only
+// the later shares starts later.
+type stage int
+
+const (
+	stageEyebrows stage = iota // the eyebrow combiner, on pose[:eyebrowParams]
+	stageFace                  // the face morpher, on pose[eyebrowParams:faceParamsEnd]
+	stageBody                  // the rotator and the editor, on the rest
+)
+
+// stageNetworks is what each stage runs, for the timings of those skipped.
+var stageNetworks = [...][]string{
+	stageEyebrows: {netEyebrowCombiner},
+	stageFace:     {netFaceMorpher},
+	stageBody:     {netRotator, netEditor},
+}
+
+// firstChange is the stage the pose must be computed from, given the last
+// one, or false when nothing changed at all.
+func firstChange(last, pose [NumParams]float32) (stage, bool) {
+	switch {
+	case [eyebrowParams]float32(last[:eyebrowParams]) != [eyebrowParams]float32(pose[:eyebrowParams]):
+		return stageEyebrows, true
+	case [faceParamsEnd - eyebrowParams]float32(last[eyebrowParams:faceParamsEnd]) !=
+		[faceParamsEnd - eyebrowParams]float32(pose[eyebrowParams:faceParamsEnd]):
+		return stageFace, true
+	case last != pose:
+		return stageBody, true
+	}
+	return 0, false
+}
+
+// poseCPU runs the five networks on the processor, following FiveStepPoserComputationProtocol in the demo's separable_float.py,
+// from stage from: what the stages before it made is kept from the last pose.
+func (p *Poser) poseCPU(pose [NumParams]float32, from stage) (Tensor, error) {
 	eyebrowPose := pose[:eyebrowParams]
 	facePose := pose[eyebrowParams:faceParamsEnd]
 	rotationPose := pose[faceParamsEnd:]
@@ -144,23 +183,25 @@ func (p *Poser) poseCPU(pose [NumParams]float32) (Tensor, error) {
 		p.timings[network] = time.Since(start)
 	}
 
-	var eyebrows Tensor
-	p.trace.emit(netEyebrowCombiner+".in.0", p.background)
-	p.trace.emit(netEyebrowCombiner+".in.1", p.eyebrow)
-	timed(netEyebrowCombiner, func() {
-		eyebrows = p.combiner.forward(p.background, p.eyebrow, eyebrowPose, p.trace.sub(netEyebrowCombiner))
-	})
+	if from <= stageEyebrows {
+		p.trace.emit(netEyebrowCombiner+".in.0", p.background)
+		p.trace.emit(netEyebrowCombiner+".in.1", p.eyebrow)
+		timed(netEyebrowCombiner, func() {
+			p.eyebrows = p.combiner.forward(p.background, p.eyebrow, eyebrowPose, p.trace.sub(netEyebrowCombiner))
+		})
+	}
 
-	faceIn := p.image.Crop(32, 160, 192, 192)
-	faceIn.Paste(eyebrows, 32, 32)
-	p.trace.emit(netFaceMorpher+".in.0", faceIn)
-	var face Tensor
-	timed(netFaceMorpher, func() {
-		face = p.face.forward(faceIn, facePose, p.trace.sub(netFaceMorpher))
-	})
+	if from <= stageFace {
+		faceIn := p.image.Crop(32, 160, 192, 192)
+		faceIn.Paste(p.eyebrows, 32, 32)
+		p.trace.emit(netFaceMorpher+".in.0", faceIn)
+		timed(netFaceMorpher, func() {
+			p.morphed = p.face.forward(faceIn, facePose, p.trace.sub(netFaceMorpher))
+		})
+	}
 
 	full := p.image.Clone()
-	full.Paste(face, 32, 160)
+	full.Paste(p.morphed, 32, 160)
 	half := ResizeBilinear(full, Size/2, Size/2)
 	p.trace.emit(netRotator+".in.0", half)
 	var warped, grid Tensor
@@ -182,7 +223,10 @@ func (p *Poser) poseCPU(pose [NumParams]float32) (Tensor, error) {
 
 // Pose renders the picture with the given pose. A pose equal to the last one,
 // on the same picture, returns a copy of the last frame without computing
-// anything, so a caller that asks for the same pose again costs nothing.
+// anything, so a caller that asks for the same pose again costs nothing. A
+// pose that keeps the eyebrows of the last one skips the eyebrow combiner,
+// and one that also keeps the face skips the face morpher: breathing and
+// turning the head run only the rotator and the editor.
 func (p *Poser) Pose(pose [NumParams]float32) (Tensor, error) {
 	if p.closed {
 		return Tensor{}, errClosed
@@ -190,20 +234,33 @@ func (p *Poser) Pose(pose [NumParams]float32) (Tensor, error) {
 	if p.image.Data == nil {
 		return Tensor{}, fmt.Errorf("tha3: Pose before SetImage")
 	}
-	if p.haveLast && pose == p.lastPose {
-		return p.lastFrame.Clone(), nil
+	from := stageEyebrows
+	if p.haveLast {
+		changed, ok := firstChange(p.lastPose, pose)
+		if !ok {
+			return p.lastFrame.Clone(), nil
+		}
+		from = changed
+	}
+	for _, skipped := range stageNetworks[:from] {
+		for _, name := range skipped {
+			p.timings[name] = 0
+		}
 	}
 	var frame Tensor
 	var err error
 	if p.gpu != nil {
-		frame, err = p.gpu.pose(p, pose)
+		frame, err = p.gpu.pose(p, pose, from)
 	} else {
-		frame, err = p.poseCPU(pose)
+		frame, err = p.poseCPU(pose, from)
 	}
 	if err != nil {
+		// What the stages kept may be half written: start over next time.
+		p.haveLast = false
 		return Tensor{}, err
 	}
 	p.renders++
+	p.started = from
 	p.lastPose, p.lastFrame, p.haveLast = pose, frame, true
 	return frame.Clone(), nil
 }

@@ -34,8 +34,8 @@ type tha3KernelSpec struct {
 
 var tha3Kernels = map[tha3Kernel]tha3KernelSpec{}
 
-// THA3Runner is a built graph: its buffers, its pipelines and one recorded
-// program per phase.
+// THA3Runner is a built graph: its buffers, its pipelines, the recorded image
+// pass, and one recorded pose pass per entry.
 type THA3Runner struct {
 	d           *Device
 	g           *THA3Graph
@@ -46,8 +46,10 @@ type THA3Runner struct {
 	pose        *Buffer
 	out         *Buffer
 	trace       *Buffer
-	programs    [2]*Program
-	timeline    *Timeline
+	image       *Program
+	poses       []*Program  // by entry
+	timelines   []*Timeline // by entry, when profiling
+	last        int         // the entry the last pose pass started at
 	outAt       []int
 	traceAt     map[string][2]int // offset and length, in floats
 	arenaFloats int
@@ -60,8 +62,9 @@ func floatBytes(f []float32) []byte {
 }
 
 // Build plans the arena, uploads the weights, creates a pipeline and one
-// descriptor set per kernel, and records the two phases. With profile set, a
-// timeline stamps the pose phase wherever the graph asked for a Stamp.
+// descriptor set per kernel, and records the image pass and a pose pass from
+// every entry. With profile set, a timeline stamps each pose pass wherever
+// the graph asked for a Stamp.
 func (g *THA3Graph) Build(d *Device, profile bool) (*THA3Runner, error) {
 	x := &THA3Runner{d: d, g: g, pipes: map[tha3Kernel]*Pipeline{}, sets: map[tha3Kernel]*Set{}, traceAt: map[string][2]int{}}
 	fail := func(err error) (*THA3Runner, error) {
@@ -122,18 +125,13 @@ func (g *THA3Graph) Build(d *Device, profile bool) (*THA3Runner, error) {
 		}
 		x.sets[k] = s
 	}
-	if profile && g.stamps > 0 {
-		if x.timeline, err = d.NewTimeline(g.stamps + 1); err != nil {
-			return fail(err)
-		}
-	}
-	for phase := range x.programs {
-		prog, err := d.Compile(func(r *Recorder) {
-			if phase == THA3PosePhase && x.timeline != nil {
-				x.timeline.Reset(r)
-				x.timeline.Stamp(r, "start")
+	record := func(phase, from int, timeline *Timeline) (*Program, error) {
+		return d.Compile(func(r *Recorder) {
+			if timeline != nil {
+				timeline.Reset(r)
+				timeline.Stamp(r, "start")
 			}
-			for _, o := range g.ops {
+			for _, o := range g.ops[from:] {
 				if o.phase != phase {
 					continue
 				}
@@ -141,15 +139,28 @@ func (g *THA3Graph) Build(d *Device, profile bool) (*THA3Runner, error) {
 					o.record(r, x)
 					r.Barrier()
 				}
-				if o.stamp != "" && phase == THA3PosePhase {
-					x.timeline.Stamp(r, o.stamp)
+				if o.stamp != "" && timeline != nil {
+					timeline.Stamp(r, o.stamp)
 				}
 			}
 		})
+	}
+	if x.image, err = record(THA3ImagePhase, 0, nil); err != nil {
+		return fail(err)
+	}
+	for _, from := range append([]int{0}, g.entries...) {
+		var tl *Timeline
+		if profile && g.stamps > 0 {
+			if tl, err = d.NewTimeline(g.stamps + 1); err != nil {
+				return fail(err)
+			}
+			x.timelines = append(x.timelines, tl)
+		}
+		prog, err := record(THA3PosePhase, from, tl)
 		if err != nil {
 			return fail(err)
 		}
-		x.programs[phase] = prog
+		x.poses = append(x.poses, prog)
 	}
 	return x, nil
 }
@@ -214,12 +225,21 @@ func (x *THA3Runner) Write(t THA3Tensor, data []float32) error {
 func (x *THA3Runner) SetPose(pose []float32) { copy(x.pose.Floats(), pose) }
 
 // RunImage runs the image phase.
-func (x *THA3Runner) RunImage() error { return x.programs[THA3ImagePhase].Run() }
+func (x *THA3Runner) RunImage() error { return x.image.Run() }
 
-// RunPose runs the pose phase and returns how long the submission took.
-func (x *THA3Runner) RunPose() (time.Duration, error) {
+// RunPose runs the whole pose phase and returns how long the submission took.
+func (x *THA3Runner) RunPose() (time.Duration, error) { return x.RunPoseFrom(0) }
+
+// RunPoseFrom runs the pose phase from an entry and returns how long the
+// submission took. What comes before the entry is what the last pass left,
+// so it must have run at least once since the inputs it reads last changed.
+func (x *THA3Runner) RunPoseFrom(entry int) (time.Duration, error) {
+	if entry < 0 || entry >= len(x.poses) {
+		return 0, fmt.Errorf("vk: THA3 pose entry %d of %d", entry, len(x.poses))
+	}
 	start := time.Now()
-	err := x.programs[THA3PosePhase].Run()
+	err := x.poses[entry].Run()
+	x.last = entry
 	return time.Since(start), err
 }
 
@@ -245,10 +265,10 @@ func (x *THA3Runner) Waypoint(name string) []float32 {
 
 // Spans returns the last pose pass's timeline, or nil when not profiling.
 func (x *THA3Runner) Spans() ([]Span, error) {
-	if x.timeline == nil {
+	if len(x.timelines) == 0 {
 		return nil, nil
 	}
-	return x.timeline.Spans()
+	return x.timelines[x.last].Spans()
 }
 
 // ArenaBytes is the size of the planned arena.
@@ -256,12 +276,14 @@ func (x *THA3Runner) ArenaBytes() int { return x.arenaFloats * 4 }
 
 // Close releases everything Build made. It is safe on a half-built runner.
 func (x *THA3Runner) Close() {
-	for i, p := range x.programs {
-		if p != nil {
-			p.Close()
-			x.programs[i] = nil
-		}
+	if x.image != nil {
+		x.image.Close()
+		x.image = nil
 	}
+	for _, p := range x.poses {
+		p.Close()
+	}
+	x.poses = nil
 	for k, s := range x.sets {
 		s.Close()
 		delete(x.sets, k)
@@ -270,10 +292,10 @@ func (x *THA3Runner) Close() {
 		p.Close()
 		delete(x.pipes, k)
 	}
-	if x.timeline != nil {
-		x.timeline.Close()
-		x.timeline = nil
+	for _, t := range x.timelines {
+		t.Close()
 	}
+	x.timelines = nil
 	for _, b := range []**Buffer{&x.arena, &x.weights, &x.pose, &x.out, &x.trace} {
 		if *b != nil {
 			(*b).Close()

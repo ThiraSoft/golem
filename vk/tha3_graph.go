@@ -19,6 +19,11 @@ package vk
 // decomposer), the pose phase once per pose. A tensor the image phase makes
 // and the pose phase reads is pinned, since the pose phase runs many times
 // over it; so is an input, which the host writes whenever it likes.
+//
+// The pose phase may also be entered part way, at an Entry, when what comes
+// before it would compute the same as last time. A tensor made before an
+// entry and read after it is pinned for the same reason: a pass that starts
+// at the entry reads what an earlier pass left there.
 
 import (
 	"fmt"
@@ -87,6 +92,7 @@ type THA3Graph struct {
 	traceT  []THA3Tensor
 	outputs []THA3Tensor
 	stamps  int
+	entries []int // ops where a pose pass may start, besides the first
 }
 
 // NewTHA3Graph starts a graph in the image phase.
@@ -120,6 +126,16 @@ func (g *THA3Graph) Input(c, h, w int) THA3Tensor {
 func (g *THA3Graph) Stamp(label string) {
 	g.ops = append(g.ops, tha3Op{phase: g.phase, stamp: label})
 	g.stamps++
+}
+
+// Entry marks where a pose pass may start, for THA3Runner.RunPoseFrom, and
+// returns its number. Entry 0 is the start of the pose phase.
+func (g *THA3Graph) Entry() int {
+	if g.phase != THA3PosePhase {
+		panic("vk: THA3 entry outside the pose phase")
+	}
+	g.entries = append(g.entries, len(g.ops))
+	return len(g.entries)
 }
 
 func (g *THA3Graph) tensor(c, h, w int) THA3Tensor {
@@ -176,6 +192,12 @@ func (g *THA3Graph) liveness() (first, last []int, pinned []bool) {
 			first[id] = -1
 		case first[id] >= 0 && t.phase == THA3ImagePhase && g.ops[last[id]].phase == THA3PosePhase:
 			pinned[id] = true
+		case first[id] >= 0:
+			for _, e := range g.entries {
+				if first[id] < e && last[id] >= e {
+					pinned[id] = true
+				}
+			}
 		}
 		if pinned[id] {
 			last[id] = len(g.ops)

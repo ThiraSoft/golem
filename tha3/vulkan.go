@@ -73,9 +73,9 @@ func (q *gpuPoser) setImage(p *Poser, img Tensor) error {
 	return nil
 }
 
-func (q *gpuPoser) pose(p *Poser, pose [NumParams]float32) (Tensor, error) {
+func (q *gpuPoser) pose(p *Poser, pose [NumParams]float32, from stage) (Tensor, error) {
 	q.run.SetPose(pose[:])
-	total, err := q.run.RunPose()
+	total, err := q.run.RunPoseFrom(int(from))
 	if err != nil {
 		return Tensor{}, err
 	}
@@ -301,10 +301,18 @@ func (d *describer) poser(p *Poser) vk.THA3Tensor {
 	eyebrows := d.combiner(p.combiner, background, eyebrow)
 	g.Stamp(netEyebrowCombiner)
 
+	if g.Entry() != int(stageFace) {
+		panic("tha3: the face's entry is not the face's stage")
+	}
+
 	faceIn := g.Paste(g.Crop(image, 32, 160, 192, 192), eyebrows, 32, 32)
 	d.emit(netFaceMorpher+".in.0", faceIn)
 	face := d.face(p.face, faceIn)
 	g.Stamp(netFaceMorpher)
+
+	if g.Entry() != int(stageBody) {
+		panic("tha3: the body's entry is not the body's stage")
+	}
 
 	full := g.Paste(image, face, 32, 160)
 	half := g.Resize(full, Size/2, Size/2)

@@ -113,3 +113,27 @@ func TestTHA3PhasesGoForward(t *testing.T) {
 	g.SetPhase(THA3PosePhase)
 	g.SetPhase(THA3ImagePhase)
 }
+
+func TestTHA3PlanPinsAcrossEntries(t *testing.T) {
+	g := NewTHA3Graph()
+	g.SetPhase(THA3PosePhase)
+	x := g.Input(1, 8, 8)
+	kept := chain(g, x)    // read on both sides of the entry
+	dropped := chain(g, x) // read before it only
+	g.op([]THA3Tensor{dropped}, nil, nil)
+	if e := g.Entry(); e != 1 {
+		t.Fatalf("first entry is %d, want 1", e)
+	}
+	after := chain(g, x) // made and read after it
+	for i := 0; i < 4; i++ {
+		chain(g, after)
+	}
+	g.op([]THA3Tensor{kept}, nil, nil)
+	g.plan()
+	_, _, pinned := g.liveness()
+	if !pinned[kept.id] || pinned[dropped.id] || pinned[after.id] {
+		t.Fatalf("pinned kept=%v dropped=%v after=%v, want true, false, false",
+			pinned[kept.id], pinned[dropped.id], pinned[after.id])
+	}
+	overlapFree(t, g)
+}

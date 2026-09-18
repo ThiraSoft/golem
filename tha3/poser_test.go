@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/ThiraSoft/golem/internal/kyutai/reference"
+	"github.com/ThiraSoft/golem/vk"
 )
 
 // End to end: the recorded picture and pose in, every network's inputs and
@@ -102,4 +103,72 @@ func TestClosedPoserFails(t *testing.T) {
 	if err := p.UseVulkan(); err == nil {
 		t.Fatal("UseVulkan after Close did not fail")
 	}
+}
+
+// A pose that keeps the eyebrows, or the eyebrows and the face, of the last
+// one starts at a later stage and must give the frame a full pass gives, on
+// the processor and on the card.
+func TestPoseStartsAtTheFirstChange(t *testing.T) {
+	f := loadFixtures(t, "neutral")
+	img := f.tensor(t, "image")
+	var base [NumParams]float32
+	copy(base[:], f.Pose)
+	steps := []struct {
+		name   string
+		change func(*[NumParams]float32)
+		want   stage
+	}{
+		{"first", func(*[NumParams]float32) {}, stageEyebrows},
+		{"breathing", func(p *[NumParams]float32) { p[Breathing] = 0.8 }, stageBody},
+		{"mouth", func(p *[NumParams]float32) { p[MouthAaa] = 0.6 }, stageFace},
+		{"head and mouth", func(p *[NumParams]float32) { p[HeadX] = -0.3; p[MouthAaa] = 0.2 }, stageFace},
+		{"eyebrows", func(p *[NumParams]float32) { p[EyebrowHappyLeft] = 1 }, stageEyebrows},
+		{"neck", func(p *[NumParams]float32) { p[NeckZ] = 0.2 }, stageBody},
+	}
+	check := func(t *testing.T, p, full *Poser) {
+		for _, x := range []*Poser{p, full} {
+			if err := x.SetImage(img); err != nil {
+				t.Fatal(err)
+			}
+		}
+		pose := base
+		for _, s := range steps {
+			s.change(&pose)
+			got, err := p.Pose(pose)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if p.started != s.want {
+				t.Fatalf("%s: started at stage %d, want %d", s.name, p.started, s.want)
+			}
+			full.haveLast = false
+			want, err := full.Pose(pose)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reference.Compare(t, s.name, got.Data, want.Data, tolerance)
+		}
+	}
+	t.Run("cpu", func(t *testing.T) {
+		p, full := openPoserOrSkip(t), openPoserOrSkip(t)
+		defer p.Close()
+		defer full.Close()
+		check(t, p, full)
+	})
+	t.Run("card", func(t *testing.T) {
+		dev, err := vk.Open()
+		if err != nil {
+			t.Skipf("no Vulkan device: %v", err)
+		}
+		dev.Close()
+		p, full := openPoserOrSkip(t), openPoserOrSkip(t)
+		defer p.Close()
+		defer full.Close()
+		for _, x := range []*Poser{p, full} {
+			if err := x.UseVulkan(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		check(t, p, full)
+	})
 }
