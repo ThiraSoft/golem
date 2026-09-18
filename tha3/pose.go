@@ -55,7 +55,6 @@ const (
 
 // Where the three groups of networks cut the pose.
 const (
-	eyebrowParams  = 12
-	faceParamsEnd  = eyebrowParams + 27
-	rotationParams = NumParams - faceParamsEnd
+	eyebrowParams = 12
+	faceParamsEnd = eyebrowParams + 27
 )

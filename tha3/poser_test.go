@@ -1,6 +1,8 @@
 package tha3
 
 import (
+	"errors"
+	"io/fs"
 	"testing"
 
 	"github.com/ThiraSoft/golem/internal/kyutai/reference"
@@ -14,7 +16,10 @@ func TestPoser(t *testing.T) {
 			f := loadFixtures(t, run)
 			p, err := Open(Dir())
 			if err != nil {
-				t.Skipf("weights not found (%v): see ref/tha3/README.md", err)
+				if errors.Is(err, fs.ErrNotExist) {
+					t.Skipf("weights not found (%v): see ref/tha3/README.md", err)
+				}
+				t.Fatal(err)
 			}
 			defer p.Close()
 			p.trace = f.checker(t, "")
@@ -33,12 +38,7 @@ func TestPoser(t *testing.T) {
 }
 
 func TestPoseBeforeImage(t *testing.T) {
-	p, err := Open(Dir())
-	if err != nil {
-		t.Skipf("weights not found (%v)", err)
-	}
-	defer p.Close()
-	if _, err := p.Pose([NumParams]float32{}); err == nil {
+	if _, err := (&Poser{}).Pose([NumParams]float32{}); err == nil {
 		t.Fatal("Pose without a picture did not fail")
 	}
 }

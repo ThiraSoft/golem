@@ -26,7 +26,8 @@ func Dir() string {
 	return filepath.Join(home, ".cache", "golem", "tha3", "separable_float")
 }
 
-// Poser holds the five networks and the picture they animate.
+// Poser holds the five networks and the picture they animate. Pose is not safe
+// for concurrent use because it writes the timings map.
 type Poser struct {
 	decomposer *eyebrowDecomposer
 	combiner   *eyebrowCombiner
@@ -90,7 +91,8 @@ func (p *Poser) SetImage(img Tensor) error {
 	if img.C != 4 || img.H != Size || img.W != Size {
 		return fmt.Errorf("tha3: picture is %dx%dx%d, want 4x%dx%d", img.C, img.H, img.W, Size, Size)
 	}
-	p.image = img
+	// Clone the image so callers cannot mutate the stored picture.
+	p.image = img.Clone()
 	crop := img.Crop(64, 192, 128, 128)
 	p.trace.emit(netEyebrowDecomposer+".in.0", crop)
 	start := time.Now()

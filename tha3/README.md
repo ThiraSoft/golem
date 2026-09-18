@@ -28,13 +28,14 @@ each network took.
 
 ## Measured
 
-Measured on an Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz using 8 threads (nproc 8) in pure Go CPU mode. The numbers record the execution time of one pose after SetImage has cached the decomposed background. Note that the eyebrow decomposer runs once per picture in SetImage, not per pose.
+Measured on an Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz using 8 threads
+(nproc 8). The table is one pose after SetImage.
 
 | Network | Time (ms) |
 | --- | ---: |
 | editor | 1140.8 |
-| eyebrow_decomposer | 306.9 |
 | eyebrow_morphing_combiner | 122.6 |
 | face_morpher | 285.3 |
 | two_algo_face_body_rotator | 628.6 |
-| pose (without decomposer) | 2179.6 |
+| total | 2179.6 |
+| eyebrow_decomposer (once-per-picture cost of SetImage) | 306.9 |

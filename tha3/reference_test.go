@@ -8,6 +8,8 @@ package tha3
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -95,24 +97,27 @@ func openNetwork(t *testing.T, network string) *weights {
 	t.Helper()
 	w, err := openWeights(Dir(), network)
 	if err != nil {
-		t.Skipf("weights not found (%v): see ref/tha3/README.md", err)
+		if errors.Is(err, fs.ErrNotExist) {
+			t.Skipf("weights not found (%v): see ref/tha3/README.md", err)
+		}
+		t.Fatal(err)
 	}
 	t.Cleanup(func() { w.close() })
 	return w
 }
 
-// Building every body from the real files checks every name and shape the
+// Building every network from the real files checks every name and shape the
 // code expects, before any arithmetic is compared.
 func TestBodiesLoad(t *testing.T) {
 	cases := []struct {
 		network string
 		build   func(w *weights)
 	}{
-		{netEyebrowDecomposer, func(w *weights) { newEncoderDecoder(w, "body", 128, 4, 0, 64, 16, 6, ReLU) }},
-		{netEyebrowCombiner, func(w *weights) { newEncoderDecoder(w, "body", 128, 8, 12, 64, 16, 6, ReLU) }},
-		{netFaceMorpher, func(w *weights) { newEncoderDecoder(w, "body", 192, 4, 27, 64, 24, 6, ReLU) }},
-		{netRotator, func(w *weights) { newResizeEncoderDecoder(w, "encoder_decoder", 256, 10, 64, 32, 6, leaky) }},
-		{netEditor, func(w *weights) { newUNet(w, "body", 512, 16, 32, 64, 6, leaky) }},
+		{netEyebrowDecomposer, func(w *weights) { newEyebrowDecomposer(w) }},
+		{netEyebrowCombiner, func(w *weights) { newEyebrowCombiner(w) }},
+		{netFaceMorpher, func(w *weights) { newFaceMorpher(w) }},
+		{netRotator, func(w *weights) { newRotator(w) }},
+		{netEditor, func(w *weights) { newEditor(w) }},
 	}
 	for _, c := range cases {
 		w := openNetwork(t, c.network)
