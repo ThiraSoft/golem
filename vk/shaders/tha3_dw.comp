@@ -1,0 +1,36 @@
+#version 450
+
+// A depthwise k×k convolution, no bias: every channel with its own kernel, as
+// tha3/conv.go's depthwise. One lane an output pixel, one workgroup row a
+// channel. K is 3, 4 or 7 in these networks; it is a push constant because the
+// loop costs nothing next to the reads.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Arena { float a[]; };
+layout(std430, binding = 1) readonly buffer Weights { float w[]; };
+layout(std430, binding = 2) readonly buffer Pose { float pose[]; };
+
+layout(push_constant) uniform Push {
+    uint src, dst, h, w, oh, ow, k, stride, pad, weights;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.oh * p.ow) return;
+    uint c = gl_WorkGroupID.y;
+    int oy = int(i / p.ow), ox = int(i % p.ow);
+    uint sbase = p.src + c * p.h * p.w;
+    uint wbase = p.weights + c * p.k * p.k;
+    float sum = 0.0;
+    for (int ky = 0; ky < int(p.k); ky++) {
+        int iy = oy * int(p.stride) - int(p.pad) + ky;
+        if (iy < 0 || iy >= int(p.h)) continue;
+        for (int kx = 0; kx < int(p.k); kx++) {
+            int ix = ox * int(p.stride) - int(p.pad) + kx;
+            if (ix < 0 || ix >= int(p.w)) continue;
+            sum += w[wbase + uint(ky) * p.k + uint(kx)] * a[sbase + uint(iy) * p.w + uint(ix)];
+        }
+    }
+    a[p.dst + c * p.oh * p.ow + i] = sum;
+}

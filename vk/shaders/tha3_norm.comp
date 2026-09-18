@@ -1,0 +1,46 @@
+#version 450
+
+// The second half of an instance norm, in place: the slices' statistics
+// combined by Chan's formula, then (x - mean) / sqrt(var + 1e-5) scaled and
+// shifted, then the block's non-linearity, then the resnet's residual, in
+// the order tha3/blocks.go applies them.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Arena { float a[]; };
+layout(std430, binding = 1) readonly buffer Weights { float w[]; };
+layout(std430, binding = 2) readonly buffer Pose { float pose[]; };
+
+layout(push_constant) uniform Push {
+    uint x, plane, slices, stats, gamma, beta, act, residual, hasResidual;
+} p;
+
+shared float scaleShift[2];
+
+void main() {
+    uint c = gl_WorkGroupID.y;
+    if (gl_LocalInvocationID.x == 0u) {
+        uint o = p.stats + c * p.slices * 3u;
+        float n = a[o], mean = a[o + 1u], m2 = a[o + 2u];
+        for (uint s = 1u; s < p.slices; s++) {
+            float nb = a[o + s * 3u], mb = a[o + s * 3u + 1u], m2b = a[o + s * 3u + 2u];
+            float nt = n + nb;
+            float d = mb - mean;
+            mean += d * nb / nt;
+            m2 += m2b + d * d * n * nb / nt;
+            n = nt;
+        }
+        float scale = w[p.gamma + c] / sqrt(m2 / n + 1e-5);
+        scaleShift[0] = scale;
+        scaleShift[1] = w[p.beta + c] - mean * scale;
+    }
+    barrier();
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.plane) return;
+    uint at = p.x + c * p.plane + i;
+    float v = a[at] * scaleShift[0] + scaleShift[1];
+    if (p.act == 1u) v = max(v, 0.0);
+    else if (p.act == 2u && v < 0.0) v *= 0.1;
+    if (p.hasResidual != 0u) v += a[p.residual + c * p.plane + i];
+    a[at] = v;
+}

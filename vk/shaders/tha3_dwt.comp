@@ -1,0 +1,40 @@
+#version 450
+
+// The depthwise transposed 4×4, stride 2, padding 1 of the upsampling blocks,
+// written as a gather: an output pixel oy is reached by input iy through tap
+// ky when oy = 2*iy - 1 + ky, so each output reads at most two rows and two
+// columns and no two lanes write the same float.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Arena { float a[]; };
+layout(std430, binding = 1) readonly buffer Weights { float w[]; };
+layout(std430, binding = 2) readonly buffer Pose { float pose[]; };
+
+layout(push_constant) uniform Push {
+    uint src, dst, h, w, oh, ow, weights;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.oh * p.ow) return;
+    uint c = gl_WorkGroupID.y;
+    int oy = int(i / p.ow), ox = int(i % p.ow);
+    uint sbase = p.src + c * p.h * p.w;
+    uint wbase = p.weights + c * 16u;
+    float sum = 0.0;
+    for (int ky = 0; ky < 4; ky++) {
+        int ty = oy + 1 - ky;
+        if (ty < 0 || (ty & 1) != 0) continue;
+        int iy = ty / 2;
+        if (iy >= int(p.h)) continue;
+        for (int kx = 0; kx < 4; kx++) {
+            int tx = ox + 1 - kx;
+            if (tx < 0 || (tx & 1) != 0) continue;
+            int ix = tx / 2;
+            if (ix >= int(p.w)) continue;
+            sum += w[wbase + uint(ky * 4 + kx)] * a[sbase + uint(iy) * p.w + uint(ix)];
+        }
+    }
+    a[p.dst + c * p.oh * p.ow + i] = sum;
+}

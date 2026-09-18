@@ -1,0 +1,53 @@
+#version 450
+
+// An output head: a dense 3×3 from the last feature map (32 or 64 channels)
+// to one, two or four, a bias, and a sigmoid, a tanh or nothing. There are too
+// few outputs to give each its own lane, so one lane computes every output of
+// its pixel.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Arena { float a[]; };
+layout(std430, binding = 1) readonly buffer Weights { float w[]; };
+layout(std430, binding = 2) readonly buffer Pose { float pose[]; };
+
+layout(push_constant) uniform Push {
+    uint src, dst, cin, cout, h, w, weights, bias, hasBias, act;
+} p;
+
+// tanh through one exponential of a negative argument, which cannot
+// overflow whatever the input.
+float stableTanh(float v) {
+    float e = exp(-2.0 * abs(v));
+    float t = (1.0 - e) / (1.0 + e);
+    return v < 0.0 ? -t : t;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint plane = p.h * p.w;
+    if (i >= plane) return;
+    int y = int(i / p.w), x = int(i % p.w);
+    float acc[4];
+    for (uint o = 0u; o < 4u; o++) acc[o] = (p.hasBias != 0u && o < p.cout) ? w[p.bias + o] : 0.0;
+    for (uint ci = 0u; ci < p.cin; ci++) {
+        uint sbase = p.src + ci * plane;
+        for (int ky = 0; ky < 3; ky++) {
+            int iy = y - 1 + ky;
+            if (iy < 0 || iy >= int(p.h)) continue;
+            for (int kx = 0; kx < 3; kx++) {
+                int ix = x - 1 + kx;
+                if (ix < 0 || ix >= int(p.w)) continue;
+                float v = a[sbase + uint(iy) * p.w + uint(ix)];
+                for (uint o = 0u; o < p.cout; o++)
+                    acc[o] += w[p.weights + (o * p.cin + ci) * 9u + uint(ky * 3 + kx)] * v;
+            }
+        }
+    }
+    for (uint o = 0u; o < p.cout; o++) {
+        float v = acc[o];
+        if (p.act == 3u) v = 1.0 / (1.0 + exp(-v));
+        else if (p.act == 4u) v = stableTanh(v);
+        a[p.dst + o * plane + i] = v;
+    }
+}

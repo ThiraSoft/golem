@@ -1,0 +1,59 @@
+#version 450
+
+// The 1×1 convolution as a product: out[m][n] = sum over k of W[m][k] X[k][n],
+// with m the output channel, k the input channel and n the pixel, plus a bias.
+// A workgroup of 16×16 lanes answers a 64×64 tile, each lane a 4×4 block,
+// stepping through the input channels sixteen at a time through shared memory.
+// Most of the poser's arithmetic is here.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) buffer Arena { float a[]; };
+layout(std430, binding = 1) readonly buffer Weights { float w[]; };
+layout(std430, binding = 2) readonly buffer Pose { float pose[]; };
+
+layout(push_constant) uniform Push {
+    uint src, dst, cin, cout, pix, weights, bias, hasBias;
+} p;
+
+shared float As[16][64];
+shared float Bs[16][64];
+
+void main() {
+    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;
+    uint lid = ty * 16u + tx;
+    uint n0 = gl_WorkGroupID.x * 64u, m0 = gl_WorkGroupID.y * 64u;
+    float acc[4][4];
+    for (uint i = 0u; i < 4u; i++)
+        for (uint j = 0u; j < 4u; j++) acc[i][j] = 0.0;
+
+    for (uint k0 = 0u; k0 < p.cin; k0 += 16u) {
+        for (uint r = 0u; r < 4u; r++) {
+            uint e = r * 256u + lid;
+            uint kk = e / 64u, mn = e % 64u;
+            uint k = k0 + kk;
+            uint m = m0 + mn, n = n0 + mn;
+            As[kk][mn] = (m < p.cout && k < p.cin) ? w[p.weights + m * p.cin + k] : 0.0;
+            Bs[kk][mn] = (k < p.cin && n < p.pix) ? a[p.src + k * p.pix + n] : 0.0;
+        }
+        barrier();
+        for (uint kk = 0u; kk < 16u; kk++) {
+            float av[4], bv[4];
+            for (uint i = 0u; i < 4u; i++) av[i] = As[kk][ty * 4u + i];
+            for (uint j = 0u; j < 4u; j++) bv[j] = Bs[kk][tx * 4u + j];
+            for (uint i = 0u; i < 4u; i++)
+                for (uint j = 0u; j < 4u; j++) acc[i][j] += av[i] * bv[j];
+        }
+        barrier();
+    }
+
+    for (uint i = 0u; i < 4u; i++) {
+        uint m = m0 + ty * 4u + i;
+        if (m >= p.cout) continue;
+        float b = p.hasBias != 0u ? w[p.bias + m] : 0.0;
+        for (uint j = 0u; j < 4u; j++) {
+            uint n = n0 + tx * 4u + j;
+            if (n < p.pix) a[p.dst + m * p.pix + n] = acc[i][j] + b;
+        }
+    }
+}
