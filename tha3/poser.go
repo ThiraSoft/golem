@@ -3,6 +3,7 @@ package tha3
 import (
 	"errors"
 	"fmt"
+	"image"
 	"os"
 	"path/filepath"
 	"time"
@@ -38,6 +39,8 @@ type Poser struct {
 	editor     *editor
 	files      []*weights
 	gpu        *gpuPoser // set by UseVulkan
+	gpuTrace   bool      // the card keeps every waypoint, for the tests
+	view       image.Rectangle
 	closed     bool
 
 	// The last pose rendered and its frame, reused while neither changes.
@@ -57,6 +60,9 @@ type Poser struct {
 	trace tracer // tests only
 }
 
+// whole is the frame the networks make, and the view until SetView.
+var whole = image.Rect(0, 0, Size, Size)
+
 // Timings is how long each network took on the last call, by network name.
 type Timings map[string]time.Duration
 
@@ -66,7 +72,7 @@ var errClosed = errors.New("tha3: poser is closed")
 
 // Open loads the five networks from dir, which Dir usually names.
 func Open(dir string) (*Poser, error) {
-	p := &Poser{timings: Timings{}}
+	p := &Poser{timings: Timings{}, view: whole}
 	byName := map[string]*weights{}
 	for _, n := range []string{netEyebrowDecomposer, netEyebrowCombiner, netFaceMorpher, netRotator, netEditor} {
 		w, err := openWeights(dir, n)
@@ -218,6 +224,9 @@ func (p *Poser) poseCPU(pose [NumParams]float32, from stage) (Tensor, error) {
 	timed(netEditor, func() {
 		frame = p.editor.forward(full, warped, grid, rotationPose, p.trace.sub(netEditor))
 	})
+	if v := p.view; v != whole {
+		frame = frame.Crop(v.Min.Y, v.Min.X, v.Dy(), v.Dx())
+	}
 	return frame, nil
 }
 
@@ -263,6 +272,37 @@ func (p *Poser) Pose(pose [NumParams]float32) (Tensor, error) {
 	p.started = from
 	p.lastPose, p.lastFrame, p.haveLast = pose, frame, true
 	return frame.Clone(), nil
+}
+
+// SetView makes Pose return only the part r of the frame. The networks still
+// compute the whole frame, which their norms need, but the card sends back
+// only r: a 224×224 view is a fifth of the floats of the whole 512×512 frame.
+// On the card a new view rebuilds the passes, so it is set once, early.
+func (p *Poser) SetView(r image.Rectangle) error {
+	if p.closed {
+		return errClosed
+	}
+	if r.Empty() || !r.In(whole) {
+		return fmt.Errorf("tha3: view %v is not inside the %dx%d frame", r, Size, Size)
+	}
+	if r == p.view {
+		return nil
+	}
+	old := p.view
+	p.view = r
+	p.haveLast = false
+	if p.gpu == nil {
+		return nil
+	}
+	p.gpu.close()
+	p.gpu = nil
+	if err := p.useVulkan(p.gpuTrace); err != nil {
+		// Back to the view the card had, on the processor: the caller
+		// learns the card is gone rather than finding out by the speed.
+		p.view = old
+		return fmt.Errorf("tha3: the card for the new view: %w", err)
+	}
+	return nil
 }
 
 // Timings returns how long each network took on the last SetImage and Pose.

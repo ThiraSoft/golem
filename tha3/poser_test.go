@@ -2,6 +2,7 @@ package tha3
 
 import (
 	"errors"
+	"image"
 	"io/fs"
 	"testing"
 
@@ -170,5 +171,80 @@ func TestPoseStartsAtTheFirstChange(t *testing.T) {
 			}
 		}
 		check(t, p, full)
+	})
+}
+
+// A view is the same floats as that part of the whole frame, on the
+// processor, and on the card whether the view came before or after it.
+func TestView(t *testing.T) {
+	f := loadFixtures(t, "neutral")
+	img := f.tensor(t, "image")
+	var pose [NumParams]float32
+	copy(pose[:], f.Pose)
+	view := image.Rect(144, 32, 368, 256)
+	check := func(t *testing.T, card bool, before bool) {
+		p, full := openPoserOrSkip(t), openPoserOrSkip(t)
+		defer p.Close()
+		defer full.Close()
+		if card {
+			if err := full.UseVulkan(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if before {
+			if err := p.SetView(view); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if card {
+			if err := p.UseVulkan(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, x := range []*Poser{p, full} {
+			if err := x.SetImage(img); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !before {
+			if _, err := p.Pose(pose); err != nil { // a frame of the old view, cached
+				t.Fatal(err)
+			}
+			if err := p.SetView(view); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := p.Pose(pose)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.C != 4 || got.H != view.Dy() || got.W != view.Dx() {
+			t.Fatalf("frame is %dx%dx%d, want 4x%dx%d", got.C, got.H, got.W, view.Dy(), view.Dx())
+		}
+		want, err := full.Pose(pose)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want = want.Crop(view.Min.Y, view.Min.X, view.Dy(), view.Dx())
+		for i := range got.Data {
+			if got.Data[i] != want.Data[i] {
+				t.Fatalf("float %d is %v, want %v", i, got.Data[i], want.Data[i])
+			}
+		}
+	}
+	t.Run("cpu", func(t *testing.T) { check(t, false, true) })
+	dev, err := vk.Open()
+	if err != nil {
+		t.Skipf("no Vulkan device: %v", err)
+	}
+	dev.Close()
+	t.Run("card, view first", func(t *testing.T) { check(t, true, true) })
+	t.Run("card, view after", func(t *testing.T) { check(t, true, false) })
+	t.Run("outside", func(t *testing.T) {
+		p := openPoserOrSkip(t)
+		defer p.Close()
+		if err := p.SetView(image.Rect(400, 0, 600, 100)); err == nil {
+			t.Fatal("a view past the frame was accepted")
+		}
 	})
 }

@@ -56,7 +56,7 @@ func (p *Poser) useVulkan(trace bool) error {
 			return err
 		}
 	}
-	p.gpu = q
+	p.gpu, p.gpuTrace = q, trace
 	p.haveLast = false
 	return nil
 }
@@ -95,7 +95,7 @@ func (q *gpuPoser) pose(p *Poser, pose [NumParams]float32, from stage) (Tensor, 
 			p.timings[s.Label] = time.Duration(float64(total) * float64(s.Ticks) / float64(sum))
 		}
 	}
-	return Tensor{C: 4, H: Size, W: Size, Data: q.run.Output(0)}, nil
+	return Tensor{C: 4, H: p.view.Dy(), W: p.view.Dx(), Data: q.run.Output(0)}, nil
 }
 
 func (q *gpuPoser) close() {
@@ -326,6 +326,9 @@ func (d *describer) poser(p *Poser) vk.THA3Tensor {
 	d.emit(netEditor+".in.1", warped)
 	d.emit(netEditor+".in.2", grid)
 	frame := d.editor(p.editor, full, warped, grid)
+	if v := p.view; v != whole {
+		frame = g.Crop(frame, v.Min.Y, v.Min.X, v.Dy(), v.Dx())
+	}
 	g.Output(frame)
 	g.Stamp(netEditor)
 	return image
