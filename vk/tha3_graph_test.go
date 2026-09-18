@@ -137,3 +137,21 @@ func TestTHA3PlanPinsAcrossEntries(t *testing.T) {
 	}
 	overlapFree(t, g)
 }
+
+func TestTHA3PWSlices(t *testing.T) {
+	for _, c := range []struct{ tiles, cin, slices int }{
+		{4 * 8, 512, 8},  // 512 to 512 on 16×16: split
+		{16 * 8, 512, 2}, // on 32×32
+		{4096, 96, 1},    // the editor's first product, wide already
+		{8, 32, 1},       // too few channels to split
+		{1, 539, 7},      // 8 asked, of 80 channels once rounded: 7 cover it
+	} {
+		slices, kper := pwSlices(c.tiles, c.cin)
+		if slices != c.slices {
+			t.Errorf("%d tiles over %d channels: %d slices, want %d", c.tiles, c.cin, slices, c.slices)
+		}
+		if slices > 1 && (kper%16 != 0 || slices*kper < c.cin || (slices-1)*kper >= c.cin) {
+			t.Errorf("%d tiles over %d channels: %d slices of %d do not cover it once", c.tiles, c.cin, slices, kper)
+		}
+	}
+}

@@ -22,6 +22,7 @@ const (
 	tha3PW
 	tha3Stats
 	tha3Norm
+	tha3Sum
 )
 
 // tha3KernelSpec is one shader and the size of its push constants. Each ops

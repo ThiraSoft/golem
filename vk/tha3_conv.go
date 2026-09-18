@@ -11,6 +11,7 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/tha3_dw.comp -o shaders/tha3_dw.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/tha3_dwt.comp -o shaders/tha3_dwt.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/tha3_pw.comp -o shaders/tha3_pw.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/tha3_sum.comp -o shaders/tha3_sum.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/tha3_head.comp -o shaders/tha3_head.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/tha3_stats.comp -o shaders/tha3_stats.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/tha3_norm.comp -o shaders/tha3_norm.spv
@@ -23,6 +24,9 @@ var tha3DWTSPIRV []byte
 
 //go:embed shaders/tha3_pw.spv
 var tha3PWSPIRV []byte
+
+//go:embed shaders/tha3_sum.spv
+var tha3SumSPIRV []byte
 
 //go:embed shaders/tha3_head.spv
 var tha3HeadSPIRV []byte
@@ -42,7 +46,9 @@ type tha3DWPush struct{ src, dst, h, w, oh, ow, k, stride, pad, weights uint32 }
 
 type tha3DWTPush struct{ src, dst, h, w, oh, ow, weights uint32 }
 
-type tha3PWPush struct{ src, dst, cin, cout, pix, weights, bias, hasBias uint32 }
+type tha3PWPush struct{ src, dst, cin, cout, pix, weights, bias, hasBias, slices, kper uint32 }
+
+type tha3SumPush struct{ src, dst, cout, pix, slices, bias, hasBias uint32 }
 
 type tha3HeadPush struct{ src, dst, cin, cout, h, w, weights, bias, hasBias, act uint32 }
 
@@ -54,6 +60,7 @@ func init() {
 	tha3Kernels[tha3DW] = tha3KernelSpec{tha3DWSPIRV, unsafe.Sizeof(tha3DWPush{})}
 	tha3Kernels[tha3DWT] = tha3KernelSpec{tha3DWTSPIRV, unsafe.Sizeof(tha3DWTPush{})}
 	tha3Kernels[tha3PW] = tha3KernelSpec{tha3PWSPIRV, unsafe.Sizeof(tha3PWPush{})}
+	tha3Kernels[tha3Sum] = tha3KernelSpec{tha3SumSPIRV, unsafe.Sizeof(tha3SumPush{})}
 	tha3Kernels[tha3Head] = tha3KernelSpec{tha3HeadSPIRV, unsafe.Sizeof(tha3HeadPush{})}
 	tha3Kernels[tha3Stats] = tha3KernelSpec{tha3StatsSPIRV, unsafe.Sizeof(tha3StatsPush{})}
 	tha3Kernels[tha3Norm] = tha3KernelSpec{tha3NormSPIRV, unsafe.Sizeof(tha3NormPush{})}
@@ -99,14 +106,52 @@ func (g *THA3Graph) PW(x THA3Tensor, w, bias THA3Weights, out int) THA3Tensor {
 	}
 	y := g.tensor(out, x.H, x.W)
 	pix := x.H * x.W
-	g.op([]THA3Tensor{x}, []THA3Tensor{y}, func(r *Recorder, rx *THA3Runner) {
-		push := tha3PWPush{src: rx.at(x), dst: rx.at(y), cin: uint32(x.C), cout: uint32(out), pix: uint32(pix), weights: uint32(w.off)}
+	pixTiles, outTiles := (pix+63)/64, (out+63)/64
+	slices, kper := pwSlices(pixTiles*outTiles, x.C)
+	if slices == 1 {
+		g.op([]THA3Tensor{x}, []THA3Tensor{y}, func(r *Recorder, rx *THA3Runner) {
+			push := tha3PWPush{src: rx.at(x), dst: rx.at(y), cin: uint32(x.C), cout: uint32(out), pix: uint32(pix),
+				weights: uint32(w.off), slices: 1, kper: uint32(x.C)}
+			if bias.n != 0 {
+				push.bias, push.hasBias = uint32(bias.off), 1
+			}
+			rx.dispatch(r, tha3PW, pixTiles, outTiles, unsafe.Pointer(&push))
+		})
+		return y
+	}
+	parts := g.tensor(slices*out, x.H, x.W)
+	g.op([]THA3Tensor{x}, []THA3Tensor{parts}, func(r *Recorder, rx *THA3Runner) {
+		push := tha3PWPush{src: rx.at(x), dst: rx.at(parts), cin: uint32(x.C), cout: uint32(out), pix: uint32(pix),
+			weights: uint32(w.off), slices: uint32(slices), kper: uint32(kper)}
+		rx.dispatch(r, tha3PW, pixTiles*slices, outTiles, unsafe.Pointer(&push))
+	})
+	g.op([]THA3Tensor{parts}, []THA3Tensor{y}, func(r *Recorder, rx *THA3Runner) {
+		push := tha3SumPush{src: rx.at(parts), dst: rx.at(y), cout: uint32(out), pix: uint32(pix), slices: uint32(slices)}
 		if bias.n != 0 {
 			push.bias, push.hasBias = uint32(bias.off), 1
 		}
-		rx.dispatch(r, tha3PW, (pix+63)/64, (out+63)/64, unsafe.Pointer(&push))
+		rx.dispatch(r, tha3Sum, groups256(pix), out, unsafe.Pointer(&push))
 	})
 	return y
+}
+
+// pwTarget is how many workgroups a product is split to reach, and pwMinK the
+// fewest input channels a slice walks: below that the sum pass costs more than
+// the slice saves. Measured on the RX 9070 XT, the whole pose went from 24.2 to
+// 22 ms; 128 to 512 workgroups all land within the noise of it, and slices
+// of 32 channels are slower.
+const pwTarget, pwMinK = 256, 64
+
+// pwSlices splits a product of tiles tiles over cin input channels into
+// slices of kper channels, a whole number of the kernel's sixteen.
+func pwSlices(tiles, cin int) (slices, kper int) {
+	slices = min((pwTarget+tiles-1)/tiles, cin/pwMinK)
+	if slices <= 1 {
+		return 1, cin
+	}
+	kper = (cin + slices - 1) / slices
+	kper = (kper + 15) / 16 * 16
+	return (cin + kper - 1) / kper, kper
 }
 
 // Head is a dense 3×3 to at most four channels, a bias or none, and a sigmoid,
