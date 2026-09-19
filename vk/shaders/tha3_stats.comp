@@ -1,0 +1,56 @@
+#version 450
+
+// The first half of an instance norm: for one slice of one channel, the
+// count, the mean and the sum of squared deviations from that mean. Two
+// passes over the slice rather than a sum of squares, which loses the
+// variance to cancellation on a plane whose mean is large. tha3_norm.comp
+// combines the slices.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Arena { float a[]; };
+layout(std430, binding = 1) readonly buffer Weights { float w[]; };
+layout(std430, binding = 2) readonly buffer Pose { float pose[]; };
+
+layout(push_constant) uniform Push {
+    uint src, plane, sliceLen, slices, stats;
+} p;
+
+shared float part[256];
+
+void main() {
+    uint s = gl_WorkGroupID.x, c = gl_WorkGroupID.y, t = gl_LocalInvocationID.x;
+    uint begin = s * p.sliceLen;
+    uint end = min(p.plane, begin + p.sliceLen);
+    uint base = p.src + c * p.plane;
+
+    float sum = 0.0;
+    for (uint i = begin + t; i < end; i += 256u) sum += a[base + i];
+    part[t] = sum;
+    barrier();
+    for (uint span = 128u; span > 0u; span >>= 1) {
+        if (t < span) part[t] += part[t + span];
+        barrier();
+    }
+    float n = float(end - begin);
+    float mean = part[0] / n;
+    barrier();
+
+    float m2 = 0.0;
+    for (uint i = begin + t; i < end; i += 256u) {
+        float d = a[base + i] - mean;
+        m2 += d * d;
+    }
+    part[t] = m2;
+    barrier();
+    for (uint span = 128u; span > 0u; span >>= 1) {
+        if (t < span) part[t] += part[t + span];
+        barrier();
+    }
+    if (t == 0u) {
+        uint o = p.stats + (c * p.slices + s) * 3u;
+        a[o] = n;
+        a[o + 1u] = mean;
+        a[o + 2u] = part[0];
+    }
+}

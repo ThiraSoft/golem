@@ -1,0 +1,24 @@
+#version 450
+
+// The end of a product split along its input channels (tha3_pw.comp): the
+// slices' partial sums added, in slice order, and the bias.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Arena { float a[]; };
+layout(std430, binding = 1) readonly buffer Weights { float w[]; };
+layout(std430, binding = 2) readonly buffer Pose { float pose[]; };
+
+layout(push_constant) uniform Push {
+    uint src, dst, cout, pix, slices, bias, hasBias;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.pix) return;
+    uint m = gl_WorkGroupID.y;
+    uint at = m * p.pix + i;
+    float v = p.hasBias != 0u ? w[p.bias + m] : 0.0;
+    for (uint s = 0u; s < p.slices; s++) v += a[p.src + s * p.cout * p.pix + at];
+    a[p.dst + at] = v;
+}

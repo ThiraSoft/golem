@@ -338,3 +338,29 @@ func TestAPromptIsCutToThePassWidth(t *testing.T) {
 		})
 	}
 }
+
+// Every picture has the same placeholder tokens: a new one is not the one the
+// cache read, and the prefix stops where it starts.
+func TestCommonStopsAtAnotherPicture(t *testing.T) {
+	ids := []int32{1, 7, 7, 2}
+	red, blue := []float32{1, 0}, []float32{0, 1}
+	held := [][]float32{nil, red, red, nil}
+	for _, c := range []struct {
+		name   string
+		embeds [][]float32
+		want   int
+	}{
+		{"the same rows", [][]float32{nil, red, red, nil}, 4},
+		{"equal rows, other slices", [][]float32{nil, {1, 0}, {1, 0}, nil}, 4},
+		{"another picture", [][]float32{nil, blue, blue, nil}, 1},
+		{"its second half changed", [][]float32{nil, red, blue, nil}, 1},
+		{"text where a picture was", nil, 1},
+	} {
+		if got := common(ids, held, ids, c.embeds); got != c.want {
+			t.Errorf("%s: %d positions shared, want %d", c.name, got, c.want)
+		}
+	}
+	if got := common(ids, nil, ids, nil); got != 4 {
+		t.Errorf("text alone: %d shared, want 4", got)
+	}
+}

@@ -2,6 +2,7 @@
 /pocket-tts
 /golem-cli
 /golem-server
+/tha3-pose
 *.test
 
 # Voice states. None ship with the repository: they belong to whoever published
@@ -67,3 +68,6 @@ __pycache__/
 # behind. They belong to whoever published the text; the two commands that
 # make them are in compress/README.md.
 /scratchpad/
+
+# THA3 recordings, same rule as the others. ref/tha3/README.md makes them.
+/testdata/tha3/

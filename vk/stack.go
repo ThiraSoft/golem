@@ -161,7 +161,10 @@ type Stack struct {
 	embedPre *Buffer
 	embedSet *Set
 	ids      *Buffer // one identifier a column, negative where the caller wrote its own
-	embedOf  embedPush
+	// seeded says the pass SetTokens set up has columns of the caller's: the
+	// stream is copied onto the card before the lookup fills the others.
+	seeded  bool
+	embedOf embedPush
 
 	routerIn  *Buffer // the residual under the router's own norm and scale
 	routerOut *Buffer // one logit per expert
@@ -407,6 +410,13 @@ func (s *Stack) SetTokens(ids []int32) error {
 		return fmt.Errorf("vk: a pass carries %d columns, given %d identifiers", maxColumns, len(ids))
 	}
 	copy(unsafe.Slice((*int32)(unsafe.Pointer(&s.ids.Bytes()[0])), maxColumns), ids)
+	s.seeded = false
+	for _, id := range ids {
+		if id < 0 {
+			s.seeded = true
+			break
+		}
+	}
 	return nil
 }
 
@@ -707,13 +717,19 @@ func (s *Stack) Run(at []Position, experts, used int) error {
 		s.programs = map[string]*Program{}
 	}
 	shape := shapeKey(runs)
+	// A pass that brings rows of its own records the copy that a pass of
+	// tokens alone goes without.
+	seeded := s.embedSet != nil && s.seeded
+	if seeded {
+		shape += "+seeded"
+	}
 	p, ok := s.programs[shape]
 	if !ok {
 		if len(s.programs) >= programCap {
 			s.forget()
 		}
 		var err error
-		if p, err = s.d.Compile(func(r *Recorder) { s.record(r, experts, used, columns, runs) }); err != nil {
+		if p, err = s.d.Compile(func(r *Recorder) { s.record(r, experts, used, columns, runs, seeded) }); err != nil {
 			return err
 		}
 		s.programs[shape] = p
@@ -737,7 +753,7 @@ func shapeKey(runs []span) string {
 }
 
 // record is the whole stack, written into a command buffer once.
-func (s *Stack) record(r *Recorder, experts, used, columns int, runs []span) {
+func (s *Stack) record(r *Recorder, experts, used, columns int, runs []span, seeded bool) {
 	cols := uint32(columns)
 	quant := normPush{n: uint32(s.dim), flags: normGain | normQuant, eps: s.eps, scalar: 1}
 	if s.attn.Golem() {
@@ -765,7 +781,13 @@ func (s *Stack) record(r *Recorder, experts, used, columns int, runs []span) {
 	}
 	if s.embedSet != nil {
 		// The embedding before anything, since the stream is what the first
-		// block norms.
+		// block norms. A picture's rows were written to the stage, and the
+		// lookup leaves their columns alone: they are copied first, or the
+		// model reads whatever the last pass left there.
+		if seeded {
+			r.CopyFrom(s.xs, 0, s.stage, 0, columns*s.dim*4)
+			r.Barrier()
+		}
 		groups := cols
 		if s.embedGolem != nil {
 			// A workgroup a group of the rotation rather than a column.

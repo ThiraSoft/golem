@@ -1,0 +1,31 @@
+#version 450
+
+// F.interpolate(mode="bilinear", align_corners=False) without antialias, the
+// same taps as tha3/resample.go's bilinearTaps: the output centre mapped
+// back, clamped at zero, the upper neighbour clamped to the last pixel.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Arena { float a[]; };
+layout(std430, binding = 1) readonly buffer Weights { float w[]; };
+layout(std430, binding = 2) readonly buffer Pose { float pose[]; };
+
+layout(push_constant) uniform Push {
+    uint src, srcH, srcW, dst, dstH, dstW;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.dstH * p.dstW) return;
+    uint c = gl_WorkGroupID.y;
+    uint oy = i / p.dstW, ox = i % p.dstW;
+    float sy = max((float(oy) + 0.5) * (float(p.srcH) / float(p.dstH)) - 0.5, 0.0);
+    float sx = max((float(ox) + 0.5) * (float(p.srcW) / float(p.dstW)) - 0.5, 0.0);
+    uint y0 = min(uint(sy), p.srcH - 1u), y1 = min(y0 + 1u, p.srcH - 1u);
+    uint x0 = min(uint(sx), p.srcW - 1u), x1 = min(x0 + 1u, p.srcW - 1u);
+    float fy = sy - float(y0), fx = sx - float(x0);
+    uint base = p.src + c * p.srcH * p.srcW;
+    float top = a[base + y0 * p.srcW + x0] * (1.0 - fx) + a[base + y0 * p.srcW + x1] * fx;
+    float bottom = a[base + y1 * p.srcW + x0] * (1.0 - fx) + a[base + y1 * p.srcW + x1] * fx;
+    a[p.dst + c * p.dstH * p.dstW + i] = top * (1.0 - fy) + bottom * fy;
+}

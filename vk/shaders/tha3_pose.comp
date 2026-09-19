@@ -1,0 +1,22 @@
+#version 450
+
+// Pose floats tiled over planes, one plane a value: what the networks
+// concatenate to their features. It reads the pose buffer, which the host
+// rewrites before every pose, so the recording never changes.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Arena { float a[]; };
+layout(std430, binding = 1) readonly buffer Weights { float w[]; };
+layout(std430, binding = 2) readonly buffer Pose { float pose[]; };
+
+layout(push_constant) uniform Push {
+    uint dst, plane, from;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.plane) return;
+    uint c = gl_WorkGroupID.y;
+    a[p.dst + c * p.plane + i] = pose[p.from + c];
+}

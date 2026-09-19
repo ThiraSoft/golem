@@ -113,6 +113,15 @@ func TestUnifiedProjectionMatchesTheReference(t *testing.T) {
 // for E2B: the picture encoded, spliced into the fixture's own tokens, and the
 // same continuation drawn from it.
 func TestUnifiedVisionGenerationMatchesTheReference(t *testing.T) {
+	unifiedVisionGeneration(t, false)
+}
+
+// The same on the card, which is where the server runs it.
+func TestUnifiedVisionGenerationOnVulkan(t *testing.T) {
+	unifiedVisionGeneration(t, true)
+}
+
+func unifiedVisionGeneration(t *testing.T, vulkan bool) {
 	f := loadVisionFixture(t, "vision12")
 	if os.Getenv("GOLEM_MMPROJ_12B") == "" {
 		t.Skip("set GOLEM_MMPROJ_12B to run this test")
@@ -122,6 +131,14 @@ func TestUnifiedVisionGenerationMatchesTheReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { m.Close() })
+	if vulkan {
+		if err := m.UseVulkanStack(); err != nil {
+			t.Skipf("no card: %v", err)
+		}
+		if err := m.UseVulkanHead(); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := m.OpenProjector(os.Getenv("GOLEM_MMPROJ_12B")); err != nil {
 		t.Fatal(err)
 	}
