@@ -61,6 +61,9 @@ type Model struct {
 	Forward  Forward
 	Vocab    Vocabulary
 	Template chat.Template
+	// TemplateFrom says which template renders: the file's, or the engine's
+	// own and why.
+	TemplateFrom string
 	// Name is the architecture the file declares.
 	Name string
 	// Window is the largest sliding window any block uses, and 0 when every
@@ -315,8 +318,9 @@ func openGemma(g *tensors.GGUF, maxContext int) (*Model, error) {
 			window = b.WindowSize
 		}
 	}
+	tpl, from := fileTemplate(g, gemma.NewTemplate(inner.Cfg), gemma.FileMedia, nil)
 	return &Model{
-		Forward: inner, Vocab: vocab, Template: gemma.NewTemplate(inner.Cfg),
+		Forward: inner, Vocab: vocab, Template: tpl, TemplateFrom: from,
 		Window: window, Vocabulary: inner.Cfg.Vocab,
 		Blocks: len(inner.Cfg.Blocks), Sampling: inner.Cfg.Sampling,
 		closer: inner,
@@ -334,8 +338,9 @@ func openQwen(g *tensors.GGUF, maxContext int) (*Model, error) {
 	}
 	// Every Qwen3 block attends to the whole context: there is no window to
 	// respect, and a rewind costs nothing.
+	tpl, from := fileTemplate(g, qwen.NewTemplate(inner.Cfg), nil, qwen.DeveloperAsSystem)
 	return &Model{
-		Forward: inner, Vocab: vocab, Template: qwen.NewTemplate(inner.Cfg),
+		Forward: inner, Vocab: vocab, Template: tpl, TemplateFrom: from,
 		Window: 0, Vocabulary: inner.Cfg.Vocab,
 		Blocks: len(inner.Cfg.Blocks), Sampling: inner.Cfg.Sampling,
 		closer: inner,
@@ -360,8 +365,9 @@ func openQwen35(g *tensors.GGUF, maxContext int) (*Model, error) {
 			}
 		}
 	}
+	tpl, from := fileTemplate(g, qwen35.NewTemplate(), qwen35.FileMedia, qwen.DeveloperAsSystem)
 	return &Model{
-		Forward: inner, Vocab: vocab, Template: qwen35.NewTemplate(),
+		Forward: inner, Vocab: vocab, Template: tpl, TemplateFrom: from,
 		Window: 0, Vocabulary: inner.Cfg.Vocab,
 		Blocks: len(inner.Cfg.Blocks), Sampling: inner.Cfg.Sampling,
 		closer: inner,

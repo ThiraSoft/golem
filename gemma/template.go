@@ -4,7 +4,16 @@ package gemma
 // chat.go and does not change; what changes is that the caller no longer has
 // to know which of the two checkpoints it is holding.
 
-import "github.com/ThiraSoft/golem/chat"
+import (
+	"strings"
+
+	"github.com/ThiraSoft/golem/chat"
+)
+
+// FileMedia turns the one token the file's template writes for a picture or a
+// recording into the empty pair of markers RenderChat writes, which is what
+// BuildPrompt fills in.
+var FileMedia = strings.NewReplacer(imageSoft, imageOpen+imageClose, audioSoft, audioOpen+audioClose)
 
 type Template struct{ cfg *Config }
 

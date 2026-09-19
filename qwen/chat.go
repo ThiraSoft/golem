@@ -2,6 +2,10 @@ package qwen
 
 // The chat template, without Jinja.
 //
+// The file's own template renders when there is one golem/jinja reads, through
+// chat.FileTemplate; this is what renders when there is not, or when the
+// caller asks for it.
+//
 // The GGUF carries the template under tokenizer.chat_template. It is not long,
 // but three of its rules are not the ones a reading of the output would
 // suggest, and all three are reproduced here: nothing is trimmed, the empty
@@ -49,14 +53,7 @@ func RenderChat(msgs []chat.Message, opt chat.Options) (string, error) {
 	if len(msgs) == 0 {
 		return "", fmt.Errorf("qwen: the template reads the first message of an empty conversation")
 	}
-	// The template has no developer role and would drop such a message in
-	// silence. It stands for the system message, and is read as one.
-	msgs = append([]chat.Message(nil), msgs...)
-	for i := range msgs {
-		if msgs[i].Role == roleDeveloper {
-			msgs[i].Role = roleSystem
-		}
-	}
+	msgs = DeveloperAsSystem(msgs)
 	for i, m := range msgs {
 		switch m.Role {
 		case roleUser, roleAssistant, roleSystem:
@@ -124,6 +121,19 @@ func RenderChat(msgs []chat.Message, opt chat.Options) (string, error) {
 		}
 	}
 	return b.String(), nil
+}
+
+// DeveloperAsSystem reads a developer message as the system message it stands
+// for. Qwen's template has no developer role and would drop such a message in
+// silence, whichever of the two templates renders it.
+func DeveloperAsSystem(msgs []chat.Message) []chat.Message {
+	msgs = append([]chat.Message(nil), msgs...)
+	for i := range msgs {
+		if msgs[i].Role == roleDeveloper {
+			msgs[i].Role = roleSystem
+		}
+	}
+	return msgs
 }
 
 // lastQueryIndex is the index of the last user message that is not itself a

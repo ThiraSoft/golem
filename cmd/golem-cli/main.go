@@ -82,6 +82,7 @@ func main() {
 	sttDir := flag.String("stt", os.Getenv("GOLEM_STT"), "directory holding a Kyutai STT checkpoint (or GOLEM_STT)")
 	transcribe := flag.String("transcribe", "", "sound file to transcribe; prints the text and exits")
 	listen := flag.Bool("listen", false, "transcribe the microphone until interrupted")
+	builtinTemplate := flag.Bool("builtin-template", false, "write the conversation with golem's own template rather than the one the file carries")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [options]\n", filepath.Base(os.Args[0]))
@@ -132,6 +133,9 @@ func main() {
 		fail(err)
 	}
 	defer m.Close()
+	if *builtinTemplate {
+		m.UseBuiltinTemplate()
+	}
 	if *mmproj != "" {
 		if err := m.OpenProjector(*mmproj); err != nil {
 			fail(err)
@@ -191,6 +195,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%s: %s, %d blocks, %d positions, vocabulary %d, %s, loaded in %s on %d cores\n",
 			filepath.Base(*model), m.Name, m.Blocks, *context, m.Vocabulary, where,
 			loading.Round(time.Millisecond), runtime.NumCPU())
+		fmt.Fprintf(os.Stderr, "template: %s\n", m.TemplateFrom)
 		fmt.Fprintf(os.Stderr, "sampling: temperature %g, top-k %d, top-p %g, seed %d\n",
 			params.Temperature, params.TopK, params.TopP, params.Seed)
 		if params.PenaltyRepeat != 1 || params.PenaltyFreq != 0 || params.PenaltyPresent != 0 {

@@ -51,6 +51,12 @@ the GGUF header with the same code as Gemma's and writes
 `testdata/qwen/chat/cases.json`; its docstring says which of its two
 disagreements with llama.cpp is deliberate.
 
+[`jinja/dump_cases.py`](jinja/dump_cases.py) holds golem's Jinja interpreter
+to Jinja2 itself, in the environment transformers renders chat templates with.
+It writes `testdata/jinja/cases.json`: small templates one construct at a time,
+and every template in `testdata/jinja/templates` — each read out of a model
+file golem runs — over a set of conversations.
+
 ## Building
 
 `LLAMA_DIR` must point at a llama.cpp checkout that has already been built: the

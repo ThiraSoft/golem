@@ -45,6 +45,7 @@ func main() {
 	ttl := flag.Duration("cache-ttl", 0, "forget a conversation's tokens after this long idle; 0 never forgets. The memory is allocated at startup and is released by neither")
 	vulkan := flag.Bool("vulkan", false, "put the logit head and the expert stacks on a Vulkan device")
 	sttStreams := flag.Int("stt-parallel", 1, "transcriptions to carry at once; they are stepped together, so the trunk's weights are read once for all of them")
+	builtinTemplate := flag.Bool("builtin-template", false, "write conversations with golem's own template rather than the one the file carries")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [options]\n", filepath.Base(os.Args[0]))
@@ -74,6 +75,9 @@ func main() {
 		fail(err)
 	}
 	defer m.Close()
+	if *builtinTemplate {
+		m.UseBuiltinTemplate()
+	}
 	if *assistant != "" {
 		if err := m.OpenAssistant(*assistant); err != nil {
 			fail(err)
@@ -170,6 +174,7 @@ func main() {
 	fmt.Fprintf(os.Stderr, "%s: %s, %d blocks, %d positions in %d slot(s) of %d, %s%s, loaded in %s on %d cores\n",
 		name, m.Name, m.Blocks, *context, m.Slots(), m.SlotContext(), head, draft,
 		time.Since(start).Round(time.Millisecond), runtime.NumCPU())
+	fmt.Fprintf(os.Stderr, "template: %s\n", m.TemplateFrom)
 
 	// The image tower, when there is one. It is worth a line of its own: a
 	// tower that did not fit beside the model still runs on the card, and the

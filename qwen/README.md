@@ -50,9 +50,16 @@ it quietly ignored.
 
 ## The chat template
 
-The GGUF carries the template as Jinja under `tokenizer.chat_template`. golem
-does not interpret Jinja. [`chat.go`](chat.go) writes out what that template
-renders: no leading marker of any kind, one `<|im_start|>{role}\n…<|im_end|>\n`
+The GGUF carries the template as Jinja under `tokenizer.chat_template`, and
+that is what renders a conversation, through
+[`chat.FileTemplate`](../chat/filetemplate.go) and golem's interpreter in
+[`jinja/`](../jinja/). A developer message is read as the system message
+first, since the template would drop it. What follows is the built-in
+template, which renders when the file carries none, when its Jinja does not
+parse, or when `-builtin-template` asks for it, and which parses the calls in
+every case.
+
+[`chat.go`](chat.go) writes out what that template renders: no leading marker of any kind, one `<|im_start|>{role}\n…<|im_end|>\n`
 per message, tool declarations folded into the system turn, and an empty
 assistant turn at the end when the caller wants one generated.
 

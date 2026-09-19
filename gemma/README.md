@@ -806,9 +806,15 @@ to read fewer bytes rather than spread them better.
 
 ## The chat template
 
-The GGUF carries the template as eighteen kilobytes of Jinja. golem does not
-interpret Jinja. `chat.go` writes out the path a text conversation takes through
-that template, which is short: a `<bos>`, an optional system turn, one
+The GGUF carries the template as eighteen kilobytes of Jinja, and that is what
+renders a conversation: [`chat.FileTemplate`](../chat/filetemplate.go) runs it
+through golem's own interpreter, [`jinja/`](../jinja/). What follows is the
+built-in template, which renders when the file carries none, when its Jinja
+does not parse, or when `-builtin-template` asks for it, and which parses the
+calls the model writes in every case.
+
+`chat.go` writes out the path a text conversation takes through that template,
+which is short: a `<bos>`, an optional system turn, one
 `<|turn>{role}\n…<turn|>\n` per message with `assistant` renamed `model`, and an
 empty model turn at the end when the caller wants one generated.
 

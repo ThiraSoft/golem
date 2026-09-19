@@ -7,6 +7,11 @@ import (
 	"github.com/ThiraSoft/golem/qwen"
 )
 
+// FileMedia empties the vision pair the file's template writes for a picture,
+// the way this package's Template writes it: the pad between the markers is
+// BuildPrompt's to fill, as many rows as the tower returns.
+var FileMedia = strings.NewReplacer(VisionStart+ImagePad+VisionEnd, VisionStart+VisionEnd)
+
 // Template writes a conversation the way this checkpoint reads one.
 //
 // It is Qwen3's, with one thing added: a turn carrying pictures opens each of

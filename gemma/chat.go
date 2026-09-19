@@ -2,6 +2,10 @@ package gemma
 
 // The chat template, without Jinja.
 //
+// The file's own template renders when there is one golem/jinja reads, through
+// chat.FileTemplate; this is what renders when there is not, or when the
+// caller asks for it.
+//
 // The GGUF carries eighteen kilobytes of Jinja under tokenizer.chat_template.
 // Most of it serves tool declarations, tool calls and content-part arrays; a
 // text conversation walks a path that fits on one screen, and that path is what
