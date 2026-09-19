@@ -71,3 +71,6 @@ __pycache__/
 
 # THA3 recordings, same rule as the others. ref/tha3/README.md makes them.
 /testdata/tha3/
+
+# Krea 2, recorded from ComfyUI by ref/krea2/dump.py.
+/testdata/krea2/
