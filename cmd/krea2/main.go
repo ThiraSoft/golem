@@ -11,7 +11,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"image/png"
 	"math/rand"
 	"os"
 	"time"
@@ -66,7 +65,7 @@ func main() {
 		if err != nil {
 			fail(err)
 		}
-		if err := png.Encode(f, img); err != nil {
+		if err := p.WritePNG(f, img, r); err != nil {
 			fail(err)
 		}
 		f.Close()

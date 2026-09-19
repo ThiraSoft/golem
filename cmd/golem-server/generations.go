@@ -5,7 +5,8 @@ package main
 // It is OpenAI's endpoint with what the ComfyUI mobile front sends beside it:
 // the negative prompt, the steps, the guidance and the seed. The answer is the
 // picture as a base64 PNG, and the seed that drew it, so that a client that
-// asked for a random one can ask for the same picture again.
+// asked for a random one can ask for the same picture again. The PNG carries
+// the request too, and the golem that drew it.
 
 import (
 	"bytes"
@@ -13,7 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
-	"image/png"
+	"io"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
@@ -27,12 +28,17 @@ import (
 // Imager draws pictures. krea2.Pipeline is one; the tests have another.
 type Imager interface {
 	Generate(r krea2.Request, progress krea2.Progress) (*image.NRGBA, krea2.Timings, error)
+	WritePNG(w io.Writer, img image.Image, r krea2.Request) error
 }
 
 // lockedImager lets one picture be drawn at a time: the card holds one.
 type lockedImager struct {
 	mu sync.Mutex
 	im Imager
+}
+
+func (l *lockedImager) WritePNG(w io.Writer, img image.Image, r krea2.Request) error {
+	return l.im.WritePNG(w, img, r)
 }
 
 func (l *lockedImager) Generate(r krea2.Request, p krea2.Progress) (*image.NRGBA, krea2.Timings, error) {
@@ -78,7 +84,7 @@ func (s *Server) generations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
+	if err := s.imager.WritePNG(&buf, img, k); err != nil {
 		refuse(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}

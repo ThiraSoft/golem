@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"image"
 	"image/png"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -15,6 +16,10 @@ import (
 )
 
 type fakeImager struct{ got krea2.Request }
+
+func (f *fakeImager) WritePNG(w io.Writer, img image.Image, r krea2.Request) error {
+	return krea2.WritePNG(w, img, r, "fake")
+}
 
 func (f *fakeImager) Generate(r krea2.Request, _ krea2.Progress) (*image.NRGBA, krea2.Timings, error) {
 	f.got = r
@@ -59,6 +64,9 @@ func TestGenerationsReadsTheFrontsFields(t *testing.T) {
 	}
 	if img.Bounds().Dx() != 512 || img.Bounds().Dy() != 768 || out.Data[0].Seed != 42 {
 		t.Fatalf("a %v picture, seed %d", img.Bounds(), out.Data[0].Seed)
+	}
+	if !bytes.Contains(raw, []byte("Seed: 42")) || !bytes.Contains(raw, []byte("golem ")) {
+		t.Fatal("the PNG does not say how it was drawn")
 	}
 }
 
