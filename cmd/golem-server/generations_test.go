@@ -1,0 +1,164 @@
+package main
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"image"
+	"image/png"
+	"io"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/ThiraSoft/golem/krea2"
+	"github.com/ThiraSoft/golem/sample"
+)
+
+type fakeImager struct{ got krea2.Request }
+
+func (f *fakeImager) WritePNG(w io.Writer, img image.Image, r krea2.Request) error {
+	return krea2.WritePNG(w, img, r, "fake")
+}
+
+func (f *fakeImager) Generate(r krea2.Request, progress krea2.Progress) (*image.NRGBA, krea2.Timings, error) {
+	f.got = r
+	if progress != nil {
+		for i := 1; i <= r.Steps; i++ {
+			progress(i, r.Steps)
+		}
+	}
+	return image.NewNRGBA(image.Rect(0, 0, r.Width, r.Height)), krea2.Timings{}, nil
+}
+
+func generate(t *testing.T, body string) (*fakeImager, *httptest.ResponseRecorder) {
+	t.Helper()
+	f := &fakeImager{}
+	s := NewServer(nil, nil, "krea2", nil, sample.Params{})
+	s.SetImager(f)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/images/generations", strings.NewReader(body)))
+	return f, rec
+}
+
+func TestGenerationsReadsTheFrontsFields(t *testing.T) {
+	f, rec := generate(t, `{"prompt":"a cat","negative_prompt":"ugly","size":"512x768","steps":6,"cfg":2.5,"seed":42}`)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	want := krea2.Request{Prompt: "a cat", Negative: "ugly", Width: 512, Height: 768, Steps: 6, CFG: 2.5, Seed: 42}
+	if f.got != want {
+		t.Fatalf("drew %+v, want %+v", f.got, want)
+	}
+	var out struct {
+		Data []struct {
+			B64  string `json:"b64_json"`
+			Seed uint64 `json:"seed"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(out.Data[0].B64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := png.Decode(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if img.Bounds().Dx() != 512 || img.Bounds().Dy() != 768 || out.Data[0].Seed != 42 {
+		t.Fatalf("a %v picture, seed %d", img.Bounds(), out.Data[0].Seed)
+	}
+	if !bytes.Contains(raw, []byte("Seed: 42")) || !bytes.Contains(raw, []byte("golem ")) {
+		t.Fatal("the PNG does not say how it was drawn")
+	}
+}
+
+func TestGenerationsDefaultsAreTheFronts(t *testing.T) {
+	f, rec := generate(t, `{"prompt":"a cat"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if f.got.Width != 768 || f.got.Height != 1024 || f.got.Steps != 8 || f.got.CFG != 1 {
+		t.Fatalf("drew %+v", f.got)
+	}
+	_, rec = generate(t, `{"prompt":"a cat","seed":-1}`)
+	if rec.Code != 200 {
+		t.Fatalf("status %d", rec.Code)
+	}
+}
+
+func TestGenerationsRefuses(t *testing.T) {
+	for _, body := range []string{`{}`, `{"prompt":"x","n":2}`, `{"prompt":"x","size":"big"}`, `{"prompt":"x","response_format":"url"}`, `nope`} {
+		if _, rec := generate(t, body); rec.Code != 400 {
+			t.Errorf("%s: status %d, want 400", body, rec.Code)
+		}
+	}
+}
+
+func TestGenerationsCanHideThePrompt(t *testing.T) {
+	_, rec := generate(t, `{"prompt":"un secret","negative_prompt":"un autre","seed":3,"hide_prompt":true}`)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out struct {
+		Data []struct {
+			B64 string `json:"b64_json"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(out.Data[0].B64)
+	if bytes.Contains(raw, []byte("secret")) || bytes.Contains(raw, []byte("autre")) || !bytes.Contains(raw, []byte("Seed: 3")) {
+		t.Fatal("the PNG carries the prompt, or not the settings")
+	}
+}
+
+func TestGenerationsReadsTheLoRA(t *testing.T) {
+	f, rec := generate(t, `{"prompt":"a cat","seed":1,"lora":"style.safetensors","lora_strength":0.6}`)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if f.got.Lora != "style.safetensors" || f.got.LoraStrength != 0.6 {
+		t.Fatalf("drew %+v", f.got)
+	}
+	f, _ = generate(t, `{"prompt":"a cat","lora":"style.safetensors"}`)
+	if f.got.LoraStrength != 1 {
+		t.Fatalf("with no strength, drew %+v", f.got)
+	}
+	if _, rec = generate(t, `{"prompt":"a cat","lora":"x.safetensors","lora_strength":2.5}`); rec.Code != 400 {
+		t.Fatalf("a strength of 2.5: status %d", rec.Code)
+	}
+	if _, rec = generate(t, `{"prompt":"a cat","lora":"../unet/krea2_turbo_fp8.safetensors"}`); rec.Code != 400 {
+		t.Fatalf("a path for a LoRA: status %d", rec.Code)
+	}
+}
+
+func TestGenerationsStreamsTheSteps(t *testing.T) {
+	_, rec := generate(t, `{"prompt":"a cat","steps":3,"seed":9,"stream":true}`)
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("status %d, %s", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	var kinds []string
+	var last map[string]any
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if data, ok := strings.CutPrefix(line, "data: "); ok {
+			last = map[string]any{}
+			if err := json.Unmarshal([]byte(data), &last); err != nil {
+				t.Fatal(err)
+			}
+			kinds = append(kinds, fmt.Sprintf("%v %v", last["type"], last["step"]))
+		}
+	}
+	want := "[image_generation.progress 1 image_generation.progress 2 image_generation.progress 3 image_generation.completed <nil>]"
+	if fmt.Sprint(kinds) != want {
+		t.Fatalf("events %v", kinds)
+	}
+	raw, err := base64.StdEncoding.DecodeString(last["b64_json"].(string))
+	if err != nil || !bytes.Contains(raw, []byte("Seed: 9")) || last["seed"].(float64) != 9 {
+		t.Fatalf("the last event's picture: %v", err)
+	}
+}

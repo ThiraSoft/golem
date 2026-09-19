@@ -371,6 +371,29 @@ the embedder's blocks go on the card, beside whatever else is there.
 `nomic/README.md` has the speed against llama.cpp and ollama, on the processor
 and on the card, and the vectors against both.
 
+## Pictures
+
+With `-krea2 <dir>` (or `GOLEM_KREA2`), a ComfyUI directory holding Krea 2's
+three files, it draws pictures at `/v1/images/generations`, alone or beside
+the rest. `krea2/README.md` says what it draws and how close to ComfyUI.
+
+```bash
+./golem-server -krea2 /mnt/data/dev/ComfyUI -krea2-keep -addr 127.0.0.1:8083
+
+curl -s localhost:8083/v1/images/generations \
+  -d '{"prompt": "a red fox in the snow, photo", "size": "768x1024", "seed": 5}'
+```
+
+It is OpenAI's endpoint with what the ComfyUI mobile front sends beside it:
+`negative_prompt`, `steps` (8), `cfg` (1, which never reads the negative
+prompt) and `seed` (drawn when absent or -1). The answer is one picture as
+`b64_json`, a PNG, and the `seed` that drew it. `n` above 1 and
+`response_format: url` are refused. One picture is drawn at a time.
+
+`-krea2-keep` leaves the twelve-gigabyte DiT on the card between pictures;
+without it each picture reads it again, which is most of its time when the
+file is not in the page cache.
+
 ## Flags
 
 | | |

@@ -1,0 +1,53 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// RMS norm of one row a workgroup, in float32 as F.rms_norm does it after
+// ComfyUI's .float(): x / sqrt(mean(x²) + eps), times a weight that is either
+// w (Qwen3's norms) or 1 + w (Krea 2's, whose scales are stored centred on
+// zero), then optionally the DiT's modulation, x·(1 + s) + h, where s and h
+// are each the sum of a vector in the arena (the step's timestep vector) and
+// one in the parameters (the block's own).
+//
+// One wave of sixty-four a row: the rows are either 6144 or 2560 wide, or a
+// head's 128, and there are thousands of them.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint src, srcStride;
+    uint dst, dstStride;
+    uint n, rows;
+    uint weight;   // in the parameters; ~0 for none
+    uint onePlus;
+    float eps;
+    uint sa, sb;   // scale: arena, parameters; ~0 for none
+    uint ha, hb;   // shift
+} p;
+
+void main() {
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (row >= p.rows) return;
+    uint t = gl_LocalInvocationID.x;
+    uint src = p.src + row * p.srcStride, dst = p.dst + row * p.dstStride;
+    float ss = 0.0;
+    for (uint i = t; i < p.n; i += 64u) {
+        float v = a[src + i];
+        ss += v * v;
+    }
+    ss = subgroupAdd(ss);
+    float inv = inversesqrt(ss / float(p.n) + p.eps);
+    for (uint i = t; i < p.n; i += 64u) {
+        float v = a[src + i] * inv;
+        if (p.weight != ~0u) v *= par[p.weight + i] + ((p.onePlus != 0u) ? 1.0 : 0.0);
+        if (p.sa != ~0u) {
+            float s = a[p.sa + i] + par[p.sb + i];
+            float h = a[p.ha + i] + par[p.hb + i];
+            v = v * (1.0 + s) + h;
+        }
+        a[dst + i] = v;
+    }
+}

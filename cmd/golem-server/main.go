@@ -26,6 +26,7 @@ import (
 
 	"github.com/ThiraSoft/golem/engine"
 	"github.com/ThiraSoft/golem/internal/version"
+	"github.com/ThiraSoft/golem/krea2"
 	"github.com/ThiraSoft/golem/nomic"
 	"github.com/ThiraSoft/golem/sample"
 	"github.com/ThiraSoft/golem/stt"
@@ -46,6 +47,8 @@ func main() {
 	vulkan := flag.Bool("vulkan", false, "put the logit head and the expert stacks on a Vulkan device")
 	sttStreams := flag.Int("stt-parallel", 1, "transcriptions to carry at once; they are stepped together, so the trunk's weights are read once for all of them")
 	builtinTemplate := flag.Bool("builtin-template", false, "write conversations with golem's own template rather than the one the file carries")
+	krea2Dir := flag.String("krea2", os.Getenv("GOLEM_KREA2"), "a ComfyUI directory holding Krea 2's three files, to answer /v1/images/generations with (or GOLEM_KREA2)")
+	krea2Keep := flag.Bool("krea2-keep", false, "keep Krea 2's twelve-gigabyte DiT on the card between pictures")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [options]\n", filepath.Base(os.Args[0]))
@@ -58,15 +61,15 @@ func main() {
 		return
 	}
 
-	if *model == "" && *sttDir == "" && *embedPath == "" {
-		fail(fmt.Errorf("no model: pass -model, -stt or -embed, or set GOLEM_MODEL, GOLEM_STT or GOLEM_EMBED"))
+	if *model == "" && *sttDir == "" && *embedPath == "" && *krea2Dir == "" {
+		fail(fmt.Errorf("no model: pass -model, -stt, -embed or -krea2, or set GOLEM_MODEL, GOLEM_STT, GOLEM_EMBED or GOLEM_KREA2"))
 	}
 	// A transcriber or an embedder alone is a whole server. It holds no
 	// conversation, so nothing below this — the runner, the slots, the
 	// generators — has anything to own, and building them around a model that
 	// was never opened would only be a longer way of writing nil.
 	if *model == "" {
-		serveWithoutConversation(*sttDir, *embedPath, *addr, *sttStreams, *vulkan)
+		serveWithoutConversation(*sttDir, *embedPath, *krea2Dir, *krea2Keep, *addr, *sttStreams, *vulkan)
 		return
 	}
 	start := time.Now()
@@ -165,6 +168,11 @@ func main() {
 		defer e.Close()
 		server.SetEmbedder(e)
 	}
+	if *krea2Dir != "" {
+		p := openKrea2(*krea2Dir, *krea2Keep)
+		defer p.Close()
+		server.SetImager(p)
+	}
 
 	head := vulkanLine(m.Vulkan())
 	draft := ""
@@ -234,7 +242,7 @@ func sttOnVulkan(m *stt.Model, vulkan bool, streams int) {
 // both, and no conversation. Server.Handler registers the conversation route
 // only when there is a pool, so what this listens on is /v1/models and the
 // routes of what it carries.
-func serveWithoutConversation(dir, embedPath, addr string, streams int, vulkan bool) {
+func serveWithoutConversation(dir, embedPath, krea2Dir string, krea2Keep bool, addr string, streams int, vulkan bool) {
 	start := time.Now()
 	var name string
 	var carries []string
@@ -273,6 +281,15 @@ func serveWithoutConversation(dir, embedPath, addr string, streams int, vulkan b
 		}
 		carries = append(carries, "embeddings")
 	}
+	if krea2Dir != "" {
+		p := openKrea2(krea2Dir, krea2Keep)
+		defer p.Close()
+		server.SetImager(p)
+		if name == "" {
+			name = "krea2"
+		}
+		carries = append(carries, "pictures")
+	}
 	server.name = name
 
 	listener, err := net.Listen("tcp", addr)
@@ -284,6 +301,23 @@ func serveWithoutConversation(dir, embedPath, addr string, streams int, vulkan b
 	if err := http.Serve(listener, logging(os.Stderr, server.Handler())); err != nil {
 		fail(err)
 	}
+}
+
+// openKrea2 readies Krea 2 from a ComfyUI directory. Its DiT is read at the
+// first picture, and kept on the card after it when keep says so.
+func openKrea2(dir string, keep bool) *krea2.Pipeline {
+	o := krea2.ComfyUI(dir)
+	o.Keep = keep
+	p, err := krea2.Open(o)
+	if err != nil {
+		fail(fmt.Errorf("krea2: %w", err))
+	}
+	how := "read for each picture"
+	if keep {
+		how = "kept on the card after the first picture"
+	}
+	fmt.Fprintf(os.Stderr, "krea2 from %s, the DiT %s\n", dir, how)
+	return p
 }
 
 // openEmbedder opens the embedding model, on the card when -vulkan says so,

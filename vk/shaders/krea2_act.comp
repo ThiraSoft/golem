@@ -1,0 +1,47 @@
+#version 450
+
+// The elementwise steps between the products, one element a thread:
+//   0  x = gelu(x), tanh form            (the DiT's MLPs on the timestep and text)
+//   1  x = silu(x) · y                    (SwiGLU)
+//   2  x = x · sigmoid(y)                 (the attention's gate)
+//   3  x = x + y
+//   4  x = y
+//   5  x = silu(x)
+// x and y are strided rows: n entries a row, rows of them.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint x, xStride;
+    uint y, yStride;
+    uint n, rows;
+    uint op;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u;
+    if (i >= p.n * p.rows) return;
+    uint row = i / p.n, col = i % p.n;
+    uint xi = p.x + row * p.xStride + col;
+    uint yi = p.y + row * p.yStride + col;
+    float v = a[xi];
+    if (p.op == 0u) {
+        float u = 0.7978845608028654 * (v + 0.044715 * v * v * v);
+        v = 0.5 * v * (1.0 + tanh(clamp(u, -15.0, 15.0)));
+    } else if (p.op == 1u) {
+        v = v / (1.0 + exp(-v)) * a[yi];
+    } else if (p.op == 2u) {
+        v = v / (1.0 + exp(-a[yi]));
+    } else if (p.op == 3u) {
+        v = v + a[yi];
+    } else if (p.op == 4u) {
+        v = a[yi];
+    } else {
+        v = v / (1.0 + exp(-v));
+    }
+    a[xi] = v;
+}

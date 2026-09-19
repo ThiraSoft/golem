@@ -1,0 +1,57 @@
+#version 450
+
+// The VAE's steps between its convolutions, over channel-major planes:
+//   0  RMS over the channels of a pixel, times √C and γ, then SiLU if asked
+//      (RMS_norm: F.normalize over the channel axis)
+//   1  nearest upsampling to twice the size
+//   2  planes to tokens, [c][pixel] to [pixel][c], for the attention
+//   3  tokens back to planes, plus a residual
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint src, dst;
+    uint c, h, w;
+    uint gamma;
+    uint silu;
+    uint op;
+    uint residual;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u;
+    uint pixels = p.h * p.w;
+    if (p.op == 0u) {
+        if (i >= pixels) return;
+        float ss = 0.0;
+        for (uint c = 0u; c < p.c; c++) {
+            float v = a[p.src + c * pixels + i];
+            ss += v * v;
+        }
+        float k = sqrt(float(p.c)) / max(sqrt(ss), 1e-12);
+        for (uint c = 0u; c < p.c; c++) {
+            float v = a[p.src + c * pixels + i] * k * par[p.gamma + c];
+            if (p.silu != 0u) v = v / (1.0 + exp(-v));
+            a[p.dst + c * pixels + i] = v;
+        }
+    } else if (p.op == 1u) {
+        uint W2 = p.w * 2u, H2 = p.h * 2u;
+        if (i >= p.c * H2 * W2) return;
+        uint x = i % W2, y = (i / W2) % H2, c = i / (W2 * H2);
+        a[p.dst + i] = a[p.src + c * pixels + (y / 2u) * p.w + x / 2u];
+    } else if (p.op == 2u) {
+        if (i >= p.c * pixels) return;
+        uint c = i % p.c, px = i / p.c;
+        a[p.dst + i] = a[p.src + c * pixels + px];
+    } else {
+        if (i >= p.c * pixels) return;
+        uint px = i % pixels, c = i / pixels;
+        float v = a[p.src + px * p.c + c];
+        if (p.residual != ~0u) v += a[p.residual + i];
+        a[p.dst + i] = v;
+    }
+}

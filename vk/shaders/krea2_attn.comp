@@ -1,0 +1,225 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_vote : require
+
+// Scaled dot-product attention on the matrix cores, for every attention Krea 2
+// has: the DiT's (48 heads of 128 over 12 of keys and values, no mask), the
+// text encoder's (causal), the text fusion's (a sequence of twelve layers for
+// every token, many sequences a dispatch) and the VAE's (one head of 384).
+//
+// A workgroup is sixty-four queries of one head of one sequence, sixteen to a
+// wave, held in registers; the grid's first axis is the query tile and the
+// sequence, its second the head. The keys go by in tiles of BC, and the
+// softmax is the online one: each row keeps its running maximum and sum, and
+// when a tile raises a row's maximum the rows already accumulated are scaled
+// down to it. A cooperative accumulator has no rows to scale, so a wave whose
+// maximum moved puts its accumulators through shared memory to do it; after
+// the first tiles a maximum seldom moves, and the wave skips that.
+//
+// The tiles are small enough that two workgroups share a compute unit: the
+// shared memory is what bounds how many run at once, and one at a time left
+// the card waiting on every barrier.
+//
+// Everything that meets the cores is fp16 — the queries, keys, values and the
+// probabilities — and the sums are float32.
+
+#ifndef HD
+#define HD 128
+#endif
+#ifndef BC
+#define BC 32
+#endif
+#define THREADS 256
+#define BR 64
+#define SH (HD + 8)
+#define SS (BC + 4)   // at least 20: a staged sixteen-square needs that
+#define SP (BC + 8)
+#define DT (HD / 16)
+#define COLS (BC / 4)
+#define LOG2E 1.4426950408889634
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint q, qStride, qSeq;
+    uint k, kStride, kSeq;
+    uint v, vStride, vSeq;
+    uint o, oStride, oSeq;
+    uint queries, keys;
+    uint group;     // query heads to a key head
+    uint causal;
+    uint tiles;     // query tiles a sequence
+    float scale;
+} p;
+
+shared float16_t sk[BC * SH];
+shared float16_t sv[BC * SH];
+shared float16_t sp[BR * SP];
+// Scores, and a wave's staging for its accumulators: sixteen rows a wave.
+shared float ss[BR * SS];
+shared float rowScale[BR];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint wave = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint seq = gl_WorkGroupID.x / p.tiles;
+    uint q0 = (gl_WorkGroupID.x % p.tiles) * uint(BR);
+    uint head = gl_WorkGroupID.y, kvHead = head / p.group;
+    uint qBase = p.q + seq * p.qSeq + head * uint(HD);
+    uint kBase = p.k + seq * p.kSeq + kvHead * uint(HD);
+    uint vBase = p.v + seq * p.vSeq + kvHead * uint(HD);
+    uint oBase = p.o + seq * p.oSeq + head * uint(HD);
+    const uint SW = uint(SS);
+    uint mine = wave * 16u * SW;
+    // Four lanes a row for the softmax, BC/4 columns each; the row is one of
+    // this wave's sixteen.
+    uint rr = lane >> 2, part = lane & 3u;
+    uint row = wave * 16u + rr;
+    uint query = q0 + row;
+    float lscale = p.scale * LOG2E;
+
+    // The queries, BC rows at a time through sk, into each wave's registers.
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> qa[DT];
+    for (uint r0 = 0u; r0 < uint(BR); r0 += uint(BC)) {
+        for (uint e = t; e < uint(BC * HD) / 4u; e += uint(THREADS)) {
+            uint r = e / uint(HD / 4), d = (e % uint(HD / 4)) * 4u;
+            uint qi = q0 + r0 + r;
+            vec4 x = vec4(0.0);
+            if (qi < p.queries) {
+                uint at = qBase + qi * p.qStride + d;
+                x = vec4(a[at], a[at + 1u], a[at + 2u], a[at + 3u]);
+            }
+            x = clamp(x, vec4(-65504.0), vec4(65504.0));
+            uint s = r * uint(SH) + d;
+            sk[s] = float16_t(x.x); sk[s + 1u] = float16_t(x.y); sk[s + 2u] = float16_t(x.z); sk[s + 3u] = float16_t(x.w);
+        }
+        barrier();
+        if (wave * 16u >= r0 && wave * 16u < r0 + uint(BC)) {
+            [[unroll]] for (uint d = 0u; d < uint(DT); d++) {
+                coopMatLoad(qa[d], sk, (wave * 16u - r0) * uint(SH) + d * 16u, uint(SH), gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+        barrier();
+    }
+
+    // The keys a query may see: all of them, or up to itself.
+    uint last = p.keys;
+    if (p.causal != 0u) last = min(p.keys, q0 + uint(BR));
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> o[DT];
+    [[unroll]] for (uint j = 0u; j < uint(DT); j++) o[j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    float peak = -1.0e30, sum = 0.0;   // in log2 units, per row
+
+    for (uint c0 = 0u; c0 < last; c0 += uint(BC)) {
+        barrier();
+        for (uint e = t; e < uint(BC * HD) / 4u; e += uint(THREADS)) {
+            uint r = e / uint(HD / 4), d = (e % uint(HD / 4)) * 4u;
+            vec4 x = vec4(0.0), y = vec4(0.0);
+            if (c0 + r < p.keys) {
+                uint at = kBase + (c0 + r) * p.kStride + d;
+                x = vec4(a[at], a[at + 1u], a[at + 2u], a[at + 3u]);
+                at = vBase + (c0 + r) * p.vStride + d;
+                y = vec4(a[at], a[at + 1u], a[at + 2u], a[at + 3u]);
+            }
+            x = clamp(x, vec4(-65504.0), vec4(65504.0));
+            y = clamp(y, vec4(-65504.0), vec4(65504.0));
+            uint s = r * uint(SH) + d;
+            sk[s] = float16_t(x.x); sk[s + 1u] = float16_t(x.y); sk[s + 2u] = float16_t(x.z); sk[s + 3u] = float16_t(x.w);
+            sv[s] = float16_t(y.x); sv[s + 1u] = float16_t(y.y); sv[s + 2u] = float16_t(y.z); sv[s + 3u] = float16_t(y.w);
+        }
+        barrier();
+
+        // This wave's sixteen queries against the tile.
+        [[unroll]] for (uint j = 0u; j < uint(BC) / 16u; j++) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> s =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            [[unroll]] for (uint d = 0u; d < uint(DT); d++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+                coopMatLoad(b, sk, j * 16u * uint(SH) + d * 16u, uint(SH), gl_CooperativeMatrixLayoutColumnMajor);
+                s = coopMatMulAdd(qa[d], b, s);
+            }
+            coopMatStore(s, ss, mine + j * 16u, SW, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        // The online softmax, a row at four lanes.
+        float x[COLS];
+        float top = -1.0e30;
+        [[unroll]] for (uint c = 0u; c < uint(COLS); c++) {
+            uint col = part * uint(COLS) + c, key = c0 + col;
+            bool live = key < p.keys && (p.causal == 0u || key <= query);
+            x[c] = live ? ss[mine + rr * SW + col] * lscale : -1.0e30;
+            top = max(top, x[c]);
+        }
+        top = subgroupClusteredMax(top, 4u);
+        float next = max(peak, top);
+        float shrink = exp2(peak - next);
+        float got = 0.0;
+        [[unroll]] for (uint c = 0u; c < uint(COLS); c++) {
+            float e = (x[c] > -1.0e29) ? exp2(x[c] - next) : 0.0;
+            got += e;
+            sp[row * uint(SP) + part * uint(COLS) + c] = float16_t(e);
+        }
+        sum = sum * shrink + subgroupClusteredAdd(got, 4u);
+        peak = next;
+        if (part == 0u) rowScale[row] = shrink;
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        // Rows whose maximum moved scale what they hold down to it.
+        if (subgroupAny(shrink < 1.0)) {
+            [[unroll]] for (uint j = 0u; j < uint(DT); j++) {
+                coopMatStore(o[j], ss, mine, SW, gl_CooperativeMatrixLayoutRowMajor);
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
+                [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                    uint r = (lane >> 4) + u * 4u, c = lane & 15u;
+                    ss[mine + r * SW + c] *= rowScale[wave * 16u + r];
+                }
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
+                coopMatLoad(o[j], ss, mine, SW, gl_CooperativeMatrixLayoutRowMajor);
+                subgroupBarrier();
+            }
+        }
+
+        [[unroll]] for (uint j = 0u; j < uint(DT); j++) {
+            [[unroll]] for (uint kk = 0u; kk < uint(BC); kk += 16u) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> pa;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> vb;
+                coopMatLoad(pa, sp, wave * 16u * uint(SP) + kk, uint(SP), gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(vb, sv, kk * uint(SH) + j * 16u, uint(SH), gl_CooperativeMatrixLayoutRowMajor);
+                o[j] = coopMatMulAdd(pa, vb, o[j]);
+            }
+        }
+    }
+
+    // Out, a sixteen-square at a time through the wave's own rows.
+    if (part == 0u) rowScale[row] = 1.0 / sum;
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+    [[unroll]] for (uint j = 0u; j < uint(DT); j++) {
+        coopMatStore(o[j], ss, mine, SW, gl_CooperativeMatrixLayoutRowMajor);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        [[unroll]] for (uint u = 0u; u < 4u; u++) {
+            uint r = (lane >> 4) + u * 4u, c = lane & 15u;
+            uint qi = q0 + wave * 16u + r;
+            if (qi < p.queries) {
+                a[oBase + qi * p.oStride + j * 16u + c] = ss[mine + r * SW + c] * rowScale[wave * 16u + r];
+            }
+        }
+        subgroupBarrier();
+    }
+}

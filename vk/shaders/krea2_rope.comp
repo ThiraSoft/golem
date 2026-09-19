@@ -1,0 +1,43 @@
+#version 450
+
+// Rotary position, in place, from a table of cos and sin the host wrote into
+// the arena: one pair per thread. The two conventions differ in which two
+// entries of a head make a pair: Krea 2's (Flux's apply_rope) pairs 2i with
+// 2i + 1, Qwen3's rotate_half pairs i with i + D/2. Either way the pair turns
+// by the angle of its index i, and the table holds, per token, D/2 cosines
+// then D/2 sines.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint x, stride;   // the first token's first head, and a token's stride
+    uint heads, dim;  // dim is the head's width
+    uint tokens;
+    uint table;
+    uint halves;
+} p;
+
+void main() {
+    uint half_ = p.dim / 2u;
+    uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u;
+    if (i >= p.tokens * p.heads * half_) return;
+    uint pair = i % half_;
+    uint head = (i / half_) % p.heads;
+    uint tok = i / (half_ * p.heads);
+    uint at = p.x + tok * p.stride + head * p.dim;
+    uint i0, i1;
+    if (p.halves != 0u) {
+        i0 = at + pair; i1 = at + pair + half_;
+    } else {
+        i0 = at + 2u * pair; i1 = i0 + 1u;
+    }
+    float c = a[p.table + tok * p.dim + pair];
+    float s = a[p.table + tok * p.dim + half_ + pair];
+    float x0 = a[i0], x1 = a[i1];
+    a[i0] = c * x0 - s * x1;
+    a[i1] = s * x0 + c * x1;
+}

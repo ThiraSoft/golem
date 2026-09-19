@@ -56,6 +56,7 @@ The bet is that it is worth it only if the result is actually fast. See [the num
 | **Vision** | Gemma 4 and Qwen3.8, from a projector file |
 | **Audio in** | Gemma 4 hears WAV, MP3 and FLAC. Kyutai STT transcribes English and French |
 | **Audio out** | Kyutai Pocket TTS, 12 shipped models across 6 languages, plus voice cloning |
+| **Images** | Krea 2 from ComfyUI's fp8 files, with its LoRA, the same picture as ComfyUI for the same seed |
 | **Serving** | OpenAI-compatible HTTP API, tool calls, continuous batching, JSON schemas and GBNF grammars |
 | **Weights** | GGUF, every K-quant llama.cpp writes, and golem's own `.golem` format |
 

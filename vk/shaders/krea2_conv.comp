@@ -1,0 +1,145 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// The VAE's convolutions, 3×3 with a padding of one or 1×1, as a product on
+// the matrix cores: the output channels are the rows, the pixels the columns,
+// and the shared dimension is every input channel's taps, gathered from the
+// planes as the tile is staged. Planes are channel-major, H×W floats a
+// channel. The weights are fp16, a row of Inputs·Taps halves padded with
+// zeros to KStride, a multiple of thirty-two.
+//
+// With up set, the input is half the size of the output and is read as if
+// upsampled to it by nearest neighbour, which is the VAE's Resample: the
+// quadrupled plane is never written out.
+//
+// A causal 3D convolution over one frame is this: ComfyUI pads the time axis
+// with zeros before the frame, so only the kernel's last temporal slice meets
+// it, and that slice is what the weights hold.
+
+#define THREADS 256
+#define BM 128
+#define BN 128
+#define BK 32
+#define SA (BK + 8)
+#define ST 20
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly buffer W { uvec4 w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint outputs, inputs;
+    uint h, w;
+    uint taps;
+    uint wAt, kStride;
+    uint x, y;
+    uint bias;
+    uint residual;
+    uint up;
+} p;
+
+shared float16_t sa[BM * SA];
+shared float16_t sb[BN * SA];
+shared float stage[4 * 16 * ST];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint pixels = p.h * p.w;
+    uint tiles = (p.outputs + uint(BM) - 1u) / uint(BM);
+    uint tile = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint row0 = (tile % tiles) * uint(BM);
+    uint col0 = (tile / tiles) * uint(BN);
+    if (col0 >= pixels) return;
+    uint wave = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint wr = (wave & 1u) * 64u, wc = (wave >> 1) * 64u;
+    uint K = p.inputs * p.taps;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[4][4];
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        [[unroll]] for (uint j = 0u; j < 4u; j++) {
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    for (uint k0 = 0u; k0 < K; k0 += uint(BK)) {
+        [[unroll]] for (uint i = 0u; i < 2u; i++) {
+            uint e = t + i * uint(THREADS);
+            uint r = e >> 2, q = (e & 3u) * 8u;
+            uint srow = row0 + r;
+            uvec4 v = uvec4(0u);
+            if (srow < p.outputs) v = w[(p.wAt + (srow * p.kStride + k0 + q) * 2u) >> 4];
+            f16vec2 c0 = unpackFloat2x16(v.x), c1 = unpackFloat2x16(v.y);
+            f16vec2 c2 = unpackFloat2x16(v.z), c3 = unpackFloat2x16(v.w);
+            uint at = r * uint(SA) + q;
+            sa[at]      = c0.x; sa[at + 1u] = c0.y; sa[at + 2u] = c1.x; sa[at + 3u] = c1.y;
+            sa[at + 4u] = c2.x; sa[at + 5u] = c2.y; sa[at + 6u] = c3.x; sa[at + 7u] = c3.y;
+        }
+        // The gathered operand: a hundred and twenty-eight pixels by thirty-two
+        // taps, sixteen a thread. Consecutive threads take consecutive pixels,
+        // which are consecutive floats of a plane.
+        [[unroll]] for (uint i = 0u; i < 16u; i++) {
+            uint e = t + i * uint(THREADS);
+            uint c = e & 127u, kk = e >> 7;
+            uint pix = col0 + c, k = k0 + kk;
+            float v = 0.0;
+            if (pix < pixels && k < K) {
+                uint ci = k / p.taps, tap = k % p.taps;
+                int yy = int(pix / p.w), xx = int(pix % p.w);
+                if (p.taps == 9u) {
+                    yy += int(tap / 3u) - 1;
+                    xx += int(tap % 3u) - 1;
+                }
+                if (yy >= 0 && yy < int(p.h) && xx >= 0 && xx < int(p.w)) {
+                    uint iw = p.w >> p.up, ih = p.h >> p.up;
+                    v = a[p.x + ci * ih * iw + (uint(yy) >> p.up) * iw + (uint(xx) >> p.up)];
+                }
+            }
+            sb[c * uint(SA) + kk] = float16_t(clamp(v, -65504.0, 65504.0));
+        }
+        barrier();
+
+        [[unroll]] for (uint kk = 0u; kk < uint(BK); kk += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[4];
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[4];
+            [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                coopMatLoad(ma[i], sa, (wr + i * 16u) * uint(SA) + kk, uint(SA), gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(mb[i], sb, (wc + i * 16u) * uint(SA) + kk, uint(SA), gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                [[unroll]] for (uint j = 0u; j < 4u; j++) acc[i][j] = coopMatMulAdd(ma[i], mb[j], acc[i][j]);
+            }
+        }
+        barrier();
+    }
+
+    // Out a sixteen-square at a time, a lane a pixel so that the writes run
+    // along a plane.
+    uint mine = wave * 16u * uint(ST);
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        [[unroll]] for (uint j = 0u; j < 4u; j++) {
+            coopMatStore(acc[i][j], stage, mine, uint(ST), gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                uint c = lane & 15u, r = (lane >> 4) + u * 4u;
+                uint row = row0 + wr + i * 16u + r;
+                uint pix = col0 + wc + j * 16u + c;
+                if (row < p.outputs && pix < pixels) {
+                    float v = stage[mine + r * uint(ST) + c];
+                    if (p.bias != ~0u) v += par[p.bias + row];
+                    uint to = row * pixels + pix;
+                    if (p.residual != ~0u) v += a[p.residual + to];
+                    a[p.y + to] = v;
+                }
+            }
+            subgroupBarrier();
+        }
+    }
+}
