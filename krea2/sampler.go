@@ -25,7 +25,7 @@ func SampleERSDE(d Denoiser, x []float32, sigmas []float32, noise *CUDARandn, pr
 	// offset_first_sigma_for_snr: a flow model's first sigma of 1 has no
 	// log-SNR, so it is moved to percent_to_sigma(1e-4).
 	if sigmas[0] >= 1 {
-		sigmas[0] = float32(math.Exp(Shift) / (math.Exp(Shift) + (1/(1-1e-4) - 1)))
+		sigmas[0] = firstSigma()
 	}
 	// er_lambda = sigma / alpha, alpha = 1 - sigma for a flow model.
 	lambdas := make([]float32, len(sigmas))

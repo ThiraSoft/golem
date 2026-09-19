@@ -48,4 +48,10 @@ func LatentOut(latent []float32) {
 	}
 }
 
-func expShift() float64 { return 1 / math.Exp(Shift) }
+// firstSigma is offset_first_sigma_for_snr's answer for a flow model whose
+// schedule starts at 1, where the log-SNR is not defined:
+// percent_to_sigma(1e-4), computed in Python's double precision.
+func firstSigma() float32 {
+	e := math.Exp(Shift)
+	return float32(e / (e + (1/(1-1e-4) - 1)))
+}

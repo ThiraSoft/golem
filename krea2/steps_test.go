@@ -24,7 +24,7 @@ func TestEveryStepMatchesComfyUI(t *testing.T) {
 		t.Fatal(err)
 	}
 	sigmas := f.read(t, "sample/sigmas")
-	sigmas[0] = float32(1 / (1 + (1/(1-1e-4)-1)/1*expShift()))
+	sigmas[0] = firstSigma()
 	shape := f.shape(t, "sample/x0")
 	h, w := shape[3], shape[4]
 	for i := 0; i < len(sigmas)-1; i++ {
