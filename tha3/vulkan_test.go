@@ -153,6 +153,12 @@ func TestCardHighMatchesCPU(t *testing.T) {
 		if err := p.SetScale(2); err != nil {
 			t.Fatal(err)
 		}
+		// With the sharpening on, so that the two extra resamplings
+		// and the two sharpen passes of the high path are compared
+		// too; the other scaled tests leave it off.
+		if err := p.SetSharpen(0.6); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for _, run := range runs {
 		f := loadFixtures(t, run)

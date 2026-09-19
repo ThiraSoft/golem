@@ -207,6 +207,41 @@ func (p *Poser) finishCPU(high, face Tensor) Tensor {
 	return out
 }
 
+// SetSharpen sets how hard the mouth and the closed eyes are sharpened on
+// the larger picture, where the face morpher's fields arrive blown up from
+// 192 and what they paint arrives blurred. Zero, the default, leaves them as
+// the enlargement made them; 0.8 is what a talking face was settled on, where
+// the lash line and the lips read as drawn rather than smudged, and 1.2 is
+// about as far as it is worth going. The colour cannot drift whatever the
+// amount, only the light. It does nothing at a scale of one, where nothing
+// was enlarged.
+//
+// On the card it rebuilds the passes, so it is set once, early.
+func (p *Poser) SetSharpen(amount float32) error {
+	if p.closed {
+		return errClosed
+	}
+	if amount < 0 {
+		return fmt.Errorf("tha3: a sharpening of %v is below zero", amount)
+	}
+	if amount == p.sharpen {
+		return nil
+	}
+	old := p.sharpen
+	p.sharpen = amount
+	p.haveLast = false
+	if p.gpu == nil {
+		return nil
+	}
+	p.gpu.close()
+	p.gpu = nil
+	if err := p.useVulkan(p.gpuTrace); err != nil {
+		p.sharpen = old
+		return fmt.Errorf("tha3: the card for a sharpening of %v: %w", amount, err)
+	}
+	return nil
+}
+
 // SetHeldBody makes a pose that leaves the head, the neck and the body where
 // they were reuse what the rotator and the editor decided for the last one:
 // only the brows and the face run again, and the frame is made from their

@@ -61,6 +61,7 @@ type Poser struct {
 	faced                   faceFields
 	edited                  editorFields
 	scale                   int
+	sharpen                 float32 // the unsharp mask on what the face morpher paints
 	high                    Tensor
 	hiEyebrow, hiBackground Tensor
 	hiEyebrows, hiMorphed   Tensor
@@ -260,7 +261,7 @@ func (p *Poser) poseCPU(pose [NumParams]float32, from stage, short bool) (Tensor
 				k := p.high.H / Size
 				hiIn := p.high.Crop(32*k, 160*k, 192*k, 192*k)
 				hiIn.Paste(p.hiEyebrows, 32*k, 32*k)
-				p.hiMorphed = p.faced.resized(192*k, 192*k).apply(hiIn)
+				p.hiMorphed = p.faced.resized(192*k, 192*k).applySharp(hiIn, p.sharpen)
 			}
 		})
 	}

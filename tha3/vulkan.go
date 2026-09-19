@@ -322,6 +322,33 @@ func (d *describer) morph(f cardFields, image vk.THA3Tensor) vk.THA3Tensor {
 	return d.g.ColorChange(f["eyeAlpha"], f["eyeColor"], mouth)
 }
 
+// steepened is the fields with their two alphas pulled away from the middle,
+// as faceFields.applySharp steepens them.
+func (d *describer) steepened(f cardFields, amount float32) cardFields {
+	if amount <= 0 {
+		return f
+	}
+	out := cardFields{}
+	for name, t := range f {
+		out[name] = t
+	}
+	by := steepenBy(amount)
+	out["mouthAlpha"] = d.g.Steepen(f["mouthAlpha"], by)
+	out["eyeAlpha"] = d.g.Steepen(f["eyeAlpha"], by)
+	return out
+}
+
+// sharpen is faceFields.applySharp's second half: the mouth and the eyes of
+// out brought back to an edge, each under the morpher's own alpha.
+func (d *describer) sharpen(f cardFields, out vk.THA3Tensor, amount float32) vk.THA3Tensor {
+	if amount <= 0 {
+		return out
+	}
+	blurred := d.g.Resize(d.g.Resize(out, max(out.H/blurRatio, 1), max(out.W/blurRatio, 1)), out.H, out.W)
+	out = d.g.Sharpen(f["mouthAlpha"], blurred, out, amount)
+	return d.g.Sharpen(f["eyeAlpha"], blurred, out, amount)
+}
+
 // resized is every field resized to h×w, for the larger picture.
 func (d *describer) resized(f cardFields, h, w int) cardFields {
 	// In the order of the names, so that the graph is the same every time.
@@ -409,7 +436,12 @@ func (d *describer) poser(p *Poser) (image, high vk.THA3Tensor) {
 	var hiFace vk.THA3Tensor
 	if k > 1 {
 		hiFaceIn := g.Paste(g.Crop(high, 32*k, 160*k, 192*k, 192*k), hiEyebrows, 32*k, 32*k)
-		hiFace = d.morph(d.resized(faced, 192*k, 192*k), hiFaceIn)
+		hiFaced := d.resized(faced, 192*k, 192*k)
+		// The morph composites through the steepened alphas, which is
+		// what sharpens the outline of the mouth; the unsharp mask
+		// after it is weighed by the alphas as they came, so that it
+		// reaches everything the morpher painted.
+		hiFace = d.sharpen(hiFaced, d.morph(d.steepened(hiFaced, p.sharpen), hiFaceIn), p.sharpen)
 	}
 	g.Stamp(netFaceMorpher)
 

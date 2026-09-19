@@ -121,6 +121,14 @@ func TestCardBlends(t *testing.T) {
 		return g.RGBHalfAlpha(in[0], in[1])
 	})
 	checkCard(t, "half alpha", got, applyRGBChange(half, change, image))
+	got = onCard(t, nil, []Tensor{alpha1, change, image}, func(g *vk.THA3Graph, in []vk.THA3Tensor) vk.THA3Tensor {
+		return g.Sharpen(in[0], in[1], in[2], 0.6)
+	})
+	checkCard(t, "sharpen", got, applySharpen(alpha1, change, image, 0.6))
+	got = onCard(t, nil, []Tensor{alpha1}, func(g *vk.THA3Graph, in []vk.THA3Tensor) vk.THA3Tensor {
+		return g.Steepen(in[0], steepenBy(0.6))
+	})
+	checkCard(t, "steepen", got, steepen(alpha1, 0.6))
 }
 
 func TestCardResize(t *testing.T) {
