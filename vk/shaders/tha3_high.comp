@@ -1,0 +1,105 @@
+#version 450
+
+// The editor's last step on a picture k times larger, over one window of it:
+// the editor's grid, the rotator's added, its alpha and its colour, all made
+// at 512, are resized as tha3_resize does at each pixel they are read; the
+// large picture is warped by them as tha3_warp does and blended as
+// tha3_blend's mode 0. The large picture is read with the face pasted over
+// it, from the face's own tensor, so that the pasted copy is never made.
+//
+// With finish set, the window is framed by a zoom read from the pose buffer
+// at zoomAt (scale, then the centre as fractions of the window), the pixel
+// is laid on the background bg in sRGB, and what is written is one float a
+// pixel, R + 256 G + 65536 B, which a float holds exactly.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Arena { float a[]; };
+layout(std430, binding = 1) readonly buffer Weights { float w[]; };
+layout(std430, binding = 2) readonly buffer Pose { float pose[]; };
+
+layout(push_constant) uniform Push {
+    uint dst, image, face, faceY, faceX, faceS;
+    uint grid, add, alpha, color, lowH, lowW;
+    uint h, w, winY, winX, winH, winW;
+    uint finish, bgR, bgG, bgB, zoomAt, outH, outW;
+} p;
+
+uint y0, y1, x0, x1;
+float fy, fx;
+
+float field(uint base, uint c) {
+    uint plane = p.lowH * p.lowW;
+    uint b = base + c * plane;
+    float top = a[b + y0 * p.lowW + x0] * (1.0 - fx) + a[b + y0 * p.lowW + x1] * fx;
+    float bottom = a[b + y1 * p.lowW + x0] * (1.0 - fx) + a[b + y1 * p.lowW + x1] * fx;
+    return top * (1.0 - fy) + bottom * fy;
+}
+
+float picture(uint c, uint y, uint x) {
+    if (y >= p.faceY && y < p.faceY + p.faceS && x >= p.faceX && x < p.faceX + p.faceS) {
+        return a[p.face + c * p.faceS * p.faceS + (y - p.faceY) * p.faceS + (x - p.faceX)];
+    }
+    return a[p.image + c * p.h * p.w + y * p.w + x];
+}
+
+float unit(float v) { return clamp((v + 1.0) / 2.0, 0.0, 1.0); }
+
+float srgb(float x) {
+    return x <= 0.003130804953560372 ? x * 12.92 : 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint plane = p.outH * p.outW;
+    if (i >= plane) return;
+    uint oy = i / p.outW, ox = i % p.outW;
+    // Where the pixel is in the large picture: the window's own pixel, or
+    // with a zoom the point it frames, between pixels.
+    float y = float(p.winY + oy), x = float(p.winX + ox);
+    if (p.finish != 0u) {
+        float s = pose[p.zoomAt], cx = pose[p.zoomAt + 1u], cy = pose[p.zoomAt + 2u];
+        float spanX = float(p.winW) / s, spanY = float(p.winH) / s;
+        x = float(p.winX) + cx * float(p.winW) - spanX / 2.0 + (float(ox) + 0.5) * spanX / float(p.outW) - 0.5;
+        y = float(p.winY) + cy * float(p.winH) - spanY / 2.0 + (float(oy) + 0.5) * spanY / float(p.outH) - 0.5;
+    }
+
+    float sy = max((y + 0.5) * (float(p.lowH) / float(p.h)) - 0.5, 0.0);
+    float sx = max((x + 0.5) * (float(p.lowW) / float(p.w)) - 0.5, 0.0);
+    y0 = min(uint(sy), p.lowH - 1u); y1 = min(y0 + 1u, p.lowH - 1u);
+    x0 = min(uint(sx), p.lowW - 1u); x1 = min(x0 + 1u, p.lowW - 1u);
+    fy = sy - float(y0); fx = sx - float(x0);
+
+    float gx = field(p.grid, 0u) + field(p.add, 0u);
+    float gy = field(p.grid, 1u) + field(p.add, 1u);
+    float fw = float(p.w), fh = float(p.h);
+    float u = (2.0 * x + 1.0) / fw - 1.0 + gx;
+    float v = (2.0 * y + 1.0) / fh - 1.0 + gy;
+    float tx = clamp(((u + 1.0) * fw - 1.0) / 2.0, 0.0, fw - 1.0);
+    float ty = clamp(((v + 1.0) * fh - 1.0) / 2.0, 0.0, fh - 1.0);
+    int sx0 = int(floor(tx)), sy0 = int(floor(ty));
+    float gfx = tx - float(sx0), gfy = ty - float(sy0);
+    uint ux0 = uint(sx0), uy0 = uint(sy0), ux1 = ux0 + 1u, uy1 = uy0 + 1u;
+    bool inX = ux1 < p.w, inY = uy1 < p.h;
+
+    float px[4];
+    for (uint c = 0u; c < 4u; c++) {
+        float v00 = picture(c, uy0, ux0);
+        float v01 = inX ? picture(c, uy0, ux1) : 0.0;
+        float v10 = inY ? picture(c, uy1, ux0) : 0.0;
+        float v11 = (inX && inY) ? picture(c, uy1, ux1) : 0.0;
+        float warped = v00 * (1.0 - gfx) * (1.0 - gfy) + v01 * gfx * (1.0 - gfy) +
+            v10 * (1.0 - gfx) * gfy + v11 * gfx * gfy;
+        float al = field(p.alpha, c);
+        px[c] = field(p.color, c) * al + warped * (1.0 - al);
+    }
+    if (p.finish == 0u) {
+        for (uint c = 0u; c < 4u; c++) a[p.dst + c * plane + i] = px[c];
+        return;
+    }
+    float al = unit(px[3]);
+    float r = floor(srgb(unit(px[0])) * 255.0 * al + float(p.bgR) * (1.0 - al) + 0.5);
+    float g = floor(srgb(unit(px[1])) * 255.0 * al + float(p.bgG) * (1.0 - al) + 0.5);
+    float b = floor(srgb(unit(px[2])) * 255.0 * al + float(p.bgB) * (1.0 - al) + 0.5);
+    a[p.dst + i] = r + 256.0 * g + 65536.0 * b;
+}

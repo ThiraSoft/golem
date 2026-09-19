@@ -155,3 +155,30 @@ func TestTHA3PWSlices(t *testing.T) {
 		}
 	}
 }
+
+// A tensor a shortened pass spans is pinned, as one an entry spans is: the
+// pass reads what the last whole pass left there.
+func TestTHA3PlanPinsAcrossASkip(t *testing.T) {
+	g := NewTHA3Graph()
+	g.SetPhase(THA3PosePhase)
+	x := g.Input(1, 8, 8)
+	face := chain(g, x) // before the skip, read after it
+	g.Skip()
+	kept := chain(g, face)    // made inside the skip, read after it
+	dropped := chain(g, kept) // made and read inside the skip
+	g.op([]THA3Tensor{dropped}, nil, nil)
+	g.SkipEnd()
+	out := g.tensor(1, 8, 8)
+	g.op([]THA3Tensor{face, kept}, []THA3Tensor{out}, nil)
+	g.plan()
+	_, _, pinned := g.liveness()
+	for name, id := range map[string]int{"face": face.id, "kept": kept.id} {
+		if !pinned[id] {
+			t.Errorf("%s is not pinned across the skip", name)
+		}
+	}
+	if pinned[dropped.id] {
+		t.Error("a tensor the skip holds from end to end is pinned")
+	}
+	overlapFree(t, g)
+}

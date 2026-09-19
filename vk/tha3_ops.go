@@ -14,6 +14,7 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/tha3_blend.comp -o shaders/tha3_blend.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/tha3_resize.comp -o shaders/tha3_resize.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/tha3_warp.comp -o shaders/tha3_warp.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/tha3_high.comp -o shaders/tha3_high.spv
 
 //go:embed shaders/tha3_copy.spv
 var tha3CopySPIRV []byte
@@ -192,4 +193,57 @@ func (g *THA3Graph) warp(image, grid THA3Tensor, add *THA3Tensor) THA3Tensor {
 		x.dispatch(r, tha3Warp, groups256(image.H*image.W), 1, unsafe.Pointer(&push))
 	})
 	return out
+}
+
+//go:embed shaders/tha3_high.spv
+var tha3HighSPIRV []byte
+
+type tha3HighPush struct {
+	dst, image, face, faceY, faceX, faceS uint32
+	grid, add, alpha, color, lowH, lowW   uint32
+	h, w, winY, winX, winH, winW          uint32
+	finish, bgR, bgG, bgB, zoomAt         uint32
+	outH, outW                            uint32
+}
+
+func init() {
+	tha3Kernels[tha3High] = tha3KernelSpec{tha3HighSPIRV, unsafe.Sizeof(tha3HighPush{})}
+}
+
+// EditHigh is the editor's last step, Resize of its fields then WarpAdd then
+// ColorChange, done on image, a picture k times larger than the fields, with
+// face pasted at (faceY, faceX), and only over the window win of the result:
+// grid, add, alpha and color are the editor's, made at the fields' size.
+func (g *THA3Graph) EditHigh(image, face THA3Tensor, faceY, faceX int, grid, add, alpha, color THA3Tensor, winY, winX, winH, winW int) THA3Tensor {
+	out := g.tensor(4, winH, winW)
+	g.editHigh(out, tha3HighPush{winY: uint32(winY), winX: uint32(winX), winH: uint32(winH), winW: uint32(winW),
+		outH: uint32(winH), outW: uint32(winW)}, image, face, faceY, faceX, grid, add, alpha, color)
+	return out
+}
+
+// EditHighRGB is EditHigh finished for the screen: the window framed by the
+// zoom at pose[zoomAt:zoomAt+3] (scale, then centre as fractions of the
+// window) into outH×outW, laid on the background bg in sRGB. Each pixel is
+// one float, R + 256 G + 65536 B.
+func (g *THA3Graph) EditHighRGB(image, face THA3Tensor, faceY, faceX int, grid, add, alpha, color THA3Tensor, winY, winX, winH, winW int,
+	bg [3]uint8, zoomAt, outH, outW int) THA3Tensor {
+	out := g.tensor(1, outH, outW)
+	g.editHigh(out, tha3HighPush{winY: uint32(winY), winX: uint32(winX), winH: uint32(winH), winW: uint32(winW),
+		finish: 1, bgR: uint32(bg[0]), bgG: uint32(bg[1]), bgB: uint32(bg[2]), zoomAt: uint32(zoomAt),
+		outH: uint32(outH), outW: uint32(outW)}, image, face, faceY, faceX, grid, add, alpha, color)
+	return out
+}
+
+func (g *THA3Graph) editHigh(out THA3Tensor, push tha3HighPush, image, face THA3Tensor, faceY, faceX int, grid, add, alpha, color THA3Tensor) {
+	if image.C != 4 || face.C != 4 || face.H != face.W || alpha.C != 4 || color.C != 4 {
+		panic("vk: EditHigh wants pictures and fields of four channels and a square face")
+	}
+	g.op([]THA3Tensor{image, face, grid, add, alpha, color}, []THA3Tensor{out}, func(r *Recorder, x *THA3Runner) {
+		p := push
+		p.dst, p.image, p.face = x.at(out), x.at(image), x.at(face)
+		p.faceY, p.faceX, p.faceS = uint32(faceY), uint32(faceX), uint32(face.H)
+		p.grid, p.add, p.alpha, p.color = x.at(grid), x.at(add), x.at(alpha), x.at(color)
+		p.lowH, p.lowW, p.h, p.w = uint32(grid.H), uint32(grid.W), uint32(image.H), uint32(image.W)
+		x.dispatch(r, tha3High, groups256(int(p.outH*p.outW)), 1, unsafe.Pointer(&p))
+	})
 }

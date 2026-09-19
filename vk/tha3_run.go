@@ -23,6 +23,7 @@ const (
 	tha3Stats
 	tha3Norm
 	tha3Sum
+	tha3High
 )
 
 // tha3KernelSpec is one shader and the size of its push constants. Each ops
@@ -49,8 +50,10 @@ type THA3Runner struct {
 	trace       *Buffer
 	image       *Program
 	poses       []*Program  // by entry
+	shorts      []*Program  // by entry, without the skipped operations
 	timelines   []*Timeline // by entry, when profiling
 	last        int         // the entry the last pose pass started at
+	lastWhole   bool        // and whether it was a whole pass, which a timeline stamped
 	outAt       []int
 	traceAt     map[string][2]int // offset and length, in floats
 	arenaFloats int
@@ -126,14 +129,17 @@ func (g *THA3Graph) Build(d *Device, profile bool) (*THA3Runner, error) {
 		}
 		x.sets[k] = s
 	}
-	record := func(phase, from int, timeline *Timeline) (*Program, error) {
+	record := func(phase, from int, timeline *Timeline, skip bool) (*Program, error) {
 		return d.Compile(func(r *Recorder) {
 			if timeline != nil {
 				timeline.Reset(r)
 				timeline.Stamp(r, "start")
 			}
-			for _, o := range g.ops[from:] {
+			for i, o := range g.ops[from:] {
 				if o.phase != phase {
+					continue
+				}
+				if skip && from+i >= g.skip[0] && from+i < g.skip[1] {
 					continue
 				}
 				if o.record != nil {
@@ -146,7 +152,7 @@ func (g *THA3Graph) Build(d *Device, profile bool) (*THA3Runner, error) {
 			}
 		})
 	}
-	if x.image, err = record(THA3ImagePhase, 0, nil); err != nil {
+	if x.image, err = record(THA3ImagePhase, 0, nil, false); err != nil {
 		return fail(err)
 	}
 	for _, from := range append([]int{0}, g.entries...) {
@@ -157,11 +163,18 @@ func (g *THA3Graph) Build(d *Device, profile bool) (*THA3Runner, error) {
 			}
 			x.timelines = append(x.timelines, tl)
 		}
-		prog, err := record(THA3PosePhase, from, tl)
+		prog, err := record(THA3PosePhase, from, tl, false)
 		if err != nil {
 			return fail(err)
 		}
 		x.poses = append(x.poses, prog)
+		var short *Program
+		if g.skipping() && from <= g.skip[0] {
+			if short, err = record(THA3PosePhase, from, nil, true); err != nil {
+				return fail(err)
+			}
+		}
+		x.shorts = append(x.shorts, short)
 	}
 	return x, nil
 }
@@ -231,6 +244,19 @@ func (x *THA3Runner) RunImage() error { return x.image.Run() }
 // RunPose runs the whole pose phase and returns how long the submission took.
 func (x *THA3Runner) RunPose() (time.Duration, error) { return x.RunPoseFrom(0) }
 
+// RunPoseShort runs a pose pass from an entry without the operations the
+// graph marked Skip, which keep what the last whole pass left. It fails
+// when the graph marked none, or none before that entry.
+func (x *THA3Runner) RunPoseShort(entry int) (time.Duration, error) {
+	if entry < 0 || entry >= len(x.shorts) || x.shorts[entry] == nil {
+		return 0, fmt.Errorf("vk: THA3 has no shortened pose pass from entry %d", entry)
+	}
+	start := time.Now()
+	err := x.shorts[entry].Run()
+	x.last, x.lastWhole = entry, false
+	return time.Since(start), err
+}
+
 // RunPoseFrom runs the pose phase from an entry and returns how long the
 // submission took. What comes before the entry is what the last pass left,
 // so it must have run at least once since the inputs it reads last changed.
@@ -240,7 +266,7 @@ func (x *THA3Runner) RunPoseFrom(entry int) (time.Duration, error) {
 	}
 	start := time.Now()
 	err := x.poses[entry].Run()
-	x.last = entry
+	x.last, x.lastWhole = entry, true
 	return time.Since(start), err
 }
 
@@ -266,7 +292,7 @@ func (x *THA3Runner) Waypoint(name string) []float32 {
 
 // Spans returns the last pose pass's timeline, or nil when not profiling.
 func (x *THA3Runner) Spans() ([]Span, error) {
-	if len(x.timelines) == 0 {
+	if len(x.timelines) == 0 || !x.lastWhole {
 		return nil, nil
 	}
 	return x.timelines[x.last].Spans()
@@ -281,10 +307,12 @@ func (x *THA3Runner) Close() {
 		x.image.Close()
 		x.image = nil
 	}
-	for _, p := range x.poses {
-		p.Close()
+	for _, p := range append(x.poses, x.shorts...) {
+		if p != nil {
+			p.Close()
+		}
 	}
-	x.poses = nil
+	x.poses, x.shorts = nil, nil
 	for k, s := range x.sets {
 		s.Close()
 		delete(x.sets, k)
