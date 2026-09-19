@@ -6,7 +6,8 @@ package main
 // the negative prompt, the steps, the guidance and the seed. The answer is the
 // picture as a base64 PNG, and the seed that drew it, so that a client that
 // asked for a random one can ask for the same picture again. The PNG carries
-// the request too, and the golem that drew it.
+// the request too, and the golem that drew it. A LoRA is named as the front
+// names it, lora and lora_strength.
 
 import (
 	"bytes"
@@ -17,6 +18,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,6 +61,10 @@ type generationRequest struct {
 	Steps          int      `json:"steps"`
 	CFG            *float32 `json:"cfg"`
 	Seed           *int64   `json:"seed"`
+	// A LoRA by its file name in ComfyUI's models/loras, as the front's
+	// lora_name, and its strength, 1 when not given.
+	Lora         string   `json:"lora"`
+	LoraStrength *float32 `json:"lora_strength"`
 }
 
 // The mobile front's defaults.
@@ -129,6 +135,18 @@ func (req generationRequest) krea2() (krea2.Request, error) {
 	}
 	if req.CFG != nil {
 		k.CFG = *req.CFG
+	}
+	if req.Lora != "" {
+		if req.Lora != filepath.Base(req.Lora) || strings.HasPrefix(req.Lora, ".") {
+			return k, fmt.Errorf("lora %q: a file name in the LoRA directory", req.Lora)
+		}
+		k.Lora, k.LoraStrength = req.Lora, 1
+		if req.LoraStrength != nil {
+			k.LoraStrength = *req.LoraStrength
+		}
+		if k.LoraStrength < 0 || k.LoraStrength > krea2.MaxLoRAStrength {
+			return k, fmt.Errorf("lora_strength %g: from 0 to %d", k.LoraStrength, krea2.MaxLoRAStrength)
+		}
 	}
 	if req.Seed != nil && *req.Seed >= 0 {
 		k.Seed = uint64(*req.Seed)

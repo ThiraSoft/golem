@@ -3,6 +3,7 @@
 // for the same seed the same picture.
 //
 //	krea2 -prompt "a cat on a wooden table" -seed 42 -out cat.png
+//	krea2 -prompt "..." -lora style.safetensors -lora-strength 0.8
 //
 // It needs a Vulkan device with cooperative matrices and about thirteen
 // gigabytes on it.
@@ -13,6 +14,8 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ThiraSoft/golem/krea2"
@@ -32,7 +35,13 @@ func main() {
 	encoder := flag.String("encoder", krea2.EncoderPath(), "the text encoder, Qwen3-VL-4B fp8-scaled")
 	vae := flag.String("vae", krea2.VAEPath(), "the VAE")
 	tokenizer := flag.String("tokenizer", krea2.TokenizerDir(), "a directory with vocab.json, merges.txt and tokenizer_config.json")
+	lora := flag.String("lora", "", "a LoRA of the DiT: a file in -loras, or a path")
+	loraStrength := flag.Float64("lora-strength", 1, "how much of the LoRA, from 0 to 2")
+	loras := flag.String("loras", krea2.LoRADir(), "the directory -lora names a file in")
 	flag.Parse()
+	if strings.ContainsRune(*lora, filepath.Separator) {
+		*loras, *lora = filepath.Split(*lora)
+	}
 	if *prompt == "" {
 		fmt.Fprintln(os.Stderr, "krea2: -prompt is required")
 		os.Exit(2)
@@ -42,7 +51,7 @@ func main() {
 	}
 
 	start := time.Now()
-	p, err := krea2.Open(krea2.Options{Encoder: *encoder, DiT: *dit, VAE: *vae, Tokenizer: *tokenizer,
+	p, err := krea2.Open(krea2.Options{Encoder: *encoder, DiT: *dit, VAE: *vae, Tokenizer: *tokenizer, LoRAs: *loras,
 		Keep: *n > 1, MaxPixels: max(*width**height, 1024*1024)})
 	if err != nil {
 		fail(err)
@@ -52,7 +61,7 @@ func main() {
 
 	for i := 0; i < *n; i++ {
 		r := krea2.Request{Prompt: *prompt, Negative: *negative, Width: *width, Height: *height, Steps: *steps,
-			CFG: float32(*cfg), Seed: uint64(*seed + int64(i))}
+			CFG: float32(*cfg), Seed: uint64(*seed + int64(i)), Lora: *lora, LoraStrength: float32(*loraStrength)}
 		img, tm, err := p.Generate(r, func(step, steps int) { fmt.Fprintf(os.Stderr, "\rstep %d/%d", step, steps) })
 		if err != nil {
 			fail(err)

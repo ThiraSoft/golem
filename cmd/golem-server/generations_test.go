@@ -91,3 +91,23 @@ func TestGenerationsRefuses(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerationsReadsTheLoRA(t *testing.T) {
+	f, rec := generate(t, `{"prompt":"a cat","seed":1,"lora":"style.safetensors","lora_strength":0.6}`)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if f.got.Lora != "style.safetensors" || f.got.LoraStrength != 0.6 {
+		t.Fatalf("drew %+v", f.got)
+	}
+	f, _ = generate(t, `{"prompt":"a cat","lora":"style.safetensors"}`)
+	if f.got.LoraStrength != 1 {
+		t.Fatalf("with no strength, drew %+v", f.got)
+	}
+	if _, rec = generate(t, `{"prompt":"a cat","lora":"x.safetensors","lora_strength":2.5}`); rec.Code != 400 {
+		t.Fatalf("a strength of 2.5: status %d", rec.Code)
+	}
+	if _, rec = generate(t, `{"prompt":"a cat","lora":"../unet/krea2_turbo_fp8.safetensors"}`); rec.Code != 400 {
+		t.Fatalf("a path for a LoRA: status %d", rec.Code)
+	}
+}

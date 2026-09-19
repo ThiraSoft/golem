@@ -22,6 +22,7 @@ func DiTPath() string      { return ComfyUI(comfyDir()).DiT }
 func EncoderPath() string  { return ComfyUI(comfyDir()).Encoder }
 func VAEPath() string      { return ComfyUI(comfyDir()).VAE }
 func TokenizerDir() string { return ComfyUI(comfyDir()).Tokenizer }
+func LoRADir() string      { return ComfyUI(comfyDir()).LoRAs }
 
 // ComfyUI is the Options that read the three files and the tokenizer out of
 // a ComfyUI directory. The tokenizer is ComfyUI's copy of Qwen2's, which is
@@ -32,5 +33,6 @@ func ComfyUI(dir string) Options {
 		Encoder:   filepath.Join(dir, "models", "text_encoders", "qwen3vl_4b_fp8_scaled.safetensors"),
 		VAE:       filepath.Join(dir, "models", "vae", "qwen_image_vae.safetensors"),
 		Tokenizer: filepath.Join(dir, "comfy", "text_encoders", "qwen25_tokenizer"),
+		LoRAs:     filepath.Join(dir, "models", "loras"),
 	}
 }

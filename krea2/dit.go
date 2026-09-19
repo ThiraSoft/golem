@@ -12,6 +12,7 @@ package krea2
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/ThiraSoft/golem/vk"
 )
@@ -85,7 +86,19 @@ type DiT struct {
 	fusion map[int][2]*vk.Program
 	steps  map[[3]int][]*vk.Program
 	ctxLen [2]int
+
+	// The products by weight name, and the LoRA on them (lora.go).
+	products map[string]product
+	groups   [][]string
+	loraT    uint32
+	lora     map[int]*loraOn
+	loraOf   *LoRA
+	loraS    float32
+	loraBufs []int // the stacks of A's, then the B's
 }
+
+// product is one of the DiT's fp8 products, rows × cols.
+type product struct{ w, rows, cols int }
 
 // OpenDiT uploads the DiT to the card: twelve gigabytes, most of the card.
 func OpenDiT(d *vk.Device, path string) (*DiT, error) {
@@ -93,7 +106,8 @@ func OpenDiT(d *vk.Device, path string) (*DiT, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := &DiT{ck: ck, fusion: map[int][2]*vk.Program{}, steps: map[[3]int][]*vk.Program{}}
+	m := &DiT{ck: ck, fusion: map[int][2]*vk.Program{}, steps: map[[3]int][]*vk.Program{},
+		products: map[string]product{}, lora: map[int]*loraOn{}}
 	fail := func(err error) (*DiT, error) {
 		m.Close()
 		return nil, err
@@ -184,6 +198,7 @@ func OpenDiT(d *vk.Device, path string) (*DiT, error) {
 	m.table = a.take(N * ditHeadDim)
 	m.img = a.take(MaxImageTokens * ditIn)
 	m.out = a.take(MaxImageTokens * ditIn)
+	m.loraT = a.take(max(N, R) * loraMaxGroup)
 
 	if m.k, err = vk.NewK2(d, a.n, par.data); err != nil {
 		return fail(err)
@@ -191,6 +206,7 @@ func OpenDiT(d *vk.Device, path string) (*DiT, error) {
 	up := func(h *int, name string, rows, cols int) {
 		if err == nil {
 			*h, err = ck.fp8(m.k, name, rows, cols)
+			m.products[strings.TrimSuffix(name, ".weight")] = product{*h, rows, cols}
 		}
 	}
 	upAttn := func(pre string, a *attnWeights, width, kv int) {
@@ -207,6 +223,7 @@ func OpenDiT(d *vk.Device, path string) (*DiT, error) {
 		up(&b.gate, pre+"mlp.gate.weight", ditFFN, ditWidth)
 		up(&b.up, pre+"mlp.up.weight", ditFFN, ditWidth)
 		up(&b.down, pre+"mlp.down.weight", ditWidth, ditFFN)
+		m.groups = append(m.groups, loraGroups(pre)...)
 	}
 	for i := 0; i < 2; i++ {
 		for _, tb := range []struct {
@@ -217,6 +234,7 @@ func OpenDiT(d *vk.Device, path string) (*DiT, error) {
 			up(&tb.b.gate, tb.pre+"mlp.gate.weight", txtFFN, txtWidth)
 			up(&tb.b.up, tb.pre+"mlp.up.weight", txtFFN, txtWidth)
 			up(&tb.b.down, tb.pre+"mlp.down.weight", txtWidth, txtFFN)
+			m.groups = append(m.groups, loraGroups(tb.pre)...)
 		}
 	}
 	up(&m.first, "first.weight", ditWidth, ditIn)
@@ -233,13 +251,13 @@ func OpenDiT(d *vk.Device, path string) (*DiT, error) {
 }
 
 func (m *DiT) mm(r *vk.Recorder, w int, outs, ins, cols, x, y, bias, mode uint32) {
-	m.k.MM(r, w, true, vk.K2MM{Outputs: outs, Inputs: ins, Cols: cols, X: x, XStride: ins, Y: y, YStride: outs,
-		Bias: bias, Scale: 1, Mode: mode})
+	m.k.MM(r, w, true, m.withLoRA(r, w, vk.K2MM{Outputs: outs, Inputs: ins, Cols: cols, X: x, XStride: ins, Y: y, YStride: outs,
+		Bias: bias, Scale: 1, Mode: mode}))
 }
 
 func (m *DiT) gatedMM(r *vk.Recorder, w int, outs, ins, cols, x, y, gateA, gateB uint32) {
-	m.k.MM(r, w, true, vk.K2MM{Outputs: outs, Inputs: ins, Cols: cols, X: x, XStride: ins, Y: y, YStride: outs,
-		Bias: vk.K2None, Scale: 1, Mode: vk.K2GatedAdd, GateA: gateA, GateB: gateB})
+	m.k.MM(r, w, true, m.withLoRA(r, w, vk.K2MM{Outputs: outs, Inputs: ins, Cols: cols, X: x, XStride: ins, Y: y, YStride: outs,
+		Bias: vk.K2None, Scale: 1, Mode: vk.K2GatedAdd, GateA: gateA, GateB: gateB}))
 }
 
 // textBlock records a TextFusionBlock over seqs sequences of length each.
@@ -255,6 +273,7 @@ func (m *DiT) textBlock(r *vk.Recorder, b *txtBlock, seqs, length uint32) {
 		m.k.Norm(r, vk.K2Norm{Src: src, SrcStride: n, Dst: dst, DstStride: n, N: n, Rows: rows, Weight: weight, OnePlus: 1, Eps: ditEps, ScaleA: vk.K2None})
 	}
 	norm(m.x, m.n, w, rows, b.pre)
+	m.loraA(r, rows, m.n, b.q, b.k, b.v, b.attnWeights.gate)
 	m.mm(r, b.q, w, w, rows, m.n, q, vk.K2None, vk.K2Store)
 	m.mm(r, b.k, w, w, rows, m.n, k, vk.K2None, vk.K2Store)
 	m.mm(r, b.v, w, w, rows, m.n, v, vk.K2None, vk.K2Store)
@@ -269,6 +288,7 @@ func (m *DiT) textBlock(r *vk.Recorder, b *txtBlock, seqs, length uint32) {
 	norm(m.x, m.n, w, rows, b.post)
 	h1 := m.scratch
 	h2 := h1 + rows*txtFFN
+	m.loraA(r, rows, m.n, b.gate, b.up)
 	m.mm(r, b.gate, txtFFN, w, rows, m.n, h1, vk.K2None, vk.K2Store)
 	m.mm(r, b.up, txtFFN, w, rows, m.n, h2, vk.K2None, vk.K2Store)
 	m.k.Act(r, vk.K2Act{X: h1, XStride: txtFFN, Y: h2, YStride: txtFFN, N: txtFFN, Rows: rows, Op: vk.K2SwiGLU})
@@ -436,6 +456,7 @@ func (m *DiT) stepPrograms(slot, txt, img int) ([]*vk.Program, error) {
 			ha, hb := mod(1)
 			m.k.Norm(r, vk.K2Norm{Src: m.x, SrcStride: F, Dst: m.n, DstStride: F, N: F, Rows: N, Weight: b.pre, OnePlus: 1, Eps: ditEps,
 				ScaleA: sa, ScaleB: sb, ShiftA: ha, ShiftB: hb})
+			m.loraA(r, N, m.n, b.q, b.k, b.v, b.attnWeights.gate)
 			m.mm(r, b.q, F, F, N, m.n, q, vk.K2None, vk.K2Store)
 			m.mm(r, b.k, kv, F, N, m.n, k, vk.K2None, vk.K2Store)
 			m.mm(r, b.v, kv, F, N, m.n, v, vk.K2None, vk.K2Store)
@@ -457,6 +478,7 @@ func (m *DiT) stepPrograms(slot, txt, img int) ([]*vk.Program, error) {
 			ha, hb = mod(4)
 			m.k.Norm(r, vk.K2Norm{Src: m.x, SrcStride: F, Dst: m.n, DstStride: F, N: F, Rows: N, Weight: b.post, OnePlus: 1, Eps: ditEps,
 				ScaleA: sa, ScaleB: sb, ShiftA: ha, ShiftB: hb})
+			m.loraA(r, N, m.n, b.gate, b.up)
 			m.mm(r, b.gate, ditFFN, F, N, m.n, h1, vk.K2None, vk.K2Store)
 			m.mm(r, b.up, ditFFN, F, N, m.n, h2, vk.K2None, vk.K2Store)
 			m.k.Act(r, vk.K2Act{X: h1, XStride: ditFFN, Y: h2, YStride: ditFFN, N: ditFFN, Rows: N, Op: vk.K2SwiGLU})
@@ -568,9 +590,8 @@ func ditRope(txt, ph, pw int) []float32 {
 	return out
 }
 
-// Trim gives the DiT's working memory back to the card, and forgets the
-// text: SetText again before the next Step.
-func (m *DiT) Trim() {
+// forget closes every recorded program.
+func (m *DiT) forget() {
 	for _, p := range m.fusion {
 		p[0].Close()
 		p[1].Close()
@@ -582,6 +603,12 @@ func (m *DiT) Trim() {
 		}
 	}
 	m.steps = map[[3]int][]*vk.Program{}
+}
+
+// Trim gives the DiT's working memory back to the card, and forgets the
+// text: SetText again before the next Step.
+func (m *DiT) Trim() {
+	m.forget()
 	m.ctxLen = [2]int{}
 	m.k.FreeArena()
 }
@@ -591,17 +618,7 @@ func (m *DiT) WeightBytes() int { return m.k.WeightBytes() }
 
 // Close frees the card and the checkpoint.
 func (m *DiT) Close() {
-	for _, p := range m.fusion {
-		p[0].Close()
-		p[1].Close()
-	}
-	m.fusion = nil
-	for _, ps := range m.steps {
-		for _, p := range ps {
-			p.Close()
-		}
-	}
-	m.steps = nil
+	m.forget()
 	if m.k != nil {
 		m.k.Close()
 		m.k = nil

@@ -3,7 +3,8 @@ package krea2
 // What a picture says about how it was drawn, in the PNG itself: the prompt,
 // the settings and the seed, enough to draw it again, and which golem drew
 // it. The parameters are written the way Automatic1111 writes them, which is
-// what most tools that read a picture's settings look for.
+// what most tools that read a picture's settings look for, a LoRA included:
+// <lora:name:strength> after the prompt.
 
 import (
 	"bytes"
@@ -24,6 +25,9 @@ import (
 func (r Request) Parameters(model string) string {
 	var b strings.Builder
 	b.WriteString(r.Prompt)
+	if r.Lora != "" && r.LoraStrength != 0 {
+		fmt.Fprintf(&b, " <lora:%s:%g>", strings.TrimSuffix(r.Lora, ".safetensors"), r.LoraStrength)
+	}
 	if r.Negative != "" {
 		fmt.Fprintf(&b, "\nNegative prompt: %s", r.Negative)
 	}

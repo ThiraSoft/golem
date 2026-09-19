@@ -24,6 +24,12 @@ img, times, err := p.Generate(krea2.Request{
 `cmd/krea2` draws one from the command line, and `golem-server -krea2 DIR`
 serves `/v1/images/generations`.
 
+A LoRA of the DiT is named as the front names it, a file in ComfyUI's
+`models/loras` and a strength from 0 to 2: `Request.Lora` and
+`Request.LoraStrength`, `-lora` and `-lora-strength`, `lora` and
+`lora_strength` in the server's request. The picture's metadata carries it,
+`<lora:name:strength>` after the prompt.
+
 It wants a Vulkan device with cooperative matrices and about fourteen
 gigabytes on it: the DiT is twelve, the rest is working memory, taken and
 given back one network at a time. The text encoder stays in system memory and
@@ -49,8 +55,41 @@ further from ComfyUI's, not nearer: ComfyUI's rounding is ROCm's products',
 which torch in bf16 on the CPU does not reproduce either.
 
 So the pictures are the same to the eye and not to the bit. At the front's
-defaults the recorded portrait is 30.7 dB from ComfyUI's; at 256 × 256, a size
+defaults the recorded portrait is 30.7 dB from ComfyUI's, and 24 dB at seeds
+43 and 44 (`seeds/`); at 256 × 256, a size
 the model was not made for, it is the same cat with other whiskers, 22 dB.
+
+## LoRA
+
+ComfyUI folds a LoRA into the weights two ways according to where it put the
+module: one it holds on the card is patched once and rounded back to fp8
+stochastically, one it left in system memory is patched in bf16 at every
+call. The second is the arithmetic; the first adds a noise, weight by weight,
+larger than the change. Which modules are which follows the card's free
+memory: on the recording, 210 of the 256 changed weights were of the second
+kind.
+
+golem leaves the fp8 weights alone and adds s·B·(A·x) inside the same
+product, which is what both stand for and what ComfyUI's bypass loader does
+(`lora.go`, `shaders/krea2_mm.comp`). A LoRA is then a few hundred megabytes
+beside the DiT, and with the DiT kept another strength costs nothing and
+another LoRA the time to upload it, not the time to read twelve gigabytes.
+
+With the front's LoRA a DiT call is 0.73% from the same call in float32 and
+2.4% from ComfyUI's, what the call without one is. The portrait at seeds 43
+and 44 is 23 to 25 dB from ComfyUI's with the LoRA and 24 without, the same
+picture to the eye; ComfyUI's two loaders part by 26 and 31 dB there. At
+seed 42 it is 21 dB with the LoRA, the same woman and dress with other lace,
+and ComfyUI's two loaders 23.
+
+A step at 768 × 1024:
+
+| | a DiT step | putting it on |
+|---|---:|---:|
+| no LoRA | 1.38 s | |
+| `style`, rank 32 | 1.42 s | 0.3 to 1.2 s |
+| `identity`, rank 256 | 1.49 s | 2.5 to 5 s |
+| another strength | same | 60 µs |
 
 ## Measured
 

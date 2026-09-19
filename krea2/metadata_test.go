@@ -44,3 +44,14 @@ func TestPNGCarriesTheRequest(t *testing.T) {
 		t.Errorf("golem = %q (%v)", texts["golem"], err)
 	}
 }
+
+func TestParametersNameTheLoRA(t *testing.T) {
+	r := Request{Prompt: "a cat", Width: 64, Height: 64, Steps: 8, CFG: 1, Seed: 5, Lora: "style.safetensors", LoraStrength: 0.75}
+	if got := r.Parameters("m"); !strings.HasPrefix(got, "a cat <lora:style:0.75>\nSteps: 8,") {
+		t.Errorf("parameters = %q", got)
+	}
+	r.LoraStrength = 0
+	if got := r.Parameters("m"); !strings.HasPrefix(got, "a cat\nSteps") {
+		t.Errorf("at strength 0, parameters = %q", got)
+	}
+}

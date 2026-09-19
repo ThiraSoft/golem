@@ -7,6 +7,8 @@ package krea2
 import (
 	"fmt"
 	"image"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ThiraSoft/golem/token/bytebpe"
@@ -17,6 +19,9 @@ import (
 type Options struct {
 	// The three checkpoints and the tokenizer; empty means ComfyUI's.
 	Encoder, DiT, VAE, Tokenizer string
+	// LoRAs is the directory a request's LoRA is named in; empty means
+	// ComfyUI's.
+	LoRAs string
 	// Keep leaves the DiT's twelve gigabytes on the card between pictures,
 	// which is most of the time a picture takes when it is not kept.
 	Keep bool
@@ -33,7 +38,14 @@ type Request struct {
 	Steps    int     `json:"steps"`
 	CFG      float32 `json:"cfg"`
 	Seed     uint64  `json:"seed"`
+	// Lora is a file in Options.LoRAs, as the front's lora_name, and
+	// LoraStrength how much of it, from 0 to 2; none when either is zero.
+	Lora         string  `json:"lora,omitempty"`
+	LoraStrength float32 `json:"lora_strength,omitempty"`
 }
+
+// MaxLoRAStrength is the front's bound on a LoRA's strength.
+const MaxLoRAStrength = 2
 
 // Timings is where a picture's time went.
 type Timings struct {
@@ -49,6 +61,7 @@ type Pipeline struct {
 	enc   *Encoder
 	dit   *DiT
 	vae   *VAE
+	lora  *LoRA // the last one asked for, kept in memory
 }
 
 // Open readies a pipeline. The DiT is read at the first picture.
@@ -64,6 +77,9 @@ func Open(o Options) (*Pipeline, error) {
 	}
 	if o.Tokenizer == "" {
 		o.Tokenizer = TokenizerDir()
+	}
+	if o.LoRAs == "" {
+		o.LoRAs = LoRADir()
 	}
 	if o.MaxPixels == 0 {
 		o.MaxPixels = 1024 * 1024
@@ -101,8 +117,38 @@ func (p *Pipeline) check(r Request) error {
 		return fmt.Errorf("krea2: %d steps", r.Steps)
 	case r.CFG <= 0:
 		return fmt.Errorf("krea2: a CFG of %g", r.CFG)
+	case r.LoraStrength < 0 || r.LoraStrength > MaxLoRAStrength:
+		return fmt.Errorf("krea2: a LoRA strength of %g, from 0 to %d", r.LoraStrength, MaxLoRAStrength)
+	case r.Lora != "" && (r.Lora != filepath.Base(r.Lora) || strings.HasPrefix(r.Lora, ".")):
+		return fmt.Errorf("krea2: LoRA %q is not a file name", r.Lora)
 	}
 	return nil
+}
+
+// loraFor reads the request's LoRA, or keeps the one read last when it is
+// the same; nil for none.
+func (p *Pipeline) loraFor(r Request) (*LoRA, error) {
+	if r.Lora == "" || r.LoraStrength == 0 {
+		return nil, nil
+	}
+	path := filepath.Join(p.o.LoRAs, r.Lora)
+	if p.lora != nil && p.lora.path == path {
+		return p.lora, nil
+	}
+	if p.dit != nil {
+		// The one on the card goes before this one is read: it is in memory
+		// only for the card's sake.
+		if err := p.dit.SetLoRA(nil, 0); err != nil {
+			return nil, err
+		}
+	}
+	p.lora = nil
+	l, err := OpenLoRA(path)
+	if err != nil {
+		return nil, err
+	}
+	p.lora = l
+	return l, nil
 }
 
 // Generate draws one picture. progress, if set, hears about each step.
@@ -131,10 +177,17 @@ func (p *Pipeline) Generate(r Request, progress Progress) (*image.NRGBA, Timings
 	tm.Encode = time.Since(start)
 
 	t := time.Now()
+	lora, err := p.loraFor(r)
+	if err != nil {
+		return nil, tm, err
+	}
 	if p.dit == nil {
 		if p.dit, err = OpenDiT(p.d, p.o.DiT); err != nil {
 			return nil, tm, err
 		}
+	}
+	if err := p.dit.SetLoRA(lora, r.LoraStrength); err != nil {
+		return nil, tm, err
 	}
 	tm.Load = time.Since(t)
 	t = time.Now()
