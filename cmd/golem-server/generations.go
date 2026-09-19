@@ -8,7 +8,7 @@ package main
 // asked for a random one can ask for the same picture again. The PNG carries
 // the request too, and the golem that drew it. A LoRA is named as the front
 // names it, lora and lora_strength. hide_prompt keeps the prompt out of the
-// PNG.
+// PNG. With stream, the answer is server-sent events, one a step.
 
 import (
 	"bytes"
@@ -68,6 +68,8 @@ type generationRequest struct {
 	LoraStrength *float32 `json:"lora_strength"`
 	// HidePrompt leaves the prompt out of the PNG's metadata.
 	HidePrompt bool `json:"hide_prompt"`
+	// Stream answers with server-sent events: one a step, then the picture.
+	Stream bool `json:"stream"`
 }
 
 // The mobile front's defaults.
@@ -87,26 +89,73 @@ func (s *Server) generations(w http.ResponseWriter, r *http.Request) {
 		refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	img, tm, err := s.imager.Generate(k, nil)
+	if req.Stream {
+		s.streamGeneration(w, req, k)
+		return
+	}
+	png, err := s.draw(w, k, nil)
 	if err != nil {
 		refuse(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"created": time.Now().Unix(),
+		"data": []map[string]any{{
+			"b64_json":       base64.StdEncoding.EncodeToString(png),
+			"revised_prompt": req.Prompt,
+			"seed":           k.Seed,
+		}},
+	})
+}
+
+// draw draws the picture and returns it as a PNG, noting its cost for the
+// log line.
+func (s *Server) draw(w http.ResponseWriter, k krea2.Request, progress krea2.Progress) ([]byte, error) {
+	img, tm, err := s.imager.Generate(k, progress)
+	if err != nil {
+		return nil, err
+	}
 	var buf bytes.Buffer
 	if err := s.imager.WritePNG(&buf, img, k); err != nil {
-		refuse(w, http.StatusInternalServerError, "server_error", err.Error())
-		return
+		return nil, err
 	}
 	if rec, ok := w.(*recorder); ok {
 		rec.reason = fmt.Sprintf("%dx%d, %d steps, seed %d, %s", k.Width, k.Height, k.Steps, k.Seed, tm.Total.Round(time.Millisecond))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"created": time.Now().Unix(),
-		"data": []map[string]any{{
-			"b64_json":       base64.StdEncoding.EncodeToString(buf.Bytes()),
-			"revised_prompt": req.Prompt,
-			"seed":           k.Seed,
-		}},
+	return buf.Bytes(), nil
+}
+
+// streamGeneration answers with server-sent events, named as OpenAI names
+// those of a streamed picture: image_generation.progress after each step
+// (step, steps), then image_generation.completed with the picture, or error.
+// A client waiting behind another picture hears nothing until its own starts.
+func (s *Server) streamGeneration(w http.ResponseWriter, req generationRequest, k krea2.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		refuse(w, http.StatusInternalServerError, "server_error", "this connection cannot be streamed to")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	send := func(kind string, body map[string]any) {
+		body["type"] = kind
+		data, _ := json.Marshal(body)
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", kind, data)
+		flusher.Flush()
+	}
+	png, err := s.draw(w, k, func(step, steps int) {
+		send("image_generation.progress", map[string]any{"step": step, "steps": steps})
+	})
+	if err != nil {
+		send("error", map[string]any{"error": map[string]any{"type": "server_error", "message": err.Error()}})
+		return
+	}
+	send("image_generation.completed", map[string]any{
+		"created_at":     time.Now().Unix(),
+		"b64_json":       base64.StdEncoding.EncodeToString(png),
+		"revised_prompt": req.Prompt,
+		"seed":           k.Seed,
 	})
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/png"
 	"io"
@@ -21,8 +22,13 @@ func (f *fakeImager) WritePNG(w io.Writer, img image.Image, r krea2.Request) err
 	return krea2.WritePNG(w, img, r, "fake")
 }
 
-func (f *fakeImager) Generate(r krea2.Request, _ krea2.Progress) (*image.NRGBA, krea2.Timings, error) {
+func (f *fakeImager) Generate(r krea2.Request, progress krea2.Progress) (*image.NRGBA, krea2.Timings, error) {
 	f.got = r
+	if progress != nil {
+		for i := 1; i <= r.Steps; i++ {
+			progress(i, r.Steps)
+		}
+	}
 	return image.NewNRGBA(image.Rect(0, 0, r.Width, r.Height)), krea2.Timings{}, nil
 }
 
@@ -128,5 +134,31 @@ func TestGenerationsReadsTheLoRA(t *testing.T) {
 	}
 	if _, rec = generate(t, `{"prompt":"a cat","lora":"../unet/krea2_turbo_fp8.safetensors"}`); rec.Code != 400 {
 		t.Fatalf("a path for a LoRA: status %d", rec.Code)
+	}
+}
+
+func TestGenerationsStreamsTheSteps(t *testing.T) {
+	_, rec := generate(t, `{"prompt":"a cat","steps":3,"seed":9,"stream":true}`)
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("status %d, %s", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	var kinds []string
+	var last map[string]any
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if data, ok := strings.CutPrefix(line, "data: "); ok {
+			last = map[string]any{}
+			if err := json.Unmarshal([]byte(data), &last); err != nil {
+				t.Fatal(err)
+			}
+			kinds = append(kinds, fmt.Sprintf("%v %v", last["type"], last["step"]))
+		}
+	}
+	want := "[image_generation.progress 1 image_generation.progress 2 image_generation.progress 3 image_generation.completed <nil>]"
+	if fmt.Sprint(kinds) != want {
+		t.Fatalf("events %v", kinds)
+	}
+	raw, err := base64.StdEncoding.DecodeString(last["b64_json"].(string))
+	if err != nil || !bytes.Contains(raw, []byte("Seed: 9")) || last["seed"].(float64) != 9 {
+		t.Fatalf("the last event's picture: %v", err)
 	}
 }
