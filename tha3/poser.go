@@ -54,6 +54,26 @@ type Poser struct {
 	eyebrows  Tensor
 	morphed   Tensor
 
+	// What each network decided on the processor, applied again to the
+	// larger picture when the scale is above one, and what that made.
+	decomposed              decomposerFields
+	combined                combinerFields
+	faced                   faceFields
+	edited                  editorFields
+	scale                   int
+	high                    Tensor
+	hiEyebrow, hiBackground Tensor
+	hiEyebrows, hiMorphed   Tensor
+
+	// heldBody reuses the rotator's and the editor's last decisions when
+	// only the face and the brows move.
+	heldBody bool
+
+	// After SetBackground, frames come out finished, zoomed by zoom.
+	finish bool
+	bg     [3]uint8
+	zoom   Zoom
+
 	image, eyebrow, background Tensor
 	timings                    Timings
 
@@ -72,7 +92,7 @@ var errClosed = errors.New("tha3: poser is closed")
 
 // Open loads the five networks from dir, which Dir usually names.
 func Open(dir string) (*Poser, error) {
-	p := &Poser{timings: Timings{}, view: whole}
+	p := &Poser{timings: Timings{}, view: whole, scale: 1}
 	byName := map[string]*weights{}
 	for _, n := range []string{netEyebrowDecomposer, netEyebrowCombiner, netFaceMorpher, netRotator, netEditor} {
 		w, err := openWeights(dir, n)
@@ -117,29 +137,52 @@ func (p *Poser) Close() error {
 
 // SetImage sets the picture to animate and runs the eyebrow decomposer on it,
 // which depends on nothing else and is kept for every pose that follows.
-func (p *Poser) SetImage(img Tensor) error {
+// With a scale above one, the larger picture is the picture resized: see
+// SetImageHigh for one that has more to show.
+func (p *Poser) SetImage(img Tensor) error { return p.SetImageHigh(img, Tensor{}) }
+
+// SetImageHigh is SetImage with the larger picture Pose draws from when the
+// scale is above one: the same picture, 512 times the scale on a side, so
+// that what the networks only move keeps its detail. An empty high is img
+// resized; at a scale of one, high is not used.
+func (p *Poser) SetImageHigh(img, high Tensor) error {
 	if p.closed {
 		return errClosed
 	}
 	if img.C != 4 || img.H != Size || img.W != Size {
 		return fmt.Errorf("tha3: picture is %dx%dx%d, want 4x%dx%d", img.C, img.H, img.W, Size, Size)
 	}
+	n := Size * p.scale
+	switch {
+	case p.scale == 1:
+		high = Tensor{}
+	case high.Data == nil:
+		high = ResizeBilinear(img, n, n)
+	case high.C != 4 || high.H != n || high.W != n:
+		return fmt.Errorf("tha3: larger picture is %dx%dx%d, want 4x%dx%d", high.C, high.H, high.W, n, n)
+	default:
+		high = high.Clone()
+	}
 	// Clone the image so callers cannot mutate the stored picture. It is
 	// stored only once the card, if there is one, holds it too.
 	pic := img.Clone()
 	p.haveLast = false
 	if p.gpu != nil {
-		if err := p.gpu.setImage(p, pic); err != nil {
+		if err := p.gpu.setImage(p, pic, high); err != nil {
 			return err
 		}
-		p.image = pic
+		p.image, p.high = pic, high
 		return nil
 	}
-	p.image = pic
+	p.image, p.high = pic, high
 	crop := img.Crop(64, 192, 128, 128)
 	p.trace.emit(netEyebrowDecomposer+".in.0", crop)
 	start := time.Now()
-	p.eyebrow, p.background = p.decomposer.forward(crop, p.trace.sub(netEyebrowDecomposer))
+	p.eyebrow, p.background, p.decomposed = p.decomposer.forward(crop, p.trace.sub(netEyebrowDecomposer))
+	if p.high.Data != nil {
+		k := p.high.H / Size
+		p.hiEyebrow, p.hiBackground = p.decomposed.resized(128*k, 128*k).apply(p.high.Crop(64*k, 192*k, 128*k, 128*k))
+	}
 	p.timings[netEyebrowDecomposer] = time.Since(start)
 	return nil
 }
@@ -177,9 +220,15 @@ func firstChange(last, pose [NumParams]float32) (stage, bool) {
 	return 0, false
 }
 
+// sameBody reports whether two poses turn the head and the body the same
+// way, which is what the rotator and the editor read.
+func sameBody(a, b [NumParams]float32) bool {
+	return [NumParams - faceParamsEnd]float32(a[faceParamsEnd:]) == [NumParams - faceParamsEnd]float32(b[faceParamsEnd:])
+}
+
 // poseCPU runs the five networks on the processor, following FiveStepPoserComputationProtocol in the demo's separable_float.py,
 // from stage from: what the stages before it made is kept from the last pose.
-func (p *Poser) poseCPU(pose [NumParams]float32, from stage) (Tensor, error) {
+func (p *Poser) poseCPU(pose [NumParams]float32, from stage, short bool) (Tensor, error) {
 	eyebrowPose := pose[:eyebrowParams]
 	facePose := pose[eyebrowParams:faceParamsEnd]
 	rotationPose := pose[faceParamsEnd:]
@@ -193,7 +242,11 @@ func (p *Poser) poseCPU(pose [NumParams]float32, from stage) (Tensor, error) {
 		p.trace.emit(netEyebrowCombiner+".in.0", p.background)
 		p.trace.emit(netEyebrowCombiner+".in.1", p.eyebrow)
 		timed(netEyebrowCombiner, func() {
-			p.eyebrows = p.combiner.forward(p.background, p.eyebrow, eyebrowPose, p.trace.sub(netEyebrowCombiner))
+			p.eyebrows, p.combined = p.combiner.forward(p.background, p.eyebrow, eyebrowPose, p.trace.sub(netEyebrowCombiner))
+			if p.high.Data != nil {
+				k := p.high.H / Size
+				p.hiEyebrows = p.combined.resized(128*k, 128*k).apply(p.hiBackground, p.hiEyebrow)
+			}
 		})
 	}
 
@@ -202,8 +255,21 @@ func (p *Poser) poseCPU(pose [NumParams]float32, from stage) (Tensor, error) {
 		faceIn.Paste(p.eyebrows, 32, 32)
 		p.trace.emit(netFaceMorpher+".in.0", faceIn)
 		timed(netFaceMorpher, func() {
-			p.morphed = p.face.forward(faceIn, facePose, p.trace.sub(netFaceMorpher))
+			p.morphed, p.faced = p.face.forward(faceIn, facePose, p.trace.sub(netFaceMorpher))
+			if p.high.Data != nil {
+				k := p.high.H / Size
+				hiIn := p.high.Crop(32*k, 160*k, 192*k, 192*k)
+				hiIn.Paste(p.hiEyebrows, 32*k, 32*k)
+				p.hiMorphed = p.faced.resized(192*k, 192*k).apply(hiIn)
+			}
 		})
+	}
+
+	if short {
+		// The rotator and the editor keep what they decided for the
+		// last pose: the face alone moved under their warp.
+		p.timings[netRotator], p.timings[netEditor] = 0, 0
+		return p.compose(), nil
 	}
 
 	full := p.image.Clone()
@@ -222,12 +288,36 @@ func (p *Poser) poseCPU(pose [NumParams]float32, from stage) (Tensor, error) {
 	p.trace.emit(netEditor+".in.2", grid)
 	var frame Tensor
 	timed(netEditor, func() {
-		frame = p.editor.forward(full, warped, grid, rotationPose, p.trace.sub(netEditor))
+		frame, p.edited = p.editor.forward(full, warped, grid, rotationPose, p.trace.sub(netEditor))
+		if p.finish || p.high.Data != nil {
+			frame = p.compose()
+		}
 	})
+	if p.finish || p.high.Data != nil {
+		return frame, nil
+	}
 	if v := p.view; v != whole {
 		frame = frame.Crop(v.Min.Y, v.Min.X, v.Dy(), v.Dx())
 	}
 	return frame, nil
+}
+
+// compose is the last step on the processor, from what the editor decided:
+// the larger picture warped and repainted, finished for the screen or not,
+// cut to the view.
+func (p *Poser) compose() Tensor {
+	high, face := p.high, p.hiMorphed
+	if high.Data == nil {
+		high, face = p.image, p.morphed
+	}
+	if p.finish {
+		return p.finishCPU(high, face)
+	}
+	k, v := high.H/Size, p.view
+	full := high.Clone()
+	full.Paste(face, 32*k, 160*k)
+	frame := p.edited.resized(high.H, high.W).apply(full)
+	return frame.Crop(v.Min.Y*k, v.Min.X*k, v.Dy()*k, v.Dx()*k)
 }
 
 // Pose renders the picture with the given pose. A pose equal to the last one,
@@ -237,6 +327,13 @@ func (p *Poser) poseCPU(pose [NumParams]float32, from stage) (Tensor, error) {
 // and one that also keeps the face skips the face morpher: breathing and
 // turning the head run only the rotator and the editor.
 func (p *Poser) Pose(pose [NumParams]float32) (Tensor, error) {
+	if p.finish {
+		return Tensor{}, fmt.Errorf("tha3: Pose after SetBackground: use PoseRGBA")
+	}
+	return p.render(pose, Zoom{})
+}
+
+func (p *Poser) render(pose [NumParams]float32, zoom Zoom) (Tensor, error) {
 	if p.closed {
 		return Tensor{}, errClosed
 	}
@@ -246,22 +343,32 @@ func (p *Poser) Pose(pose [NumParams]float32) (Tensor, error) {
 	from := stageEyebrows
 	if p.haveLast {
 		changed, ok := firstChange(p.lastPose, pose)
-		if !ok {
+		switch {
+		case !ok && zoom == p.zoom:
 			return p.lastFrame.Clone(), nil
+		case !ok:
+			// Only the zoom moved, which the last step alone reads.
+			changed = stageBody
 		}
 		from = changed
 	}
+	p.zoom = zoom
 	for _, skipped := range stageNetworks[:from] {
 		for _, name := range skipped {
 			p.timings[name] = 0
 		}
 	}
+	// With the body held, a pose that leaves the rotation alone reuses
+	// the warp and the repaint of the last one, and neither the rotator
+	// nor the editor runs. The brows and the face may have moved; the
+	// rotation, which those two read, may not.
+	short := p.heldBody && p.haveLast && sameBody(p.lastPose, pose)
 	var frame Tensor
 	var err error
 	if p.gpu != nil {
-		frame, err = p.gpu.pose(p, pose, from)
+		frame, err = p.gpu.pose(p, pose, from, short)
 	} else {
-		frame, err = p.poseCPU(pose, from)
+		frame, err = p.poseCPU(pose, from, short)
 	}
 	if err != nil {
 		// What the stages kept may be half written: start over next time.

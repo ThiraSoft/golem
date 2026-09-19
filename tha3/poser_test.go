@@ -3,6 +3,8 @@ package tha3
 import (
 	"errors"
 	"image"
+	"image/color"
+	"image/draw"
 	"io/fs"
 	"testing"
 
@@ -247,4 +249,73 @@ func TestView(t *testing.T) {
 			t.Fatal("a view past the frame was accepted")
 		}
 	})
+}
+
+// The larger picture at the scale of one is the picture itself: applying
+// the networks' decisions again to it must give the frame they made.
+func TestHighAtOneIsPose(t *testing.T) {
+	f := loadFixtures(t, "neutral")
+	p := openPoserOrSkip(t)
+	defer p.Close()
+	img := f.tensor(t, "image")
+	var pose [NumParams]float32
+	copy(pose[:], f.Pose)
+	pose[MouthAaa], pose[HeadY] = 1, 0.5
+	if err := p.SetImage(img); err != nil {
+		t.Fatal(err)
+	}
+	want, err := p.Pose(pose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SetImage(img); err != nil {
+		t.Fatal(err)
+	}
+	p.high = img.Clone()
+	p.hiEyebrow, p.hiBackground = p.decomposed.apply(img.Crop(64, 192, 128, 128))
+	got, err := p.Pose(pose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference.Compare(t, "frame", got.Data, want.Data, 1e-6)
+}
+
+// A finished frame at the scale of one, not zoomed, is the frame ToNRGBA
+// makes, laid on the background.
+func TestFinishIsFrameOnBackground(t *testing.T) {
+	f := loadFixtures(t, "mix")
+	img := f.tensor(t, "image")
+	var pose [NumParams]float32
+	copy(pose[:], f.Pose)
+	view := image.Rect(144, 32, 368, 256)
+	bg := color.RGBA{0x1f, 0x1a, 0x28, 0xff}
+	p := openPoserOrSkip(t)
+	defer p.Close()
+	if err := p.SetView(view); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SetImage(img); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := p.Pose(pose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := image.NewRGBA(image.Rect(0, 0, view.Dx(), view.Dy()))
+	draw.Draw(want, want.Rect, &image.Uniform{C: bg}, image.Point{}, draw.Src)
+	draw.Draw(want, want.Rect, ToNRGBA(frame), image.Point{}, draw.Over)
+	if err := p.SetBackground(bg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := p.PoseRGBA(pose, Zoom{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worst := 0
+	for i := range got.Pix {
+		worst = max(worst, abs(int(got.Pix[i])-int(want.Pix[i])))
+	}
+	if worst > 2 {
+		t.Fatalf("a byte differs by %d", worst)
+	}
 }
