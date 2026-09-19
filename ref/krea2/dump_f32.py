@@ -11,7 +11,10 @@ waypoints under dit32/.
         /mnt/data/dev/ComfyUI testdata/krea2 [step]
 
 With a step, the call is the recorded run's at that step instead of its
-first, and the waypoints go under dit32_<step>/.
+first, and the waypoints go under dit32_<step>/. With "lora" in place of a
+step, the call is the one dump.py recorded with the front's LoRA (lora/dit/),
+the LoRA folded into the weights in float32, and the waypoints go under
+lora/dit32/.
 """
 
 import json
@@ -21,7 +24,12 @@ import sys
 import numpy as np
 
 COMFY, OUT = sys.argv[1], os.path.abspath(sys.argv[2])
-STEP = int(sys.argv[3]) if len(sys.argv) > 3 else None
+ARG = sys.argv[3] if len(sys.argv) > 3 else None
+LORA = ARG in ("lora", "lora-bf16")
+# lora-bf16 folds the LoRA as ComfyUI does for a module it casts at every
+# call: B·A in bf16, added to the weight in bf16.
+ROUND = ARG == "lora-bf16"
+STEP = int(ARG) if ARG is not None and not LORA else None
 sys.path.insert(0, COMFY)
 os.chdir(COMFY)
 sys.argv = [sys.argv[0], "--cpu"]
@@ -57,10 +65,22 @@ def save(name, t):
 
 
 st = safe_open(UNET, "pt")
+lora = safe_open(os.path.join(COMFY, "models/loras/style.safetensors"), "pt") if LORA else None
 
 
 def load(module, prefix):
     sd = {k[len(prefix):]: st.get_tensor(k).to(F32) for k in st.keys() if k.startswith(prefix)}
+    if lora is not None:
+        for k in list(sd):
+            a = "diffusion_model." + prefix + k[:-len("weight")] + "lora_A.weight"
+            if k.endswith(".weight") and a in lora.keys():
+                b = a.replace("lora_A", "lora_B")
+                if ROUND:
+                    B16, A16 = lora.get_tensor(b).to(torch.bfloat16), lora.get_tensor(a).to(torch.bfloat16)
+                    d = (B16.float() @ A16.float()).to(torch.bfloat16)
+                    sd[k] = (sd[k].to(torch.bfloat16) + d).float()
+                else:
+                    sd[k] = sd[k] + lora.get_tensor(b).to(F32) @ lora.get_tensor(a).to(F32)
     missing, unexpected = module.load_state_dict(sd, strict=False)
     assert not missing, missing
     return module.to(F32)
@@ -74,10 +94,11 @@ axes = [headdim - 12 * (headdim // 16), 6 * (headdim // 16), 6 * (headdim // 16)
 dm.patch, dm.channels, dm.tdim, dm.txtlayers, dm.txtdim = patch, channels, 256, 12, 2560
 dm.pe_embedder = K.EmbedND(dim=headdim, theta=1000, axes_dim=axes)
 
-x = read("dit/x")[:, :, 0]
-t = read("dit/t")
-context = read("dit/context")
-PRE = "dit32/"
+SRC = "lora/dit/" if LORA else "dit/"
+x = read(SRC + "x")[:, :, 0]
+t = read(SRC + "t")
+context = read(SRC + "context")
+PRE = ("lora/dit32bf/" if ROUND else "lora/dit32/") if LORA else "dit32/"
 if STEP is not None:
     x = read("sample/x%d" % STEP)[:, :, 0]
     sig = read("sample/sigmas")

@@ -7,8 +7,11 @@ stage as raw little-endian float32, with meta.json giving each file's shape.
     /mnt/data/dev/ComfyUI/.venv/bin/python ref/krea2/dump.py \
         /mnt/data/dev/ComfyUI testdata/krea2 [stage ...]
 
-Stages: tokens, sample, accept (default: all three). sample also records one
-DiT call and one VAE decode with their waypoints.
+Stages: tokens, sample, accept (default: all three), and lora. sample also
+records one DiT call and one VAE decode with their waypoints. lora draws the
+acceptance picture again with the front's LoRA, as LoraLoaderModelOnly applies
+it and as the bypass loader does, and one DiT call at 256 × 256 through the
+bypass loader, whose arithmetic is the one without rounding to fp8.
 """
 
 import json
@@ -38,6 +41,7 @@ import comfy.samplers  # noqa: E402
 UNET = "krea2_turbo_fp8.safetensors"
 CLIP = "qwen3vl_4b_fp8_scaled.safetensors"
 VAE = "qwen_image_vae.safetensors"
+LORA = "style.safetensors"
 NEGATIVE = "(ugly, anime, text, watermark, label, worst,sketch,censor, cg, cgi, rendered, 3d :1.0)"
 PROMPTS = {
     "short": "a cat",
@@ -160,7 +164,7 @@ def vae_hooks(vae, rec):
     return hooks
 
 
-def run(unet, clip, vae, prompt, width, height, steps, cfg, seed, tag, waypoints):
+def run(unet, clip, vae, prompt, width, height, steps, cfg, seed, tag, waypoints, dit="dit", extra=None):
     rec = {"steps": [], "noise": []}
     pos = nodes.CLIPTextEncode().encode(clip, prompt)[0]
     neg = nodes.CLIPTextEncode().encode(clip, NEGATIVE)[0]
@@ -228,17 +232,64 @@ def run(unet, clip, vae, prompt, width, height, steps, cfg, seed, tag, waypoints
     Image.fromarray(arr).save(os.path.join(OUT, tag, "image.png"))
     if waypoints:
         x, t, c = drec.pop("in")
-        save("dit/x", x)
-        save("dit/t", t)
-        save("dit/context", c)
+        save(dit + "/x", x)
+        save(dit + "/t", t)
+        save(dit + "/context", c)
         for k, v in drec.items():
-            save("dit/" + k, v)
-        for k, v in vrec.items():
-            save("vae/" + k, v)
+            save(dit + "/" + k, v)
+        if dit == "dit":
+            for k, v in vrec.items():
+                save("vae/" + k, v)
+    req = {"prompt": prompt, "negative": NEGATIVE, "width": width, "height": height,
+           "steps": steps, "cfg": cfg, "seed": seed}
+    req.update(extra or {})
     with open(os.path.join(OUT, tag, "request.json"), "w") as f:
-        json.dump({"prompt": prompt, "negative": NEGATIVE, "width": width, "height": height,
-                   "steps": steps, "cfg": cfg, "seed": seed}, f)
+        json.dump(req, f)
     print(tag, "done", tuple(samples["samples"].shape), "steps", len(rec["steps"]), "noise", len(rec["noise"]))
+
+
+def lowvram_keys(model):
+    """The weights ComfyUI patches as it casts them rather than once in fp8:
+    those of the modules it left in system memory."""
+    keys = []
+    for n, m in model.model.named_modules():
+        for f in getattr(m, "weight_function", []) or []:
+            if getattr(f, "is_lowvram_patch", False):
+                keys.append(f.key)
+    return sorted(keys)
+
+
+def stage_lora(unet, clip, vae):
+    import comfy.sd
+    import comfy.utils
+    lora = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("loras", LORA), safe_load=True)
+    for strength, tag in ((1.0, "lora/fused1"), (0.5, "lora/fused05")):
+        m = nodes.LoraLoaderModelOnly().load_lora_model_only(unet, LORA, strength)[0]
+        run(m, clip, vae, PROMPTS["portrait"], 768, 1024, 8, 1.0, 42, tag, False,
+            extra={"lora": LORA, "lora_strength": strength})
+        with open(os.path.join(OUT, tag, "lowvram.json"), "w") as f:
+            json.dump(lowvram_keys(m), f, indent=0)
+        del m
+    m = comfy.sd.load_bypass_lora_for_models(unet, None, lora, 1.0, 0)[0]
+    run(m, clip, vae, PROMPTS["portrait"], 768, 1024, 8, 1.0, 42, "lora/bypass1", False,
+        extra={"lora": LORA, "lora_strength": 1.0})
+    run(m, clip, vae, PROMPTS["short"], 256, 256, 8, 1.0, 7, "lora/sample", True, dit="lora/dit",
+        extra={"lora": LORA, "lora_strength": 1.0})
+
+
+def stage_seeds(unet, clip, vae):
+    """The portrait at two more seeds, without the LoRA and with it both
+    ways: how far ComfyUI's own two loaders part is what a picture with a
+    LoRA can be held to."""
+    import comfy.sd
+    import comfy.utils
+    lora = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("loras", LORA), safe_load=True)
+    fused = nodes.LoraLoaderModelOnly().load_lora_model_only(unet, LORA, 1.0)[0]
+    bypass = comfy.sd.load_bypass_lora_for_models(unet, None, lora, 1.0, 0)[0]
+    extra = {"lora": LORA, "lora_strength": 1.0}
+    for seed in (43, 44):
+        for tag, m, x in (("none", unet, None), ("fused1", fused, extra), ("bypass1", bypass, extra)):
+            run(m, clip, vae, PROMPTS["portrait"], 768, 1024, 8, 1.0, seed, "seeds/%d/%s" % (seed, tag), False, extra=x)
 
 
 def main():
@@ -250,6 +301,10 @@ def main():
             run(unet, clip, vae, PROMPTS["short"], 256, 256, 8, 1.0, 7, "sample", True)
         if "accept" in STAGES:
             run(unet, clip, vae, PROMPTS["portrait"], 768, 1024, 8, 1.0, 42, "accept", False)
+        if "lora" in STAGES:
+            stage_lora(unet, clip, vae)
+        if "seeds" in STAGES:
+            stage_seeds(unet, clip, vae)
     write_meta()
 
 

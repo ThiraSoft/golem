@@ -36,7 +36,16 @@ line turns off.
   and the picture;
 - `dit/`: the first DiT call of that run with its waypoints;
 - `vae/`: the decode of that run with a waypoint per block;
-- `accept/`: the front's defaults, 768 × 1024, seed 42, and the PNG.
+- `accept/`: the front's defaults, 768 × 1024, seed 42, and the PNG;
+- `lora/` (stage `lora`): the portrait again with `style`, through
+  `LoraLoaderModelOnly` at 1 and 0.5 (`fused1/`, `fused05/`, with the weights
+  it patched as cast in `lowvram.json`) and through the bypass loader
+  (`bypass1/`), and the first DiT call of the 256 × 256 run through the
+  bypass loader with its waypoints (`dit/`); `dump_f32.py ... lora` writes
+  that call in float32 under `dit32/`;
+- `seeds/` (stage `seeds`): the portrait at seeds 43 and 44 without the LoRA
+  and with it through both loaders, which is how far ComfyUI parts from
+  itself.
 
 The noise is torch's on this machine: the CPU generator for the start, the
 ROCm one for each step. `krea2/rng.go` says why that is enough to know.
