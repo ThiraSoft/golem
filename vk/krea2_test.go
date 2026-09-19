@@ -513,3 +513,77 @@ func sgn(s uint32) float32 {
 	}
 	return 1
 }
+
+// A product with a LoRA on it: the kernel goes on from W to B against t, a
+// few columns further along a wider t, B at an offset in its buffer, in each
+// of the three modes.
+func TestK2ProductLoRA(t *testing.T) {
+	r := rand.New(rand.NewSource(3))
+	outs, ins, cols, rank := 300, 64, 130, 64
+	tRows, tAt := 96, 32 // t is 96 rows a column; this product's are 32 to 96
+	w := randomFP8(r, outs*ins)
+	x := randomFloats(r, cols*ins, 1)
+	tv := randomFloats(r, cols*tRows, 1)
+	bf := randomFloats(r, outs*rank, 0.05)
+	const pad = 24 // halves before B in its buffer, 48 bytes
+	bb := make([]byte, 2*(pad+len(bf)))
+	for i, v := range bf {
+		binary.LittleEndian.PutUint16(bb[2*(pad+i):], f32ToF16(v))
+	}
+	bias := randomFloats(r, outs, 1)
+	gate := randomFloats(r, outs, 1)
+	base := randomFloats(r, cols*outs, 1)
+	const scale = 0.37
+	for mode := uint32(0); mode < 3; mode++ {
+		params := append(append([]float32{}, bias...), gate...)
+		yAt := cols * ins
+		tIn := yAt + cols*outs
+		gAt := tIn + cols*tRows
+		k := newK2(t, gAt+outs, params)
+		wb, err := k.AddWeights(w)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lb, err := k.AddWeights(bb)
+		if err != nil {
+			t.Fatal(err)
+		}
+		k.SetLoRA(lb)
+		k.Write(0, x)
+		k.Write(yAt, base)
+		k.Write(tIn, tv)
+		k.Write(gAt, gate)
+		run(t, k, func(rec *Recorder) {
+			k.MM(rec, wb, true, K2MM{Outputs: uint32(outs), Inputs: uint32(ins), Cols: uint32(cols),
+				X: 0, XStride: uint32(ins), Y: uint32(yAt), YStride: uint32(outs), Bias: 0, Scale: scale,
+				Mode: mode, GateA: uint32(gAt), GateB: uint32(outs),
+				LoRAAt: 2 * pad, LoRARank: uint32(rank), LoRAT: uint32(tIn + tAt), LoRATStride: uint32(tRows)})
+		})
+		got, err := k.Read(yAt, cols*outs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := make([]float32, cols*outs)
+		for c := 0; c < cols; c++ {
+			for o := 0; o < outs; o++ {
+				var s float64
+				for i := 0; i < ins; i++ {
+					s += float64(e4m3(w[o*ins+i])) * float64(f16ToF32(f32ToF16(x[c*ins+i])))
+				}
+				for j := 0; j < rank; j++ {
+					s += float64(f16ToF32(f32ToF16(bf[o*rank+j]))) * float64(f16ToF32(f32ToF16(tv[c*tRows+tAt+j])))
+				}
+				v := float32(s)*scale + bias[o]
+				switch mode {
+				case K2Store:
+					want[c*outs+o] = v
+				case K2Add:
+					want[c*outs+o] = base[c*outs+o] + v
+				default:
+					want[c*outs+o] = base[c*outs+o] + 2*gate[o]*v
+				}
+			}
+		}
+		k2Compare(t, "mm with a LoRA", got, want, 5e-5)
+	}
+}

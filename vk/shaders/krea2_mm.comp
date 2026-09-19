@@ -25,6 +25,13 @@
 // MODE, in the push constants: 0 writes Y, 1 adds to Y, 2 adds to Y times a
 // gate vector read from the arena (ga) plus one read from the parameters (gb),
 // which is the DiT's gated residual.
+//
+// A LoRA on the product (loraRank above 0) goes on after the weights, in the
+// same sums: its B, fp16 rows of loraRank in the fourth buffer at byte
+// loraAt, against t, loraRank floats a column in the arena at loraT, which
+// is A·X times the strength, made by a product of its own before this one.
+// So Y = scale · (W·X + B·t) + bias, and the gate and the adding see the
+// change as they see the rest of the answer.
 
 #define THREADS 256
 #define BM 128
@@ -38,6 +45,7 @@ layout(local_size_x = THREADS) in;
 layout(std430, binding = 0) readonly buffer W { uvec4 w[]; };
 layout(std430, binding = 1) buffer A { float a[]; };
 layout(std430, binding = 2) readonly buffer P { float par[]; };
+layout(std430, binding = 3) readonly buffer L { uvec4 l[]; };
 
 layout(push_constant) uniform Push {
     uint outputs;   // rows of W, entries of a column of Y
@@ -53,6 +61,10 @@ layout(push_constant) uniform Push {
     uint mode;
     uint ga;        // gate in the arena (mode 2)
     uint gb;        // gate in the parameters (mode 2)
+    uint loraAt;    // B's first byte in L, a multiple of 16
+    uint loraRank;  // a multiple of 32; 0 for no LoRA
+    uint loraT;     // t in the arena, floats
+    uint loraTStride;
 } p;
 
 shared float16_t sa[BM * SA];
@@ -94,6 +106,33 @@ void load(uint k0, uint row0, uint col0, uint t, out uvec4 wn[2], out vec4 xn[4]
             uint at = p.x + scol * p.xStride + k0 + (e & 7u) * 4u;
             xn[i] = vec4(a[at], a[at + 1u], a[at + 2u], a[at + 3u]);
         }
+    }
+}
+
+// loraTile puts the tile at k0 of B and of t in shared memory, as halves.
+void loraTile(uint k0, uint row0, uint col0, uint t) {
+    [[unroll]] for (uint i = 0u; i < 2u; i++) {
+        uint e = t + i * uint(THREADS);
+        uint srow = row0 + (e >> 2);
+        uvec4 v = uvec4(0u);
+        if (srow < p.outputs) v = l[(p.loraAt + (srow * p.loraRank + k0 + (e & 3u) * 8u) * 2u) >> 4];
+        f16vec2 c0 = unpackFloat2x16(v.x), c1 = unpackFloat2x16(v.y);
+        f16vec2 c2 = unpackFloat2x16(v.z), c3 = unpackFloat2x16(v.w);
+        uint at = (e >> 2) * uint(SA) + (e & 3u) * 8u;
+        sa[at]      = c0.x; sa[at + 1u] = c0.y; sa[at + 2u] = c1.x; sa[at + 3u] = c1.y;
+        sa[at + 4u] = c2.x; sa[at + 5u] = c2.y; sa[at + 6u] = c3.x; sa[at + 7u] = c3.y;
+    }
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        uint e = t + i * uint(THREADS);
+        uint scol = col0 + (e >> 3);
+        vec4 v = vec4(0.0);
+        if (scol < p.cols) {
+            uint at = p.loraT + scol * p.loraTStride + k0 + (e & 7u) * 4u;
+            v = clamp(vec4(a[at], a[at + 1u], a[at + 2u], a[at + 3u]), vec4(-65504.0), vec4(65504.0));
+        }
+        uint at = (e >> 3) * uint(SA) + (e & 7u) * 4u;
+        sb[at]      = float16_t(v.x); sb[at + 1u] = float16_t(v.y);
+        sb[at + 2u] = float16_t(v.z); sb[at + 3u] = float16_t(v.w);
     }
 }
 
@@ -161,8 +200,14 @@ void main() {
 #endif
     vec4 xn[4];
     load(0u, row0, col0, t, wn, xn);
-    for (uint k0 = 0u; k0 < p.inputs; k0 += uint(BK)) {
-        stash(t, wn, xn);
+    // The weights' tiles, then the LoRA's: past p.inputs, k0 counts B's.
+    uint kEnd = p.inputs + p.loraRank;
+    for (uint k0 = 0u; k0 < kEnd; k0 += uint(BK)) {
+        if (k0 < p.inputs) {
+            stash(t, wn, xn);
+        } else {
+            loraTile(k0 - p.inputs, row0, col0, t);
+        }
         barrier();
         if (k0 + uint(BK) < p.inputs) load(k0 + uint(BK), row0, col0, t, wn, xn);
 

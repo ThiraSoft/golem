@@ -10,7 +10,9 @@ package vk
 // one buffer per tensor, fp8 or fp16, which is what keeps a 12 GB network
 // under the four gigabytes one storage buffer addresses. Every kernel binds
 // the same three things — a weight buffer, the arena, the parameters — and a
-// kernel that reads no weight binds the parameters in its place.
+// kernel that reads no weight binds the parameters in its place. The products
+// bind a fourth, the DiT's LoRA (SetLoRA), or the parameters when there is
+// none.
 
 import (
 	_ "embed"
@@ -81,6 +83,10 @@ type K2MM struct {
 	Scale                 float32
 	Mode                  uint32 // K2Store, K2Add, K2GatedAdd
 	GateA, GateB          uint32
+	// A LoRA's B in the buffer SetLoRA gave, at byte LoRAAt, of LoRARank
+	// columns (0 for none), against t at LoRAT in the arena.
+	LoRAAt, LoRARank   uint32
+	LoRAT, LoRATStride uint32
 }
 
 // What a product does with its answer.
@@ -197,6 +203,7 @@ type K2 struct {
 	params      *Buffer
 	readback    *Buffer
 	weights     []*Buffer
+	lora        int // the weights the products' fourth buffer is; -1 for none
 }
 
 type k2SetKey struct {
@@ -226,7 +233,7 @@ func NewK2(d *Device, arenaFloats int, params []float32) (*K2, error) {
 	if !d.Coopmat() {
 		return nil, fmt.Errorf("vk: Krea 2 wants cooperative matrices, which this device does not offer")
 	}
-	k := &K2{d: d, sets: map[k2SetKey]*Set{}}
+	k := &K2{d: d, sets: map[k2SetKey]*Set{}, lora: -1}
 	fail := func(err error) (*K2, error) {
 		k.Close()
 		return nil, err
@@ -243,7 +250,11 @@ func NewK2(d *Device, arenaFloats int, params []float32) (*K2, error) {
 		return fail(err)
 	}
 	for i, spec := range k2Specs {
-		if k.pipes[i], err = d.newPipeline(*spec.spirv, 3, uint32(spec.push), coopmatWave, nil); err != nil {
+		bindings := 3
+		if i == int(k2MM8) || i == int(k2MM16) {
+			bindings = 4
+		}
+		if k.pipes[i], err = d.newPipeline(*spec.spirv, bindings, uint32(spec.push), coopmatWave, nil); err != nil {
 			return fail(fmt.Errorf("vk: Krea 2 kernel %d: %w", i, err))
 		}
 	}
@@ -280,6 +291,41 @@ func (k *K2) addWeights(data []byte, host bool) (int, error) {
 	}
 	k.weights = append(k.weights, b)
 	return len(k.weights) - 1, nil
+}
+
+// SetLoRA makes the weights of handle h, or none when h is -1, what the
+// products read a LoRA's B from.
+func (k *K2) SetLoRA(h int) {
+	if h == k.lora {
+		return
+	}
+	for key, s := range k.sets {
+		if key.k == k2MM8 || key.k == k2MM16 {
+			s.Close()
+			delete(k.sets, key)
+		}
+	}
+	k.lora = h
+}
+
+// FreeWeights gives back the tensors of these handles, which no program may
+// read afterwards. The handles are not handed out again.
+func (k *K2) FreeWeights(handles ...int) {
+	for _, h := range handles {
+		for key, s := range k.sets {
+			if key.w == h {
+				s.Close()
+				delete(k.sets, key)
+			}
+		}
+		if k.weights[h] != nil {
+			k.weights[h].Close()
+			k.weights[h] = nil
+		}
+		if h == k.lora {
+			k.SetLoRA(-1)
+		}
+	}
 }
 
 // Arena makes sure the arena exists, making it again after FreeArena.
@@ -326,7 +372,15 @@ func (k *K2) set(kern k2Kernel, w int) *Set {
 	if w >= 0 {
 		first = k.weights[w]
 	}
-	s, err := k.pipes[kern].NewSet([]*Buffer{first, k.arena, k.params})
+	bufs := []*Buffer{first, k.arena, k.params}
+	if kern == k2MM8 || kern == k2MM16 {
+		lora := k.params
+		if k.lora >= 0 {
+			lora = k.weights[k.lora]
+		}
+		bufs = append(bufs, lora)
+	}
+	s, err := k.pipes[kern].NewSet(bufs)
 	if err != nil {
 		panic(fmt.Sprintf("vk: Krea 2 set for kernel %d: %v", kern, err))
 	}
