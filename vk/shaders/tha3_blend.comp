@@ -1,10 +1,16 @@
 #version 450
 
-// The three blends of tha3/blend.go. Mode 0 is applyColorChange, where an
+// The four blends of tha3/blend.go. Mode 0 is applyColorChange, where an
 // alpha of one channel applies to every channel and one of as many channels
 // as the image applies channel to channel. Mode 1 is applyRGBChange, which
 // keeps the image's alpha channel. Mode 2 is mode 1 with the alpha taken from
 // the change's own fourth channel as (a+1)/2, the eyebrow combiner's output 2.
+// Mode 3 is applySharpen, an unsharp mask weighed by the alpha, where the
+// change is the blurred picture. It lifts the brightness only, all three
+// colour channels by the same step, so an edge sharpens without its colour
+// drifting; it keeps the image's alpha as mode 1 does. Mode 4 is steepen: it
+// pulls the image away from 0.5 by the amount and clamps, and reads neither
+// the change nor the alpha.
 
 layout(local_size_x = 256) in;
 
@@ -14,6 +20,7 @@ layout(std430, binding = 2) readonly buffer Pose { float pose[]; };
 
 layout(push_constant) uniform Push {
     uint dst, image, change, alpha, plane, alphaC, mode;
+    float amount;
 } p;
 
 void main() {
@@ -21,6 +28,10 @@ void main() {
     if (i >= p.plane) return;
     uint c = gl_WorkGroupID.y;
     float im = a[p.image + c * p.plane + i];
+    if (p.mode == 4u) {
+        a[p.dst + c * p.plane + i] = clamp(0.5 + (im - 0.5) * p.amount, 0.0, 1.0);
+        return;
+    }
     if (p.mode != 0u && c == 3u) {
         a[p.dst + c * p.plane + i] = im;
         return;
@@ -31,6 +42,22 @@ void main() {
         al = (a[p.change + 3u * p.plane + i] + 1.0) / 2.0;
     } else {
         al = a[p.alpha + (p.alphaC > 1u ? c : 0u) * p.plane + i];
+    }
+    if (p.mode == 3u) {
+        const vec3 luma = vec3(0.2126, 0.7152, 0.0722);
+        const float bound = 3.0;
+        float lit = 0.0, blur = 0.0;
+        for (uint k = 0u; k < 3u; k++) {
+            lit += luma[k] * (a[p.image + k * p.plane + i] + 1.0) / 2.0;
+            blur += luma[k] * (a[p.change + k * p.plane + i] + 1.0) / 2.0;
+        }
+        if (lit <= 0.0) {
+            a[p.dst + c * p.plane + i] = im;
+            return;
+        }
+        float gain = clamp(1.0 + p.amount * al * (lit - blur) / lit, 1.0 / bound, bound);
+        a[p.dst + c * p.plane + i] = min((im + 1.0) / 2.0 * gain, 1.0) * 2.0 - 1.0;
+        return;
     }
     a[p.dst + c * p.plane + i] = ch * al + im * (1.0 - al);
 }

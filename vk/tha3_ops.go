@@ -39,7 +39,10 @@ type tha3CopyPush struct {
 
 type tha3PosePush struct{ dst, plane, from uint32 }
 
-type tha3BlendPush struct{ dst, image, change, alpha, plane, alphaC, mode uint32 }
+type tha3BlendPush struct {
+	dst, image, change, alpha, plane, alphaC, mode uint32
+	amount                                         float32 // modes 3 and 4 only
+}
 
 type tha3ResizePush struct{ src, srcH, srcW, dst, dstH, dstW uint32 }
 
@@ -130,11 +133,15 @@ func (g *THA3Graph) PoseSlice(from, n, h, w int) THA3Tensor {
 }
 
 func (g *THA3Graph) blend(mode uint32, alpha, change, image THA3Tensor) THA3Tensor {
+	return g.blendBy(mode, alpha, change, image, 0)
+}
+
+func (g *THA3Graph) blendBy(mode uint32, alpha, change, image THA3Tensor, amount float32) THA3Tensor {
 	out := g.tensor(image.C, image.H, image.W)
 	g.op([]THA3Tensor{alpha, change, image}, []THA3Tensor{out}, func(r *Recorder, x *THA3Runner) {
 		push := tha3BlendPush{
 			dst: x.at(out), image: x.at(image), change: x.at(change), alpha: x.at(alpha),
-			plane: uint32(image.H * image.W), alphaC: uint32(alpha.C), mode: mode,
+			plane: uint32(image.H * image.W), alphaC: uint32(alpha.C), mode: mode, amount: amount,
 		}
 		x.dispatch(r, tha3Blend, groups256(image.H*image.W), image.C, unsafe.Pointer(&push))
 	})
@@ -157,6 +164,20 @@ func (g *THA3Graph) RGBHalfAlpha(change, image THA3Tensor) THA3Tensor {
 	// Mode 2 reads its alpha from change itself; the alpha handle is change
 	// again only so the op has one.
 	return g.blend(2, change, change, image)
+}
+
+// Sharpen is applySharpen: an unsharp mask weighed by mask, on the brightness
+// alone, so that an edge sharpens without its colour drifting; the image's
+// alpha is kept. The amount is baked into the pass when it is recorded, so
+// changing it means building the graph again.
+func (g *THA3Graph) Sharpen(mask, blurred, image THA3Tensor, amount float32) THA3Tensor {
+	return g.blendBy(3, mask, blurred, image, amount)
+}
+
+// Steepen is tha3's steepen: the mask pulled away from 0.5 by by, clamped to
+// [0, 1], so that its ramp crosses over fewer pixels.
+func (g *THA3Graph) Steepen(mask THA3Tensor, by float32) THA3Tensor {
+	return g.blendBy(4, mask, mask, mask, by)
 }
 
 // Resize is bilinear, align_corners=False, no antialias.
