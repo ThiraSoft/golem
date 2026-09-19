@@ -24,7 +24,7 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_rope.comp -o shaders/krea2_rope.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_act.comp -o shaders/krea2_act.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_attn.comp -o shaders/krea2_attn128.spv
-//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DHD=384 -DBC=32 shaders/krea2_attn.comp -o shaders/krea2_attn384.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DHD=384 -DBC=16 shaders/krea2_attn.comp -o shaders/krea2_attn384.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_conv.comp -o shaders/krea2_conv.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_pix.comp -o shaders/krea2_pix.spv
 

@@ -67,6 +67,70 @@ f16vec2 widen(uint v) {
 }
 #endif
 
+// load reads the tile at k0 of the weights and the operand into registers.
+#ifdef FP8
+void load(uint k0, uint row0, uint col0, uint t, out uvec4 wn, out vec4 xn[4]) {
+    // A hundred and twenty-eight rows of thirty-two bytes: two uvec4 a row,
+    // one a thread.
+    uint srow = row0 + (t >> 1);
+    wn = uvec4(0u);
+    if (srow < p.outputs) wn = w[(p.wAt + srow * p.inputs + k0 + (t & 1u) * 16u) >> 4];
+#else
+void load(uint k0, uint row0, uint col0, uint t, out uvec4 wn[2], out vec4 xn[4]) {
+    [[unroll]] for (uint i = 0u; i < 2u; i++) {
+        uint e = t + i * uint(THREADS);
+        uint srow = row0 + (e >> 2);
+        wn[i] = uvec4(0u);
+        if (srow < p.outputs) wn[i] = w[(p.wAt + (srow * p.inputs + k0 + (e & 3u) * 8u) * 2u) >> 4];
+    }
+#endif
+    // A hundred and twenty-eight columns of thirty-two floats, four loads of
+    // four a thread.
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        uint e = t + i * uint(THREADS);
+        uint scol = col0 + (e >> 3);
+        xn[i] = vec4(0.0);
+        if (scol < p.cols) {
+            uint at = p.x + scol * p.xStride + k0 + (e & 7u) * 4u;
+            xn[i] = vec4(a[at], a[at + 1u], a[at + 2u], a[at + 3u]);
+        }
+    }
+}
+
+// stash writes what load read into shared memory, as halves.
+#ifdef FP8
+void stash(uint t, uvec4 v, vec4 xn[4]) {
+    uint at = (t >> 1) * uint(SA) + (t & 1u) * 16u;
+    f16vec2 h;
+    h = widen(v.x);       sa[at]       = h.x; sa[at + 1u]  = h.y;
+    h = widen(v.x >> 16); sa[at + 2u]  = h.x; sa[at + 3u]  = h.y;
+    h = widen(v.y);       sa[at + 4u]  = h.x; sa[at + 5u]  = h.y;
+    h = widen(v.y >> 16); sa[at + 6u]  = h.x; sa[at + 7u]  = h.y;
+    h = widen(v.z);       sa[at + 8u]  = h.x; sa[at + 9u]  = h.y;
+    h = widen(v.z >> 16); sa[at + 10u] = h.x; sa[at + 11u] = h.y;
+    h = widen(v.w);       sa[at + 12u] = h.x; sa[at + 13u] = h.y;
+    h = widen(v.w >> 16); sa[at + 14u] = h.x; sa[at + 15u] = h.y;
+#else
+void stash(uint t, uvec4 wn[2], vec4 xn[4]) {
+    [[unroll]] for (uint i = 0u; i < 2u; i++) {
+        uint e = t + i * uint(THREADS);
+        uvec4 v = wn[i];
+        f16vec2 c0 = unpackFloat2x16(v.x), c1 = unpackFloat2x16(v.y);
+        f16vec2 c2 = unpackFloat2x16(v.z), c3 = unpackFloat2x16(v.w);
+        uint at = (e >> 2) * uint(SA) + (e & 3u) * 8u;
+        sa[at]      = c0.x; sa[at + 1u] = c0.y; sa[at + 2u] = c1.x; sa[at + 3u] = c1.y;
+        sa[at + 4u] = c2.x; sa[at + 5u] = c2.y; sa[at + 6u] = c3.x; sa[at + 7u] = c3.y;
+    }
+#endif
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        uint e = t + i * uint(THREADS);
+        vec4 v = clamp(xn[i], vec4(-65504.0), vec4(65504.0));
+        uint at = (e >> 3) * uint(SA) + (e & 7u) * 4u;
+        sb[at]      = float16_t(v.x); sb[at + 1u] = float16_t(v.y);
+        sb[at + 2u] = float16_t(v.z); sb[at + 3u] = float16_t(v.w);
+    }
+}
+
 void main() {
     uint t = gl_LocalInvocationID.x;
     // The tiles run down the rows first, so that neighbouring workgroups read
@@ -88,57 +152,19 @@ void main() {
         }
     }
 
-    for (uint k0 = 0u; k0 < p.inputs; k0 += uint(BK)) {
+    // The next tile is read from memory into registers while the matrix cores
+    // work on this one, and written to shared memory after.
 #ifdef FP8
-        // A hundred and twenty-eight rows of thirty-two bytes: two uvec4 a
-        // row, one a thread.
-        {
-            uint r = t >> 1, q = (t & 1u) * 16u;
-            uint srow = row0 + r;
-            uvec4 v = uvec4(0u);
-            if (srow < p.outputs) v = w[(p.wAt + srow * p.inputs + k0 + q) >> 4];
-            uint at = r * uint(SA) + q;
-            f16vec2 h;
-            h = widen(v.x);       sa[at]       = h.x; sa[at + 1u]  = h.y;
-            h = widen(v.x >> 16); sa[at + 2u]  = h.x; sa[at + 3u]  = h.y;
-            h = widen(v.y);       sa[at + 4u]  = h.x; sa[at + 5u]  = h.y;
-            h = widen(v.y >> 16); sa[at + 6u]  = h.x; sa[at + 7u]  = h.y;
-            h = widen(v.z);       sa[at + 8u]  = h.x; sa[at + 9u]  = h.y;
-            h = widen(v.z >> 16); sa[at + 10u] = h.x; sa[at + 11u] = h.y;
-            h = widen(v.w);       sa[at + 12u] = h.x; sa[at + 13u] = h.y;
-            h = widen(v.w >> 16); sa[at + 14u] = h.x; sa[at + 15u] = h.y;
-        }
+    uvec4 wn;
 #else
-        [[unroll]] for (uint i = 0u; i < 2u; i++) {
-            uint e = t + i * uint(THREADS);
-            uint r = e >> 2, q = (e & 3u) * 8u;
-            uint srow = row0 + r;
-            uvec4 v = uvec4(0u);
-            if (srow < p.outputs) v = w[(p.wAt + (srow * p.inputs + k0 + q) * 2u) >> 4];
-            f16vec2 c0 = unpackFloat2x16(v.x), c1 = unpackFloat2x16(v.y);
-            f16vec2 c2 = unpackFloat2x16(v.z), c3 = unpackFloat2x16(v.w);
-            uint at = r * uint(SA) + q;
-            sa[at]      = c0.x; sa[at + 1u] = c0.y; sa[at + 2u] = c1.x; sa[at + 3u] = c1.y;
-            sa[at + 4u] = c2.x; sa[at + 5u] = c2.y; sa[at + 6u] = c3.x; sa[at + 7u] = c3.y;
-        }
+    uvec4 wn[2];
 #endif
-        // A hundred and twenty-eight columns of thirty-two floats, four a
-        // thread-load, four loads a thread.
-        [[unroll]] for (uint i = 0u; i < 4u; i++) {
-            uint e = t + i * uint(THREADS);
-            uint c = e >> 3, q = (e & 7u) * 4u;
-            uint scol = col0 + c;
-            vec4 v = vec4(0.0);
-            if (scol < p.cols) {
-                uint at = p.x + scol * p.xStride + k0 + q;
-                v = vec4(a[at], a[at + 1u], a[at + 2u], a[at + 3u]);
-            }
-            v = clamp(v, vec4(-65504.0), vec4(65504.0));
-            uint at = c * uint(SA) + q;
-            sb[at]      = float16_t(v.x); sb[at + 1u] = float16_t(v.y);
-            sb[at + 2u] = float16_t(v.z); sb[at + 3u] = float16_t(v.w);
-        }
+    vec4 xn[4];
+    load(0u, row0, col0, t, wn, xn);
+    for (uint k0 = 0u; k0 < p.inputs; k0 += uint(BK)) {
+        stash(t, wn, xn);
         barrier();
+        if (k0 + uint(BK) < p.inputs) load(k0 + uint(BK), row0, col0, t, wn, xn);
 
         [[unroll]] for (uint kk = 0u; kk < uint(BK); kk += 16u) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[4];
