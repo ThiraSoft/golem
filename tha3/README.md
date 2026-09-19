@@ -24,6 +24,14 @@ The picture must be 512×512 with an alpha channel, the background at alpha 0,
 the character upright and facing forward, the head inside the 128×128 box
 centred in the top half, the hands away from the head.
 
+`SetScale(k)` and `SetImageHigh(img, high)` make the frame k times larger
+without running the networks any larger: what they decide at 512 (where each
+pixel goes, where they repaint) is resized and applied to `high`, the same
+picture at 512·k, so that what they only move keeps its detail. At k = 4 on
+the card, a pose costs about 1.5 ms more. `SetBackground` and `PoseRGBA`
+finish the frame on the card (laid on a colour, sRGB, framed by a zoom) so
+that only bytes come back.
+
 `cmd/tha3-pose` renders one frame from the command line and prints how long
 each network took.
 

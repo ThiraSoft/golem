@@ -93,6 +93,7 @@ type THA3Graph struct {
 	outputs []THA3Tensor
 	stamps  int
 	entries []int // ops where a pose pass may start, besides the first
+	skip    [2]int
 }
 
 // NewTHA3Graph starts a graph in the image phase.
@@ -137,6 +138,18 @@ func (g *THA3Graph) Entry() int {
 	g.entries = append(g.entries, len(g.ops))
 	return len(g.entries)
 }
+
+// Skip marks the operations a shortened pose pass leaves out, from the
+// operation Skip is called before to the one End is called before. What
+// they made is kept from the last whole pass, as a tensor an entry spans
+// is, so a pass that skips them reads what that pass left there.
+func (g *THA3Graph) Skip() { g.skip[0] = len(g.ops) }
+
+// SkipEnd ends the range Skip began.
+func (g *THA3Graph) SkipEnd() { g.skip[1] = len(g.ops) }
+
+// skipping reports whether a range was marked.
+func (g *THA3Graph) skipping() bool { return g.skip[1] > g.skip[0] }
 
 func (g *THA3Graph) tensor(c, h, w int) THA3Tensor {
 	g.tensors = append(g.tensors, tha3Tensor{floats: c * h * w, phase: g.phase})
@@ -185,6 +198,12 @@ func (g *THA3Graph) liveness() (first, last []int, pinned []bool) {
 			last[id] = i
 		}
 	}
+	// A tensor a shortened pass spans must survive it as one an entry
+	// spans must: the pass reads what the last whole pass left there.
+	spans := g.entries
+	if g.skipping() {
+		spans = append(append([]int{}, g.entries...), g.skip[1])
+	}
 	for id, t := range g.tensors {
 		switch {
 		case t.input:
@@ -193,7 +212,7 @@ func (g *THA3Graph) liveness() (first, last []int, pinned []bool) {
 		case first[id] >= 0 && t.phase == THA3ImagePhase && g.ops[last[id]].phase == THA3PosePhase:
 			pinned[id] = true
 		case first[id] >= 0:
-			for _, e := range g.entries {
+			for _, e := range spans {
 				if first[id] < e && last[id] >= e {
 					pinned[id] = true
 				}
@@ -211,6 +230,12 @@ type tha3Span struct{ off, n int }
 // plan places every tensor and returns the arena's size in floats. Placement
 // is first fit in a free list kept sorted and merged; a tensor's floats are
 // freed after the operation that uses it last, and never for a pinned one.
+//
+// A pinned tensor is placed before any other, not at the operation that
+// makes it. It is never freed, so this costs nothing in room, and it is what
+// a shortened pass needs: the operations before the skip run again after the
+// skipped ones left their answer there, and a place they were given because
+// the skipped operations had not run yet would be written over.
 func (g *THA3Graph) plan() int {
 	_, last, pinned := g.liveness()
 	var free []tha3Span
@@ -245,13 +270,16 @@ func (g *THA3Graph) plan() int {
 		}
 		free = merged
 	}
-	for id, t := range g.tensors {
-		if t.input {
-			g.tensors[id].off = alloc(t.floats)
+	for id := range g.tensors {
+		if pinned[id] {
+			g.tensors[id].off = alloc(g.tensors[id].floats)
 		}
 	}
 	for i, o := range g.ops {
 		for _, id := range o.creates {
+			if pinned[id] {
+				continue
+			}
 			g.tensors[id].off = alloc(g.tensors[id].floats)
 		}
 		released := map[int]bool{}

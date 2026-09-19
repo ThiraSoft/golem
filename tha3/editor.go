@@ -16,15 +16,27 @@ func newEditor(w *weights) *editor {
 	}
 }
 
-func (e *editor) forward(original, warped, gridChange Tensor, pose []float32, t tracer) Tensor {
+func (e *editor) forward(original, warped, gridChange Tensor, pose []float32, t tracer) (Tensor, editorFields) {
 	in := Concat(original, warped, gridChange, Broadcast(pose, original.H, original.W))
 	f := e.body.forward(in, t)
 	grid := e.gridChange.Apply(f)
 	for i, v := range gridChange.Data {
 		grid.Data[i] += v
 	}
-	rewarped := applyGridChange(grid, original)
-	out := applyColorChange(e.alpha.Apply(f), e.color.Apply(f), rewarped)
+	fields := editorFields{grid: grid, alpha: e.alpha.Apply(f), color: e.color.Apply(f)}
+	out := fields.apply(original)
 	t.emit("out.0", out)
-	return out
+	return out, fields
+}
+
+// editorFields is what the editor decides, apart from the picture: the whole
+// warp, the rotator's included, and the repaint over it.
+type editorFields struct{ grid, alpha, color Tensor }
+
+func (f editorFields) apply(original Tensor) Tensor {
+	return applyColorChange(f.alpha, f.color, applyGridChange(f.grid, original))
+}
+
+func (f editorFields) resized(h, w int) editorFields {
+	return editorFields{resize(f.grid, h, w), resize(f.alpha, h, w), resize(f.color, h, w)}
 }

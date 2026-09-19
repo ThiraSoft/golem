@@ -10,6 +10,7 @@ package tha3
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/ThiraSoft/golem/vk"
@@ -17,9 +18,9 @@ import (
 
 // gpuPoser is the card's side of a Poser.
 type gpuPoser struct {
-	dev   *vk.Device
-	run   *vk.THA3Runner
-	image vk.THA3Tensor
+	dev         *vk.Device
+	run         *vk.THA3Runner
+	image, high vk.THA3Tensor // high only when the scale is above one
 }
 
 // UseVulkan moves SetImage and Pose to the first Vulkan device. It fails
@@ -41,17 +42,17 @@ func (p *Poser) useVulkan(trace bool) error {
 		return err
 	}
 	d := &describer{g: vk.NewTHA3Graph(), trace: trace}
-	image := d.poser(p)
+	image, high := d.poser(p)
 	run, err := d.g.Build(dev, true)
 	if err != nil {
 		dev.Close()
 		return fmt.Errorf("tha3: %w", err)
 	}
-	q := &gpuPoser{dev: dev, run: run, image: image}
+	q := &gpuPoser{dev: dev, run: run, image: image, high: high}
 	// A picture already set goes to the card before the card is taken: if it
 	// cannot, the poser stays on the processor, whole.
 	if p.image.Data != nil {
-		if err := q.setImage(p, p.image); err != nil {
+		if err := q.setImage(p, p.image, p.high); err != nil {
 			q.close()
 			return err
 		}
@@ -61,9 +62,14 @@ func (p *Poser) useVulkan(trace bool) error {
 	return nil
 }
 
-func (q *gpuPoser) setImage(p *Poser, img Tensor) error {
+func (q *gpuPoser) setImage(p *Poser, img, high Tensor) error {
 	if err := q.run.Write(q.image, img.Data); err != nil {
 		return err
+	}
+	if high.Data != nil {
+		if err := q.run.Write(q.high, high.Data); err != nil {
+			return err
+		}
 	}
 	start := time.Now()
 	if err := q.run.RunImage(); err != nil {
@@ -73,15 +79,28 @@ func (q *gpuPoser) setImage(p *Poser, img Tensor) error {
 	return nil
 }
 
-func (q *gpuPoser) pose(p *Poser, pose [NumParams]float32, from stage) (Tensor, error) {
-	q.run.SetPose(pose[:])
-	total, err := q.run.RunPoseFrom(int(from))
+func (q *gpuPoser) pose(p *Poser, pose [NumParams]float32, from stage, short bool) (Tensor, error) {
+	var buf [zoomAt + 3]float32
+	copy(buf[:], pose[:])
+	z := p.zoom.orWhole()
+	buf[zoomAt], buf[zoomAt+1], buf[zoomAt+2] = float32(z.Scale), float32(z.X), float32(z.Y)
+	q.run.SetPose(buf[:])
+	run := q.run.RunPoseFrom
+	if short {
+		run = q.run.RunPoseShort
+	}
+	total, err := run(int(from))
 	if err != nil {
 		return Tensor{}, err
 	}
 	// The card's clock gives each network's share; the wall clock around the
 	// submission gives the total the shares are scaled to. The copy of the
 	// frame out of the readback buffer comes after and is not counted.
+	if short {
+		// A shortened pass is not stamped: the networks it left out
+		// took no time, and the others keep what they last took.
+		p.timings[netRotator], p.timings[netEditor] = 0, 0
+	}
 	spans, err := q.run.Spans()
 	if err != nil {
 		return Tensor{}, err
@@ -95,7 +114,11 @@ func (q *gpuPoser) pose(p *Poser, pose [NumParams]float32, from stage) (Tensor, 
 			p.timings[s.Label] = time.Duration(float64(total) * float64(s.Ticks) / float64(sum))
 		}
 	}
-	return Tensor{C: 4, H: p.view.Dy(), W: p.view.Dx(), Data: q.run.Output(0)}, nil
+	c := 4
+	if p.finish {
+		c = 1
+	}
+	return Tensor{C: c, H: p.view.Dy() * p.scale, W: p.view.Dx() * p.scale, Data: q.run.Output(0)}, nil
 }
 
 func (q *gpuPoser) close() {
@@ -233,33 +256,84 @@ func (d *describer) unet(net string, u *unet, x vk.THA3Tensor, act vk.THA3Act) v
 	return x
 }
 
-func (d *describer) decomposer(m *eyebrowDecomposer, image vk.THA3Tensor) (eyebrow, background vk.THA3Tensor) {
+// cardFields is what a network decided, on the card, by the name of the
+// field on the processor: for the larger picture, as the fields types there.
+type cardFields map[string]vk.THA3Tensor
+
+func (d *describer) decomposer(m *eyebrowDecomposer, image vk.THA3Tensor) (eyebrow, background vk.THA3Tensor, fields cardFields) {
 	const net = netEyebrowDecomposer
 	f := d.encoderDecoder(net, m.body, image, 0, 0, vk.THA3ReLU)
-	background = d.g.ColorChange(d.head(f, m.backgroundAlpha, vk.THA3Sigmoid), d.head(f, m.backgroundColor, vk.THA3Tanh), image)
-	eyebrow = d.g.ColorChange(d.head(f, m.eyebrowAlpha, vk.THA3Sigmoid), image, d.head(f, m.eyebrowColor, vk.THA3Tanh))
+	fields = cardFields{
+		"backgroundAlpha": d.head(f, m.backgroundAlpha, vk.THA3Sigmoid),
+		"backgroundColor": d.head(f, m.backgroundColor, vk.THA3Tanh),
+		"eyebrowAlpha":    d.head(f, m.eyebrowAlpha, vk.THA3Sigmoid),
+		"eyebrowColor":    d.head(f, m.eyebrowColor, vk.THA3Tanh),
+	}
+	eyebrow, background = d.decompose(fields, image)
 	d.emit(net+".out.0", eyebrow)
 	d.emit(net+".out.3", background)
+	return eyebrow, background, fields
+}
+
+// decompose is decomposerFields.apply.
+func (d *describer) decompose(f cardFields, image vk.THA3Tensor) (eyebrow, background vk.THA3Tensor) {
+	background = d.g.ColorChange(f["backgroundAlpha"], f["backgroundColor"], image)
+	eyebrow = d.g.ColorChange(f["eyebrowAlpha"], image, f["eyebrowColor"])
 	return eyebrow, background
 }
 
-func (d *describer) combiner(m *eyebrowCombiner, background, eyebrow vk.THA3Tensor) vk.THA3Tensor {
+func (d *describer) combiner(m *eyebrowCombiner, background, eyebrow vk.THA3Tensor) (vk.THA3Tensor, cardFields) {
 	const net = netEyebrowCombiner
 	f := d.encoderDecoder(net, m.body, d.g.Concat(background, eyebrow), 0, eyebrowParams, vk.THA3ReLU)
-	warped := d.g.Warp(eyebrow, d.head(f, m.gridChange, vk.THA3None))
-	morphed := d.g.ColorChange(d.head(f, m.alpha, vk.THA3Sigmoid), d.head(f, m.color, vk.THA3Tanh), warped)
-	out := d.g.RGBHalfAlpha(morphed, background)
+	fields := cardFields{
+		"grid":  d.head(f, m.gridChange, vk.THA3None),
+		"alpha": d.head(f, m.alpha, vk.THA3Sigmoid),
+		"color": d.head(f, m.color, vk.THA3Tanh),
+	}
+	out := d.combine(fields, background, eyebrow)
 	d.emit(net+".out.2", out)
-	return out
+	return out, fields
 }
 
-func (d *describer) face(m *faceMorpher, image vk.THA3Tensor) vk.THA3Tensor {
+// combine is combinerFields.apply.
+func (d *describer) combine(f cardFields, background, eyebrow vk.THA3Tensor) vk.THA3Tensor {
+	morphed := d.g.ColorChange(f["alpha"], f["color"], d.g.Warp(eyebrow, f["grid"]))
+	return d.g.RGBHalfAlpha(morphed, background)
+}
+
+func (d *describer) face(m *faceMorpher, image vk.THA3Tensor) (vk.THA3Tensor, cardFields) {
 	const net = netFaceMorpher
 	f := d.encoderDecoder(net, m.body, image, eyebrowParams, faceParamsEnd-eyebrowParams, vk.THA3ReLU)
-	warped := d.g.Warp(image, d.head(f, m.irisMouthGrid, vk.THA3None))
-	mouth := d.g.ColorChange(d.head(f, m.irisMouthAlpha, vk.THA3Sigmoid), d.head(f, m.irisMouthColor, vk.THA3Tanh), warped)
-	out := d.g.ColorChange(d.head(f, m.eyeAlpha, vk.THA3Sigmoid), d.head(f, m.eyeColor, vk.THA3Tanh), mouth)
+	fields := cardFields{
+		"grid":       d.head(f, m.irisMouthGrid, vk.THA3None),
+		"mouthAlpha": d.head(f, m.irisMouthAlpha, vk.THA3Sigmoid),
+		"mouthColor": d.head(f, m.irisMouthColor, vk.THA3Tanh),
+		"eyeAlpha":   d.head(f, m.eyeAlpha, vk.THA3Sigmoid),
+		"eyeColor":   d.head(f, m.eyeColor, vk.THA3Tanh),
+	}
+	out := d.morph(fields, image)
 	d.emit(net+".out.0", out)
+	return out, fields
+}
+
+// morph is faceFields.apply.
+func (d *describer) morph(f cardFields, image vk.THA3Tensor) vk.THA3Tensor {
+	mouth := d.g.ColorChange(f["mouthAlpha"], f["mouthColor"], d.g.Warp(image, f["grid"]))
+	return d.g.ColorChange(f["eyeAlpha"], f["eyeColor"], mouth)
+}
+
+// resized is every field resized to h×w, for the larger picture.
+func (d *describer) resized(f cardFields, h, w int) cardFields {
+	// In the order of the names, so that the graph is the same every time.
+	names := make([]string, 0, len(f))
+	for name := range f {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := cardFields{}
+	for _, name := range names {
+		out[name] = d.g.Resize(f[name], h, w)
+	}
 	return out
 }
 
@@ -274,31 +348,55 @@ func (d *describer) rotator(m *rotator, image vk.THA3Tensor) (warped, grid vk.TH
 	return warped, grid
 }
 
-func (d *describer) editor(m *editor, original, warped, grid vk.THA3Tensor) vk.THA3Tensor {
+// editor returns the frame, or with high set only the editor's fields: the
+// frame is then made from them on the larger picture, and the one at 512
+// would be thrown away.
+func (d *describer) editor(m *editor, original, warped, grid vk.THA3Tensor, high bool) (vk.THA3Tensor, cardFields) {
 	const net = netEditor
 	in := d.g.Concat(original, warped, grid, d.g.PoseSlice(faceParamsEnd, NumParams-faceParamsEnd, original.H, original.W))
 	f := d.unet(net, m.body, in, vk.THA3Leaky)
-	rewarped := d.g.WarpAdd(original, d.head(f, m.gridChange, vk.THA3None), grid)
-	out := d.g.ColorChange(d.head(f, m.alpha, vk.THA3Sigmoid), d.head(f, m.color, vk.THA3Tanh), rewarped)
+	fields := cardFields{
+		"grid":  d.head(f, m.gridChange, vk.THA3None),
+		"alpha": d.head(f, m.alpha, vk.THA3Sigmoid),
+		"color": d.head(f, m.color, vk.THA3Tanh),
+	}
+	if high {
+		return vk.THA3Tensor{}, fields
+	}
+	rewarped := d.g.WarpAdd(original, fields["grid"], grid)
+	out := d.g.ColorChange(fields["alpha"], fields["color"], rewarped)
 	d.emit(net+".out.0", out)
-	return out
+	return out, fields
 }
 
 // poser describes SetImage and Pose as Poser runs them on the processor and
-// returns the picture's input tensor.
-func (d *describer) poser(p *Poser) vk.THA3Tensor {
+// returns the picture's input tensor, and the larger picture's when the
+// scale is above one.
+func (d *describer) poser(p *Poser) (image, high vk.THA3Tensor) {
 	g := d.g
-	image := g.Input(4, Size, Size)
+	k := p.scale
+	image = g.Input(4, Size, Size)
+	if k > 1 {
+		high = g.Input(4, Size*k, Size*k)
+	}
 
 	g.SetPhase(vk.THA3ImagePhase)
 	crop := g.Crop(image, 64, 192, 128, 128)
 	d.emit(netEyebrowDecomposer+".in.0", crop)
-	eyebrow, background := d.decomposer(p.decomposer, crop)
+	eyebrow, background, decomposed := d.decomposer(p.decomposer, crop)
+	var hiEyebrow, hiBackground vk.THA3Tensor
+	if k > 1 {
+		hiEyebrow, hiBackground = d.decompose(d.resized(decomposed, 128*k, 128*k), g.Crop(high, 64*k, 192*k, 128*k, 128*k))
+	}
 
 	g.SetPhase(vk.THA3PosePhase)
 	d.emit(netEyebrowCombiner+".in.0", background)
 	d.emit(netEyebrowCombiner+".in.1", eyebrow)
-	eyebrows := d.combiner(p.combiner, background, eyebrow)
+	eyebrows, combined := d.combiner(p.combiner, background, eyebrow)
+	var hiEyebrows vk.THA3Tensor
+	if k > 1 {
+		hiEyebrows = d.combine(d.resized(combined, 128*k, 128*k), hiBackground, hiEyebrow)
+	}
 	g.Stamp(netEyebrowCombiner)
 
 	if g.Entry() != int(stageFace) {
@@ -307,13 +405,19 @@ func (d *describer) poser(p *Poser) vk.THA3Tensor {
 
 	faceIn := g.Paste(g.Crop(image, 32, 160, 192, 192), eyebrows, 32, 32)
 	d.emit(netFaceMorpher+".in.0", faceIn)
-	face := d.face(p.face, faceIn)
+	face, faced := d.face(p.face, faceIn)
+	var hiFace vk.THA3Tensor
+	if k > 1 {
+		hiFaceIn := g.Paste(g.Crop(high, 32*k, 160*k, 192*k, 192*k), hiEyebrows, 32*k, 32*k)
+		hiFace = d.morph(d.resized(faced, 192*k, 192*k), hiFaceIn)
+	}
 	g.Stamp(netFaceMorpher)
 
 	if g.Entry() != int(stageBody) {
 		panic("tha3: the body's entry is not the body's stage")
 	}
 
+	g.Skip()
 	full := g.Paste(image, face, 32, 160)
 	half := g.Resize(full, Size/2, Size/2)
 	d.emit(netRotator+".in.0", half)
@@ -325,11 +429,32 @@ func (d *describer) poser(p *Poser) vk.THA3Tensor {
 	d.emit(netEditor+".in.0", full)
 	d.emit(netEditor+".in.1", warped)
 	d.emit(netEditor+".in.2", grid)
-	frame := d.editor(p.editor, full, warped, grid)
-	if v := p.view; v != whole {
+	if k == 1 {
+		// Finishing at the scale of one: the larger picture is the
+		// picture, and the face on it the face.
+		high, hiFace = image, face
+	}
+	frame, edited := d.editor(p.editor, full, warped, grid, k > 1 || p.finish)
+	if p.heldBody {
+		// The face alone may move without the rotator and the editor
+		// running again: the frame is made from what they left.
+		g.SkipEnd()
+	}
+	v := p.view
+	switch {
+	case p.finish:
+		frame = g.EditHighRGB(high, hiFace, 32*k, 160*k, edited["grid"], grid, edited["alpha"], edited["color"],
+			v.Min.Y*k, v.Min.X*k, v.Dy()*k, v.Dx()*k, p.bg, zoomAt, v.Dy()*k, v.Dx()*k)
+	case k > 1:
+		frame = g.EditHigh(high, hiFace, 32*k, 160*k, edited["grid"], grid, edited["alpha"], edited["color"],
+			v.Min.Y*k, v.Min.X*k, v.Dy()*k, v.Dx()*k)
+	case v != whole:
 		frame = g.Crop(frame, v.Min.Y, v.Min.X, v.Dy(), v.Dx())
 	}
 	g.Output(frame)
 	g.Stamp(netEditor)
-	return image
+	if k == 1 {
+		high = vk.THA3Tensor{}
+	}
+	return image, high
 }

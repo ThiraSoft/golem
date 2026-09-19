@@ -21,13 +21,31 @@ func newEyebrowDecomposer(w *weights) *eyebrowDecomposer {
 // forward returns upstream's outputs 0 and 3. Note the eyebrow layer blends
 // the other way round from the background: the picture is what the alpha
 // selects, and the colour change what shows through.
-func (d *eyebrowDecomposer) forward(image Tensor, t tracer) (eyebrow, background Tensor) {
+func (d *eyebrowDecomposer) forward(image Tensor, t tracer) (eyebrow, background Tensor, fields decomposerFields) {
 	f := d.body.forward(image, nil, t)
-	background = applyColorChange(d.backgroundAlpha.Apply(f), d.backgroundColor.Apply(f), image)
-	eyebrow = applyColorChange(d.eyebrowAlpha.Apply(f), image, d.eyebrowColor.Apply(f))
+	fields = decomposerFields{
+		backgroundAlpha: d.backgroundAlpha.Apply(f),
+		backgroundColor: d.backgroundColor.Apply(f),
+		eyebrowAlpha:    d.eyebrowAlpha.Apply(f),
+		eyebrowColor:    d.eyebrowColor.Apply(f),
+	}
+	eyebrow, background = fields.apply(image)
 	t.emit("out.0", eyebrow)
 	t.emit("out.3", background)
+	return eyebrow, background, fields
+}
+
+// decomposerFields is what the decomposer decides, apart from the picture.
+type decomposerFields struct{ backgroundAlpha, backgroundColor, eyebrowAlpha, eyebrowColor Tensor }
+
+func (f decomposerFields) apply(image Tensor) (eyebrow, background Tensor) {
+	background = applyColorChange(f.backgroundAlpha, f.backgroundColor, image)
+	eyebrow = applyColorChange(f.eyebrowAlpha, image, f.eyebrowColor)
 	return eyebrow, background
+}
+
+func (f decomposerFields) resized(h, w int) decomposerFields {
+	return decomposerFields{resize(f.backgroundAlpha, h, w), resize(f.backgroundColor, h, w), resize(f.eyebrowAlpha, h, w), resize(f.eyebrowColor, h, w)}
 }
 
 // eyebrowCombiner is EyebrowMorphingCombiner03: it moves the eyebrow layer as
@@ -49,15 +67,27 @@ func newEyebrowCombiner(w *weights) *eyebrowCombiner {
 // forward returns upstream's output 2, the one the poser uses: the morphed
 // eyebrow laid over the background by its own alpha. combine_alpha feeds
 // output 0 only, so it is not computed.
-func (c *eyebrowCombiner) forward(background, eyebrow Tensor, pose []float32, t tracer) Tensor {
+func (c *eyebrowCombiner) forward(background, eyebrow Tensor, pose []float32, t tracer) (Tensor, combinerFields) {
 	f := c.body.forward(Concat(background, eyebrow), pose, t)
-	warped := applyGridChange(c.gridChange.Apply(f), eyebrow)
-	morphed := applyColorChange(c.alpha.Apply(f), c.color.Apply(f), warped)
+	fields := combinerFields{grid: c.gridChange.Apply(f), alpha: c.alpha.Apply(f), color: c.color.Apply(f)}
+	out := fields.apply(background, eyebrow)
+	t.emit("out.2", out)
+	return out, fields
+}
+
+// combinerFields is what the combiner decides, apart from the layers.
+type combinerFields struct{ grid, alpha, color Tensor }
+
+func (f combinerFields) apply(background, eyebrow Tensor) Tensor {
+	warped := applyGridChange(f.grid, eyebrow)
+	morphed := applyColorChange(f.alpha, f.color, warped)
 	alpha := morphed.Channels(3, 4).Clone()
 	for i, v := range alpha.Data {
 		alpha.Data[i] = (v + 1) / 2
 	}
-	out := applyRGBChange(alpha, morphed, background)
-	t.emit("out.2", out)
-	return out
+	return applyRGBChange(alpha, morphed, background)
+}
+
+func (f combinerFields) resized(h, w int) combinerFields {
+	return combinerFields{resize(f.grid, h, w), resize(f.alpha, h, w), resize(f.color, h, w)}
 }

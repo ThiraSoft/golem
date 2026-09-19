@@ -7,6 +7,8 @@ package main
 import (
 	"flag"
 	"fmt"
+	"image"
+	"image/draw"
 	"image/png"
 	"math"
 	"os"
@@ -49,6 +51,9 @@ func main() {
 	repeat := flag.Int("n", 1, "render the pose this many times and report the last")
 	vulkan := flag.Bool("vulkan", false, "run on the first Vulkan device")
 	bench := flag.Int("bench", 0, "render this many poses of a moving sequence and print poses per second")
+	view := flag.String("view", "", "x0,y0,x1,y1: return only that part of the frame; empty for all of it")
+	scale := flag.Int("scale", 1, "return the frame this many times larger, drawn from -high")
+	high := flag.String("high", "", "the picture 512 times -scale on a side, on the same template; empty for -image resized")
 	flag.Parse()
 	if *picture == "" {
 		fail(fmt.Errorf("-image is required"))
@@ -78,11 +83,29 @@ func main() {
 			fail(err)
 		}
 	}
+	if *view != "" {
+		var r image.Rectangle
+		if _, err := fmt.Sscanf(*view, "%d,%d,%d,%d", &r.Min.X, &r.Min.Y, &r.Max.X, &r.Max.Y); err != nil {
+			fail(fmt.Errorf("-view: %w", err))
+		}
+		if err := p.SetView(r); err != nil {
+			fail(err)
+		}
+	}
+	if err := p.SetScale(*scale); err != nil {
+		fail(err)
+	}
 	img, err := tha3.LoadImage(*picture)
 	if err != nil {
 		fail(err)
 	}
-	if err := p.SetImage(img); err != nil {
+	var large tha3.Tensor
+	if *high != "" {
+		if large, err = loadAny(*high); err != nil {
+			fail(err)
+		}
+	}
+	if err := p.SetImageHigh(img, large); err != nil {
 		fail(err)
 	}
 	if *bench > 0 {
@@ -132,6 +155,22 @@ func main() {
 		fmt.Printf("%-28s %8.1f ms\n", k, float64(timings[k].Microseconds())/1000)
 	}
 	fmt.Printf("%-28s %8.1f ms\n", "pose (without decomposer)", float64(total.Microseconds())/1000)
+}
+
+// loadAny reads a PNG of any size into the model's range.
+func loadAny(path string) (tha3.Tensor, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return tha3.Tensor{}, err
+	}
+	defer f.Close()
+	img, err := png.Decode(f)
+	if err != nil {
+		return tha3.Tensor{}, fmt.Errorf("%s: %w", path, err)
+	}
+	n := image.NewNRGBA(img.Bounds())
+	draw.Draw(n, n.Bounds(), img, img.Bounds().Min, draw.Src)
+	return tha3.FromNRGBA(n), nil
 }
 
 func fail(err error) {
