@@ -16,19 +16,21 @@ func comfyDir() string {
 	return comfyDefault
 }
 
-// The three files the mobile workflow loads, under ComfyUI's models directory.
-func DiTPath() string {
-	return filepath.Join(comfyDir(), "models", "unet", "krea2_turbo_fp8.safetensors")
-}
-func EncoderPath() string {
-	return filepath.Join(comfyDir(), "models", "text_encoders", "qwen3vl_4b_fp8_scaled.safetensors")
-}
-func VAEPath() string {
-	return filepath.Join(comfyDir(), "models", "vae", "qwen_image_vae.safetensors")
-}
+// The three files the mobile workflow loads and the tokenizer, from the
+// ComfyUI of GOLEM_KREA2_COMFY or this machine's.
+func DiTPath() string      { return ComfyUI(comfyDir()).DiT }
+func EncoderPath() string  { return ComfyUI(comfyDir()).Encoder }
+func VAEPath() string      { return ComfyUI(comfyDir()).VAE }
+func TokenizerDir() string { return ComfyUI(comfyDir()).Tokenizer }
 
-// TokenizerDir is ComfyUI's copy of the Qwen2 tokenizer, which is the one its
-// Krea 2 text encoder is loaded with.
-func TokenizerDir() string {
-	return filepath.Join(comfyDir(), "comfy", "text_encoders", "qwen25_tokenizer")
+// ComfyUI is the Options that read the three files and the tokenizer out of
+// a ComfyUI directory. The tokenizer is ComfyUI's copy of Qwen2's, which is
+// the one its Krea 2 text encoder is loaded with.
+func ComfyUI(dir string) Options {
+	return Options{
+		DiT:       filepath.Join(dir, "models", "unet", "krea2_turbo_fp8.safetensors"),
+		Encoder:   filepath.Join(dir, "models", "text_encoders", "qwen3vl_4b_fp8_scaled.safetensors"),
+		VAE:       filepath.Join(dir, "models", "vae", "qwen_image_vae.safetensors"),
+		Tokenizer: filepath.Join(dir, "comfy", "text_encoders", "qwen25_tokenizer"),
+	}
 }
