@@ -76,7 +76,11 @@ type Context struct {
 	ttl        time.Duration
 
 	held []int32 // the tokens the cache holds, position by position
-	last time.Time
+	// media is the rows the last prompt put in at its soft positions, nil
+	// elsewhere. Every picture has the same placeholder tokens, so held alone
+	// would take a new picture for the one already read.
+	media [][]float32
+	last  time.Time
 }
 
 func NewContext(r *Runner, window, maxContext int, now func() time.Time, ttl time.Duration) *Context {
@@ -171,10 +175,8 @@ func (c *Context) PrefillPromptState(p engine.Prompt, logits []float32, state *[
 	}
 	c.expire()
 
-	shared := 0
-	for shared < len(c.held) && shared < len(ids) && c.held[shared] == ids[shared] {
-		shared++
-	}
+	embeds := p.Embeds()
+	shared := common(c.held, c.media, ids, embeds)
 	// The hidden state of a cached position was not kept, so the last position
 	// of the prompt is fed whatever is shared.
 	from := shared
@@ -215,6 +217,7 @@ func (c *Context) PrefillPromptState(p engine.Prompt, logits []float32, state *[
 		at = to
 	}
 	c.held = append(c.held[:0], ids...)
+	c.media = embeds
 	c.last = c.now()
 	return len(ids) - from, nil
 }
@@ -291,5 +294,47 @@ func (c *Context) expire() {
 	}
 	c.runner.Reset(c.slot)
 	c.held = nil
+	c.media = nil
 	c.owner = nil
+}
+
+// common is how many positions two prompts share from the start: the same
+// token, and at a soft position the same row.
+func common(held []int32, media [][]float32, ids []int32, embeds [][]float32) int {
+	n := 0
+	for n < len(held) && n < len(ids) && held[n] == ids[n] && sameRow(rowAt(media, n), rowAt(embeds, n)) {
+		n++
+	}
+	// A picture is read in one pass or not at all: a divergence inside one
+	// goes back to where it starts.
+	for n > 0 && rowAt(embeds, n) != nil && rowAt(embeds, n-1) != nil {
+		n--
+	}
+	return n
+}
+
+// rowAt is the row a prompt put in at position i, or nil for a token of text.
+func rowAt(rows [][]float32, i int) []float32 {
+	if i < len(rows) {
+		return rows[i]
+	}
+	return nil
+}
+
+// sameRow reports whether two positions were fed the same row: both text, or
+// both the same soft token. The image cache hands out the same slice for the
+// same picture, which is the quick answer; anything else is read through.
+func sameRow(a, b []float32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 || &a[0] == &b[0] {
+		return true
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
