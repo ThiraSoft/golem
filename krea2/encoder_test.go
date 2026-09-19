@@ -33,7 +33,7 @@ func TestEncoderMatchesComfyUI(t *testing.T) {
 	f := loadFixtures(t)
 	needFile(t, EncoderPath())
 	v := vocab(t)
-	e, err := OpenEncoder(device(t), EncoderPath())
+	e, err := OpenEncoder(device(t), EncoderPath(), false)
 	if err != nil {
 		t.Fatal(err)
 	}

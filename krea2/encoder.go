@@ -59,8 +59,11 @@ type Encoder struct {
 	programs                               map[int]*vk.Program
 }
 
-// OpenEncoder uploads the text model's first 35 layers to the card.
-func OpenEncoder(d *vk.Device, path string) (*Encoder, error) {
+// OpenEncoder uploads the text model's first 35 layers to the card, or,
+// with host set, keeps them in system memory the card reads across the bus:
+// a prompt reads each weight once, so that costs about half a second a
+// prompt and none of the card, which the DiT wants all of.
+func OpenEncoder(d *vk.Device, path string, host bool) (*Encoder, error) {
 	ck, err := openCheckpoint(path)
 	if err != nil {
 		return nil, err
@@ -122,6 +125,10 @@ func OpenEncoder(d *vk.Device, path string) (*Encoder, error) {
 	if e.k, err = vk.NewK2(d, a.n, par.data); err != nil {
 		return fail(err)
 	}
+	add := e.k.AddWeights
+	if host {
+		add = e.k.AddHostWeights
+	}
 	for i := range e.layers {
 		l := &e.layers[i]
 		pre := fmt.Sprintf("model.layers.%d.", i)
@@ -131,7 +138,11 @@ func OpenEncoder(d *vk.Device, path string) (*Encoder, error) {
 		}
 		handles := [7]*int{&l.q, &l.k, &l.v, &l.o, &l.gate, &l.up, &l.down}
 		for j, name := range names {
-			if *handles[j], err = ck.fp8(e.k, pre+name+".weight", shapes[j][0], shapes[j][1]); err != nil {
+			t, err := ck.get(pre+name+".weight", "F8_E4M3", shapes[j][0], shapes[j][1])
+			if err != nil {
+				return fail(err)
+			}
+			if *handles[j], err = add(t.Raw); err != nil {
 				return fail(err)
 			}
 		}
@@ -253,6 +264,16 @@ func encoderRope(T int) []float32 {
 		}
 	}
 	return out
+}
+
+// Trim gives the encoder's working memory back to the card; the next Encode
+// takes it again.
+func (e *Encoder) Trim() {
+	for _, p := range e.programs {
+		p.Close()
+	}
+	e.programs = map[int]*vk.Program{}
+	e.k.FreeArena()
 }
 
 // WeightBytes is what the encoder holds on the card.

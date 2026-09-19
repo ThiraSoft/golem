@@ -8,7 +8,10 @@ in memory together, on the inputs dump.py recorded, and writes the same
 waypoints under dit32/.
 
     /mnt/data/dev/ComfyUI/.venv/bin/python ref/krea2/dump_f32.py \
-        /mnt/data/dev/ComfyUI testdata/krea2
+        /mnt/data/dev/ComfyUI testdata/krea2 [step]
+
+With a step, the call is the recorded run's at that step instead of its
+first, and the waypoints go under dit32_<step>/.
 """
 
 import json
@@ -18,6 +21,7 @@ import sys
 import numpy as np
 
 COMFY, OUT = sys.argv[1], os.path.abspath(sys.argv[2])
+STEP = int(sys.argv[3]) if len(sys.argv) > 3 else None
 sys.path.insert(0, COMFY)
 os.chdir(COMFY)
 sys.argv = [sys.argv[0], "--cpu"]
@@ -73,6 +77,15 @@ dm.pe_embedder = K.EmbedND(dim=headdim, theta=1000, axes_dim=axes)
 x = read("dit/x")[:, :, 0]
 t = read("dit/t")
 context = read("dit/context")
+PRE = "dit32/"
+if STEP is not None:
+    x = read("sample/x%d" % STEP)[:, :, 0]
+    sig = read("sample/sigmas")
+    if STEP == 0:
+        sig[0] = t[0]
+    t = sig[STEP:STEP + 1].clone()
+    PRE = "dit32_%d/" % STEP
+    save(PRE + "t", t)
 
 first = load(ops.Linear(64, features, bias=True, dtype=F32), "first.")
 tmlp = load(torch.nn.Sequential(ops.Linear(256, features, dtype=F32), torch.nn.GELU(approximate="tanh"), ops.Linear(features, features, dtype=F32)), "tmlp.")
@@ -84,15 +97,15 @@ last = load(K.LastLayer(features, patch, channels, dtype=F32, operations=ops), "
 
 img, imgpos, h_, w_ = dm.process_img(x)
 img = first(img)
-save("dit32/first", img)
+save(PRE + "first", img)
 tt = tmlp(timestep_embedding(t, 256).unsqueeze(1).to(F32))
-save("dit32/tmlp", tt)
+save(PRE + "tmlp", tt)
 tvec = tproj(tt)
-save("dit32/tvec", tvec)
+save(PRE + "tvec", tvec)
 ctx = txtfusion(context.reshape(1, context.shape[1], 12, 2560))
-save("dit32/txtfusion", ctx)
+save(PRE + "txtfusion", ctx)
 ctx = txtmlp(ctx)
-save("dit32/txtmlp", ctx)
+save(PRE + "txtmlp", ctx)
 
 txtlen = ctx.shape[1]
 combined = torch.cat((ctx, img), dim=1)
@@ -102,14 +115,14 @@ for i in range(28):
     block = load(K.SingleStreamBlock(features, heads, 4, False, kvheads, dtype=F32, operations=ops), "blocks.%d." % i)
     combined = block(combined, tvec, freqs, None)
     if i in (0, 1, 27):
-        save("dit32/block%d" % i, combined)
+        save(PRE + "block%d" % i, combined)
     del block
     print("block", i, flush=True)
 final = last(combined, tt)
-save("dit32/last", final)
+save(PRE + "last", final)
 out = final[:, txtlen:txtlen + img.shape[1]]
 out = out.reshape(1, h_, w_, channels, patch, patch).permute(0, 3, 1, 4, 2, 5).reshape(1, channels, h_ * patch, w_ * patch)
-save("dit32/out", out.unsqueeze(2))
+save(PRE + "out", out.unsqueeze(2))
 
 with open(os.path.join(OUT, "meta.json"), "w") as f:
     json.dump(meta, f, indent=1, sort_keys=True)

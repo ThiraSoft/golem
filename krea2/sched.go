@@ -47,3 +47,5 @@ func LatentOut(latent []float32) {
 		}
 	}
 }
+
+func expShift() float64 { return 1 / math.Exp(Shift) }

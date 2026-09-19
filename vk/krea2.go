@@ -189,13 +189,14 @@ type K2Pix struct {
 // K2 is a device set up for Krea 2's kernels, with one arena and one
 // parameter buffer.
 type K2 struct {
-	d        *Device
-	pipes    [k2Kernels]*Pipeline
-	sets     map[k2SetKey]*Set
-	arena    *Buffer
-	params   *Buffer
-	readback *Buffer
-	weights  []*Buffer
+	d           *Device
+	pipes       [k2Kernels]*Pipeline
+	sets        map[k2SetKey]*Set
+	arenaFloats int
+	arena       *Buffer
+	params      *Buffer
+	readback    *Buffer
+	weights     []*Buffer
 }
 
 type k2SetKey struct {
@@ -230,14 +231,11 @@ func NewK2(d *Device, arenaFloats int, params []float32) (*K2, error) {
 		k.Close()
 		return nil, err
 	}
-	bytes := uint64(max(arenaFloats, 1)) * 4
-	if bytes >= 1<<32 {
-		return fail(fmt.Errorf("vk: Krea 2 arena of %d bytes is past what one storage buffer addresses", bytes))
+	k.arenaFloats = max(arenaFloats, 1)
+	if uint64(k.arenaFloats)*4 >= 1<<32 {
+		return fail(fmt.Errorf("vk: Krea 2 arena of %d floats is past what one storage buffer addresses", k.arenaFloats))
 	}
 	var err error
-	if k.arena, err = d.Local(int(bytes), bufferUsageStorage|bufferUsageTransferSrc|bufferUsageTransferDst); err != nil {
-		return fail(err)
-	}
 	if len(params) == 0 {
 		params = []float32{0}
 	}
@@ -256,19 +254,56 @@ func NewK2(d *Device, arenaFloats int, params []float32) (*K2, error) {
 func (k *K2) Device() *Device { return k.d }
 
 // AddWeights uploads one tensor's bytes and returns its handle.
-func (k *K2) AddWeights(data []byte) (int, error) {
+func (k *K2) AddWeights(data []byte) (int, error) { return k.addWeights(data, false) }
+
+// AddHostWeights keeps one tensor's bytes in system memory the card reads
+// across the bus, and returns its handle. It is for weights read once per
+// use, which cost the bus once rather than a place on the card for good.
+func (k *K2) AddHostWeights(data []byte) (int, error) { return k.addWeights(data, true) }
+
+func (k *K2) addWeights(data []byte, host bool) (int, error) {
 	if len(data)%16 != 0 {
 		// The products read sixteen bytes at a time.
 		padded := make([]byte, (len(data)+15)/16*16)
 		copy(padded, data)
 		data = padded
 	}
-	b, err := k.d.Upload(data)
+	var b *Buffer
+	var err error
+	if host {
+		b, err = k.d.HostResident(data)
+	} else {
+		b, err = k.d.Upload(data)
+	}
 	if err != nil {
 		return 0, err
 	}
 	k.weights = append(k.weights, b)
 	return len(k.weights) - 1, nil
+}
+
+// Arena makes sure the arena exists, making it again after FreeArena.
+func (k *K2) Arena() error {
+	if k.arena != nil {
+		return nil
+	}
+	var err error
+	k.arena, err = k.d.Local(k.arenaFloats*4, bufferUsageStorage|bufferUsageTransferSrc|bufferUsageTransferDst)
+	return err
+}
+
+// FreeArena gives the arena's memory back to the card. Every program
+// recorded before it is dead: close them first, and record again after
+// Arena.
+func (k *K2) FreeArena() {
+	for key, s := range k.sets {
+		s.Close()
+		delete(k.sets, key)
+	}
+	if k.arena != nil {
+		k.arena.Close()
+		k.arena = nil
+	}
 }
 
 // WeightBytes is what the uploaded weights hold on the card.
@@ -372,18 +407,29 @@ func (k *K2) Pix(r *Recorder, p K2Pix) {
 }
 
 // Compile records a program over this machine's buffers.
-func (k *K2) Compile(record func(r *Recorder)) (*Program, error) { return k.d.Compile(record) }
+func (k *K2) Compile(record func(r *Recorder)) (*Program, error) {
+	if err := k.Arena(); err != nil {
+		return nil, err
+	}
+	return k.d.Compile(record)
+}
 
 // Write puts floats into the arena at an offset in floats.
 func (k *K2) Write(at int, data []float32) error {
 	if len(data) == 0 {
 		return nil
 	}
+	if err := k.Arena(); err != nil {
+		return err
+	}
 	return k.d.CopyInto(k.arena, at*4, floatBytes(data))
 }
 
 // Read copies n floats out of the arena.
 func (k *K2) Read(at, n int) ([]float32, error) {
+	if err := k.Arena(); err != nil {
+		return nil, err
+	}
 	if k.readback == nil || k.readback.Size() < n*4 {
 		if k.readback != nil {
 			k.readback.Close()

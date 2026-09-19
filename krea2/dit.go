@@ -78,13 +78,13 @@ type DiT struct {
 
 	// The arena.
 	temb, tA, t, tg, tvec uint32
-	ctx                   uint32
+	ctx                   [2]uint32 // the prompt's text, and the negative's
 	x, n, scratch         uint32
 	table, img, out       uint32
 
 	fusion map[int][2]*vk.Program
-	steps  map[[2]int]*vk.Program
-	ctxLen int
+	steps  map[[3]int][]*vk.Program
+	ctxLen [2]int
 }
 
 // OpenDiT uploads the DiT to the card: twelve gigabytes, most of the card.
@@ -93,7 +93,7 @@ func OpenDiT(d *vk.Device, path string) (*DiT, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := &DiT{ck: ck, fusion: map[int][2]*vk.Program{}, steps: map[[2]int]*vk.Program{}}
+	m := &DiT{ck: ck, fusion: map[int][2]*vk.Program{}, steps: map[[3]int][]*vk.Program{}}
 	fail := func(err error) (*DiT, error) {
 		m.Close()
 		return nil, err
@@ -174,7 +174,8 @@ func OpenDiT(d *vk.Device, path string) (*DiT, error) {
 	m.t = a.take(ditWidth)
 	m.tg = a.take(ditWidth)
 	m.tvec = a.take(6 * ditWidth)
-	m.ctx = a.take(MaxPromptTokens * ditWidth)
+	m.ctx[0] = a.take(MaxPromptTokens * ditWidth)
+	m.ctx[1] = a.take(MaxPromptTokens * ditWidth)
 	N := MaxPromptTokens + MaxImageTokens
 	R := MaxPromptTokens * txtLayers
 	m.x = a.take(max(N*ditWidth, R*txtWidth))
@@ -275,13 +276,16 @@ func (m *DiT) textBlock(r *vk.Recorder, b *txtBlock, seqs, length uint32) {
 }
 
 // SetText runs the text's part of the DiT on a prompt's conditioning, seq
-// tokens of CondWidth, and keeps the answer on the card for Step. It returns
-// what the text fusion made of it and the text MLP's answer, for tests.
-func (m *DiT) SetText(cond []float32, seq int) error {
+// tokens of CondWidth, and keeps the answer on the card for Step, in slot 0
+// (the prompt) or 1 (the negative prompt, which only a CFG above 1 reads).
+func (m *DiT) SetText(slot int, cond []float32, seq int) error {
+	if slot != 0 && slot != 1 {
+		return fmt.Errorf("krea2: text slot %d", slot)
+	}
 	if seq < 1 || seq > MaxPromptTokens || len(cond) != seq*CondWidth {
 		return fmt.Errorf("krea2: %d floats of conditioning for %d tokens", len(cond), seq)
 	}
-	progs, ok := m.fusion[seq]
+	progs, ok := m.fusion[seq*2+slot]
 	if !ok {
 		S := uint32(seq)
 		a, err := m.k.Compile(func(r *vk.Recorder) {
@@ -300,14 +304,14 @@ func (m *DiT) SetText(cond []float32, seq int) error {
 				Weight: m.txtNorm, OnePlus: 1, Eps: ditEps, ScaleA: vk.K2None})
 			m.mm(r, m.txt1, ditWidth, txtWidth, S, m.n, m.scratch, m.txt1B, vk.K2Store)
 			m.k.Act(r, vk.K2Act{X: m.scratch, XStride: ditWidth, N: ditWidth, Rows: S, Op: vk.K2Gelu})
-			m.mm(r, m.txt3, ditWidth, ditWidth, S, m.scratch, m.ctx, m.txt3B, vk.K2Store)
+			m.mm(r, m.txt3, ditWidth, ditWidth, S, m.scratch, m.ctx[slot], m.txt3B, vk.K2Store)
 		})
 		if err != nil {
 			a.Close()
 			return err
 		}
 		progs = [2]*vk.Program{a, b}
-		m.fusion[seq] = progs
+		m.fusion[seq*2+slot] = progs
 	}
 	if err := m.k.Write(int(m.x), cond); err != nil {
 		return err
@@ -337,23 +341,23 @@ func (m *DiT) SetText(cond []float32, seq int) error {
 	if err := progs[1].Run(); err != nil {
 		return err
 	}
-	m.ctxLen = seq
+	m.ctxLen[slot] = seq
 	return nil
 }
 
 // Text returns the text MLP's answer from the last SetText, for tests.
-func (m *DiT) Text() ([]float32, error) { return m.k.Read(int(m.ctx), m.ctxLen*ditWidth) }
+func (m *DiT) Text() ([]float32, error) { return m.k.Read(int(m.ctx[0]), m.ctxLen[0]*ditWidth) }
 
 // Fused returns the text fusion's answer from the last SetText, for tests:
 // what the text MLP was given, before its norm.
-func (m *DiT) Fused() ([]float32, error) { return m.k.Read(int(m.x), m.ctxLen*txtWidth) }
+func (m *DiT) Fused() ([]float32, error) { return m.k.Read(int(m.x), m.ctxLen[0]*txtWidth) }
 
 // Step is one call of the DiT on a latent of 16 × h × w (h and w even), at
-// noise level sigma, with the text of the last SetText. It returns the
-// velocity, the same shape as the latent.
-func (m *DiT) Step(latent []float32, h, w int, sigma float32) ([]float32, error) {
-	if m.ctxLen == 0 {
-		return nil, fmt.Errorf("krea2: a DiT step before any text")
+// noise level sigma, with the text in slot. It returns the velocity, the
+// same shape as the latent.
+func (m *DiT) Step(slot int, latent []float32, h, w int, sigma float32) ([]float32, error) {
+	if slot != 0 && slot != 1 || m.ctxLen[slot] == 0 {
+		return nil, fmt.Errorf("krea2: a DiT step with no text in slot %d", slot)
 	}
 	if h%ditPatch != 0 || w%ditPatch != 0 || len(latent) != ditLatent*h*w {
 		return nil, fmt.Errorf("krea2: a latent of %d floats for 16 × %d × %d", len(latent), h, w)
@@ -362,7 +366,7 @@ func (m *DiT) Step(latent []float32, h, w int, sigma float32) ([]float32, error)
 	if img > MaxImageTokens {
 		return nil, fmt.Errorf("krea2: %d patches is past the %d the DiT holds", img, MaxImageTokens)
 	}
-	prog, err := m.stepProgram(m.ctxLen, img)
+	progs, err := m.stepPrograms(slot, m.ctxLen[slot], img)
 	if err != nil {
 		return nil, err
 	}
@@ -372,11 +376,13 @@ func (m *DiT) Step(latent []float32, h, w int, sigma float32) ([]float32, error)
 	if err := m.k.Write(int(m.temb), timestepEmbedding(sigma)); err != nil {
 		return nil, err
 	}
-	if err := m.k.Write(int(m.table), ditRope(m.ctxLen, h/ditPatch, w/ditPatch)); err != nil {
+	if err := m.k.Write(int(m.table), ditRope(m.ctxLen[slot], h/ditPatch, w/ditPatch)); err != nil {
 		return nil, err
 	}
-	if err := prog.Run(); err != nil {
-		return nil, err
+	for _, prog := range progs {
+		if err := prog.Run(); err != nil {
+			return nil, err
+		}
 	}
 	out, err := m.k.Read(int(m.out), img*ditIn)
 	if err != nil {
@@ -385,8 +391,16 @@ func (m *DiT) Step(latent []float32, h, w int, sigma float32) ([]float32, error)
 	return unpatchify(out, h, w), nil
 }
 
-func (m *DiT) stepProgram(txt, img int) (*vk.Program, error) {
-	key := [2]int{txt, img}
+// blocksASubmission is how many blocks one submission of a step holds. The
+// driver gives a submission two seconds before it declares the card hung, and
+// a step at 768 × 1024 takes longer than that; four blocks there take a
+// fraction of a second.
+const blocksASubmission = 4
+
+// stepPrograms records a step as several submissions, run one after the
+// other.
+func (m *DiT) stepPrograms(slot, txt, img int) ([]*vk.Program, error) {
+	key := [3]int{slot, txt, img}
 	if p, ok := m.steps[key]; ok {
 		return p, nil
 	}
@@ -394,19 +408,20 @@ func (m *DiT) stepProgram(txt, img int) (*vk.Program, error) {
 	N := T + I
 	const F = ditWidth
 	kv := uint32(ditKVHeads * ditHeadDim)
-	p, err := m.k.Compile(func(r *vk.Recorder) {
-		// The timestep: tmlp, then tproj over it.
-		m.mm(r, m.tmlp0, F, ditTDim, 1, m.temb, m.tA, m.tmlp0B, vk.K2Store)
-		m.k.Act(r, vk.K2Act{X: m.tA, XStride: F, N: F, Rows: 1, Op: vk.K2Gelu})
-		m.mm(r, m.tmlp2, F, F, 1, m.tA, m.t, m.tmlp2B, vk.K2Store)
-		m.k.Act(r, vk.K2Act{X: m.tg, XStride: F, Y: m.t, YStride: F, N: F, Rows: 1, Op: vk.K2Copy})
-		m.k.Act(r, vk.K2Act{X: m.tg, XStride: F, N: F, Rows: 1, Op: vk.K2Gelu})
-		m.mm(r, m.tproj, 6*F, F, 1, m.tg, m.tvec, m.tprojB, vk.K2Store)
+	rec := func(r *vk.Recorder, from, to int, head, tail bool) {
+		if head {
+			// The timestep: tmlp, then tproj over it.
+			m.mm(r, m.tmlp0, F, ditTDim, 1, m.temb, m.tA, m.tmlp0B, vk.K2Store)
+			m.k.Act(r, vk.K2Act{X: m.tA, XStride: F, N: F, Rows: 1, Op: vk.K2Gelu})
+			m.mm(r, m.tmlp2, F, F, 1, m.tA, m.t, m.tmlp2B, vk.K2Store)
+			m.k.Act(r, vk.K2Act{X: m.tg, XStride: F, Y: m.t, YStride: F, N: F, Rows: 1, Op: vk.K2Copy})
+			m.k.Act(r, vk.K2Act{X: m.tg, XStride: F, N: F, Rows: 1, Op: vk.K2Gelu})
+			m.mm(r, m.tproj, 6*F, F, 1, m.tg, m.tvec, m.tprojB, vk.K2Store)
 
-		// The stream: the text, then the patches.
-		m.k.Act(r, vk.K2Act{X: m.x, XStride: F, Y: m.ctx, YStride: F, N: F, Rows: T, Op: vk.K2Copy})
-		m.mm(r, m.first, F, ditIn, I, m.img, m.x+T*F, m.firstB, vk.K2Store)
-
+			// The stream: the text, then the patches.
+			m.k.Act(r, vk.K2Act{X: m.x, XStride: F, Y: m.ctx[slot], YStride: F, N: F, Rows: T, Op: vk.K2Copy})
+			m.mm(r, m.first, F, ditIn, I, m.img, m.x+T*F, m.firstB, vk.K2Store)
+		}
 		q := m.scratch
 		k := q + N*F
 		v := k + N*kv
@@ -414,7 +429,7 @@ func (m *DiT) stepProgram(txt, img int) (*vk.Program, error) {
 		att := g + N*F
 		h1 := m.scratch
 		h2 := h1 + N*ditFFN
-		for i := range m.blocks {
+		for i := from; i < to; i++ {
 			b := &m.blocks[i]
 			mod := func(j uint32) (uint32, uint32) { return m.tvec + j*F, b.mod + j*F }
 			sa, sb := mod(0)
@@ -448,17 +463,29 @@ func (m *DiT) stepProgram(txt, img int) (*vk.Program, error) {
 			ga, gb = mod(5)
 			m.gatedMM(r, b.down, F, ditFFN, N, h1, m.x, ga, gb)
 		}
+		if !tail {
+			return
+		}
 		// The last layer, on the patches alone: its modulation is the
 		// timestep's t plus its own two vectors.
 		m.k.Norm(r, vk.K2Norm{Src: m.x + T*F, SrcStride: F, Dst: m.n, DstStride: F, N: F, Rows: I, Weight: m.lastNorm, OnePlus: 1, Eps: ditEps,
 			ScaleA: m.t, ScaleB: m.lastMod, ShiftA: m.t, ShiftB: m.lastMod + F})
 		m.mm(r, m.lastW, ditIn, F, I, m.n, m.out, m.lastB, vk.K2Store)
-	})
-	if err != nil {
-		return nil, err
 	}
-	m.steps[key] = p
-	return p, nil
+	var progs []*vk.Program
+	for from := 0; from < ditBlocks; from += blocksASubmission {
+		to := min(from+blocksASubmission, ditBlocks)
+		p, err := m.k.Compile(func(r *vk.Recorder) { rec(r, from, to, from == 0, to == ditBlocks) })
+		if err != nil {
+			for _, p := range progs {
+				p.Close()
+			}
+			return nil, err
+		}
+		progs = append(progs, p)
+	}
+	m.steps[key] = progs
+	return progs, nil
 }
 
 // patchify is process_img: a 16 × h × w latent to (h/2)·(w/2) patches of
@@ -541,6 +568,24 @@ func ditRope(txt, ph, pw int) []float32 {
 	return out
 }
 
+// Trim gives the DiT's working memory back to the card, and forgets the
+// text: SetText again before the next Step.
+func (m *DiT) Trim() {
+	for _, p := range m.fusion {
+		p[0].Close()
+		p[1].Close()
+	}
+	m.fusion = map[int][2]*vk.Program{}
+	for _, ps := range m.steps {
+		for _, p := range ps {
+			p.Close()
+		}
+	}
+	m.steps = map[[3]int][]*vk.Program{}
+	m.ctxLen = [2]int{}
+	m.k.FreeArena()
+}
+
 // WeightBytes is what the DiT holds on the card.
 func (m *DiT) WeightBytes() int { return m.k.WeightBytes() }
 
@@ -551,8 +596,10 @@ func (m *DiT) Close() {
 		p[1].Close()
 	}
 	m.fusion = nil
-	for _, p := range m.steps {
-		p.Close()
+	for _, ps := range m.steps {
+		for _, p := range ps {
+			p.Close()
+		}
 	}
 	m.steps = nil
 	if m.k != nil {

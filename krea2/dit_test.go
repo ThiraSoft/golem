@@ -22,7 +22,7 @@ func TestDiTMatchesComfyUI(t *testing.T) {
 	}
 	defer m.Close()
 	cond := f.read(t, "dit/context")
-	if err := m.SetText(cond, len(cond)/CondWidth); err != nil {
+	if err := m.SetText(0, cond, len(cond)/CondWidth); err != nil {
 		t.Fatal(err)
 	}
 	fused, err := m.Fused()
@@ -38,10 +38,11 @@ func TestDiTMatchesComfyUI(t *testing.T) {
 	compareRMS(t, "txtmlp", text, f.read(t, "dit32/txtmlp"), 1e-3)
 	compareRMS(t, "txtmlp against bf16", text, f.read(t, "dit/txtmlp"), 5e-2)
 	shape := f.shape(t, "dit/x")
-	out, err := m.Step(f.read(t, "dit/x"), shape[3], shape[4], f.read(t, "dit/t")[0])
+	out, err := m.Step(0, f.read(t, "dit/x"), shape[3], shape[4], f.read(t, "dit/t")[0])
 	if err != nil {
 		t.Fatal(err)
 	}
 	compareRMS(t, "out", out, f.read(t, "dit32/out"), 1.5e-2)
 	compareRMS(t, "out against bf16", out, f.read(t, "dit/out"), 4e-2)
+
 }
