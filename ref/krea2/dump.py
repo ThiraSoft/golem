@@ -89,10 +89,10 @@ def stage_tokens(clip):
         ids = [int(t[0]) for t in toks[0]]
         weights = [float(t[1]) for t in toks[0]]
         rec = {}
-        hooks = [tm.embed_tokens.register_forward_hook(lambda m, i, o: rec.__setitem__("embed", o))]
+        hooks = [tm.embed_tokens.register_forward_hook(lambda m, i, o: rec.__setitem__("embed", o.clone()))]
         for n in (0, 1, 17, 34):
             hooks.append(tm.layers[n].register_forward_hook(
-                lambda m, i, o, n=n: rec.__setitem__("layer%d" % n, first(o))))
+                lambda m, i, o, n=n: rec.__setitem__("layer%d" % n, first(o).clone())))
         cond = clip.encode_from_tokens_scheduled(clip.tokenize(text))
         for h in hooks:
             h.remove()

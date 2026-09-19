@@ -12,6 +12,10 @@
 // channel. The weights are fp16, a row of Inputs·Taps halves padded with
 // zeros to KStride, a multiple of thirty-two.
 //
+// With up set, the input is half the size of the output and is read as if
+// upsampled to it by nearest neighbour, which is the VAE's Resample: the
+// quadrupled plane is never written out.
+//
 // A causal 3D convolution over one frame is this: ComfyUI pads the time axis
 // with zeros before the frame, so only the kernel's last temporal slice meets
 // it, and that slice is what the weights hold.
@@ -37,6 +41,7 @@ layout(push_constant) uniform Push {
     uint x, y;
     uint bias;
     uint residual;
+    uint up;
 } p;
 
 shared float16_t sa[BM * SA];
@@ -92,7 +97,8 @@ void main() {
                     xx += int(tap % 3u) - 1;
                 }
                 if (yy >= 0 && yy < int(p.h) && xx >= 0 && xx < int(p.w)) {
-                    v = a[p.x + ci * pixels + uint(yy) * p.w + uint(xx)];
+                    uint iw = p.w >> p.up, ih = p.h >> p.up;
+                    v = a[p.x + ci * ih * iw + (uint(yy) >> p.up) * iw + (uint(xx) >> p.up)];
                 }
             }
             sb[c * uint(SA) + kk] = float16_t(clamp(v, -65504.0, 65504.0));

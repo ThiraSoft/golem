@@ -79,9 +79,36 @@ func compare(t testing.TB, name string, got, want []float32, tolerance float64) 
 	}
 	rel := worst / scale
 	if !(rel <= tolerance) {
-		t.Errorf("%s: gap %.3g at %d (got %g, want %g), %.4f%% of the scale, beyond %.4f%%",
-			name, worst, at, got[at], want[at], rel*100, tolerance*100)
+		t.Errorf("%s: gap %.3g at %d (got %g, want %g), %.4f%% of the scale, beyond %.4f%%; rms error %.4f%%",
+			name, worst, at, got[at], want[at], rel*100, tolerance*100, rmsError(got, want)*100)
 		return
 	}
-	t.Logf("%s: max gap %.3g, %.4f%% of the scale", name, worst, rel*100)
+	t.Logf("%s: max gap %.3g, %.4f%% of the scale; rms error %.4f%%", name, worst, rel*100, rmsError(got, want)*100)
+}
+
+// rmsError is the root mean square of the difference over that of the
+// reference: what a reference computed in bf16 is fairly held to, where one
+// entry's gap measures the reference's own rounding at its largest values.
+func rmsError(got, want []float32) float64 {
+	var d, n float64
+	for i := range want {
+		e := float64(got[i] - want[i])
+		d += e * e
+		n += float64(want[i]) * float64(want[i])
+	}
+	return math.Sqrt(d / (n + 1e-30))
+}
+
+// compareRMS fails when the rms error passes tolerance.
+func compareRMS(t testing.TB, name string, got, want []float32, tolerance float64) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s: %d values, want %d", name, len(got), len(want))
+	}
+	e := rmsError(got, want)
+	if !(e <= tolerance) {
+		t.Errorf("%s: rms error %.4f%%, beyond %.4f%%", name, e*100, tolerance*100)
+		return
+	}
+	t.Logf("%s: rms error %.4f%%", name, e*100)
 }

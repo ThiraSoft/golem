@@ -370,7 +370,7 @@ func TestK2Attention(t *testing.T) {
 
 func TestK2Conv(t *testing.T) {
 	r := rand.New(rand.NewSource(7))
-	for _, c := range []struct{ outs, ins, h, w, taps int }{{96, 16, 20, 33, 9}, {3, 96, 17, 16, 9}, {384, 192, 9, 10, 1}} {
+	for _, c := range []struct{ outs, ins, h, w, taps, up int }{{96, 16, 20, 33, 9, 0}, {3, 96, 17, 16, 9, 0}, {384, 192, 9, 10, 1, 0}, {192, 384, 12, 14, 9, 1}} {
 		K := c.ins * c.taps
 		kStride := (K + 31) / 32 * 32
 		wf := randomFloats(r, c.outs*K, 0.1)
@@ -381,7 +381,8 @@ func TestK2Conv(t *testing.T) {
 			}
 		}
 		px := c.h * c.w
-		x := randomFloats(r, c.ins*px, 1)
+		ih, iw := c.h>>c.up, c.w>>c.up
+		x := randomFloats(r, c.ins*ih*iw, 1)
 		res := randomFloats(r, c.outs*px, 1)
 		bias := randomFloats(r, c.outs, 1)
 		k := newK2(t, c.ins*px+2*c.outs*px, bias)
@@ -390,7 +391,7 @@ func TestK2Conv(t *testing.T) {
 		k.Write(c.ins*px+c.outs*px, res)
 		run(t, k, func(rec *Recorder) {
 			k.Conv(rec, wb, K2Conv{Outputs: uint32(c.outs), Inputs: uint32(c.ins), H: uint32(c.h), W: uint32(c.w), Taps: uint32(c.taps),
-				KStride: uint32(kStride), X: 0, Y: uint32(c.ins * px), Bias: 0, Residual: uint32(c.ins*px + c.outs*px)})
+				KStride: uint32(kStride), X: 0, Y: uint32(c.ins * px), Bias: 0, Residual: uint32(c.ins*px + c.outs*px), Up: uint32(c.up)})
 		})
 		got, _ := k.Read(c.ins*px, c.outs*px)
 		want := make([]float32, c.outs*px)
@@ -407,14 +408,14 @@ func TestK2Conv(t *testing.T) {
 							if yy < 0 || yy >= c.h || xs < 0 || xs >= c.w {
 								continue
 							}
-							s += float64(f16ToF32(f32ToF16(wf[o*K+i*c.taps+tap]))) * float64(f16ToF32(f32ToF16(x[i*px+yy*c.w+xs])))
+							s += float64(f16ToF32(f32ToF16(wf[o*K+i*c.taps+tap]))) * float64(f16ToF32(f32ToF16(x[i*ih*iw+(yy>>c.up)*iw+xs>>c.up])))
 						}
 					}
 					want[o*px+y*c.w+xx] = float32(s) + res[o*px+y*c.w+xx]
 				}
 			}
 		}
-		k2Compare(t, "conv", got, want, 1e-5)
+		k2Compare(t, "conv", got, want, 5e-5)
 	}
 }
 

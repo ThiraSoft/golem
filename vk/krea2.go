@@ -166,6 +166,7 @@ type K2Conv struct {
 	X, Y            uint32
 	Bias            uint32
 	Residual        uint32 // added to the answer; K2None for none
+	Up              uint32 // 1: the input is half the size, read upsampled
 }
 
 // The pixel steps of shaders/krea2_pix.comp.
