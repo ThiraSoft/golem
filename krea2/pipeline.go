@@ -42,6 +42,10 @@ type Request struct {
 	// LoraStrength how much of it, from 0 to 2; none when either is zero.
 	Lora         string  `json:"lora,omitempty"`
 	LoraStrength float32 `json:"lora_strength,omitempty"`
+	// HidePrompt leaves the prompt and the negative prompt out of the
+	// picture's metadata, and is left out itself; the settings, the seed
+	// and the LoRA stay.
+	HidePrompt bool `json:"hide_prompt,omitempty"`
 }
 
 // MaxLoRAStrength is the front's bound on a LoRA's strength.

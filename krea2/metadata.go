@@ -4,7 +4,8 @@ package krea2
 // the settings and the seed, enough to draw it again, and which golem drew
 // it. The parameters are written the way Automatic1111 writes them, which is
 // what most tools that read a picture's settings look for, a LoRA included:
-// <lora:name:strength> after the prompt.
+// <lora:name:strength> after the prompt. A request with HidePrompt set is
+// written without its prompt and its negative prompt, and without saying so.
 
 import (
 	"bytes"
@@ -26,7 +27,10 @@ func (r Request) Parameters(model string) string {
 	var b strings.Builder
 	b.WriteString(r.Prompt)
 	if r.Lora != "" && r.LoraStrength != 0 {
-		fmt.Fprintf(&b, " <lora:%s:%g>", strings.TrimSuffix(r.Lora, ".safetensors"), r.LoraStrength)
+		if r.Prompt != "" {
+			b.WriteByte(' ')
+		}
+		fmt.Fprintf(&b, "<lora:%s:%g>", strings.TrimSuffix(r.Lora, ".safetensors"), r.LoraStrength)
 	}
 	if r.Negative != "" {
 		fmt.Fprintf(&b, "\nNegative prompt: %s", r.Negative)
@@ -44,6 +48,9 @@ func (p *Pipeline) WritePNG(w io.Writer, img image.Image, r Request) error {
 // WritePNG writes img as a PNG with three text chunks after its header:
 // "parameters", "Software" and "golem", the request as JSON.
 func WritePNG(w io.Writer, img image.Image, r Request, model string) error {
+	if r.HidePrompt {
+		r.Prompt, r.Negative, r.HidePrompt = "", "", false
+	}
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
 		return err

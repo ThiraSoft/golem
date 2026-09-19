@@ -28,7 +28,8 @@ A LoRA of the DiT is named as the front names it, a file in ComfyUI's
 `models/loras` and a strength from 0 to 2: `Request.Lora` and
 `Request.LoraStrength`, `-lora` and `-lora-strength`, `lora` and
 `lora_strength` in the server's request. The picture's metadata carries it,
-`<lora:name:strength>` after the prompt.
+`<lora:name:strength>` after the prompt. `HidePrompt` (`-hide-prompt`,
+`hide_prompt`) leaves the prompt and the negative prompt out of it.
 
 It wants a Vulkan device with cooperative matrices and about fourteen
 gigabytes on it: the DiT is twelve, the rest is working memory, taken and

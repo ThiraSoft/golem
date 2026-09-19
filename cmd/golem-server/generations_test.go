@@ -92,6 +92,25 @@ func TestGenerationsRefuses(t *testing.T) {
 	}
 }
 
+func TestGenerationsCanHideThePrompt(t *testing.T) {
+	_, rec := generate(t, `{"prompt":"un secret","negative_prompt":"un autre","seed":3,"hide_prompt":true}`)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out struct {
+		Data []struct {
+			B64 string `json:"b64_json"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(out.Data[0].B64)
+	if bytes.Contains(raw, []byte("secret")) || bytes.Contains(raw, []byte("autre")) || !bytes.Contains(raw, []byte("Seed: 3")) {
+		t.Fatal("the PNG carries the prompt, or not the settings")
+	}
+}
+
 func TestGenerationsReadsTheLoRA(t *testing.T) {
 	f, rec := generate(t, `{"prompt":"a cat","seed":1,"lora":"style.safetensors","lora_strength":0.6}`)
 	if rec.Code != 200 {

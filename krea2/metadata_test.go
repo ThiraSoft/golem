@@ -45,6 +45,25 @@ func TestPNGCarriesTheRequest(t *testing.T) {
 	}
 }
 
+func TestPNGCanHideThePrompt(t *testing.T) {
+	r := Request{Prompt: "un secret", Negative: "un autre", Width: 64, Height: 48, Steps: 8, CFG: 1, Seed: 5,
+		Lora: "style.safetensors", LoraStrength: 1, HidePrompt: true}
+	var buf bytes.Buffer
+	if err := WritePNG(&buf, image.NewNRGBA(image.Rect(0, 0, 64, 48)), r, "m"); err != nil {
+		t.Fatal(err)
+	}
+	for _, hidden := range []string{"secret", "autre", "hide_prompt"} {
+		if bytes.Contains(buf.Bytes(), []byte(hidden)) {
+			t.Errorf("the PNG carries %s", hidden)
+		}
+	}
+	for _, want := range []string{"Seed: 5", "<lora:style:1>"} {
+		if !bytes.Contains(buf.Bytes(), []byte(want)) {
+			t.Errorf("the PNG does not carry %s", want)
+		}
+	}
+}
+
 func TestParametersNameTheLoRA(t *testing.T) {
 	r := Request{Prompt: "a cat", Width: 64, Height: 64, Steps: 8, CFG: 1, Seed: 5, Lora: "style.safetensors", LoraStrength: 0.75}
 	if got := r.Parameters("m"); !strings.HasPrefix(got, "a cat <lora:style:0.75>\nSteps: 8,") {

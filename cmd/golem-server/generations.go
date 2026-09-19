@@ -7,7 +7,8 @@ package main
 // picture as a base64 PNG, and the seed that drew it, so that a client that
 // asked for a random one can ask for the same picture again. The PNG carries
 // the request too, and the golem that drew it. A LoRA is named as the front
-// names it, lora and lora_strength.
+// names it, lora and lora_strength. hide_prompt keeps the prompt out of the
+// PNG.
 
 import (
 	"bytes"
@@ -65,6 +66,8 @@ type generationRequest struct {
 	// lora_name, and its strength, 1 when not given.
 	Lora         string   `json:"lora"`
 	LoraStrength *float32 `json:"lora_strength"`
+	// HidePrompt leaves the prompt out of the PNG's metadata.
+	HidePrompt bool `json:"hide_prompt"`
 }
 
 // The mobile front's defaults.
@@ -129,7 +132,8 @@ func (req generationRequest) krea2() (krea2.Request, error) {
 	if !ok || err1 != nil || err2 != nil {
 		return k, fmt.Errorf("size %q is not WIDTHxHEIGHT", req.Size)
 	}
-	k = krea2.Request{Prompt: req.Prompt, Negative: req.NegativePrompt, Width: width, Height: height, Steps: req.Steps, CFG: 1}
+	k = krea2.Request{Prompt: req.Prompt, Negative: req.NegativePrompt, Width: width, Height: height, Steps: req.Steps, CFG: 1,
+		HidePrompt: req.HidePrompt}
 	if k.Steps == 0 {
 		k.Steps = defaultSteps
 	}
