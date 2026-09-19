@@ -82,10 +82,16 @@ type DiT struct {
 	ctx                   [2]uint32 // the prompt's text, and the negative's
 	x, n, scratch         uint32
 	table, img, out       uint32
+	half                  uint32 // the MLP's answer in fp16, for its down
 
 	fusion map[int][2]*vk.Program
 	steps  map[[3]int][]*vk.Program
 	ctxLen [2]int
+
+	// The last rope table written, and the text length and latent size it is
+	// for.
+	ropeKey   [3]int
+	ropeTable []float32
 
 	// The products by weight name, and the LoRA on them (lora.go).
 	products map[string]product
@@ -198,6 +204,7 @@ func OpenDiT(d *vk.Device, path string) (*DiT, error) {
 	m.table = a.take(N * ditHeadDim)
 	m.img = a.take(MaxImageTokens * ditIn)
 	m.out = a.take(MaxImageTokens * ditIn)
+	m.half = a.take(N * ditFFN / 2)
 	m.loraT = a.take(max(N, R) * loraMaxGroup)
 
 	if m.k, err = vk.NewK2(d, a.n, par.data); err != nil {
@@ -255,9 +262,16 @@ func (m *DiT) mm(r *vk.Recorder, w int, outs, ins, cols, x, y, bias, mode uint32
 		Bias: bias, Scale: 1, Mode: mode}))
 }
 
+// mmh is mm over an x of halves, counted in halves (vk.K2MM's XHalves).
+func (m *DiT) mmh(r *vk.Recorder, w int, outs, ins, cols, x, y, bias, mode uint32) {
+	m.k.MM(r, w, true, m.withLoRA(r, w, vk.K2MM{Outputs: outs, Inputs: ins, Cols: cols, X: x, XStride: ins, Y: y, YStride: outs,
+		Bias: bias, Scale: 1, Mode: mode, XHalves: 1}))
+}
+
+// gatedMM is the gated residual's product, over an x of halves.
 func (m *DiT) gatedMM(r *vk.Recorder, w int, outs, ins, cols, x, y, gateA, gateB uint32) {
 	m.k.MM(r, w, true, m.withLoRA(r, w, vk.K2MM{Outputs: outs, Inputs: ins, Cols: cols, X: x, XStride: ins, Y: y, YStride: outs,
-		Bias: vk.K2None, Scale: 1, Mode: vk.K2GatedAdd, GateA: gateA, GateB: gateB}))
+		Bias: vk.K2None, Scale: 1, Mode: vk.K2GatedAdd, GateA: gateA, GateB: gateB, XHalves: 1}))
 }
 
 // textBlock records a TextFusionBlock over seqs sequences of length each.
@@ -273,7 +287,7 @@ func (m *DiT) textBlock(r *vk.Recorder, b *txtBlock, seqs, length uint32) {
 		m.k.Norm(r, vk.K2Norm{Src: src, SrcStride: n, Dst: dst, DstStride: n, N: n, Rows: rows, Weight: weight, OnePlus: 1, Eps: ditEps, ScaleA: vk.K2None})
 	}
 	norm(m.x, m.n, w, rows, b.pre)
-	m.loraA(r, rows, m.n, b.q, b.k, b.v, b.attnWeights.gate)
+	m.loraA(r, rows, m.n, 0, b.q, b.k, b.v, b.attnWeights.gate)
 	m.mm(r, b.q, w, w, rows, m.n, q, vk.K2None, vk.K2Store)
 	m.mm(r, b.k, w, w, rows, m.n, k, vk.K2None, vk.K2Store)
 	m.mm(r, b.v, w, w, rows, m.n, v, vk.K2None, vk.K2Store)
@@ -288,7 +302,7 @@ func (m *DiT) textBlock(r *vk.Recorder, b *txtBlock, seqs, length uint32) {
 	norm(m.x, m.n, w, rows, b.post)
 	h1 := m.scratch
 	h2 := h1 + rows*txtFFN
-	m.loraA(r, rows, m.n, b.gate, b.up)
+	m.loraA(r, rows, m.n, 0, b.gate, b.up)
 	m.mm(r, b.gate, txtFFN, w, rows, m.n, h1, vk.K2None, vk.K2Store)
 	m.mm(r, b.up, txtFFN, w, rows, m.n, h2, vk.K2None, vk.K2Store)
 	m.k.Act(r, vk.K2Act{X: h1, XStride: txtFFN, Y: h2, YStride: txtFFN, N: txtFFN, Rows: rows, Op: vk.K2SwiGLU})
@@ -396,7 +410,12 @@ func (m *DiT) Step(slot int, latent []float32, h, w int, sigma float32) ([]float
 	if err := m.k.Write(int(m.temb), timestepEmbedding(sigma)); err != nil {
 		return nil, err
 	}
-	if err := m.k.Write(int(m.table), ditRope(m.ctxLen[slot], h/ditPatch, w/ditPatch)); err != nil {
+	if key := [3]int{m.ctxLen[slot], h, w}; m.ropeTable == nil || m.ropeKey != key {
+		// The table depends on the sizes alone, and takes longer to work out
+		// than a step's host work otherwise does: once a picture.
+		m.ropeKey, m.ropeTable = key, ditRope(key[0], h/ditPatch, w/ditPatch)
+	}
+	if err := m.k.Write(int(m.table), m.ropeTable); err != nil {
 		return nil, err
 	}
 	for _, prog := range progs {
@@ -449,18 +468,24 @@ func (m *DiT) stepPrograms(slot, txt, img int) ([]*vk.Program, error) {
 		att := g + N*F
 		h1 := m.scratch
 		h2 := h1 + N*ditFFN
+		// The products read their operand in fp16, which the norms and the
+		// elementwise steps before them write so (vk.K2MM's XHalves): n in
+		// place of its floats, the gated attention over q, which is spent by
+		// then, and the MLP's answer in half. Offsets in halves are twice
+		// those in floats.
+		nh := 2 * m.n
 		for i := from; i < to; i++ {
 			b := &m.blocks[i]
 			mod := func(j uint32) (uint32, uint32) { return m.tvec + j*F, b.mod + j*F }
 			sa, sb := mod(0)
 			ha, hb := mod(1)
-			m.k.Norm(r, vk.K2Norm{Src: m.x, SrcStride: F, Dst: m.n, DstStride: F, N: F, Rows: N, Weight: b.pre, OnePlus: 1, Eps: ditEps,
-				ScaleA: sa, ScaleB: sb, ShiftA: ha, ShiftB: hb})
-			m.loraA(r, N, m.n, b.q, b.k, b.v, b.attnWeights.gate)
-			m.mm(r, b.q, F, F, N, m.n, q, vk.K2None, vk.K2Store)
-			m.mm(r, b.k, kv, F, N, m.n, k, vk.K2None, vk.K2Store)
-			m.mm(r, b.v, kv, F, N, m.n, v, vk.K2None, vk.K2Store)
-			m.mm(r, b.attnWeights.gate, F, F, N, m.n, g, vk.K2None, vk.K2Store)
+			m.k.Norm(r, vk.K2Norm{Src: m.x, SrcStride: F, Dst: nh, DstStride: F, N: F, Rows: N, Weight: b.pre, OnePlus: 1, Eps: ditEps,
+				ScaleA: sa, ScaleB: sb, ShiftA: ha, ShiftB: hb, Halves: 1})
+			m.loraA(r, N, nh, 1, b.q, b.k, b.v, b.attnWeights.gate)
+			m.mmh(r, b.q, F, F, N, nh, q, vk.K2None, vk.K2Store)
+			m.mmh(r, b.k, kv, F, N, nh, k, vk.K2None, vk.K2Store)
+			m.mmh(r, b.v, kv, F, N, nh, v, vk.K2None, vk.K2Store)
+			m.mmh(r, b.attnWeights.gate, F, F, N, nh, g, vk.K2None, vk.K2Store)
 			m.k.Norm(r, vk.K2Norm{Src: q, SrcStride: ditHeadDim, Dst: q, DstStride: ditHeadDim, N: ditHeadDim, Rows: N * ditHeads,
 				Weight: b.qNorm, OnePlus: 1, Eps: ditEps, ScaleA: vk.K2None})
 			m.k.Norm(r, vk.K2Norm{Src: k, SrcStride: ditHeadDim, Dst: k, DstStride: ditHeadDim, N: ditHeadDim, Rows: N * ditKVHeads,
@@ -470,29 +495,31 @@ func (m *DiT) stepPrograms(slot, txt, img int) ([]*vk.Program, error) {
 			m.k.Attn(r, vk.K2Attn{Q: q, QStride: F, K: k, KStride: kv, V: v, VStride: kv, O: att, OStride: F,
 				Queries: N, Keys: N, Group: ditHeads / ditKVHeads, Scale: float32(1 / math.Sqrt(ditHeadDim)),
 				Heads: ditHeads, Seqs: 1, HeadDim: ditHeadDim})
-			m.k.Act(r, vk.K2Act{X: att, XStride: F, Y: g, YStride: F, N: F, Rows: N, Op: vk.K2Sigmoid})
+			m.k.Act(r, vk.K2Act{X: att, XStride: F, Y: g, YStride: F, N: F, Rows: N, Op: vk.K2Sigmoid,
+				Dst: 2 * q, DstStride: F, Halves: 1})
 			ga, gb := mod(2)
-			m.gatedMM(r, b.o, F, F, N, att, m.x, ga, gb)
+			m.gatedMM(r, b.o, F, F, N, 2*q, m.x, ga, gb)
 
 			sa, sb = mod(3)
 			ha, hb = mod(4)
-			m.k.Norm(r, vk.K2Norm{Src: m.x, SrcStride: F, Dst: m.n, DstStride: F, N: F, Rows: N, Weight: b.post, OnePlus: 1, Eps: ditEps,
-				ScaleA: sa, ScaleB: sb, ShiftA: ha, ShiftB: hb})
-			m.loraA(r, N, m.n, b.gate, b.up)
-			m.mm(r, b.gate, ditFFN, F, N, m.n, h1, vk.K2None, vk.K2Store)
-			m.mm(r, b.up, ditFFN, F, N, m.n, h2, vk.K2None, vk.K2Store)
-			m.k.Act(r, vk.K2Act{X: h1, XStride: ditFFN, Y: h2, YStride: ditFFN, N: ditFFN, Rows: N, Op: vk.K2SwiGLU})
+			m.k.Norm(r, vk.K2Norm{Src: m.x, SrcStride: F, Dst: nh, DstStride: F, N: F, Rows: N, Weight: b.post, OnePlus: 1, Eps: ditEps,
+				ScaleA: sa, ScaleB: sb, ShiftA: ha, ShiftB: hb, Halves: 1})
+			m.loraA(r, N, nh, 1, b.gate, b.up)
+			m.mmh(r, b.gate, ditFFN, F, N, nh, h1, vk.K2None, vk.K2Store)
+			m.mmh(r, b.up, ditFFN, F, N, nh, h2, vk.K2None, vk.K2Store)
+			m.k.Act(r, vk.K2Act{X: h1, XStride: ditFFN, Y: h2, YStride: ditFFN, N: ditFFN, Rows: N, Op: vk.K2SwiGLU,
+				Dst: 2 * m.half, DstStride: ditFFN, Halves: 1})
 			ga, gb = mod(5)
-			m.gatedMM(r, b.down, F, ditFFN, N, h1, m.x, ga, gb)
+			m.gatedMM(r, b.down, F, ditFFN, N, 2*m.half, m.x, ga, gb)
 		}
 		if !tail {
 			return
 		}
 		// The last layer, on the patches alone: its modulation is the
 		// timestep's t plus its own two vectors.
-		m.k.Norm(r, vk.K2Norm{Src: m.x + T*F, SrcStride: F, Dst: m.n, DstStride: F, N: F, Rows: I, Weight: m.lastNorm, OnePlus: 1, Eps: ditEps,
-			ScaleA: m.t, ScaleB: m.lastMod, ShiftA: m.t, ShiftB: m.lastMod + F})
-		m.mm(r, m.lastW, ditIn, F, I, m.n, m.out, m.lastB, vk.K2Store)
+		m.k.Norm(r, vk.K2Norm{Src: m.x + T*F, SrcStride: F, Dst: nh, DstStride: F, N: F, Rows: I, Weight: m.lastNorm, OnePlus: 1, Eps: ditEps,
+			ScaleA: m.t, ScaleB: m.lastMod, ShiftA: m.t, ShiftB: m.lastMod + F, Halves: 1})
+		m.mmh(r, m.lastW, ditIn, F, I, nh, m.out, m.lastB, vk.K2Store)
 	}
 	var progs []*vk.Program
 	for from := 0; from < ditBlocks; from += blocksASubmission {

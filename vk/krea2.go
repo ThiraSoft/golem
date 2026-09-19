@@ -22,6 +22,9 @@ import (
 
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DFP8 shaders/krea2_mm.comp -o shaders/krea2_mm8.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_mm.comp -o shaders/krea2_mm16.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DFP8 -DXH shaders/krea2_mm.comp -o shaders/krea2_mm8h.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DXH shaders/krea2_mm.comp -o shaders/krea2_mm16h.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DFP8 -DXH -DBM=256 -DBN=256 shaders/krea2_mm.comp -o shaders/krea2_mm8hb.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_norm.comp -o shaders/krea2_norm.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_rope.comp -o shaders/krea2_rope.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_act.comp -o shaders/krea2_act.spv
@@ -35,6 +38,15 @@ var krea2MM8SPIRV []byte
 
 //go:embed shaders/krea2_mm16.spv
 var krea2MM16SPIRV []byte
+
+//go:embed shaders/krea2_mm8h.spv
+var krea2MM8HSPIRV []byte
+
+//go:embed shaders/krea2_mm16h.spv
+var krea2MM16HSPIRV []byte
+
+//go:embed shaders/krea2_mm8hb.spv
+var krea2MM8HBSPIRV []byte
 
 //go:embed shaders/krea2_norm.spv
 var krea2NormSPIRV []byte
@@ -62,6 +74,9 @@ type k2Kernel int
 const (
 	k2MM8 k2Kernel = iota
 	k2MM16
+	k2MM8H
+	k2MM16H
+	k2MM8HB
 	k2Norm
 	k2Rope
 	k2Act
@@ -87,6 +102,10 @@ type K2MM struct {
 	// columns (0 for none), against t at LoRAT in the arena.
 	LoRAAt, LoRARank   uint32
 	LoRAT, LoRATStride uint32
+	// XHalves, when not 0, says X is fp16, and X and XStride count halves,
+	// multiples of eight: what Norm and Act write with Halves set. The
+	// kernels do not read it; it picks them.
+	XHalves uint32
 }
 
 // What a product does with its answer.
@@ -109,6 +128,9 @@ type K2Norm struct {
 	Eps            float32
 	ScaleA, ScaleB uint32
 	ShiftA, ShiftB uint32
+	// Halves writes the answer as fp16, and Dst and DstStride count halves;
+	// N is even.
+	Halves uint32
 }
 
 // K2Rope turns every pair of every head of every token in place.
@@ -135,6 +157,10 @@ type K2Act struct {
 	Y, YStride uint32
 	N, Rows    uint32
 	Op         uint32
+	// With Halves set, X is left alone and the answer goes to Dst as fp16,
+	// Dst and DstStride counting halves; N is even.
+	Dst, DstStride uint32
+	Halves         uint32
 }
 
 // K2Attn is attention over Seqs sequences at once. See shaders/krea2_attn.comp.
@@ -217,6 +243,9 @@ var k2Specs = [k2Kernels]struct {
 }{
 	k2MM8:     {&krea2MM8SPIRV, unsafe.Sizeof(K2MM{})},
 	k2MM16:    {&krea2MM16SPIRV, unsafe.Sizeof(K2MM{})},
+	k2MM8H:    {&krea2MM8HSPIRV, unsafe.Sizeof(K2MM{})},
+	k2MM16H:   {&krea2MM16HSPIRV, unsafe.Sizeof(K2MM{})},
+	k2MM8HB:   {&krea2MM8HBSPIRV, unsafe.Sizeof(K2MM{})},
 	k2Norm:    {&krea2NormSPIRV, unsafe.Sizeof(K2Norm{})},
 	k2Rope:    {&krea2RopeSPIRV, unsafe.Sizeof(K2Rope{})},
 	k2Act:     {&krea2ActSPIRV, unsafe.Sizeof(K2Act{})},
@@ -251,7 +280,7 @@ func NewK2(d *Device, arenaFloats int, params []float32) (*K2, error) {
 	}
 	for i, spec := range k2Specs {
 		bindings := 3
-		if i == int(k2MM8) || i == int(k2MM16) {
+		if k2Kernel(i).product() {
 			bindings = 4
 		}
 		if k.pipes[i], err = d.newPipeline(*spec.spirv, bindings, uint32(spec.push), coopmatWave, nil); err != nil {
@@ -300,7 +329,7 @@ func (k *K2) SetLoRA(h int) {
 		return
 	}
 	for key, s := range k.sets {
-		if key.k == k2MM8 || key.k == k2MM16 {
+		if key.k.product() {
 			s.Close()
 			delete(k.sets, key)
 		}
@@ -373,7 +402,7 @@ func (k *K2) set(kern k2Kernel, w int) *Set {
 		first = k.weights[w]
 	}
 	bufs := []*Buffer{first, k.arena, k.params}
-	if kern == k2MM8 || kern == k2MM16 {
+	if kern.product() {
 		lora := k.params
 		if k.lora >= 0 {
 			lora = k.weights[k.lora]
@@ -406,13 +435,43 @@ func (k *K2) dispatch(r *Recorder, kern k2Kernel, w int, groups int, push unsafe
 	r.Barrier()
 }
 
+func (k k2Kernel) product() bool { return k.tile() > 0 }
+
+// tile is a product's tile, rows and columns; 0 for any other kernel.
+func (k k2Kernel) tile() uint32 {
+	switch k {
+	case k2MM8, k2MM16, k2MM8H, k2MM16H:
+		return 128
+	case k2MM8HB:
+		return 256
+	}
+	return 0
+}
+
+// k2BigTiles is how many tiles of 256 × 256 a product needs before it takes
+// them: fewer leave the card's 64 compute units half idle, and the tiles of
+// 128 are quicker there (the DiT's k and v, 1536 rows).
+const k2BigTiles = 128
+
 // MM records a product whose weights are fp8 (fp8 true) or fp16.
 func (k *K2) MM(r *Recorder, w int, fp8 bool, m K2MM) {
 	kern := k2MM16
 	if fp8 {
 		kern = k2MM8
 	}
-	tiles := int((m.Outputs+127)/128) * int((m.Cols+127)/128)
+	if m.XHalves != 0 {
+		if (m.X|m.XStride)%8 != 0 {
+			panic(fmt.Sprintf("vk: Krea 2 product of fp16 X at %d, stride %d", m.X, m.XStride))
+		}
+		kern += k2MM8H - k2MM8
+		// A tile of 256 × 256 reads half the bytes a product of 128 does,
+		// which is what these products wait on.
+		if kern == k2MM8H && ((m.Outputs+255)/256)*((m.Cols+255)/256) >= k2BigTiles {
+			kern = k2MM8HB
+		}
+	}
+	b := kern.tile()
+	tiles := int((m.Outputs+b-1)/b) * int((m.Cols+b-1)/b)
 	k.dispatch(r, kern, w, tiles, unsafe.Pointer(&m))
 }
 
@@ -423,7 +482,11 @@ func (k *K2) Rope(r *Recorder, p K2Rope) {
 }
 
 func (k *K2) Act(r *Recorder, a K2Act) {
-	k.dispatch(r, k2Act, -1, groups256(int(a.N*a.Rows)), unsafe.Pointer(&a))
+	n := int(a.N * a.Rows)
+	if a.Halves != 0 {
+		n /= 2
+	}
+	k.dispatch(r, k2Act, -1, groups256(n), unsafe.Pointer(&a))
 }
 
 // Attn records attention; HeadDim is 128 or 384.

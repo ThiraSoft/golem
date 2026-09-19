@@ -329,11 +329,12 @@ func (m *DiT) LoRA() (*LoRA, float32) { return m.loraOf, m.loraS }
 
 // loraA records t = strength · A·x for the stack the first of these products
 // with a change is in.
-func (m *DiT) loraA(r *vk.Recorder, cols, x uint32, ws ...int) {
+// x is in halves when xHalves is not 0, as vk.K2MM's.
+func (m *DiT) loraA(r *vk.Recorder, cols, x, xHalves uint32, ws ...int) {
 	for _, w := range ws {
 		if lo := m.lora[w]; lo != nil {
 			m.k.MM(r, lo.a, false, vk.K2MM{Outputs: lo.rows, Inputs: lo.in, Cols: cols, X: x, XStride: lo.in,
-				Y: m.loraT, YStride: lo.rows, Bias: vk.K2None, Scale: m.loraS, Mode: vk.K2Store})
+				Y: m.loraT, YStride: lo.rows, Bias: vk.K2None, Scale: m.loraS, Mode: vk.K2Store, XHalves: xHalves})
 			return
 		}
 	}
@@ -347,7 +348,7 @@ func (m *DiT) withLoRA(r *vk.Recorder, w int, mm vk.K2MM) vk.K2MM {
 		return mm
 	}
 	if !lo.stacked {
-		m.loraA(r, mm.Cols, mm.X, w)
+		m.loraA(r, mm.Cols, mm.X, mm.XHalves, w)
 	}
 	mm.LoRAAt, mm.LoRARank, mm.LoRAT, mm.LoRATStride = lo.bAt, lo.rank, m.loraT+lo.at, lo.rows
 	return mm

@@ -87,9 +87,9 @@ A step at 768 × 1024:
 
 | | a DiT step | putting it on |
 |---|---:|---:|
-| no LoRA | 1.38 s | |
-| a LoRA of rank 32 (the front's) | 1.42 s | 0.3 to 1.2 s |
-| a LoRA of rank 256 | 1.49 s | 2.5 to 5 s |
+| no LoRA | 1.02 s | |
+| a LoRA of rank 32 (the front's) | 1.03 s | 0.3 to 1.2 s |
+| a LoRA of rank 256 | 1.49 s, before the fp16 operands below | 2.5 to 5 s |
 | another strength | same | 60 µs |
 
 ## Measured
@@ -99,14 +99,26 @@ RX 9070 XT, RADV, 768 × 1024, 8 steps, cfg 1, against ComfyUI on the same card
 
 | | golem | ComfyUI |
 |---|---:|---:|
-| a DiT step | 1.38 s | 1.89 s |
-| the eight steps | 11.4 s | 15 s |
-| text encoder | 0.33 s | |
-| VAE decode | 0.26 s | |
-| a picture, DiT kept | 12.1 s | |
+| a DiT step | 1.02 s | 1.89 s |
+| the eight steps | 8.2 s | 15 s |
+| text encoder | 0.36 s | |
+| VAE decode | 0.28 s | |
+| a picture, DiT kept | 8.9 s | |
 | reading the DiT, cold / cached | 14 s / 2.3 s | |
 
 A step at that size is recorded as seven submissions of four blocks: the
 driver allows a submission two seconds before it declares the card hung.
 
-The DiT's products run at 52 to 58 TFLOPS in fp16, its attention at about 27.
+The products are what a step is made of, and what held them back was
+reading their operand, not the matrix cores (183 TFLOPS on this card,
+measured on registers alone). So the norms and the elementwise steps before
+them write it in fp16, rounded and clamped as the product would round it,
+and the product reads it as it is: half the bytes, and the same picture to
+the bit. The large ones take tiles of 256 × 256, which read half the bytes
+per product again; k and v, too small to fill the card with those, keep
+tiles of 128. Back to back, as a step runs them, they run at 90 to 100 TFLOPS
+(k and v at 60), and the attention at about 39.
+
+The step's host work is out of the way too: the rope table, which only
+depends on the sizes, is worked out once a picture, and the sampler's noise
+is drawn while the card runs the step.

@@ -10,7 +10,7 @@ import (
 )
 
 // What the DiT's kernels do at 768 × 1024, in TFLOPS: a measurement, not a
-// check.
+// check. The products read X in fp16, as the DiT's step feeds them.
 func TestK2Throughput(t *testing.T) {
 	heavy.Skip(t, "a measurement")
 	r := rand.New(rand.NewSource(1))
@@ -37,7 +37,7 @@ func TestK2Throughput(t *testing.T) {
 		k := newK2(t, N*ins+N*outs, nil)
 		w, _ := k.AddWeights(randomFP8(r, outs*ins))
 		d := time1(k, 5, func(rec *Recorder) {
-			k.MM(rec, w, true, K2MM{Outputs: uint32(outs), Inputs: uint32(ins), Cols: N, XStride: uint32(ins), Y: uint32(N * ins), YStride: uint32(outs), Bias: K2None, Scale: 1})
+			k.MM(rec, w, true, K2MM{Outputs: uint32(outs), Inputs: uint32(ins), Cols: N, XStride: uint32(ins), Y: uint32(N * ins), YStride: uint32(outs), Bias: K2None, Scale: 1, XHalves: 1})
 		})
 		t.Logf("mm %d×%d×%d: %v, %.1f TFLOPS", outs, ins, N, d, 2*float64(outs*ins*N)/d.Seconds()/1e12)
 	}

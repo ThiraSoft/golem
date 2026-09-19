@@ -1,5 +1,6 @@
 #version 450
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 // RMS norm of one row a workgroup, in float32 as F.rms_norm does it after
 // ComfyUI's .float(): x / sqrt(mean(x²) + eps), times a weight that is either
@@ -7,6 +8,10 @@
 // zero), then optionally the DiT's modulation, x·(1 + s) + h, where s and h
 // are each the sum of a vector in the arena (the step's timestep vector) and
 // one in the parameters (the block's own).
+//
+// With half set, the answer is written as fp16, clamped to fp16's range, at
+// dst counted in halves: what the products read (shaders/krea2_mm.comp, XH)
+// when they would otherwise round it themselves, and rounded the same way.
 //
 // One wave of sixty-four a row: the rows are either 6144 or 2560 wide, or a
 // head's 128, and there are thousands of them.
@@ -26,7 +31,21 @@ layout(push_constant) uniform Push {
     float eps;
     uint sa, sb;   // scale: arena, parameters; ~0 for none
     uint ha, hb;   // shift
+    uint halves;
 } p;
+
+layout(std430, binding = 1) buffer AH { uint ah[]; };
+
+float at(uint src, uint i, float inv) {
+    float v = a[src + i] * inv;
+    if (p.weight != ~0u) v *= par[p.weight + i] + ((p.onePlus != 0u) ? 1.0 : 0.0);
+    if (p.sa != ~0u) {
+        float s = a[p.sa + i] + par[p.sb + i];
+        float h = a[p.ha + i] + par[p.hb + i];
+        v = v * (1.0 + s) + h;
+    }
+    return v;
+}
 
 void main() {
     uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
@@ -40,14 +59,13 @@ void main() {
     }
     ss = subgroupAdd(ss);
     float inv = inversesqrt(ss / float(p.n) + p.eps);
-    for (uint i = t; i < p.n; i += 64u) {
-        float v = a[src + i] * inv;
-        if (p.weight != ~0u) v *= par[p.weight + i] + ((p.onePlus != 0u) ? 1.0 : 0.0);
-        if (p.sa != ~0u) {
-            float s = a[p.sa + i] + par[p.sb + i];
-            float h = a[p.ha + i] + par[p.hb + i];
-            v = v * (1.0 + s) + h;
+    if (p.halves != 0u) {
+        // Two a thread, n being even.
+        for (uint i = 2u * t; i < p.n; i += 128u) {
+            vec2 v = clamp(vec2(at(src, i, inv), at(src, i + 1u, inv)), vec2(-65504.0), vec2(65504.0));
+            ah[(dst + i) >> 1] = packFloat2x16(f16vec2(v));
         }
-        a[dst + i] = v;
+        return;
     }
+    for (uint i = t; i < p.n; i += 64u) a[dst + i] = at(src, i, inv);
 }

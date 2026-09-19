@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 // The elementwise steps between the products, one element a thread:
 //   0  x = gelu(x), tanh form            (the DiT's MLPs on the timestep and text)
@@ -8,6 +9,10 @@
 //   4  x = y
 //   5  x = silu(x)
 // x and y are strided rows: n entries a row, rows of them.
+//
+// With half set, x is left as it is and the answer goes to dst instead, as
+// fp16 clamped to fp16's range, in rows of dstStride, both counted in halves;
+// a thread then does two entries, n being even.
 
 layout(local_size_x = 256) in;
 
@@ -20,14 +25,12 @@ layout(push_constant) uniform Push {
     uint y, yStride;
     uint n, rows;
     uint op;
+    uint dst, dstStride, halves;
 } p;
 
-void main() {
-    uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u;
-    if (i >= p.n * p.rows) return;
-    uint row = i / p.n, col = i % p.n;
-    uint xi = p.x + row * p.xStride + col;
-    uint yi = p.y + row * p.yStride + col;
+layout(std430, binding = 1) buffer AH { uint ah[]; };
+
+float f(uint xi, uint yi) {
     float v = a[xi];
     if (p.op == 0u) {
         float u = 0.7978845608028654 * (v + 0.044715 * v * v * v);
@@ -43,5 +46,24 @@ void main() {
     } else {
         v = v / (1.0 + exp(-v));
     }
-    a[xi] = v;
+    return v;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u;
+    if (p.halves != 0u) {
+        uint pairs = p.n / 2u;
+        if (i >= pairs * p.rows) return;
+        uint row = i / pairs, col = 2u * (i % pairs);
+        uint xi = p.x + row * p.xStride + col;
+        uint yi = p.y + row * p.yStride + col;
+        vec2 v = clamp(vec2(f(xi, yi), f(xi + 1u, yi + 1u)), vec2(-65504.0), vec2(65504.0));
+        ah[(p.dst + row * p.dstStride + col) >> 1] = packFloat2x16(f16vec2(v));
+        return;
+    }
+    if (i >= p.n * p.rows) return;
+    uint row = i / p.n, col = i % p.n;
+    uint xi = p.x + row * p.xStride + col;
+    uint yi = p.y + row * p.yStride + col;
+    a[xi] = f(xi, yi);
 }

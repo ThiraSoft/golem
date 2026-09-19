@@ -38,8 +38,18 @@ func SampleERSDE(d Denoiser, x []float32, sigmas []float32, noise *CUDARandn, pr
 	var oldDenoised, oldD []float32
 	steps := len(sigmas) - 1
 	for i := 0; i < steps; i++ {
+		// The step's noise is drawn on the processor while the model runs:
+		// it takes a few tens of milliseconds, and nothing else waits on it.
+		var drawn chan []float32
+		if sigmas[i+1] != 0 {
+			drawn = make(chan []float32, 1)
+			go func(n int) { drawn <- noise.Next(n) }(len(x))
+		}
 		denoised, err := d(i, x, sigmas[i])
 		if err != nil {
+			if drawn != nil {
+				<-drawn
+			}
 			return nil, err
 		}
 		stage := min(3, i+1)
@@ -88,7 +98,7 @@ func SampleERSDE(d Denoiser, x []float32, sigmas []float32, noise *CUDARandn, pr
 			if amp > 0 {
 				scale = alphaT * float32(math.Sqrt(float64(amp)))
 			}
-			n := noise.Next(len(x))
+			n := <-drawn
 			for k := range x {
 				x[k] += n[k] * scale
 			}
