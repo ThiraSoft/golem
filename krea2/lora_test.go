@@ -10,11 +10,26 @@ import (
 	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
-const frontLoRA = "style.safetensors"
+// recordedLoRA is the path of the LoRA ref/krea2/dump.py recorded with,
+// which its request.json names: the front's, rank 32.
+func recordedLoRA(t testing.TB) string {
+	t.Helper()
+	f := loadFixtures(t)
+	raw, err := os.ReadFile(filepath.Join(f.dir, "lora", "sample", "request.json"))
+	if err != nil {
+		t.Skipf("no LoRA recorded (%v): see ref/krea2/README.md", err)
+	}
+	var r Request
+	if err := json.Unmarshal(raw, &r); err != nil || r.Lora == "" {
+		t.Fatalf("lora/sample/request.json names no LoRA (%v)", err)
+	}
+	path := filepath.Join(LoRADir(), r.Lora)
+	needFile(t, path)
+	return path
+}
 
 func TestOpenLoRA(t *testing.T) {
-	path := filepath.Join(LoRADir(), frontLoRA)
-	needFile(t, path)
+	path := recordedLoRA(t)
 	l, err := OpenLoRA(path)
 	if err != nil {
 		t.Fatal(err)
@@ -41,9 +56,9 @@ func TestDiTWithLoRAMatchesComfyUI(t *testing.T) {
 	heavy.Skip(t, "uploads twelve gigabytes of DiT")
 	f := loadFixtures(t)
 	needFile(t, DiTPath())
-	l, err := OpenLoRA(filepath.Join(LoRADir(), frontLoRA))
+	l, err := OpenLoRA(recordedLoRA(t))
 	if err != nil {
-		t.Skip(err)
+		t.Fatal(err)
 	}
 	m, err := OpenDiT(device(t), DiTPath())
 	if err != nil {

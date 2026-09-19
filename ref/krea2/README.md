@@ -37,7 +37,7 @@ line turns off.
 - `dit/`: the first DiT call of that run with its waypoints;
 - `vae/`: the decode of that run with a waypoint per block;
 - `accept/`: the front's defaults, 768 × 1024, seed 42, and the PNG;
-- `lora/` (stage `lora`): the portrait again with `style`, through
+- `lora/` (stage `lora`): the portrait again with the LoRA `GOLEM_KREA2_LORA` names, through
   `LoraLoaderModelOnly` at 1 and 0.5 (`fused1/`, `fused05/`, with the weights
   it patched as cast in `lowvram.json`) and through the bypass loader
   (`bypass1/`), and the first DiT call of the 256 × 256 run through the

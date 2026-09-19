@@ -65,7 +65,11 @@ def save(name, t):
 
 
 st = safe_open(UNET, "pt")
-lora = safe_open(os.path.join(COMFY, "models/loras/style.safetensors"), "pt") if LORA else None
+lora = None
+if LORA:
+    # The LoRA dump.py's lora stage recorded with.
+    with open(os.path.join(OUT, "lora", "sample", "request.json")) as f:
+        lora = safe_open(os.path.join(COMFY, "models", "loras", json.load(f)["lora"]), "pt")
 
 
 def load(module, prefix):

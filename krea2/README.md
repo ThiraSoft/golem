@@ -88,8 +88,8 @@ A step at 768 × 1024:
 | | a DiT step | putting it on |
 |---|---:|---:|
 | no LoRA | 1.38 s | |
-| `style`, rank 32 | 1.42 s | 0.3 to 1.2 s |
-| `identity`, rank 256 | 1.49 s | 2.5 to 5 s |
+| a LoRA of rank 32 (the front's) | 1.42 s | 0.3 to 1.2 s |
+| a LoRA of rank 256 | 1.49 s | 2.5 to 5 s |
 | another strength | same | 60 µs |
 
 ## Measured

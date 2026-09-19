@@ -4,6 +4,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,7 +52,8 @@ func TestFullSizeTimings(t *testing.T) {
 }
 
 // What a LoRA costs a step at 768 × 1024, and what putting one on costs: the
-// front's, rank 32, and the identity LoRA, rank 256.
+// one the fixtures were recorded with, and the files GOLEM_KREA2_LORAS names
+// in the LoRA directory, separated by commas.
 func TestLoRAStepTimings(t *testing.T) {
 	heavy.Skip(t, "a measurement at full size")
 	needFile(t, DiTPath())
@@ -84,11 +86,14 @@ func TestLoRAStepTimings(t *testing.T) {
 		t.Logf("%s: a DiT step %v", name, best)
 	}
 	step("no LoRA")
-	for _, name := range []string{frontLoRA, "identity.safetensors"} {
-		path := filepath.Join(LoRADir(), name)
-		if _, err := os.Stat(path); err != nil {
-			continue
+	paths := []string{recordedLoRA(t)}
+	for _, name := range strings.Split(os.Getenv("GOLEM_KREA2_LORAS"), ",") {
+		if name != "" {
+			paths = append(paths, filepath.Join(LoRADir(), name))
 		}
+	}
+	for _, path := range paths {
+		name := filepath.Base(path)
 		start := time.Now()
 		l, err := OpenLoRA(path)
 		if err != nil {

@@ -41,7 +41,8 @@ import comfy.samplers  # noqa: E402
 UNET = "krea2_turbo_fp8.safetensors"
 CLIP = "qwen3vl_4b_fp8_scaled.safetensors"
 VAE = "qwen_image_vae.safetensors"
-LORA = "style.safetensors"
+# The LoRA of the lora and seeds stages, a file in ComfyUI's models/loras.
+LORA = os.environ.get("GOLEM_KREA2_LORA", "")
 NEGATIVE = "(ugly, anime, text, watermark, label, worst,sketch,censor, cg, cgi, rendered, 3d :1.0)"
 PROMPTS = {
     "short": "a cat",
@@ -259,7 +260,13 @@ def lowvram_keys(model):
     return sorted(keys)
 
 
+def need_lora():
+    if not LORA:
+        sys.exit("GOLEM_KREA2_LORA names the LoRA, a file in ComfyUI's models/loras")
+
+
 def stage_lora(unet, clip, vae):
+    need_lora()
     import comfy.sd
     import comfy.utils
     lora = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("loras", LORA), safe_load=True)
@@ -281,6 +288,7 @@ def stage_seeds(unet, clip, vae):
     """The portrait at two more seeds, without the LoRA and with it both
     ways: how far ComfyUI's own two loaders part is what a picture with a
     LoRA can be held to."""
+    need_lora()
     import comfy.sd
     import comfy.utils
     lora = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("loras", LORA), safe_load=True)
