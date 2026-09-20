@@ -16,7 +16,7 @@ func TestFaceMorpher(t *testing.T) {
 				t.Fatal(err)
 			}
 			n := netFaceMorpher
-			m.forward(f.tensor(t, n+".in.0"), f.pose(t, n+".in.1"), f.checker(t, n))
+			m.forward(f.tensor(t, n+".in.0"), f.pose(t, n+".in.1"), noTone, f.checker(t, n))
 		})
 	}
 }

@@ -77,8 +77,12 @@ func (z Zoom) orWhole() Zoom {
 	return z
 }
 
-// zoomAt is where the zoom goes in the card's pose buffer, after the pose.
-const zoomAt = NumParams
+// zoomAt is where the zoom goes in the card's pose buffer, after the pose,
+// and toneAt where the eyes' gain goes, after the zoom.
+const (
+	zoomAt = NumParams
+	toneAt = zoomAt + 3
+)
 
 // SetBackground makes the poser finish its frames for the screen: laid on
 // bg, in sRGB, framed by a zoom, as PoseRGBA returns them. On the card that

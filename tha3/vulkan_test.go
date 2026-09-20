@@ -159,6 +159,12 @@ func TestCardHighMatchesCPU(t *testing.T) {
 		if err := p.SetSharpen(0.6); err != nil {
 			t.Fatal(err)
 		}
+		// And with the eyes toned, so that the gain the card reads
+		// from the pose buffer is compared to the one the processor
+		// multiplies in.
+		if err := p.SetEyeTone(1); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for _, run := range runs {
 		f := loadFixtures(t, run)
@@ -175,6 +181,9 @@ func TestCardHighMatchesCPU(t *testing.T) {
 		for _, p := range []*Poser{cpu, card} {
 			if err := p.SetImageHigh(img, high); err != nil {
 				t.Fatal(err)
+			}
+			if p.EyeTone() == noTone {
+				t.Fatalf("%s: no gain measured, the tone is not being compared", run)
 			}
 		}
 		var first [NumParams]float32

@@ -62,6 +62,8 @@ type Poser struct {
 	edited                  editorFields
 	scale                   int
 	sharpen                 float32 // the unsharp mask on what the face morpher paints
+	toneAmount              float32 // how far the eyes' colour is brought onto the picture's skin
+	eyeTone                 [3]float32
 	high                    Tensor
 	hiEyebrow, hiBackground Tensor
 	hiEyebrows, hiMorphed   Tensor
@@ -93,7 +95,7 @@ var errClosed = errors.New("tha3: poser is closed")
 
 // Open loads the five networks from dir, which Dir usually names.
 func Open(dir string) (*Poser, error) {
-	p := &Poser{timings: Timings{}, view: whole, scale: 1}
+	p := &Poser{timings: Timings{}, view: whole, scale: 1, eyeTone: noTone}
 	byName := map[string]*weights{}
 	for _, n := range []string{netEyebrowDecomposer, netEyebrowCombiner, netFaceMorpher, netRotator, netEditor} {
 		w, err := openWeights(dir, n)
@@ -168,6 +170,7 @@ func (p *Poser) SetImageHigh(img, high Tensor) error {
 	// stored only once the card, if there is one, holds it too.
 	pic := img.Clone()
 	p.haveLast = false
+	p.eyeTone = p.measureEyeTone(pic)
 	if p.gpu != nil {
 		if err := p.gpu.setImage(p, pic, high); err != nil {
 			return err
@@ -256,7 +259,7 @@ func (p *Poser) poseCPU(pose [NumParams]float32, from stage, short bool) (Tensor
 		faceIn.Paste(p.eyebrows, 32, 32)
 		p.trace.emit(netFaceMorpher+".in.0", faceIn)
 		timed(netFaceMorpher, func() {
-			p.morphed, p.faced = p.face.forward(faceIn, facePose, p.trace.sub(netFaceMorpher))
+			p.morphed, p.faced = p.face.forward(faceIn, facePose, p.eyeTone, p.trace.sub(netFaceMorpher))
 			if p.high.Data != nil {
 				k := p.high.H / Size
 				hiIn := p.high.Crop(32*k, 160*k, 192*k, 192*k)

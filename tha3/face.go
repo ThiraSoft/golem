@@ -20,14 +20,17 @@ func newFaceMorpher(w *weights) *faceMorpher {
 	}
 }
 
-func (m *faceMorpher) forward(image Tensor, pose []float32, t tracer) (Tensor, faceFields) {
+// forward morphs the face, with the colour it paints over the eyes brought
+// onto the picture's skin by tone: see tone.go. A tone of noTone is the
+// networks' own colour.
+func (m *faceMorpher) forward(image Tensor, pose []float32, tone [3]float32, t tracer) (Tensor, faceFields) {
 	f := m.body.forward(image, pose, t)
 	ff := faceFields{
 		grid:       m.irisMouthGrid.Apply(f),
 		mouthAlpha: m.irisMouthAlpha.Apply(f),
 		mouthColor: m.irisMouthColor.Apply(f),
 		eyeAlpha:   m.eyeAlpha.Apply(f),
-		eyeColor:   m.eyeColor.Apply(f),
+		eyeColor:   toned(m.eyeColor.Apply(f), tone),
 	}
 	out := ff.apply(image)
 	t.emit("out.0", out)

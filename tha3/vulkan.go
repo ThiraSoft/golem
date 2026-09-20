@@ -80,10 +80,11 @@ func (q *gpuPoser) setImage(p *Poser, img, high Tensor) error {
 }
 
 func (q *gpuPoser) pose(p *Poser, pose [NumParams]float32, from stage, short bool) (Tensor, error) {
-	var buf [zoomAt + 3]float32
+	var buf [toneAt + 3]float32
 	copy(buf[:], pose[:])
 	z := p.zoom.orWhole()
 	buf[zoomAt], buf[zoomAt+1], buf[zoomAt+2] = float32(z.Scale), float32(z.X), float32(z.Y)
+	buf[toneAt], buf[toneAt+1], buf[toneAt+2] = p.eyeTone[0], p.eyeTone[1], p.eyeTone[2]
 	q.run.SetPose(buf[:])
 	run := q.run.RunPoseFrom
 	if short {
@@ -301,6 +302,9 @@ func (d *describer) combine(f cardFields, background, eyebrow vk.THA3Tensor) vk.
 	return d.g.RGBHalfAlpha(morphed, background)
 }
 
+// face is faceMorpher.forward, with the eyes' colour toned by the gain the
+// pose buffer carries: the pass is recorded once whatever the picture, and
+// the gain arrives with the pose, as the zoom does.
 func (d *describer) face(m *faceMorpher, image vk.THA3Tensor) (vk.THA3Tensor, cardFields) {
 	const net = netFaceMorpher
 	f := d.encoderDecoder(net, m.body, image, eyebrowParams, faceParamsEnd-eyebrowParams, vk.THA3ReLU)
@@ -309,7 +313,7 @@ func (d *describer) face(m *faceMorpher, image vk.THA3Tensor) (vk.THA3Tensor, ca
 		"mouthAlpha": d.head(f, m.irisMouthAlpha, vk.THA3Sigmoid),
 		"mouthColor": d.head(f, m.irisMouthColor, vk.THA3Tanh),
 		"eyeAlpha":   d.head(f, m.eyeAlpha, vk.THA3Sigmoid),
-		"eyeColor":   d.head(f, m.eyeColor, vk.THA3Tanh),
+		"eyeColor":   d.g.Tone(d.head(f, m.eyeColor, vk.THA3Tanh), toneAt),
 	}
 	out := d.morph(fields, image)
 	d.emit(net+".out.0", out)

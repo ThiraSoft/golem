@@ -32,6 +32,15 @@ the card, a pose costs about 1.5 ms more. `SetBackground` and `PoseRGBA`
 finish the frame on the card (laid on a colour, sRGB, framed by a zoom) so
 that only bytes come back.
 
+`SetSharpen(a)` brings back the edge of what the face morpher paints, which
+it decides at 192 px and the larger picture blows up. `SetEyeTone(a)` deals
+with the colour of the same paint: the networks give a closed eyelid the skin
+they were trained on, warmer than most characters', which at 512 passes and
+on the larger picture reads as a beige patch on a face the picture drew. At
+one the gain measured on the picture itself brings it onto the character's
+own skin, at the cost of one run of the face morpher per picture set and
+nothing per frame.
+
 `cmd/tha3-pose` renders one frame from the command line and prints how long
 each network took.
 
