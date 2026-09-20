@@ -10,7 +10,9 @@
 // colour channels by the same step, so an edge sharpens without its colour
 // drifting; it keeps the image's alpha as mode 1 does. Mode 4 is steepen: it
 // pulls the image away from 0.5 by the amount and clamps, and reads neither
-// the change nor the alpha.
+// the change nor the alpha. Mode 5 is tone: every colour channel multiplied,
+// in light, by the gain the pose buffer holds from index `from`, the alpha
+// channel kept.
 
 layout(local_size_x = 256) in;
 
@@ -21,6 +23,7 @@ layout(std430, binding = 2) readonly buffer Pose { float pose[]; };
 layout(push_constant) uniform Push {
     uint dst, image, change, alpha, plane, alphaC, mode;
     float amount;
+    uint from; // mode 5 only
 } p;
 
 void main() {
@@ -34,6 +37,10 @@ void main() {
     }
     if (p.mode != 0u && c == 3u) {
         a[p.dst + c * p.plane + i] = im;
+        return;
+    }
+    if (p.mode == 5u) {
+        a[p.dst + c * p.plane + i] = clamp((im + 1.0) / 2.0 * pose[p.from + c], 0.0, 1.0) * 2.0 - 1.0;
         return;
     }
     float ch = a[p.change + c * p.plane + i];

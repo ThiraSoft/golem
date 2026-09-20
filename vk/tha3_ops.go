@@ -42,6 +42,7 @@ type tha3PosePush struct{ dst, plane, from uint32 }
 type tha3BlendPush struct {
 	dst, image, change, alpha, plane, alphaC, mode uint32
 	amount                                         float32 // modes 3 and 4 only
+	from                                           uint32  // mode 5 only
 }
 
 type tha3ResizePush struct{ src, srcH, srcW, dst, dstH, dstW uint32 }
@@ -172,6 +173,22 @@ func (g *THA3Graph) RGBHalfAlpha(change, image THA3Tensor) THA3Tensor {
 // changing it means building the graph again.
 func (g *THA3Graph) Sharpen(mask, blurred, image THA3Tensor, amount float32) THA3Tensor {
 	return g.blendBy(3, mask, blurred, image, amount)
+}
+
+// Tone is tha3's toned: every colour channel of image multiplied, in light,
+// by the gain the pose buffer holds at from, from+1 and from+2, and clamped
+// back into the range; the alpha channel is left alone. The gain is read when
+// the pass runs, so it changes without the graph being built again.
+func (g *THA3Graph) Tone(image THA3Tensor, from int) THA3Tensor {
+	out := g.tensor(image.C, image.H, image.W)
+	g.op([]THA3Tensor{image}, []THA3Tensor{out}, func(r *Recorder, x *THA3Runner) {
+		push := tha3BlendPush{
+			dst: x.at(out), image: x.at(image), change: x.at(image), alpha: x.at(image),
+			plane: uint32(image.H * image.W), alphaC: 1, mode: 5, from: uint32(from),
+		}
+		x.dispatch(r, tha3Blend, groups256(image.H*image.W), image.C, unsafe.Pointer(&push))
+	})
+	return out
 }
 
 // Steepen is tha3's steepen: the mask pulled away from 0.5 by by, clamped to
