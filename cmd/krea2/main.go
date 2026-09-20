@@ -38,6 +38,9 @@ func main() {
 	lora := flag.String("lora", "", "a LoRA of the DiT: a file in -loras, or a path")
 	loraStrength := flag.Float64("lora-strength", 1, "how much of the LoRA, from 0 to 2")
 	loras := flag.String("loras", krea2.LoRADir(), "the directory -lora names a file in")
+	chroma := flag.String("chroma", "", "draw the background in this colour, #rrggbb, to key it out afterwards")
+	chromaStrength := flag.Float64("chroma-strength", 1, "how much of the colour the noise takes, from 0 to 4")
+	chromaSpread := flag.Float64("chroma-spread", 0, "how much of the middle the colour spares, from 0 to 1; 0 is the default spread")
 	hidePrompt := flag.Bool("hide-prompt", false, "leave the prompt and the negative prompt out of the PNG's metadata")
 	flag.Parse()
 	if strings.ContainsRune(*lora, filepath.Separator) {
@@ -62,7 +65,8 @@ func main() {
 
 	for i := 0; i < *n; i++ {
 		r := krea2.Request{Prompt: *prompt, Negative: *negative, Width: *width, Height: *height, Steps: *steps,
-			CFG: float32(*cfg), Seed: uint64(*seed + int64(i)), Lora: *lora, LoraStrength: float32(*loraStrength), HidePrompt: *hidePrompt}
+			CFG: float32(*cfg), Seed: uint64(*seed + int64(i)), Lora: *lora, LoraStrength: float32(*loraStrength),
+			Chroma: *chroma, ChromaStrength: float32(*chromaStrength), ChromaSpread: float32(*chromaSpread), HidePrompt: *hidePrompt}
 		img, tm, err := p.Generate(r, func(step, steps int) { fmt.Fprintf(os.Stderr, "\rstep %d/%d", step, steps) })
 		if err != nil {
 			fail(err)

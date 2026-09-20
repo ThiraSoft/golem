@@ -42,6 +42,13 @@ type Request struct {
 	// LoraStrength how much of it, from 0 to 2; none when either is zero.
 	Lora         string  `json:"lora,omitempty"`
 	LoraStrength float32 `json:"lora_strength,omitempty"`
+	// Chroma, when set, is the colour the background is drawn in, #rrggbb,
+	// for a picture meant to be keyed out afterwards. ChromaStrength is how
+	// much of the colour's shift the noise takes, 1 by default, and
+	// ChromaSpread how wide the middle it spares is.
+	Chroma         string  `json:"chroma,omitempty"`
+	ChromaStrength float32 `json:"chroma_strength,omitempty"`
+	ChromaSpread   float32 `json:"chroma_spread,omitempty"`
 	// HidePrompt leaves the prompt and the negative prompt out of the
 	// picture's metadata, and is left out itself; the settings, the seed
 	// and the LoRA stay.
@@ -66,6 +73,11 @@ type Pipeline struct {
 	dit   *DiT
 	vae   *VAE
 	lora  *LoRA // the last one asked for, kept in memory
+
+	// chroma is the latent shift of each colour asked for so far: finding
+	// one costs seventeen little decodes, and a picture after the first in
+	// the same colour should not pay them again.
+	chroma map[Colour][16]float32
 }
 
 // Open readies a pipeline. The DiT is read at the first picture.
@@ -125,8 +137,46 @@ func (p *Pipeline) check(r Request) error {
 		return fmt.Errorf("krea2: a LoRA strength of %g, from 0 to %d", r.LoraStrength, MaxLoRAStrength)
 	case r.Lora != "" && (r.Lora != filepath.Base(r.Lora) || strings.HasPrefix(r.Lora, ".")):
 		return fmt.Errorf("krea2: LoRA %q is not a file name", r.Lora)
+	case r.ChromaStrength < 0 || r.ChromaStrength > MaxChromaStrength:
+		return fmt.Errorf("krea2: a chroma strength of %g, from 0 to %d", r.ChromaStrength, MaxChromaStrength)
+	case r.ChromaSpread < 0 || r.ChromaSpread > 1:
+		return fmt.Errorf("krea2: a chroma spread of %g, from 0 to 1", r.ChromaSpread)
+	}
+	if r.Chroma != "" {
+		if _, err := ParseColour(r.Chroma); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// MaxChromaStrength is as far as the noise may be moved towards a colour:
+// past it the picture is the colour and nothing else.
+const MaxChromaStrength = 4
+
+// chromaFor is the latent shift of the request's colour, found once per
+// colour. It is asked for while the DiT is off the card, since it decodes.
+func (p *Pipeline) chromaFor(r Request) (*[16]float32, error) {
+	if r.Chroma == "" {
+		return nil, nil
+	}
+	col, err := ParseColour(r.Chroma)
+	if err != nil {
+		return nil, err
+	}
+	if d, ok := p.chroma[col]; ok {
+		return &d, nil
+	}
+	d, err := p.vae.ChromaLatent(col)
+	p.vae.Trim()
+	if err != nil {
+		return nil, err
+	}
+	if p.chroma == nil {
+		p.chroma = map[Colour][16]float32{}
+	}
+	p.chroma[col] = d
+	return &d, nil
 }
 
 // loraFor reads the request's LoRA, or keeps the one read last when it is
@@ -180,6 +230,12 @@ func (p *Pipeline) Generate(r Request, progress Progress) (*image.NRGBA, Timings
 	}
 	tm.Encode = time.Since(start)
 
+	// The colour's shift is looked for before the DiT takes the card.
+	chroma, err := p.chromaFor(r)
+	if err != nil {
+		return nil, tm, err
+	}
+
 	t := time.Now()
 	lora, err := p.loraFor(r)
 	if err != nil {
@@ -196,7 +252,7 @@ func (p *Pipeline) Generate(r Request, progress Progress) (*image.NRGBA, Timings
 	tm.Load = time.Since(t)
 	t = time.Now()
 	h, w := r.Height/8, r.Width/8
-	latent, err := p.sample(pos, posLen, neg, negLen, cfg, r, h, w, progress)
+	latent, err := p.sample(pos, posLen, neg, negLen, cfg, r, h, w, chroma, progress)
 	if p.o.Keep {
 		p.dit.Trim()
 	} else {
@@ -222,7 +278,7 @@ func (p *Pipeline) Generate(r Request, progress Progress) (*image.NRGBA, Timings
 
 // sample is KSampler's er_sde over the simple schedule, with ComfyUI's CFG
 // when it is not 1: the negative's denoised plus CFG times the difference.
-func (p *Pipeline) sample(pos []float32, posLen int, neg []float32, negLen int, cfg bool, r Request, h, w int, progress Progress) ([]float32, error) {
+func (p *Pipeline) sample(pos []float32, posLen int, neg []float32, negLen int, cfg bool, r Request, h, w int, chroma *[16]float32, progress Progress) ([]float32, error) {
 	if err := p.dit.SetText(0, pos, posLen); err != nil {
 		return nil, err
 	}
@@ -258,6 +314,13 @@ func (p *Pipeline) sample(pos []float32, posLen int, neg []float32, negLen int, 
 	// The starting latent is torch's CPU noise at the first sigma, which is
 	// 1: the empty latent it is mixed with is weighed by nothing.
 	x := TorchCPURandn(r.Seed, 16*h*w)
+	if chroma != nil {
+		strength := r.ChromaStrength
+		if strength == 0 {
+			strength = 1
+		}
+		ChromaNoise(x, h, w, *chroma, strength, r.ChromaSpread)
+	}
 	return SampleERSDE(d, x, Sigmas(r.Steps), NewCUDARandn(r.Seed), progress)
 }
 
