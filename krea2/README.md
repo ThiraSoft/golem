@@ -92,6 +92,40 @@ A step at 768 × 1024:
 | a LoRA of rank 256 | 1.49 s, before the fp16 operands below | 2.5 to 5 s |
 | another strength | same | 60 µs |
 
+## A colour to key out
+
+`Request.Chroma` (`-chroma`, `chroma`) is a colour, `#rrggbb`, and the
+picture comes out on it: a wash even enough to be keyed away afterwards, and
+one that goes between the locks of hair as well as around them, which is what
+cutting a character out of a white background never gets right.
+
+```go
+krea2.Request{Prompt: "...", Chroma: "#00c05a", ChromaStrength: 2, ChromaSpread: 0.6}
+```
+
+Nothing is trained and no weight is touched. It is TKG-DM (arXiv 2411.15580):
+the noise the sampler starts from stays a standard normal in the middle of
+the frame, where the subject is drawn, and away from it the mean of each of
+the sixteen channels slides towards the latent of the colour, a Gaussian
+between the two. `ChromaStrength` is how far it slides, 1 by default and 4 at
+most, `ChromaSpread` how wide the middle it spares is, as a share of the
+half-diagonal, 0.4 by default.
+
+golem holds the decoder of the VAE and not its encoder, so the colour's
+latent is looked for by asking the decoder: one probe a channel gives the
+slope of each colour there, the shortest shift that lands on the colour is
+taken, and it is corrected a few times because the decoder is not quite a
+straight line. Seventeen decodes of eight latent pixels a side, under a tenth
+of a second, done before the DiT takes the card and kept for the colours a
+pipeline has already been asked for.
+
+Two things to know. The colour drawn is in the family of the colour asked for
+and not the colour itself: ask for `#00c05a` at strength 2 and a teal comes
+back, flat to three values out of 255, so read the background off the corners
+rather than trusting the request. And the spared middle frames the subject
+smaller than the same seed would draw it without a colour, which is
+resolution lost on a face; `ChromaSpread` buys it back.
+
 ## Measured
 
 RX 9070 XT, RADV, 768 × 1024, 8 steps, cfg 1, against ComfyUI on the same card
