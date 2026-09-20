@@ -56,17 +56,21 @@ type Poser struct {
 
 	// What each network decided on the processor, applied again to the
 	// larger picture when the scale is above one, and what that made.
-	decomposed              decomposerFields
-	combined                combinerFields
-	faced                   faceFields
-	edited                  editorFields
-	scale                   int
-	sharpen                 float32 // the unsharp mask on what the face morpher paints
-	toneAmount              float32 // how far the eyes' colour is brought onto the picture's skin
-	eyeTone                 [3]float32
-	high                    Tensor
-	hiEyebrow, hiBackground Tensor
-	hiEyebrows, hiMorphed   Tensor
+	decomposed decomposerFields
+	combined   combinerFields
+	faced      faceFields
+	edited     editorFields
+	scale      int
+	// front is the mask of what the picture keeps in front of the morphed
+	// face, as SetFront was given it, and frontFace and hiFront are that
+	// mask refined on the face's window at each resolution.
+	front, frontFace, hiFront Tensor
+	sharpen                   float32 // the unsharp mask on what the face morpher paints
+	toneAmount                float32 // how far the eyes' colour is brought onto the picture's skin
+	eyeTone                   [3]float32
+	high                      Tensor
+	hiEyebrow, hiBackground   Tensor
+	hiEyebrows, hiMorphed     Tensor
 
 	// heldBody reuses the rotator's and the editor's last decisions when
 	// only the face and the brows move.
@@ -176,9 +180,11 @@ func (p *Poser) SetImageHigh(img, high Tensor) error {
 			return err
 		}
 		p.image, p.high = pic, high
-		return nil
+		p.cutFront()
+		return p.gpu.setFront(p)
 	}
 	p.image, p.high = pic, high
+	p.cutFront()
 	crop := img.Crop(64, 192, 128, 128)
 	p.trace.emit(netEyebrowDecomposer+".in.0", crop)
 	start := time.Now()
@@ -260,11 +266,13 @@ func (p *Poser) poseCPU(pose [NumParams]float32, from stage, short bool) (Tensor
 		p.trace.emit(netFaceMorpher+".in.0", faceIn)
 		timed(netFaceMorpher, func() {
 			p.morphed, p.faced = p.face.forward(faceIn, facePose, p.eyeTone, p.trace.sub(netFaceMorpher))
+			p.morphed = composeFront(p.frontFace, faceIn, p.morphed)
 			if p.high.Data != nil {
 				k := p.high.H / Size
 				hiIn := p.high.Crop(32*k, 160*k, 192*k, 192*k)
 				hiIn.Paste(p.hiEyebrows, 32*k, 32*k)
 				p.hiMorphed = p.faced.resized(192*k, 192*k).applySharp(hiIn, p.sharpen)
+				p.hiMorphed = composeFront(p.hiFront, hiIn, p.hiMorphed)
 			}
 		})
 	}

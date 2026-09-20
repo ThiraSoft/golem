@@ -21,6 +21,11 @@ type gpuPoser struct {
 	dev         *vk.Device
 	run         *vk.THA3Runner
 	image, high vk.THA3Tensor // high only when the scale is above one
+	// front and hiFront hold the mask of what the picture keeps in front
+	// of the morphed face, refined for each resolution; hiFront only when
+	// the scale is above one. A mask of zeros keeps nothing, which is a
+	// poser without one.
+	front, hiFront vk.THA3Tensor
 }
 
 // UseVulkan moves SetImage and Pose to the first Vulkan device. It fails
@@ -42,13 +47,13 @@ func (p *Poser) useVulkan(trace bool) error {
 		return err
 	}
 	d := &describer{g: vk.NewTHA3Graph(), trace: trace}
-	image, high := d.poser(p)
+	image, high, front, hiFront := d.poser(p)
 	run, err := d.g.Build(dev, true)
 	if err != nil {
 		dev.Close()
 		return fmt.Errorf("tha3: %w", err)
 	}
-	q := &gpuPoser{dev: dev, run: run, image: image, high: high}
+	q := &gpuPoser{dev: dev, run: run, image: image, high: high, front: front, hiFront: hiFront}
 	// A picture already set goes to the card before the card is taken: if it
 	// cannot, the poser stays on the processor, whole.
 	if p.image.Data != nil {
@@ -56,6 +61,10 @@ func (p *Poser) useVulkan(trace bool) error {
 			q.close()
 			return err
 		}
+	}
+	if err := q.setFront(p); err != nil {
+		q.close()
+		return err
 	}
 	p.gpu, p.gpuTrace = q, trace
 	p.haveLast = false
@@ -76,6 +85,28 @@ func (q *gpuPoser) setImage(p *Poser, img, high Tensor) error {
 		return err
 	}
 	p.timings[netEyebrowDecomposer] = time.Since(start)
+	return nil
+}
+
+// setFront writes the refined masks, or zeros where there is none: the
+// operation that reads them is always in the graph, and a mask of zeros
+// leaves the morpher's face as it was.
+func (q *gpuPoser) setFront(p *Poser) error {
+	for _, m := range []struct {
+		to   vk.THA3Tensor
+		mask Tensor
+	}{{q.front, p.frontFace}, {q.hiFront, p.hiFront}} {
+		if m.to.C == 0 {
+			continue
+		}
+		data := m.mask.Data
+		if data == nil {
+			data = make([]float32, m.to.C*m.to.H*m.to.W)
+		}
+		if err := q.run.Write(m.to, data); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -403,12 +434,16 @@ func (d *describer) editor(m *editor, original, warped, grid vk.THA3Tensor, high
 // poser describes SetImage and Pose as Poser runs them on the processor and
 // returns the picture's input tensor, and the larger picture's when the
 // scale is above one.
-func (d *describer) poser(p *Poser) (image, high vk.THA3Tensor) {
+func (d *describer) poser(p *Poser) (image, high, front, hiFront vk.THA3Tensor) {
 	g := d.g
 	k := p.scale
 	image = g.Input(4, Size, Size)
 	if k > 1 {
 		high = g.Input(4, Size*k, Size*k)
+	}
+	front = g.Input(1, 192, 192)
+	if k > 1 {
+		hiFront = g.Input(1, 192*k, 192*k)
 	}
 
 	g.SetPhase(vk.THA3ImagePhase)
@@ -437,6 +472,9 @@ func (d *describer) poser(p *Poser) (image, high vk.THA3Tensor) {
 	faceIn := g.Paste(g.Crop(image, 32, 160, 192, 192), eyebrows, 32, 32)
 	d.emit(netFaceMorpher+".in.0", faceIn)
 	face, faced := d.face(p.face, faceIn)
+	// What the picture keeps in front of the face goes back on it here,
+	// before the rotator, so that the rotation and the breath carry it.
+	face = g.ColorChange(front, faceIn, face)
 	var hiFace vk.THA3Tensor
 	if k > 1 {
 		hiFaceIn := g.Paste(g.Crop(high, 32*k, 160*k, 192*k, 192*k), hiEyebrows, 32*k, 32*k)
@@ -446,6 +484,7 @@ func (d *describer) poser(p *Poser) (image, high vk.THA3Tensor) {
 		// after it is weighed by the alphas as they came, so that it
 		// reaches everything the morpher painted.
 		hiFace = d.sharpen(hiFaced, d.morph(d.steepened(hiFaced, p.sharpen), hiFaceIn), p.sharpen)
+		hiFace = g.ColorChange(hiFront, hiFaceIn, hiFace)
 	}
 	g.Stamp(netFaceMorpher)
 
@@ -492,5 +531,5 @@ func (d *describer) poser(p *Poser) (image, high vk.THA3Tensor) {
 	if k == 1 {
 		high = vk.THA3Tensor{}
 	}
-	return image, high
+	return image, high, front, hiFront
 }

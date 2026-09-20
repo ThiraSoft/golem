@@ -41,6 +41,12 @@ one the gain measured on the picture itself brings it onto the character's
 own skin, at the cost of one run of the face morpher per picture set and
 nothing per frame.
 
+`SetFront(mask)` says which pixels of the picture stay in front of the face.
+The morpher repaints the whole eye socket when an eye shuts, over whatever
+happens to be there, so a lock of hair falling across an eye flickers with
+every blink; the mask puts it back, before the rotator, so that it still
+turns with the head. It is drawn by hand and used as it is drawn.
+
 `cmd/tha3-pose` renders one frame from the command line and prints how long
 each network took.
 

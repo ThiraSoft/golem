@@ -178,12 +178,28 @@ func TestCardHighMatchesCPU(t *testing.T) {
 				}
 			}
 		}
+		// A mask of what the picture keeps in front of the face, so
+		// that the composite the card does for it is compared too.
+		front := NewTensor(1, Size, Size)
+		for y := 120; y < 170; y++ {
+			for x := 220; x < 300; x += 9 {
+				for w := 0; w < 4; w++ {
+					front.Plane(0)[y*Size+x+w] = 1
+				}
+			}
+		}
 		for _, p := range []*Poser{cpu, card} {
 			if err := p.SetImageHigh(img, high); err != nil {
 				t.Fatal(err)
 			}
 			if p.EyeTone() == noTone {
 				t.Fatalf("%s: no gain measured, the tone is not being compared", run)
+			}
+			if err := p.SetFront(front); err != nil {
+				t.Fatal(err)
+			}
+			if p.frontFace.Data == nil || p.hiFront.Data == nil {
+				t.Fatalf("%s: the front mask was not refined", run)
 			}
 		}
 		var first [NumParams]float32
