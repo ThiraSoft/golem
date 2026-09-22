@@ -104,6 +104,8 @@ func (t *FileTemplate) ParseCalls(text string) (string, []ToolCall, error) {
 
 func (t *FileTemplate) CallOpen() string { return t.own.CallOpen() }
 
+func (t *FileTemplate) ReasoningMarkers() (string, string) { return t.own.ReasoningMarkers() }
+
 // messageValue is one message the way transformers hands it to a template. A
 // turn carrying pictures or recordings has its content as a list of parts —
 // the pictures, then the recordings, then the text, which is the order the

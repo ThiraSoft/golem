@@ -33,6 +33,8 @@ func (wordTemplate) Render(msgs []chat.Message, opt chat.Options) (string, error
 
 func (wordTemplate) CallOpen() string { return "CALL" }
 
+func (wordTemplate) ReasoningMarkers() (string, string) { return "", "" }
+
 func (wordTemplate) ParseCalls(text string) (string, []chat.ToolCall, error) {
 	return text, nil, nil
 }

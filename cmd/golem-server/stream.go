@@ -52,8 +52,8 @@ func (s *Server) stream(ctx context.Context, w http.ResponseWriter, gen *Generat
 	if err := send(choice{Delta: &responseMessage{Role: "assistant"}}); err != nil {
 		return
 	}
-	answer, err := gen.GeneratePrompt(ctx, prompt, p, stop, func(text string) error {
-		return send(choice{Delta: &responseMessage{Content: text}})
+	answer, err := gen.GeneratePrompt(ctx, prompt, p, stop, func(d Delta) error {
+		return send(choice{Delta: &responseMessage{Content: d.Content, ReasoningContent: d.Reasoning}})
 	})
 	if err != nil {
 		if ctx.Err() != nil {

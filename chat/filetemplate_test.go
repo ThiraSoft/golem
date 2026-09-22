@@ -75,6 +75,7 @@ type noCalls struct{}
 func (noCalls) Render([]Message, Options) (string, error)          { return "", nil }
 func (noCalls) ParseCalls(text string) (string, []ToolCall, error) { return text, nil, nil }
 func (noCalls) CallOpen() string                                   { return "" }
+func (noCalls) ReasoningMarkers() (string, string)                 { return "", "" }
 
 func TestFileTemplateHandsTheTemplateWhatTransformersWould(t *testing.T) {
 	dir := filepath.Join("..", "testdata", "jinja")

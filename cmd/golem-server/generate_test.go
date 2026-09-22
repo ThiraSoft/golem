@@ -120,7 +120,7 @@ func TestGenerateStreamsProse(t *testing.T) {
 	g, v := newGenerator(t, []string{"hello", "there", "<turn|>"}, 32)
 	var seen []string
 	answer, err := g.Generate(context.Background(), v.Encode("a b", false, true), greedy(), nil,
-		func(text string) error { seen = append(seen, text); return nil })
+		func(d Delta) error { seen = append(seen, d.Content); return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestGenerateWithholdsAPartialCall(t *testing.T) {
 	g, v := newGenerator(t, script, 32)
 	var seen []string
 	answer, err := g.Generate(context.Background(), v.Encode("a", false, true), greedy(), nil,
-		func(text string) error { seen = append(seen, text); return nil })
+		func(d Delta) error { seen = append(seen, d.Content); return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,6 +158,81 @@ func TestGenerateWithholdsAPartialCall(t *testing.T) {
 	}
 	if answer.ToolCalls[0].ID == "" {
 		t.Fatal("a call needs an identifier the client can echo back")
+	}
+}
+
+// streamed draws an answer and returns it with what reached the client, the
+// prose and the reasoning each in one string.
+func streamed(t *testing.T, script []string) (Answer, string, string) {
+	t.Helper()
+	g, v := newGenerator(t, script, 32)
+	var content, reasoning strings.Builder
+	answer, err := g.Generate(context.Background(), v.Encode("a", false, true), greedy(), nil,
+		func(d Delta) error {
+			if d.Content != "" && d.Reasoning != "" {
+				t.Errorf("one delta carries both %q and %q", d.Content, d.Reasoning)
+			}
+			content.WriteString(d.Content)
+			reasoning.WriteString(d.Reasoning)
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return answer, content.String(), reasoning.String()
+}
+
+// What the model thinks is not what it says: the markers go, the reasoning
+// leaves apart from the prose, and the newlines the template writes around it
+// go with the markers.
+func TestGenerateSeparatesTheReasoning(t *testing.T) {
+	answer, content, reasoning := streamed(t, []string{"<think>", "\n", "pondering", "\n", "</think>", "\n\n", "Answer.", "<turn|>"})
+	if answer.Text != "Answer." || answer.Reasoning != "pondering" {
+		t.Fatalf("text %q, reasoning %q", answer.Text, answer.Reasoning)
+	}
+	if content != "Answer." || reasoning != "pondering" {
+		t.Fatalf("streamed prose %q, reasoning %q", content, reasoning)
+	}
+}
+
+// An empty thought, which a model can write even when the prompt already
+// closed one for it, leaves nothing behind.
+func TestGenerateDropsAnEmptyThought(t *testing.T) {
+	answer, content, reasoning := streamed(t, []string{"<think>", "\n", "</think>", "Hi.", "<think>", "</think>", "<turn|>"})
+	if answer.Text != "Hi." || answer.Reasoning != "" || content != "Hi." || reasoning != "" {
+		t.Fatalf("text %q, reasoning %q, streamed %q and %q", answer.Text, answer.Reasoning, content, reasoning)
+	}
+}
+
+// A marker drawn in pieces is held until it is whole: no piece of it reaches
+// the client as prose.
+func TestGenerateHoldsAMarkerDrawnInPieces(t *testing.T) {
+	answer, content, reasoning := streamed(t, []string{"Hm <th", "ink>", "maybe", "</th", "ink>", "yes", "<turn|>"})
+	if content != "Hm yes" || reasoning != "maybe" {
+		t.Fatalf("streamed prose %q, reasoning %q", content, reasoning)
+	}
+	if answer.Text != "Hm yes" || answer.Reasoning != "maybe" {
+		t.Fatalf("text %q, reasoning %q", answer.Text, answer.Reasoning)
+	}
+}
+
+// A thought the answer never closes holds everything after it, as the
+// templates read it when the answer comes back as context.
+func TestGenerateKeepsAnUnclosedThoughtAsReasoning(t *testing.T) {
+	answer, content, reasoning := streamed(t, []string{"Well.", "<think>", "still", "going", "<turn|>"})
+	if answer.Text != "Well." || answer.Reasoning != "stillgoing" || content != "Well." || reasoning != "stillgoing" {
+		t.Fatalf("text %q, reasoning %q, streamed %q and %q", answer.Text, answer.Reasoning, content, reasoning)
+	}
+}
+
+// A call after the reasoning is read from the prose alone.
+func TestGenerateReadsACallAfterTheReasoning(t *testing.T) {
+	answer, content, reasoning := streamed(t, []string{"<think>", "plan", "</think>", "CALL", "now{}", "<turn|>"})
+	if len(answer.ToolCalls) != 1 || answer.ToolCalls[0].Name != "now" || answer.Reason != "tool_calls" {
+		t.Fatalf("%+v", answer)
+	}
+	if answer.Text != "" || content != "" || answer.Reasoning != "plan" || reasoning != "plan" {
+		t.Fatalf("text %q, reasoning %q, streamed %q and %q", answer.Text, answer.Reasoning, content, reasoning)
 	}
 }
 
@@ -212,7 +287,7 @@ func TestGenerateStopsWhenTheClientHangsUp(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	drawn := 0
 	_, err := g.Generate(ctx, v.Encode("a", false, true), greedy(), nil,
-		func(string) error {
+		func(Delta) error {
 			drawn++
 			if drawn == 3 {
 				cancel()
@@ -257,6 +332,8 @@ func (wordTemplate) Render(msgs []chat.Message, opt chat.Options) (string, error
 }
 
 func (wordTemplate) CallOpen() string { return "CALL" }
+
+func (wordTemplate) ReasoningMarkers() (string, string) { return "<think>", "</think>" }
 
 func (wordTemplate) ParseCalls(text string) (string, []chat.ToolCall, error) {
 	at := strings.Index(text, "CALL")

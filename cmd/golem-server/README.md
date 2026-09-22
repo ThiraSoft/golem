@@ -58,6 +58,20 @@ leaves in a single `tool_calls` delta once it has closed. OpenAI's API allows
 fragments and clients do reassemble them, but half a function's arguments is a
 thing nothing can check.
 
+## Reasoning
+
+What the model thinks before it answers leaves in `reasoning_content`, where
+llama-server puts it, and never in `content`: Gemma's thought channel
+(`<|channel>thought` … `<channel|>`) and Qwen's `<think>` … `</think>` alike.
+Streamed, it arrives as `reasoning_content` deltas while it is drawn. The
+markers themselves never leave, nor do the newlines the template writes around
+them. A thought left open when the answer ends is reasoning to the end, as the
+template reads it back.
+
+The server never asks for thinking, and Gemma's template closes an empty
+thought channel at the end of the prompt. The 12B sometimes opens one anyway;
+it is dropped here rather than sent to the client as prose.
+
 ## Several conversations, in one pass
 
 `-parallel` is how many conversations the server holds at once, and they are

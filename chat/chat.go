@@ -45,7 +45,7 @@ type Options struct {
 // Template writes a conversation the way one checkpoint was trained to read
 // it, and reads back the calls the model wrote.
 //
-// Three methods, because three are what the commands consume. A fourth would
+// Four methods, because four are what the commands consume. A fifth would
 // mean a command has learned something about an engine.
 type Template interface {
 	// Render writes the whole conversation, leading marker included. The
@@ -58,4 +58,9 @@ type Template interface {
 	// CallOpen is where prose stops and a call begins. A streaming server
 	// watches for it to stop sending text and start holding a call back.
 	CallOpen() string
+	// ReasoningMarkers open and close what the model thinks before it
+	// answers. A server watches for them to send the reasoning apart from
+	// the prose; the newlines the template writes inside and after them are
+	// the server's to drop.
+	ReasoningMarkers() (open, close string)
 }

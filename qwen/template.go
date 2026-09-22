@@ -19,3 +19,5 @@ func (t *Template) ParseCalls(text string) (string, []chat.ToolCall, error) {
 }
 
 func (t *Template) CallOpen() string { return toolCallOpen }
+
+func (t *Template) ReasoningMarkers() (string, string) { return thinkOpen, thinkClose }

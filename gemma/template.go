@@ -33,3 +33,9 @@ func (t *Template) ParseCalls(text string) (string, []chat.ToolCall, error) {
 }
 
 func (t *Template) CallOpen() string { return toolCallOpen }
+
+// ReasoningMarkers are the thought channel's. The channel's name is part of
+// the opening marker: thought is the only channel the checkpoints write.
+func (t *Template) ReasoningMarkers() (string, string) {
+	return channelOpen + "thought", channelClose
+}

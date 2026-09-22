@@ -149,3 +149,47 @@ func TestStreamStaysInsideTheGrammar(t *testing.T) {
 		t.Fatalf("the stream carried %q, and the grammar allows only yes", text.String())
 	}
 }
+
+// The reasoning leaves in its own field, reasoning_content, as llama-server
+// sends it: streamed as it is drawn, and whole in an answer that is not.
+func TestReasoningLeavesApartFromTheContent(t *testing.T) {
+	script := []string{"<think>", "pondering", "</think>", "Answer.", "<turn|>"}
+
+	w := post(t, newTestServer(t, script), `{"messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	f := frames(t, w.Body.String())
+	var content, reasoning strings.Builder
+	for _, frame := range f[:len(f)-1] {
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content   string `json:"content"`
+					Reasoning string `json:"reasoning_content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(frame), &chunk); err != nil {
+			t.Fatalf("%q: %v", frame, err)
+		}
+		content.WriteString(chunk.Choices[0].Delta.Content)
+		reasoning.WriteString(chunk.Choices[0].Delta.Reasoning)
+	}
+	if content.String() != "Answer." || reasoning.String() != "pondering" {
+		t.Fatalf("streamed content %q, reasoning %q", content.String(), reasoning.String())
+	}
+
+	w = post(t, newTestServer(t, script), `{"messages":[{"role":"user","content":"hi"}]}`)
+	var body struct {
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				Reasoning string `json:"reasoning_content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if m := body.Choices[0].Message; m.Content != "Answer." || m.Reasoning != "pondering" {
+		t.Fatalf("content %q, reasoning %q", m.Content, m.Reasoning)
+	}
+}

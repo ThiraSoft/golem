@@ -215,9 +215,12 @@ func (s *stopStrings) UnmarshalJSON(raw []byte) error {
 }
 
 type responseMessage struct {
-	Role      string          `json:"role,omitempty"`
-	Content   string          `json:"content"`
-	ToolCalls []chat.ToolCall `json:"tool_calls,omitempty"`
+	Role    string `json:"role,omitempty"`
+	Content string `json:"content"`
+	// ReasoningContent is what the model thought before it answered, where
+	// llama-server puts it.
+	ReasoningContent string          `json:"reasoning_content,omitempty"`
+	ToolCalls        []chat.ToolCall `json:"tool_calls,omitempty"`
 }
 
 type choice struct {

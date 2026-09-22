@@ -264,7 +264,7 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 		Choices: []choice{{
 			Index: 0,
 			Message: &responseMessage{Role: "assistant", Content: answer.Text,
-				ToolCalls: answer.ToolCalls},
+				ReasoningContent: answer.Reasoning, ToolCalls: answer.ToolCalls},
 			FinishReason: &reason,
 		}},
 		Usage: &usage{PromptTokens: answer.Prompt, CompletionTokens: answer.Generated,
