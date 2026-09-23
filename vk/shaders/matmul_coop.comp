@@ -449,6 +449,13 @@ void prefetch(uint kb) {
                 uint sat = base + 16u * sbi + 2u * (b & 7u);
                 pws[i] = dd * float(bitfieldExtract(int(w[sat >> 2]), int((sat & 3u) * 8u), 8));
                 pwm[i] = dd * float(bitfieldExtract(int(w[(sat + 1u) >> 2]), int(((sat + 1u) & 3u) * 8u), 8));
+#elif defined(PQ20)
+                uint ntb   = nb >> 2;
+                uint blkB  = base + (((2u * ntb + 3u) & ~3u));
+                uint at4   = (blkB + 8u * b) >> 2;
+                pw[i]      = uvec4(w[at4], w[at4 + 1u], 0u, 0u);
+                vec2 dm    = unpackHalf2x16(w[(base + 2u * (b >> 2u)) >> 2]);
+                pws[i]     = dm[(b >> 2u) & 1u];
 #elif defined(Q2K)
                 // vk/split_q2k.go. Q2_K wants four numbers a block where every
                 // other format here wants two — a scale and a minimum for each
@@ -570,11 +577,18 @@ void stageTile() {
         uint  wh2 = pwh2[i];
 #endif
         [[unroll]] for (uint u = 0u; u < 4u; u++) {
-#if !defined(Q3K) && !defined(Q2K)
+#if !defined(Q3K) && !defined(Q2K) && !defined(PQ20)
             uint w0 = pw[i][u] & 0x0F0F0F0Fu;
             uint w1 = (pw[i][u] >> 4u) & 0x0F0F0F0Fu;
 #endif
-#if defined(Q2K)
+#if defined(PQ20)
+            uint x0 = (pw[i].x >> (8u * u)) & 0xFFu;
+            uint x1 = (pw[i].y >> (8u * u)) & 0xFFu;
+            uint w0 = (x0 & 3u) | ((x0 & 12u) << 6u) | ((x0 & 48u) << 12u) | ((x0 & 192u) << 18u);
+            uint w1 = (x1 & 3u) | ((x1 & 12u) << 6u) | ((x1 & 48u) << 12u) | ((x1 & 192u) << 18u);
+            vec4 v0 = (unpackUnorm4x8(w0) * 255.0 - 1.0) * ws;
+            vec4 v1 = (unpackUnorm4x8(w1) * 255.0 - 1.0) * ws;
+#elif defined(Q2K)
             // Two bits a weight, spread one to a byte with four masked shifts,
             // and the block's four numbers taken out of the nibbles prefetch
             // left packed. ws is d and wm is dmin here, not a scale and a
@@ -723,7 +737,10 @@ void main() {
     uint ir   = (gl_WorkGroupID.x / CGROUPS) % wgs;
     uint ik   = gl_WorkGroupID.x / (wgs * CGROUPS);
     col0      = ic * uint(BN);
-#if defined(Q5K)
+#if defined(PQ20)
+    uint ntb  = nb >> 2;
+    rowBytes  = (((2u * ntb + 3u) & ~3u) + ntb * 32u);
+#elif defined(Q5K)
     rowBytes  = nb * 24u;
 #elif defined(Q41)
     rowBytes  = nb * 20u;

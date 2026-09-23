@@ -12,7 +12,9 @@ package vk
 import (
 	"math"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"unsafe"
 
@@ -208,26 +210,32 @@ func kQuantAgainstQ8_0(m nn.Matrix, batch *nn.Batch, columns int) [][]float32 {
 	for c := range want {
 		want[c] = make([]float32, m.Rows)
 	}
-	row := make([]float32, m.Cols)
-	stride, dequant := m.Cols/nn.SuperBlock*144, nn.DequantizeQ4_K
-	switch m.Quant {
-	case nn.Q6_K:
-		stride, dequant = m.Cols/nn.SuperBlock*210, nn.DequantizeQ6_K
-	case nn.Q3_K:
-		stride, dequant = m.Cols/nn.SuperBlock*110, nn.DequantizeQ3_K
-	case nn.Q2_K:
-		stride, dequant = m.Cols/nn.SuperBlock*84, nn.DequantizeQ2_K
-	}
-	for i := 0; i < m.Rows; i++ {
-		dequant(m.Data[i*stride:(i+1)*stride], m.Cols, row)
-		for c := 0; c < columns; c++ {
-			var sum float32
-			for j := range row {
-				sum += row[j] * x[c][j]
-			}
-			want[c][i] = sum
+	var wg sync.WaitGroup
+	workers := runtime.GOMAXPROCS(0)
+	chunk := (m.Rows + workers - 1) / workers
+	for w := 0; w < workers; w++ {
+		start := w * chunk
+		end := min(start+chunk, m.Rows)
+		if start >= end {
+			break
 		}
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			row := make([]float32, m.Cols)
+			for i := start; i < end; i++ {
+				m.Row(i, row)
+				for c := 0; c < columns; c++ {
+					var sum float32
+					for j := range row {
+						sum += row[j] * x[c][j]
+					}
+					want[c][i] = sum
+				}
+			}
+		}(start, end)
 	}
+	wg.Wait()
 	return want
 }
 

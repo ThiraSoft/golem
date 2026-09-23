@@ -217,11 +217,16 @@ func NewMatMulQuant(d *Device, data []byte, rows, cols, columns int, coop bool, 
 		relayout = splitQ3_K
 	case nn.Q2_K:
 		relayout = splitQ2_K
+	case nn.PQ2_0:
+		relayout = splitPQ2_0
 	default:
 		return nil, fmt.Errorf("vk: the tiled product has no staging for %s", q)
 	}
-	if q != nn.Q4_0 && cols%nn.SuperBlock != 0 {
+	if q != nn.Q4_0 && q != nn.PQ2_0 && cols%nn.SuperBlock != 0 {
 		return nil, fmt.Errorf("vk: a %s row needs a multiple of %d columns, given %d", q, nn.SuperBlock, cols)
+	}
+	if q == nn.PQ2_0 && cols%nn.TernaryBlock != 0 {
+		return nil, fmt.Errorf("vk: a %s row needs a multiple of %d columns, given %d", q, nn.TernaryBlock, cols)
 	}
 	// The file's own row and not the packed one. data is the tensor as the file
 	// gives it, and the packings do not all hold it at that size —
@@ -257,6 +262,8 @@ func NewMatMulQuant(d *Device, data []byte, rows, cols, columns int, coop bool, 
 			spirv, err = matmulCoopQ3KSPIRV(columns)
 		} else if q == nn.Q2_K {
 			spirv, err = matmulCoopQ2KSPIRV(columns)
+		} else if q == nn.PQ2_0 {
+			spirv, err = matmulCoopPQ20SPIRV(columns)
 		} else {
 			spirv, err = matmulCoopSPIRV(columns)
 		}
@@ -554,6 +561,23 @@ func matmulCoopQ2KSPIRV(columns int) ([]byte, error) {
 		return matmulCoopQ2K512SPIRV, nil
 	}
 	return nil, fmt.Errorf("vk: the cooperative Q2_K product is built at 32, 64, 128, 256, 512 columns, not %d", columns)
+}
+
+// matmulCoopPQ20SPIRV is the cooperative PQ2_0 product at that width.
+func matmulCoopPQ20SPIRV(columns int) ([]byte, error) {
+	switch columns {
+	case 32:
+		return matmulCoopPQ2032SPIRV, nil
+	case 64:
+		return matmulCoopPQ2064SPIRV, nil
+	case 128:
+		return matmulCoopPQ20128SPIRV, nil
+	case 256:
+		return matmulCoopPQ20256SPIRV, nil
+	case 512:
+		return matmulCoopPQ20512SPIRV, nil
+	}
+	return nil, fmt.Errorf("vk: the cooperative PQ2_0 product is built at 32, 64, 128, 256, 512 columns, not %d", columns)
 }
 
 // matmulSPIRV is the binary built for that many columns.

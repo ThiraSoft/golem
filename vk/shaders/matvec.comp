@@ -4,7 +4,7 @@
 
 // y = W * x for one Q4_0 matrix against one Q8_0 activation, and for Q4_1 under
 // -DQ41, Q4_K under -DQ4K, Q5_K under -DQ5K, Q6_K under -DQ6K, Q3_K under
-// -DQ3K and Q2_K under -DQ2K.
+// -DQ3K, Q2_K under -DQ2K and PQ2_0 under -DPQ20.
 //
 // Seven formats and one kernel, because the difference between them is where a
 // block's scale lives and how many instructions its magnitudes take to unpack —
@@ -90,7 +90,11 @@ uint ubyte(uint at) { return bitfieldExtract(w[at >> 2], int((at & 3u) * 8u), 8)
 void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
     uint nb  = p.ffn >> 5;
     uint aw  = p.ffn >> 2;   // one column of the activation, in uints
-#if defined(Q2K)
+#if defined(PQ20)
+    uint ntb  = p.ffn >> 7;
+    uint magB = rowBase;
+    uint nib  = rowBase + (((2u * ntb + 3u) & ~3u));
+#elif defined(Q2K)
     // Sixteen scale-and-minimum bytes and an fp16 pair to a superblock, both
     // already a whole number of words, so nothing here is rounded.
     // vk/split_q2k.go writes it.
@@ -143,6 +147,10 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
         }
         float ws = dm.x * float(sc6);
         float wm = dm.y * float(mn6);
+#elif defined(PQ20)
+        uint tb = b >> 2u;
+        vec2 dm = unpackHalf2x16(w[(magB + 2u * tb) >> 2]);
+        float ws = dm[tb & 1u];
 #elif defined(Q2K)
         // Four numbers a block, where every other format here has two: each
         // half of a block carries its own scale *and* its own minimum, and the
@@ -208,6 +216,17 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
             uint p1 = ((x1 & 3u) | ((x1 & 12u) << 6u) | ((x1 & 48u) << 12u) | ((x1 & 192u) << 18u)) * 16u;
             lo[u] = (word & 0x0F0F0F0Fu) | p0;
             hi[u] = ((word >> 4) & 0x0F0F0F0Fu) | p1;
+        }
+#elif defined(PQ20)
+        uint at = (nib + 8u * b) >> 2;
+        uint q0w = w[at], q1w = w[at + 1u];
+        uint ab = b * 8u;
+        uint lo[4], hi[4];
+        for (uint u = 0u; u < 4u; u++) {
+            uint x0 = (q0w >> (8u * u)) & 0xFFu;
+            uint x1 = (q1w >> (8u * u)) & 0xFFu;
+            lo[u] = (x0 & 3u) | ((x0 & 12u) << 6u) | ((x0 & 48u) << 12u) | ((x0 & 192u) << 18u);
+            hi[u] = (x1 & 3u) | ((x1 & 12u) << 6u) | ((x1 & 48u) << 12u) | ((x1 & 192u) << 18u);
         }
 #elif defined(Q2K)
         // Two loads a block against the activation's eight, which is the
@@ -339,6 +358,8 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
             // the answer below is sum less corr, so this one goes the other
             // way. It is the sign llama.cpp's own dequantiser has: d*q + m.
             corr[c] -= wm * as_[sc + nb + b] * 0.125;
+#elif defined(PQ20)
+            corr[c] += ws * as_[sc + nb + b] * 0.125;
 #else
             corr[c] += ws * as_[sc + nb + b];
 #endif
@@ -354,7 +375,10 @@ void main() {
     uint lane = t % LANES;
     uint i    = gl_WorkGroupID.x * OUTS + t / LANES;
 
-#if defined(Q6K)
+#if defined(PQ20)
+    uint ntb = p.ffn >> 7;
+    uint rowBytes = (((2u * ntb + 3u) & ~3u) + ntb * 32u);
+#elif defined(Q6K)
     uint rowBytes = (((p.ffn >> 8) * 210u) + 3u) & ~3u;
 #elif defined(Q3K)
     // Eighteen bytes of superblock header and ninety-six of magnitudes, on a
