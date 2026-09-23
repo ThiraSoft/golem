@@ -364,3 +364,41 @@ func TestCommonStopsAtAnotherPicture(t *testing.T) {
 		t.Errorf("text alone: %d shared, want 4", got)
 	}
 }
+
+// A recurrent model's cache is a state that has read every position held, so
+// it can be continued but never rewound. The three cases a prompt can be in.
+func TestARecurrentCacheIsContinuedOrStartedAgain(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		second []int32
+		fed    int
+		resets int
+	}{
+		// The conversation grew: only the addition is read.
+		{"continued", []int32{1, 2, 3, 4, 5}, 2, 0},
+		// The same prompt again: feeding its last position a second time
+		// would read it twice into the state, so the slot starts over.
+		{"repeated", []int32{1, 2, 3}, 3, 1},
+		// It parts from what is held: there is no going back to 1, 2.
+		{"rewound", []int32{1, 2, 9, 9}, 4, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &recordingEngine{}
+			c := NewContext(running(t, e), 0, 4096, time.Now, 0)
+			c.SetRecurrent(true)
+			if _, err := c.Prefill([]int32{1, 2, 3}, scores()); err != nil {
+				t.Fatal(err)
+			}
+			fed, err := c.Prefill(tc.second, scores())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fed != tc.fed || e.resets != tc.resets {
+				t.Fatalf("fed %d with %d resets, want %d and %d", fed, e.resets, tc.fed, tc.resets)
+			}
+			if got := e.posOf[len(e.posOf)-fed]; got != len(tc.second)-fed {
+				t.Fatalf("the feed began at position %d, want %d", got, len(tc.second)-fed)
+			}
+		})
+	}
+}

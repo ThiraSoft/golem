@@ -66,6 +66,9 @@ type Context struct {
 	slot   int // which of the model's caches this context is
 	window int // the largest sliding window; 0 when every block is global
 	ring   int // slots in that window's ring; the window itself when unset
+	// recurrent says the model's cache is a state and not a list of keys;
+	// see engine.Model.Recurrent and PrefillPromptState.
+	recurrent bool
 
 	// owner is, for each slot of the window ring, the position it last
 	// received, or -1. A slot whose owner is not the position read from it
@@ -93,6 +96,10 @@ func NewSlotContext(r *Runner, slot, window, maxContext int, now func() time.Tim
 	c.slot = slot
 	return c
 }
+
+// SetRecurrent says the model's cache cannot be rewound; main.go reads it
+// from the model.
+func (c *Context) SetRecurrent(on bool) { c.recurrent = on }
 
 // SetRing gives the size of the window ring, which main.go reads from the
 // model. Without it the ring is taken to be the window.
@@ -180,12 +187,27 @@ func (c *Context) PrefillPromptState(p engine.Prompt, logits []float32, state *[
 	// The hidden state of a cached position was not kept, so the last position
 	// of the prompt is fed whatever is shared.
 	from := shared
-	if from >= len(ids) {
-		from = len(ids) - 1
+	if c.recurrent {
+		// A delta net's state has read every position held, and there is no
+		// taking a position back out of it. So the cache is continued only
+		// when the prompt is what is held and more; anything else, a prompt
+		// that parts from it early or one that is all of it, starts the slot
+		// again. The second is what the rule below would otherwise do to it:
+		// feed the last position again, into a state that already has it,
+		// and the model answered an identical request with nothing at all.
+		if shared < len(c.held) || shared >= len(ids) {
+			c.runner.Reset(c.slot)
+			c.held, c.media, c.owner = nil, nil, nil
+			from = 0
+		}
+	} else {
+		if from >= len(ids) {
+			from = len(ids) - 1
+		}
+		// A window block's ring may hold another conversation's keys where
+		// this one's window still looks.
+		from = c.intactFrom(from)
 	}
-	// A window block's ring may hold another conversation's keys where this
-	// one's window still looks.
-	from = c.intactFrom(from)
 
 	for at := from; at < len(ids); {
 		// A batch may not be cut inside a picture: every key of a span has to

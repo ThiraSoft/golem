@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -91,6 +92,12 @@ func main() {
 		if err := m.UseVulkan(); err != nil {
 			fail(err)
 		}
+		// The upload rewrites every matrix into the layout its kernels read
+		// and hands the copy to the card; the copies are garbage the moment
+		// they are across, but the runtime returns such memory to the system
+		// at its own pace, and a server sits on it for its whole life. On
+		// Bonsai 2 27B that was seven gigabytes resident for nothing.
+		debug.FreeOSMemory()
 	}
 
 	params := m.Sampling
@@ -136,6 +143,7 @@ func main() {
 	for i := range slots {
 		ctx := NewSlotContext(runner, i, m.Window, m.SlotContext(), time.Now, *ttl)
 		ctx.SetRing(m.WindowRing())
+		ctx.SetRecurrent(m.Recurrent)
 		gen := NewGenerator(ctx, m.Vocab, m.Template, m.Vocabulary, *maxTokens)
 		gen.calls = &calls
 		slots[i] = &slot{index: i, ctx: ctx, gen: gen}

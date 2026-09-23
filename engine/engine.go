@@ -69,6 +69,10 @@ type Model struct {
 	// Window is the largest sliding window any block uses, and 0 when every
 	// block is global. A rewind of the cache has to respect it.
 	Window int
+	// Recurrent says some blocks carry a state every position rewrites, a
+	// delta net's, rather than keys indexed by position. Such a cache cannot
+	// be rewound at all: it can be continued, or started again.
+	Recurrent bool
 	// Vocabulary is how many logits a pass produces.
 	Vocabulary int
 	// Blocks is how many there are, for the line printed at startup.
@@ -368,7 +372,7 @@ func openQwen35(g *tensors.GGUF, maxContext int) (*Model, error) {
 	tpl, from := fileTemplate(g, qwen35.NewTemplate(), qwen35.FileMedia, qwen.DeveloperAsSystem)
 	return &Model{
 		Forward: inner, Vocab: vocab, Template: tpl, TemplateFrom: from,
-		Window: 0, Vocabulary: inner.Cfg.Vocab,
+		Window: 0, Recurrent: true, Vocabulary: inner.Cfg.Vocab,
 		Blocks: len(inner.Cfg.Blocks), Sampling: inner.Cfg.Sampling,
 		closer: inner,
 	}, nil
