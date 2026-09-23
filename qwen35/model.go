@@ -41,6 +41,9 @@ type Model struct {
 	// the pipeline does not hold, so it carries its own kernels.
 	golemHead    *vk.GolemHead
 	golemKernels *vk.GolemKernels
+	// quantHead is the head in any other format vk/quantproduct.go reads,
+	// which is how a Prism checkpoint's ternary head reaches the card.
+	quantHead *vk.QuantHead
 
 	// vision is nil until a projector is opened. The tower runs once per
 	// image and shares nothing with the text path.
@@ -310,6 +313,9 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 	if len(out) != m.Cfg.Vocab {
 		panic(fmt.Sprintf("qwen35: logits need %d entries, given %d", m.Cfg.Vocab, len(out)))
 	}
+	if m.quantHeadLogits(hidden, out) {
+		return
+	}
 	batchH := nn.NewBatch(m.Cfg.Dim, 1)
 	copy(batchH.F[0], hidden)
 	batchH.QuantizeK()
@@ -342,6 +348,9 @@ func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
 	batchH.QuantizeK()
 
 	for i := 0; i < batch; i++ {
+		if m.quantHeadLogits(hidden[i], out[i]) {
+			continue
+		}
 		if m.golemHead != nil {
 			if err := m.golemHead.Logits(hidden[i], out[i]); err == nil {
 				continue
@@ -354,4 +363,25 @@ func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
 		}
 		m.W.OutputHead.MatVec(batchH, out[i])
 	}
+}
+
+// quantHeadLogits runs the head on the card when it is one vk.QuantHead reads,
+// and says whether it did.
+//
+// A Prism head carries the rotation its hidden state must go through, like
+// every projection in that file. The processor's product applies it inside
+// Matrix.MatVec; the card's head is handed a batch, so the rotation is done
+// here on a copy, a transform of the model's width against a quarter of a
+// million rows read.
+func (m *Model) quantHeadLogits(hidden, out []float32) bool {
+	if m.quantHead == nil {
+		return false
+	}
+	b := nn.NewBatch(m.Cfg.Dim, 1)
+	copy(b.F[0], hidden)
+	if head := m.W.OutputHead; head.Pre != nil {
+		nn.PrepareGolem(b.F[0], head.Pre, head.HadGroup)
+	}
+	m.quantHead.Prepare(b)
+	return m.quantHead.MatVec(b, 0, out) == nil
 }

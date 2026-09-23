@@ -3,6 +3,7 @@ package qwen35
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 
 	"github.com/ThiraSoft/golem/nn"
@@ -23,7 +24,7 @@ func (m *Model) device() (*vk.Device, error) {
 
 // UseVulkanHead uploads the logit head to the Vulkan device.
 func (m *Model) UseVulkanHead() error {
-	if m.headQ6K != nil || m.head != nil || m.golemHead != nil {
+	if m.headQ6K != nil || m.head != nil || m.golemHead != nil || m.quantHead != nil {
 		return nil
 	}
 	d, err := m.device()
@@ -58,12 +59,20 @@ func (m *Model) UseVulkanHead() error {
 			return fmt.Errorf("qwen35: cannot upload Q4_0 head to Vulkan: %w", err)
 		}
 		m.head = h
+	} else if q := m.W.OutputHead.Quant; q == nn.PQ2_0 || q == nn.PTQ1_0 {
+		// Prism's ternary heads. The other formats vk.QuantHead reads keep the
+		// path they had, which is a change nobody has measured here.
+		h, err := vk.NewQuantHead(d, m.W.OutputHead.Quant, m.W.OutputHead.Data, m.W.OutputHead.Rows, m.W.OutputHead.Cols)
+		if err != nil {
+			return fmt.Errorf("qwen35: cannot upload the %s head to Vulkan: %w", m.W.OutputHead.Quant, err)
+		}
+		m.quantHead = h
 	}
 	return nil
 }
 
 func (m *Model) VulkanHead() bool {
-	return m.headQ6K != nil || m.head != nil || m.golemHead != nil
+	return m.headQ6K != nil || m.head != nil || m.golemHead != nil || m.quantHead != nil
 }
 
 // StartVulkanCalibration turns on the per-site accumulators of the block
@@ -160,6 +169,14 @@ func (m *Model) UseVulkanStack() error {
 		}
 	}
 
+	if m.W.Rotated {
+		rot, err := m.prismRotation(numBlocks)
+		if err != nil {
+			return err
+		}
+		shape.Rotation = rot
+	}
+
 	// What this card can afford: whether the prediction block goes over, and
 	// how wide a prompt pass the scratch may be. Both asked of the device.
 	drafts, width := m.deviceBudget(d, shape, numBlocks, drafts)
@@ -223,8 +240,8 @@ func (m *Model) UseVulkanStack() error {
 				PreO:       bw.SSMOut.Pre,
 				WQKV:       bw.QKV.Data,
 				WGate:      bw.AttnGate.Data,
-				WAlpha:     bw.SSMAlpha.Data,
-				WBeta:      bw.SSMBeta.Data,
+				WAlpha:     floatBytes(bw.SSMAlpha),
+				WBeta:      floatBytes(bw.SSMBeta),
 				WOut:       bw.SSMOut.Data,
 				Out:        bw.SSMOut.Quant,
 				QKV:        bw.QKV.Quant,
@@ -324,6 +341,10 @@ func (m *Model) closeVulkan() {
 		m.golemKernels.Close()
 		m.golemKernels = nil
 	}
+	if m.quantHead != nil {
+		m.quantHead.Close()
+		m.quantHead = nil
+	}
 	if m.headQ6K != nil {
 		m.headQ6K.Close()
 		m.headQ6K = nil
@@ -365,12 +386,22 @@ func (m *Model) SkipDraftBlock() { m.noDraft = true }
 func (m *Model) deviceWeightBytes(blocks int, drafts bool) uint64 {
 	var n uint64
 	add := func(w nn.Matrix) { n += uint64(len(w.Data)) }
+	// The decay projections go up as float32 whatever the file holds; see
+	// floatBytes.
+	addFloat := func(w nn.Matrix) {
+		if w.Quant == nn.BF16 {
+			n += uint64(len(w.Data))
+		}
+		add(w)
+	}
 	for i := 0; i < blocks; i++ {
 		bw := &m.W.Blocks[i]
 		for _, w := range []nn.Matrix{bw.Q, bw.K, bw.V, bw.O, bw.QKV, bw.AttnGate,
-			bw.SSMAlpha, bw.SSMBeta, bw.SSMOut, bw.Gate, bw.Up, bw.Down} {
+			bw.SSMOut, bw.Gate, bw.Up, bw.Down} {
 			add(w)
 		}
+		addFloat(bw.SSMAlpha)
+		addFloat(bw.SSMBeta)
 	}
 	if drafts && len(m.W.Blocks) > m.trunk() {
 		bw := &m.W.Blocks[m.trunk()]
@@ -469,4 +500,84 @@ func (m *Model) deviceBudget(d *vk.Device, shape vk.QwenShape, blocks int, wantD
 	// place what it can: a model that answers slowly is better than one that
 	// refuses.
 	return drafts, floor
+}
+
+// prismRotation is what the card needs of a Prism checkpoint's rotation: one
+// sign vector per site and the delta net's gather.
+//
+// The file declares a vector per input width rather than per matrix, so every
+// block's vector for a site is the same one, and the pipeline holds each once.
+// That is checked rather than assumed: a file whose blocks disagreed would load
+// and answer with the first block's rotation everywhere.
+func (m *Model) prismRotation(blocks int) (*vk.QwenRotation, error) {
+	rot := &vk.QwenRotation{}
+	take := func(site string, into *[]float32, w nn.Matrix, i int) error {
+		if w.Pre == nil {
+			return fmt.Errorf("qwen35: block %d's %s projection carries no rotation", i, site)
+		}
+		if rot.Group == 0 {
+			rot.Group = w.HadGroup
+		} else if w.HadGroup != rot.Group {
+			return fmt.Errorf("qwen35: block %d's %s rotation is %d wide, the model's is %d", i, site, w.HadGroup, rot.Group)
+		}
+		if *into == nil {
+			*into = w.Pre
+			return nil
+		}
+		if !slices.Equal(*into, w.Pre) {
+			return fmt.Errorf("qwen35: block %d's %s rotation differs from the first block's", i, site)
+		}
+		return nil
+	}
+	gathered := false
+	for i := 0; i < blocks; i++ {
+		bw := &m.W.Blocks[i]
+		checks := []struct {
+			site string
+			into *[]float32
+			w    nn.Matrix
+		}{
+			{"gate", &rot.Dim, bw.Gate}, {"up", &rot.Dim, bw.Up}, {"down", &rot.FFN, bw.Down},
+		}
+		if m.Cfg.Blocks[i].Type == BlockFullAttn {
+			checks = append(checks, []struct {
+				site string
+				into *[]float32
+				w    nn.Matrix
+			}{{"query", &rot.Dim, bw.Q}, {"key", &rot.Dim, bw.K}, {"value", &rot.Dim, bw.V}, {"attention output", &rot.Mix, bw.O}}...)
+		} else {
+			checks = append(checks, []struct {
+				site string
+				into *[]float32
+				w    nn.Matrix
+			}{{"delta net input", &rot.Dim, bw.QKV}, {"delta net gate", &rot.Dim, bw.AttnGate}, {"delta net output", &rot.Inner, bw.SSMOut}}...)
+			if !gathered {
+				rot.GatherOut, gathered = bw.SSMOut.Gather, true
+			} else if !slices.Equal(rot.GatherOut, bw.SSMOut.Gather) {
+				return nil, fmt.Errorf("qwen35: block %d's delta net gathers its output differently from the first", i)
+			}
+		}
+		for _, c := range checks {
+			if err := take(c.site, c.into, c.w, i); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return rot, nil
+}
+
+// floatBytes is a small projection as float32 bytes, which is what the
+// pipeline's float mat-vec reads. The delta net's two decay projections are
+// float32 in every llama.cpp checkpoint and BF16 in Prism's, so the half-width
+// form is widened here, on the host: forty-eight rows each, too small for a
+// kernel of its own to be worth anything.
+func floatBytes(w nn.Matrix) []byte {
+	if w.Quant != nn.BF16 {
+		return w.Data
+	}
+	out := make([]byte, len(w.Data)*2)
+	for i := 0; i < len(w.Data)/2; i++ {
+		out[4*i+2], out[4*i+3] = w.Data[2*i], w.Data[2*i+1]
+	}
+	return out
 }

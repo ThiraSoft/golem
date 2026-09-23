@@ -351,4 +351,3 @@ func TestPTQ10MatmulCoopUnpackMatchesDequantize(t *testing.T) {
 		}
 	}
 }
-

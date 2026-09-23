@@ -384,6 +384,22 @@ type QwenShape struct {
 	// two or four bytes a weight in device memory either way, which is why it
 	// only ever makes sense beside a window: see AddBlockWindow.
 	Float WideForm
+
+	// Rotation describes the activation sign vectors and Hadamard transform
+	// used by Prism ML Bonsai models before ternary weight projections. Nil
+	// for any non-Prism model.
+	Rotation *QwenRotation
+}
+
+// QwenRotation holds the sign vectors and gather permutation used by Prism
+// ML Bonsai models for rotating activations on the GPU before ternary projections.
+type QwenRotation struct {
+	Group     int       // Hadamard transform group size (1024)
+	Dim       []float32 // Sign vector for hidden dimension sites (5120)
+	FFN       []float32 // Sign vector for FFN intermediate sites (17408)
+	Inner     []float32 // Sign vector for SSM inner output site (6144)
+	Mix       []float32 // Sign vector for attention mix output site (6144)
+	GatherOut []int32   // Permutation indices for SSM out activation (nil if none)
 }
 
 // A WideForm is the form a projection arrives in on the float path, or NotWide
@@ -680,6 +696,18 @@ type QwenPipeline struct {
 	setQKNorm    *Set
 	setQuantAttn *Set
 
+	rotPipes      *RotateQ8Pipelines
+	rotDim        *Buffer
+	rotFFN        *Buffer
+	rotInner      *Buffer
+	rotMix        *Buffer
+	rotGather     *Buffer
+	setRotNormed  *Set
+	setRotFFNNorm *Set
+	setRotAct     *Set
+	setRotYSSM    *Set
+	setRotAttnOut *Set
+
 	attnNorms []*Buffer
 	ffnNorms  []*Buffer
 	outNorm   *Buffer
@@ -799,6 +827,45 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		}
 	}
 
+	// A Prism Bonsai model: activation rotation and quantization pipelines.
+	if shape.Rotation != nil {
+		if shape.Golem.Golem() || shape.wide() {
+			p.Close()
+			return nil, fmt.Errorf("vk: rotation is not supported together with Golem or wide models")
+		}
+		rot := shape.Rotation
+		if rot.Group != RotateQ8Group {
+			p.Close()
+			return nil, fmt.Errorf("vk: rotation group must be %d, got %d", RotateQ8Group, rot.Group)
+		}
+		if p.rotPipes, err = NewRotateQ8Pipelines(d); err != nil {
+			p.Close()
+			return nil, err
+		}
+		if p.rotDim, err = p.upload(asBytes(rot.Dim)); err != nil {
+			p.Close()
+			return nil, err
+		}
+		if p.rotFFN, err = p.upload(asBytes(rot.FFN)); err != nil {
+			p.Close()
+			return nil, err
+		}
+		if p.rotInner, err = p.upload(asBytes(rot.Inner)); err != nil {
+			p.Close()
+			return nil, err
+		}
+		if p.rotMix, err = p.upload(asBytes(rot.Mix)); err != nil {
+			p.Close()
+			return nil, err
+		}
+		if len(rot.GatherOut) > 0 {
+			if p.rotGather, err = p.upload(asBytesInt32(rot.GatherOut)); err != nil {
+				p.Close()
+				return nil, err
+			}
+		}
+	}
+
 	dim := shape.Dim * shape.width()
 	if p.xin, err = d.Host(dim*4, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
 		return nil, err
@@ -892,6 +959,29 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 	}
 	if p.setQuantAttn, err = p.pipeQuant.NewSet([]*Buffer{p.attnOut, p.attnOutQ, p.attnOutS}); err != nil {
 		return nil, err
+	}
+	if shape.Rotation != nil {
+		if p.setRotNormed, err = p.rotPipes.Bind(p.normed, p.rotDim, p.normedQ, p.normedS); err != nil {
+			return nil, err
+		}
+		if p.setRotFFNNorm, err = p.rotPipes.Bind(p.ffnNorm, p.rotDim, p.ffnNormQ, p.ffnNormS); err != nil {
+			return nil, err
+		}
+		if p.setRotAct, err = p.rotPipes.Bind(p.actBuf, p.rotFFN, p.actQ, p.actS); err != nil {
+			return nil, err
+		}
+		if p.rotGather != nil {
+			if p.setRotYSSM, err = p.rotPipes.BindGather(p.ySSM, p.rotInner, p.ySSMQ, p.ySSMS, p.rotGather); err != nil {
+				return nil, err
+			}
+		} else {
+			if p.setRotYSSM, err = p.rotPipes.Bind(p.ySSM, p.rotInner, p.ySSMQ, p.ySSMS); err != nil {
+				return nil, err
+			}
+		}
+		if p.setRotAttnOut, err = p.rotPipes.Bind(p.attnOut, p.rotMix, p.attnOutQ, p.attnOutS); err != nil {
+			return nil, err
+		}
 	}
 	return p, nil
 }
@@ -1444,6 +1534,11 @@ func QwenScratchBytes(s QwenShape, width int) uint64 {
 	n += 3 * s.FFN * width * 4
 	n += q8(s.FFN) + q8(s.Inner) + q8(s.qDim())
 	n += (2*s.ConvDim + 4096 + 2*s.Inner + 2*s.Rank + s.qFullDim() + 2*s.kvDim() + 2*s.qDim() + s.Dim) * width * 4
+	if s.Rotation != nil {
+		rot := s.Rotation
+		rotBytes := (len(rot.Dim) + len(rot.FFN) + len(rot.Inner) + len(rot.Mix) + len(rot.GatherOut)) * 4
+		n += rotBytes
+	}
 	return uint64(n)
 }
 
@@ -1922,6 +2017,24 @@ func (p *QwenPipeline) HiddenColumn(c int) []float32 {
 	return p.hidden.Floats()[c*dim : (c+1)*dim]
 }
 
+// rotate is one of a Prism model's five sites: the floats the kernel in front
+// of it wrote, through the site's signs and the transform, into the Q8_0 form
+// its projections read. The kernel in front has already written a Q8_0 form of
+// the unrotated values, and this overwrites it; the floats stay as they were,
+// because the delta net's decay projections read them unrotated.
+//
+// It says whether it dispatched, which is false for every model but a Prism
+// one: there the set is nil, and the pass is the one it always was.
+func (p *QwenPipeline) rotate(r *Recorder, set *Set, n, columns int) bool {
+	if set == nil {
+		return false
+	}
+	push := rotateQ8Push{n: uint32(n), columns: uint32(columns)}
+	r.Dispatch(set, RotateQ8Groups(n, columns), unsafe.Pointer(&push))
+	r.Barrier()
+	return true
+}
+
 func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt int) {
 	if b.golem != nil {
 		p.recordGolemSSM(r, b.golem, b, columns, snapAt)
@@ -1932,6 +2045,7 @@ func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt i
 	gate := moePush{dim: uint32(s.Inner), ffn: uint32(s.Dim), used: 1}
 	small := matvecKPush{Dim: uint32(s.Rank), FFN: uint32(s.Dim)}
 	out := matvecKPush{Dim: uint32(s.Dim), FFN: uint32(s.Inner)}
+	p.rotate(r, p.setRotNormed, s.Dim, columns)
 
 	if b.f32 {
 		p.productK(r, b.setQKV, s.ConvDim, columns, matvecKPush{Dim: uint32(s.ConvDim), FFN: uint32(s.Dim)})
@@ -1959,8 +2073,10 @@ func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt i
 	// 512-token prompt where ours took 324, which is what moving it here was
 	// worth. The quantizing dispatch is one kernel over a few thousand values.
 	quant := swigluPush{N: uint32(s.Inner), Columns: uint32(columns)}
-	r.Dispatch(p.setQuantY, uint32((s.Inner/quantBlock*columns+255)/256), unsafe.Pointer(&quant))
-	r.Barrier()
+	if !p.rotate(r, p.setRotYSSM, s.Inner, columns) {
+		r.Dispatch(p.setQuantY, uint32((s.Inner/quantBlock*columns+255)/256), unsafe.Pointer(&quant))
+		r.Barrier()
+	}
 	p.product(r, b.setOut, s.Dim, columns,
 		moePush{dim: uint32(s.Dim), ffn: uint32(s.Inner), used: 1})
 }
@@ -2019,6 +2135,7 @@ func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
 	q := moePush{dim: uint32(s.qFullDim()), ffn: uint32(s.Dim), used: 1}
 	kv := moePush{dim: uint32(s.kvDim()), ffn: uint32(s.Dim), used: 1}
 	out := matvecKPush{Dim: uint32(s.Dim), FFN: uint32(s.qDim())}
+	p.rotate(r, p.setRotNormed, s.Dim, columns)
 
 	if b.f32 {
 		p.productK(r, b.setQ, s.qFullDim(), columns, matvecKPush{Dim: uint32(s.qFullDim()), FFN: uint32(s.Dim)})
@@ -2044,8 +2161,10 @@ func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
 	// The mix in eight bits, then the output projection over it, at every
 	// width — recordSSM says why that is no longer a decision.
 	quant := swigluPush{N: uint32(s.qDim()), Columns: uint32(columns)}
-	r.Dispatch(p.setQuantAttn, uint32((s.qDim()/quantBlock*columns+255)/256), unsafe.Pointer(&quant))
-	r.Barrier()
+	if !p.rotate(r, p.setRotAttnOut, s.qDim(), columns) {
+		r.Dispatch(p.setQuantAttn, uint32((s.qDim()/quantBlock*columns+255)/256), unsafe.Pointer(&quant))
+		r.Barrier()
+	}
 	p.product(r, b.setO, s.Dim, columns,
 		moePush{dim: uint32(s.Dim), ffn: uint32(s.qDim()), used: 1})
 }
@@ -2099,6 +2218,7 @@ func (p *QwenPipeline) recordFFN(r *Recorder, b *qwenFFNBlock, columns int) {
 	// pass is the same kernel over more of the buffer.
 	act := swigluPush{N: uint32(s.FFN), Columns: uint32(columns)}
 	down := matvecKPush{Dim: uint32(s.Dim), FFN: uint32(s.FFN)}
+	p.rotate(r, p.setRotFFNNorm, s.Dim, columns)
 
 	if b.f32 {
 		// The float projections have no tiled form: productK is the mat-vec at
@@ -2126,6 +2246,7 @@ func (p *QwenPipeline) recordFFN(r *Recorder, b *qwenFFNBlock, columns int) {
 	blocks := s.FFN / quantBlock * columns
 	r.Dispatch(p.setAct, uint32((blocks+255)/256), unsafe.Pointer(&act))
 	r.Barrier()
+	p.rotate(r, p.setRotAct, s.FFN, columns)
 	p.tl.Stamp(r, "ffn act")
 	p.accumulate(r, b.index, "down", columns)
 
@@ -2203,6 +2324,10 @@ func (p *QwenPipeline) Close() {
 	if p.quants != nil {
 		p.quants.Close()
 		p.quants = nil
+	}
+	if p.rotPipes != nil {
+		p.rotPipes.Close()
+		p.rotPipes = nil
 	}
 	if p.golem != nil {
 		p.golem.Close()
