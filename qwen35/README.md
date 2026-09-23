@@ -120,11 +120,20 @@ to take.
 
 ## Several conversations at once
 
-`-parallel` above 1 is **refused** on the card rather than silently fallen back
-from. Forty-eight of the sixty-four blocks are delta nets, and a delta net keeps
-a state matrix per head that every token rewrites, rather than a ring indexed by
-position. There is no ring to cut into slots, and answering two conversations
-off one state is a wrong answer rather than a slow one.
+`-parallel N` holds N conversations on the card, each with the context cut N
+ways. It is not done the way gemma and qwen do it, by cutting the attention's
+ring into slots: forty-eight of the sixty-four blocks are delta nets, whose
+state is a matrix a head that every token rewrites, and there is nothing to cut.
+So each slot owns a copy of every recurrence, its convolution window, its
+shadows and its attention caches, and a pass runs in one slot. On the 27B that
+is 151 MB of state a slot, twice that where drafting keeps shadows.
+
+Two consequences a caller sees. Several conversations in one batch go up one
+run of a conversation's tokens at a time rather than in one shared pass. And a
+state cannot be rewound, so golem-server continues a slot only when the prompt
+is what the slot holds and more, and starts it again otherwise.
+`TestVulkanSlotsAreIndependent` checks that one conversation run between two
+steps of another changes nothing, to the bit.
 
 On the processor it holds slots like every other engine here.
 
