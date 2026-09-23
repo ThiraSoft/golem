@@ -1,0 +1,128 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// Rotate and quantize an activation on the card for Prism Bonsai.
+//
+// Applied out of place, one workgroup per group of 1024 values of one column:
+// 1. read src[col*n + j] (or src[col*n + gather[j]] under -DGATHER);
+// 2. multiply by signs[j];
+// 3. normalised Walsh-Hadamard over the 1024 values in shared memory;
+// 4. quantize to Q8_0 exactly as vk/shaders/quant_q80.comp does.
+
+layout(local_size_x = 1024) in;
+
+layout(std430, binding = 0) readonly  buffer Src   { float src[];   };
+layout(std430, binding = 1) readonly  buffer Signs { float signs[]; };
+layout(std430, binding = 2) writeonly buffer AQ    { uint  aq[];    };
+layout(std430, binding = 3) writeonly buffer AS    { float as_[];   };
+#ifdef GATHER
+layout(std430, binding = 4) readonly  buffer Gather{ uint  gather[];};
+#endif
+
+layout(push_constant) uniform Push {
+    uint n;       // values in one column, a multiple of 1024
+    uint columns; // columns this pass carries
+} p;
+
+uint floatToHalf(float f) {
+    uint bits     = floatBitsToUint(f);
+    uint sign     = (bits >> 16) & 0x8000u;
+    int  exponent = int((bits >> 23) & 0xFFu) - 127 + 15;
+    uint mantissa = bits & 0x7FFFFFu;
+
+    if ((bits & 0x7FFFFFFFu) == 0u) return sign;
+    if (exponent >= 0x1F) {
+        if ((bits & 0x7F800000u) == 0x7F800000u && mantissa != 0u) return sign | 0x7E00u;
+        return sign | 0x7C00u;
+    }
+    if (exponent <= 0) {
+        if (exponent < -10) return sign;
+        mantissa = (mantissa | 0x800000u) >> (1 - exponent);
+        uint round = (mantissa >> 12) & 1u;
+        mantissa += 0x0FFFu + round;
+        return sign | (mantissa >> 13);
+    }
+    uint round = (bits >> 12) & 1u;
+    bits += 0x0FFFu + round;
+    exponent = int((bits >> 23) & 0xFFu) - 127 + 15;
+    mantissa = (bits >> 13) & 0x3FFu;
+    if (exponent >= 0x1F) return sign | 0x7C00u;
+    return sign | (uint(exponent) << 10) | mantissa;
+}
+
+float halfToFloat(uint u) { return unpackHalf2x16(u)[0]; }
+
+int nearestInt(float f) {
+    float sign = (f < 0.0) ? -1.0 : 1.0;
+    return int(f + sign * 0.5);
+}
+
+shared float s[1024];
+
+void main() {
+    uint perColumn = p.n / 1024u;
+    uint gid = gl_WorkGroupID.x;
+    uint col = gid / perColumn;
+    uint grp = gid - col * perColumn;
+    if (col >= p.columns) return;
+
+    uint t = gl_LocalInvocationID.x;
+    uint j = grp * 1024u + t;
+
+#ifdef GATHER
+    uint srcIdx = col * p.n + gather[j];
+#else
+    uint srcIdx = col * p.n + j;
+#endif
+
+    s[t] = src[srcIdx] * signs[j];
+    barrier();
+
+    for (uint l = 1u; l < 1024u; l <<= 1u) {
+        float mine = s[t];
+        float other = s[t ^ l];
+        barrier();
+        s[t] = ((t & l) == 0u) ? (mine + other) : (other - mine);
+        barrier();
+    }
+
+    s[t] = s[t] * inversesqrt(1024.0);
+    barrier();
+
+    if (t < 32u) {
+        uint bi = t;
+        uint b = grp * 32u + bi;
+        uint nb = p.n >> 5u;
+        uint baseShared = bi * 32u;
+
+        float peak = 0.0;
+        [[unroll]] for (uint i = 0u; i < 32u; i++) peak = max(peak, abs(s[baseShared + i]));
+
+        float scale = 0.0;
+        int   total = 0;
+        uint  word[8];
+        [[unroll]] for (uint u = 0u; u < 8u; u++) word[u] = 0u;
+
+        if (peak > 0.0) {
+            scale = halfToFloat(floatToHalf(peak / 127.0));
+            float inverse = 127.0 / peak;
+            [[unroll]] for (uint u = 0u; u < 8u; u++) {
+                uint w = 0u;
+                [[unroll]] for (uint m = 0u; m < 4u; m++) {
+                    int q = clamp(nearestInt(s[baseShared + u * 4u + m] * inverse), -128, 127);
+                    total += q;
+                    w |= (uint(q) & 0xFFu) << (m * 8u);
+                }
+                word[u] = w;
+            }
+        }
+
+        uint base = col * p.n + b * 32u;
+        uint at = base >> 2u;
+        [[unroll]] for (uint u = 0u; u < 8u; u++) aq[at + u] = word[u];
+
+        uint slot = col * 2u * nb + b;
+        as_[slot]      = scale;
+        as_[slot + nb] = 8.0 * scale * float(total);
+    }
+}
