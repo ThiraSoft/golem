@@ -63,14 +63,18 @@ type Poser struct {
 	scale      int
 	// front is the mask of what the picture keeps in front of the morphed
 	// face, as SetFront was given it, and frontFace and hiFront are that
-	// mask refined on the face's window at each resolution.
-	front, frontFace, hiFront Tensor
-	sharpen                   float32 // the unsharp mask on what the face morpher paints
-	toneAmount                float32 // how far the eyes' colour is brought onto the picture's skin
-	eyeTone                   [3]float32
-	high                      Tensor
-	hiEyebrow, hiBackground   Tensor
-	hiEyebrows, hiMorphed     Tensor
+	// mask refined on the face's window at each resolution. frontHigh is
+	// the larger picture's own mask, when SetFrontHigh gave one.
+	front, frontHigh, frontFace, hiFront Tensor
+	sharpen                              float32 // the unsharp mask on what the face morpher paints
+	eyeUpscale                           float32 // how far the upscaled eyes are laid over the larger face
+	upscaler                             *upscaler
+	dir                                  string  // where Open read the weights, for the upscaler's
+	toneAmount                           float32 // how far the eyes' colour is brought onto the picture's skin
+	eyeTone                              [3]float32
+	high                                 Tensor
+	hiEyebrow, hiBackground              Tensor
+	hiEyebrows, hiMorphed                Tensor
 
 	// heldBody reuses the rotator's and the editor's last decisions when
 	// only the face and the brows move.
@@ -99,7 +103,7 @@ var errClosed = errors.New("tha3: poser is closed")
 
 // Open loads the five networks from dir, which Dir usually names.
 func Open(dir string) (*Poser, error) {
-	p := &Poser{timings: Timings{}, view: whole, scale: 1, eyeTone: noTone}
+	p := &Poser{timings: Timings{}, view: whole, scale: 1, eyeTone: noTone, dir: dir}
 	byName := map[string]*weights{}
 	for _, n := range []string{netEyebrowDecomposer, netEyebrowCombiner, netFaceMorpher, netRotator, netEditor} {
 		w, err := openWeights(dir, n)
@@ -265,13 +269,18 @@ func (p *Poser) poseCPU(pose [NumParams]float32, from stage, short bool) (Tensor
 		faceIn.Paste(p.eyebrows, 32, 32)
 		p.trace.emit(netFaceMorpher+".in.0", faceIn)
 		timed(netFaceMorpher, func() {
-			p.morphed, p.faced = p.face.forward(faceIn, facePose, p.eyeTone, p.trace.sub(netFaceMorpher))
-			p.morphed = composeFront(p.frontFace, faceIn, p.morphed)
+			var morphed Tensor
+			morphed, p.faced = p.face.forward(faceIn, facePose, p.eyeTone, p.trace.sub(netFaceMorpher))
+			p.morphed = composeFront(p.frontFace, faceIn, morphed)
 			if p.high.Data != nil {
 				k := p.high.H / Size
 				hiIn := p.high.Crop(32*k, 160*k, 192*k, 192*k)
 				hiIn.Paste(p.hiEyebrows, 32*k, 32*k)
 				p.hiMorphed = p.faced.resized(192*k, 192*k).applySharp(hiIn, p.sharpen)
+				if p.eyeUpscale > 0 {
+					p.hiMorphed = p.upscaler.upscaleEyes(morphed, p.faced.eyeAlpha, p.hiMorphed, p.eyeUpscale)
+					p.trace.emit(upscalerFile+".out", p.hiMorphed)
+				}
 				p.hiMorphed = composeFront(p.hiFront, hiIn, p.hiMorphed)
 			}
 		})

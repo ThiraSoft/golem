@@ -9,11 +9,15 @@ import "fmt"
 //
 // A front mask says which pixels of the picture are in front. They are put
 // back over the morphed face, before the rotator, so that they still turn
-// with the head and breathe with the body. The mask is drawn by hand, on the
-// picture, and used as it was drawn: working it out from the colours under a
-// rough stroke was tried and dropped, since on a character whose hair is
-// near its skin it keeps the whole socket, and on one whose hair is as dark
-// as its lashes it keeps the open eye.
+// with the head and breathe with the body. The mask is used as it is given:
+// working it out from the colours under a rough stroke was tried and dropped,
+// since on a character whose hair is near its skin it keeps the whole socket,
+// and on one whose hair is as dark as its lashes it keeps the open eye. A
+// segmentation model that knows hair from lashes, or a hand, makes it.
+//
+// A lock of hair is a pixel wide at 512. A mask at that size, blown up, turns
+// it into a smudge over the closed eye, so the larger picture may have a mask
+// of its own size: SetFrontHigh.
 
 // SetFront sets the mask of what the picture keeps in front of the face: one
 // channel, 512×512, in the frame's coordinates, one where the picture wins
@@ -23,17 +27,29 @@ import "fmt"
 // On the card the mask is an input written with the picture, and the
 // operation that reads it is always in the graph: setting or clearing a mask
 // costs a write, never a rebuild.
-func (p *Poser) SetFront(mask Tensor) error {
+func (p *Poser) SetFront(mask Tensor) error { return p.SetFrontHigh(mask, Tensor{}) }
+
+// SetFrontHigh is SetFront with the mask the larger picture uses at a scale
+// above one: 512 times the scale on a side, like the picture SetImageHigh
+// takes. An empty high is mask resized. A scale set afterwards drops it, as it
+// drops the larger picture.
+func (p *Poser) SetFrontHigh(mask, high Tensor) error {
 	if p.closed {
 		return errClosed
 	}
 	if mask.Data != nil && (mask.C != 1 || mask.H != Size || mask.W != Size) {
 		return fmt.Errorf("tha3: front mask is %dx%dx%d, want 1x%dx%d", mask.C, mask.H, mask.W, Size, Size)
 	}
+	if n := Size * p.scale; high.Data != nil && (mask.Data == nil || p.scale == 1 || high.C != 1 || high.H != n || high.W != n) {
+		return fmt.Errorf("tha3: larger front mask is %dx%dx%d, want 1x%dx%d beside a mask", high.C, high.H, high.W, n, n)
+	}
 	if mask.Data != nil {
 		mask = mask.Clone()
 	}
-	p.front = mask
+	if high.Data != nil {
+		high = high.Clone()
+	}
+	p.front, p.frontHigh = mask, high
 	p.haveLast = false
 	p.cutFront()
 	if p.gpu != nil {
@@ -61,7 +77,11 @@ func (p *Poser) cutFront() {
 	p.frontFace = mask
 	if p.high.Data != nil {
 		k := p.high.H / Size
-		p.hiFront = resize(mask, 192*k, 192*k)
+		if p.frontHigh.Data != nil && p.frontHigh.H == p.high.H {
+			p.hiFront = p.frontHigh.Crop(32*k, 160*k, 192*k, 192*k)
+		} else {
+			p.hiFront = resize(mask, 192*k, 192*k)
+		}
 	}
 }
 

@@ -1,0 +1,56 @@
+#version 450
+
+// The eye upscaler's last step, tha3/upscale.go's upscaleEyes: the pixel
+// shuffle of the features plus the input enlarged by nearest neighbour, which
+// is the picture four times larger in sRGB, read bilinearly at the size of
+// face (tha3_resize.comp's taps), clamped, brought to linear light and laid
+// over face through mask, by amount. face's alpha channel is kept. Nothing of
+// the picture four times larger is ever written: each lane works out the four
+// of its pixels it reads.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Arena { float a[]; };
+layout(std430, binding = 1) readonly buffer Weights { float w[]; };
+layout(std430, binding = 2) readonly buffer Pose { float pose[]; };
+
+layout(push_constant) uniform Push {
+    uint dst, face, mask, feat, lr, lh, lw, h, w;
+    float amount;
+} p;
+
+float big(uint c, uint y, uint x) {
+    uint ly = y / 4u, lx = x / 4u;
+    uint ch = c * 16u + (y % 4u) * 4u + x % 4u;
+    uint plane = p.lh * p.lw, at = ly * p.lw + lx;
+    return a[p.feat + ch * plane + at] + a[p.lr + c * plane + at];
+}
+
+float toLinear(float v) {
+    v = clamp(v, 0.0, 1.0);
+    return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint plane = p.h * p.w;
+    if (i >= plane) return;
+    uint c = gl_WorkGroupID.y;
+    float f = a[p.face + c * plane + i];
+    if (c == 3u) {
+        a[p.dst + c * plane + i] = f;
+        return;
+    }
+    uint bh = p.lh * 4u, bw = p.lw * 4u;
+    uint oy = i / p.w, ox = i % p.w;
+    float sy = max((float(oy) + 0.5) * (float(bh) / float(p.h)) - 0.5, 0.0);
+    float sx = max((float(ox) + 0.5) * (float(bw) / float(p.w)) - 0.5, 0.0);
+    uint y0 = min(uint(sy), bh - 1u), y1 = min(y0 + 1u, bh - 1u);
+    uint x0 = min(uint(sx), bw - 1u), x1 = min(x0 + 1u, bw - 1u);
+    float fy = sy - float(y0), fx = sx - float(x0);
+    float top = big(c, y0, x0) * (1.0 - fx) + big(c, y0, x1) * fx;
+    float bottom = big(c, y1, x0) * (1.0 - fx) + big(c, y1, x1) * fx;
+    float lin = toLinear(top * (1.0 - fy) + bottom * fy) * 2.0 - 1.0;
+    float al = a[p.mask + i] * p.amount;
+    a[p.dst + c * plane + i] = f * (1.0 - al) + lin * al;
+}

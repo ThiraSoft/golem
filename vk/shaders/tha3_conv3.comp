@@ -1,0 +1,72 @@
+#version 450
+
+// A dense 3×3 convolution, stride 1, padding 1, as tha3_pw.comp's product
+// with the input channels widened to every channel and tap: k runs over
+// cin·9, and the pixel a lane reads for (k, n) is n moved by the tap, or zero
+// past the edge. The weights, laid [out][cin][3][3], are then [out][k] as the
+// product wants them. A bias always, and a PReLU with one slope per output
+// channel when hasSlopes is set: the eye upscaler's layers.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) buffer Arena { float a[]; };
+layout(std430, binding = 1) readonly buffer Weights { float w[]; };
+layout(std430, binding = 2) readonly buffer Pose { float pose[]; };
+
+layout(push_constant) uniform Push {
+    uint src, dst, cin, cout, h, w, weights, bias, slopes, hasSlopes;
+} p;
+
+shared float As[16][64];
+shared float Bs[16][64];
+
+void main() {
+    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;
+    uint lid = ty * 16u + tx;
+    uint pix = p.h * p.w;
+    uint n0 = gl_WorkGroupID.x * 64u, m0 = gl_WorkGroupID.y * 64u;
+    uint kall = p.cin * 9u;
+    float acc[4][4];
+    for (uint i = 0u; i < 4u; i++)
+        for (uint j = 0u; j < 4u; j++) acc[i][j] = 0.0;
+
+    for (uint k0 = 0u; k0 < kall; k0 += 16u) {
+        for (uint r = 0u; r < 4u; r++) {
+            uint e = r * 256u + lid;
+            uint kk = e / 64u, mn = e % 64u;
+            uint k = k0 + kk;
+            uint m = m0 + mn, n = n0 + mn;
+            As[kk][mn] = (m < p.cout && k < kall) ? w[p.weights + m * kall + k] : 0.0;
+            float v = 0.0;
+            if (k < kall && n < pix) {
+                uint ci = k / 9u, t = k % 9u;
+                int iy = int(n / p.w) + int(t / 3u) - 1, ix = int(n % p.w) + int(t % 3u) - 1;
+                if (iy >= 0 && iy < int(p.h) && ix >= 0 && ix < int(p.w))
+                    v = a[p.src + ci * pix + uint(iy) * p.w + uint(ix)];
+            }
+            Bs[kk][mn] = v;
+        }
+        barrier();
+        for (uint kk = 0u; kk < 16u; kk++) {
+            float av[4], bv[4];
+            for (uint i = 0u; i < 4u; i++) av[i] = As[kk][ty * 4u + i];
+            for (uint j = 0u; j < 4u; j++) bv[j] = Bs[kk][tx * 4u + j];
+            for (uint i = 0u; i < 4u; i++)
+                for (uint j = 0u; j < 4u; j++) acc[i][j] += av[i] * bv[j];
+        }
+        barrier();
+    }
+
+    for (uint i = 0u; i < 4u; i++) {
+        uint m = m0 + ty * 4u + i;
+        if (m >= p.cout) continue;
+        float b = w[p.bias + m];
+        float slope = p.hasSlopes != 0u ? w[p.slopes + m] : 1.0;
+        for (uint j = 0u; j < 4u; j++) {
+            uint n = n0 + tx * 4u + j;
+            if (n >= pix) continue;
+            float v = acc[i][j] + b;
+            a[p.dst + m * pix + n] = v < 0.0 ? slope * v : v;
+        }
+    }
+}

@@ -384,6 +384,25 @@ func (d *describer) sharpen(f cardFields, out vk.THA3Tensor, amount float32) vk.
 	return d.g.Sharpen(f["eyeAlpha"], blurred, out, amount)
 }
 
+// upscaleEyes is upscaler.upscaleEyes.
+func (d *describer) upscaleEyes(u *upscaler, face, eyeAlpha, hiFace vk.THA3Tensor, amount float32) vk.THA3Tensor {
+	g := d.g
+	lr := g.ToSRGB(face)
+	x := lr
+	for i, c := range u.convs {
+		var slopes vk.THA3Weights
+		if i < len(u.slopes) {
+			slopes = d.weights(u.slopes[i])
+		}
+		x = g.Conv3(x, d.weights(c.Weight), d.weights(c.Bias), slopes, c.Out)
+	}
+	blur := func(t vk.THA3Tensor, ratio int) vk.THA3Tensor {
+		return g.Resize(g.Resize(t, max(t.H/ratio, 1), max(t.W/ratio, 1)), t.H, t.W)
+	}
+	mask := blur(g.Spread(blur(eyeAlpha, eyeMaskBlur), eyeMaskGain), eyeMaskFade)
+	return g.UpscaleLay(hiFace, g.Resize(mask, hiFace.H, hiFace.W), x, lr, amount)
+}
+
 // resized is every field resized to h×w, for the larger picture.
 func (d *describer) resized(f cardFields, h, w int) cardFields {
 	// In the order of the names, so that the graph is the same every time.
@@ -471,10 +490,10 @@ func (d *describer) poser(p *Poser) (image, high, front, hiFront vk.THA3Tensor) 
 
 	faceIn := g.Paste(g.Crop(image, 32, 160, 192, 192), eyebrows, 32, 32)
 	d.emit(netFaceMorpher+".in.0", faceIn)
-	face, faced := d.face(p.face, faceIn)
+	morphed, faced := d.face(p.face, faceIn)
 	// What the picture keeps in front of the face goes back on it here,
 	// before the rotator, so that the rotation and the breath carry it.
-	face = g.ColorChange(front, faceIn, face)
+	face := g.ColorChange(front, faceIn, morphed)
 	var hiFace vk.THA3Tensor
 	if k > 1 {
 		hiFaceIn := g.Paste(g.Crop(high, 32*k, 160*k, 192*k, 192*k), hiEyebrows, 32*k, 32*k)
@@ -484,6 +503,10 @@ func (d *describer) poser(p *Poser) (image, high, front, hiFront vk.THA3Tensor) 
 		// after it is weighed by the alphas as they came, so that it
 		// reaches everything the morpher painted.
 		hiFace = d.sharpen(hiFaced, d.morph(d.steepened(hiFaced, p.sharpen), hiFaceIn), p.sharpen)
+		if p.eyeUpscale > 0 {
+			hiFace = d.upscaleEyes(p.upscaler, morphed, faced["eyeAlpha"], hiFace, p.eyeUpscale)
+			d.emit(upscalerFile+".out", hiFace)
+		}
 		hiFace = g.ColorChange(hiFront, hiFaceIn, hiFace)
 	}
 	g.Stamp(netFaceMorpher)

@@ -24,6 +24,8 @@ const (
 	tha3Norm
 	tha3Sum
 	tha3High
+	tha3Conv3
+	tha3Upscale
 )
 
 // tha3KernelSpec is one shader and the size of its push constants. Each ops

@@ -54,6 +54,8 @@ func main() {
 	view := flag.String("view", "", "x0,y0,x1,y1: return only that part of the frame; empty for all of it")
 	scale := flag.Int("scale", 1, "return the frame this many times larger, drawn from -high")
 	high := flag.String("high", "", "the picture 512 times -scale on a side, on the same template; empty for -image resized")
+	sharpen := flag.Float64("sharpen", 0, "how hard the mouth and the closed eyes are sharpened at a scale above one")
+	eyeUpscale := flag.Float64("eye-upscale", 0, "how far the upscaled eyes are laid over the face at a scale above one, 0 to 1")
 	flag.Parse()
 	if *picture == "" {
 		fail(fmt.Errorf("-image is required"))
@@ -93,6 +95,12 @@ func main() {
 		}
 	}
 	if err := p.SetScale(*scale); err != nil {
+		fail(err)
+	}
+	if err := p.SetSharpen(float32(*sharpen)); err != nil {
+		fail(err)
+	}
+	if err := p.SetEyeUpscale(float32(*eyeUpscale)); err != nil {
 		fail(err)
 	}
 	img, err := tha3.LoadImage(*picture)

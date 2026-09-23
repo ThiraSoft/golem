@@ -51,6 +51,7 @@ func (p *Poser) SetScale(k int) error {
 			return fmt.Errorf("tha3: the card for scale %d: %w", k, err)
 		}
 	}
+	p.frontHigh = Tensor{}
 	if p.image.Data == nil {
 		p.high = Tensor{}
 		return nil

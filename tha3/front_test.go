@@ -203,3 +203,43 @@ func gapTo(frame, picture, mask Tensor) float64 {
 	}
 	return sum / float64(3*n)
 }
+
+// The larger picture's own mask is cut to the face's window as it is, where
+// the mask at 512 would have been blown up; a scale set afterwards drops it.
+func TestFrontHighCutToTheWindow(t *testing.T) {
+	picture, mask, _ := paintedPicture()
+	p := &Poser{timings: Timings{}, view: whole, scale: 2, eyeTone: noTone}
+	if err := p.SetFrontHigh(mask, NewTensor(1, Size, Size)); err == nil {
+		t.Error("a larger mask of the wrong size was taken")
+	}
+	if err := p.SetFrontHigh(Tensor{}, NewTensor(1, 2*Size, 2*Size)); err == nil {
+		t.Error("a larger mask was taken without its mask at 512")
+	}
+	high := NewTensor(1, 2*Size, 2*Size)
+	// One pixel wide at the larger size: nothing a mask at 512 can hold.
+	for y := 2 * (32 + 60); y < 2*(32+150); y++ {
+		high.Data[y*2*Size+2*(160+96)] = 1
+	}
+	if err := p.SetFrontHigh(mask, high); err != nil {
+		t.Fatal(err)
+	}
+	p.image, p.high = picture, ResizeBilinear(picture, 2*Size, 2*Size)
+	p.cutFront()
+	if p.hiFront.H != 384 || p.hiFront.W != 384 {
+		t.Fatalf("the larger window is %dx%d", p.hiFront.H, p.hiFront.W)
+	}
+	row := p.hiFront.Plane(0)[(2*100)*384:]
+	for x := range 384 {
+		if want := boolFloat(x == 2*96); row[x] != want {
+			t.Fatalf("at x %d the larger mask is %v, want %v", x, row[x], want)
+		}
+	}
+	// Without networks, SetScale must not reach SetImageHigh.
+	p.scale, p.image = 1, Tensor{}
+	if err := p.SetScale(2); err != nil {
+		t.Fatal(err)
+	}
+	if p.frontHigh.Data != nil {
+		t.Error("a new scale kept the larger mask of the old one")
+	}
+}

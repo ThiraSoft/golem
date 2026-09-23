@@ -41,11 +41,21 @@ one the gain measured on the picture itself brings it onto the character's
 own skin, at the cost of one run of the face morpher per picture set and
 nothing per frame.
 
+`SetEyeUpscale(a)` goes further than the sharpening for the eyes: the face
+the morpher made at 192 goes through an anime upscaler, four times larger,
+and is laid over the larger picture's face where the eyes were repainted,
+fading out around them. A closed eye's lash line comes back as a line. It
+needs the upscaler's weights, which `ref/tha3/README.md` says how to fetch.
+At a scale of two on the card it costs about 6 ms a pose: 12.0 ms without,
+18.0 ms with, on the moving sequence of `cmd/tha3-pose -bench`.
+
 `SetFront(mask)` says which pixels of the picture stay in front of the face.
 The morpher repaints the whole eye socket when an eye shuts, over whatever
 happens to be there, so a lock of hair falling across an eye flickers with
 every blink; the mask puts it back, before the rotator, so that it still
-turns with the head. It is drawn by hand and used as it is drawn.
+turns with the head. It is used as it is given. `SetFrontHigh(mask, high)`
+adds the larger picture's own mask: a lock one pixel wide at 512, blown up
+from a mask of that size, comes back as a smudge.
 
 `cmd/tha3-pose` renders one frame from the command line and prints how long
 each network took.

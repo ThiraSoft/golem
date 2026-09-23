@@ -16,6 +16,23 @@ sh ref/tha3/fetch.sh /tmp/tha3-pt
 
 `GOLEM_THA3` points the Go side elsewhere.
 
+## Eye upscaler
+
+`Poser.SetEyeUpscale` lays the eyes the face morpher paints at 192 px,
+upscaled, over the larger picture. The upscaler is Real-ESRGAN's
+realesr-animevideov3, by Xintao Wang et al., BSD-3-Clause, from
+[Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN). It goes beside the
+five networks:
+
+```sh
+curl -fLO https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth
+/tmp/tha3-venv/bin/python ref/tha3/upscaler.py realesr-animevideov3.pth \
+    ~/.cache/golem/tha3/separable_float testdata/tha3/upscaler
+```
+
+The last argument is optional: it records the network run in torch on a
+small picture, which `TestUpscalerMatchesTorch` compares against.
+
 ## Fixtures
 
 `dump.py` runs the upstream code itself, from a checkout pinned at
