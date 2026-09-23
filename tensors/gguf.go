@@ -245,6 +245,8 @@ var ggmlTypes = map[uint32]string{
 	golemT3G: "T3G",
 	golemT4G: "T4G",
 	golemT5G: "T5G",
+	142:      "PQ2_0",
+	143:      "PTQ1_0",
 	// 1000-1004 are retired and never reused. They were, in turn, the lattice,
 	// Lloyd, the wide lattice, T4G and T5G, and then 1000-1002 were the three
 	// trellis tiers. The collision that ended that numbering is the reason for
@@ -362,20 +364,22 @@ func (g *GGUF) checkGolemFile() error {
 // blockGeometry gives, per type, how many weights sit in one block and how many
 // bytes that block occupies.
 var blockGeometry = map[string][2]int{
-	"F32":  {1, 4},
-	"F16":  {1, 2},
-	"BF16": {1, 2},
-	"Q4_0": {32, 18},   // one fp16 scale, then 32 nibbles
-	"Q4_1": {32, 20},   // an fp16 scale and an fp16 minimum, then 32 nibbles
-	"Q8_0": {32, 34},   // one fp16 scale, then 32 signed bytes
-	"Q2_K": {256, 84},  // 16 packed scale-and-minimum bytes, two-bit quants, 2 fp16
-	"Q3_K": {256, 110}, // hmask, two-bit quants, twelve packed scales, one fp16
-	"Q4_K": {256, 144}, // 2 fp16 (d, dmin) + 12 scales + 128 nibbles
-	"Q5_K": {256, 176}, // 2 fp16 (d, dmin) + 12 scales + 32 high bits + 128 nibbles
-	"Q6_K": {256, 210}, // 128 low nibbles, 64 high pairs, 16 scales, one fp16
-	"T3G":  {128, 52},  // two step codes, then a 393-bit path in 400
-	"T4G":  {128, 67},  // two step codes, then a 520-bit trellis path
-	"T5G":  {128, 83},  // the same at five bits a weight, 648 of them
+	"F32":    {1, 4},
+	"F16":    {1, 2},
+	"BF16":   {1, 2},
+	"Q4_0":   {32, 18},   // one fp16 scale, then 32 nibbles
+	"Q4_1":   {32, 20},   // an fp16 scale and an fp16 minimum, then 32 nibbles
+	"Q8_0":   {32, 34},   // one fp16 scale, then 32 signed bytes
+	"Q2_K":   {256, 84},  // 16 packed scale-and-minimum bytes, two-bit quants, 2 fp16
+	"Q3_K":   {256, 110}, // hmask, two-bit quants, twelve packed scales, one fp16
+	"Q4_K":   {256, 144}, // 2 fp16 (d, dmin) + 12 scales + 128 nibbles
+	"Q5_K":   {256, 176}, // 2 fp16 (d, dmin) + 12 scales + 32 high bits + 128 nibbles
+	"Q6_K":   {256, 210}, // 128 low nibbles, 64 high pairs, 16 scales, one fp16
+	"T3G":    {128, 52},  // two step codes, then a 393-bit path in 400
+	"T4G":    {128, 67},  // two step codes, then a 520-bit trellis path
+	"T5G":    {128, 83},  // the same at five bits a weight, 648 of them
+	"PQ2_0":  {128, 34},  // one fp16 scale, then 32 packed two-bit quants
+	"PTQ1_0": {128, 28},  // 24 bytes of trits, 2 bytes high trits, one fp16 scale
 }
 
 // rowBytes is the size on disk of one row of `n` weights of the given type.

@@ -36,6 +36,8 @@ const (
 	// and not a whole number of bytes. It is what retires the lattice: the same
 	// size, two decibels better on a Gaussian, and no table at all.
 	T3G
+	PQ2_0
+	PTQ1_0
 )
 
 // Golem says the format is one of golem's own — a matrix stored as A·(q ⊙ W),
@@ -83,6 +85,10 @@ func (q Quant) String() string {
 		return "T5G"
 	case T3G:
 		return "T3G"
+	case PQ2_0:
+		return "PQ2_0"
+	case PTQ1_0:
+		return "PTQ1_0"
 	}
 	return "unknown"
 }
@@ -118,6 +124,10 @@ func QuantOf(dtype string) (Quant, bool) {
 		return T5G, true
 	case "T3G":
 		return T3G, true
+	case "PQ2_0":
+		return PQ2_0, true
+	case "PTQ1_0":
+		return PTQ1_0, true
 	}
 	return 0, false
 }
@@ -146,4 +156,10 @@ const (
 	q6_kBlockBytes = 210
 	// q8_0BlockBytes is one fp16 scale followed by 32 int8 quants.
 	q8_0BlockBytes = 34
+	// TernaryBlock is the block size of the ternary formats (PQ2_0 and PTQ1_0).
+	TernaryBlock = 128
+	// pq2_0BlockBytes is one fp16 scale followed by 32 bytes of two-bit codes.
+	pq2_0BlockBytes = 34
+	// ptq1_0BlockBytes is 24 bytes qs, 2 bytes qh, and one fp16 scale.
+	ptq1_0BlockBytes = 28
 )
