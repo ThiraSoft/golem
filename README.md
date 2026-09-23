@@ -52,13 +52,13 @@ The bet is that it is worth it only if the result is actually fast. See [the num
 
 | | |
 | --- | --- |
-| **Text** | Gemma 4 (E2B, 12B, 26B A4B), Qwen3, Qwen3.8 27B |
+| **Text** | Gemma 4 (E2B, 12B, 26B A4B), Qwen3, Qwen3.8 27B, and Prism's ternary Bonsai 2 27B |
 | **Vision** | Gemma 4 and Qwen3.8, from a projector file |
 | **Audio in** | Gemma 4 hears WAV, MP3 and FLAC. Kyutai STT transcribes English and French |
 | **Audio out** | Kyutai Pocket TTS, 12 shipped models across 6 languages, plus voice cloning |
 | **Images** | Krea 2 from ComfyUI's fp8 files, with its LoRA, the same picture as ComfyUI for the same seed, and on a colour to key out |
 | **Serving** | OpenAI-compatible HTTP API, tool calls, continuous batching, JSON schemas and GBNF grammars |
-| **Weights** | GGUF, every K-quant llama.cpp writes, and golem's own `.golem` format |
+| **Weights** | GGUF, every K-quant llama.cpp writes, Prism's ternary PQ2_0 and PTQ1_0, and golem's own `.golem` format |
 
 ## Quickstart
 
@@ -138,6 +138,15 @@ On an RX 9070 XT against llama.cpp's Vulkan build (`ba1df050f`, b9603), same Q4_
 
 Qwen3.8 27B is absent on purpose. At 15.65 GiB on a heap of 15.92 it leaves no room on a card that is also driving a desktop, and what a table would compare there is memory pressure rather than two engines. [`qwen35/README.md`](qwen35/README.md) has that measurement.
 
+Bonsai 2 27B is Qwen3.8 27B in ternary weights, 6.7 GiB for two bits a weight and 5.5 for the dense 1.75. Stock llama.cpp does not read it, so the comparison is Prism's own fork (`PrismML-Eng/llama.cpp`, `bdc23b5`) built for Vulkan, on the same card, measured on 2026-09-23:
+
+| | golem gen | fork gen | golem pp512 | fork pp512 |
+| --- | ---: | ---: | ---: | ---: |
+| Bonsai 2 27B PQ2_0 | **47.4** | 9.3 | 810 | **1046** |
+| Bonsai 2 27B PTQ1_0 | **19.9** | 9.5 | **765** | 535 |
+
+Both packings hold the same trits. The dense one reads 17 % fewer bytes and decodes five weights a byte one at a time, which on this card costs more than the bytes save: take PQ2_0 unless memory is what is short. Held against the fork's logits at every position of a prompt, both answer within 0.0001 nats. The golem prefill figures are one cold pass each, not a repeated benchmark. [`qwen35/README.md`](qwen35/README.md) has the rotation these files carry and how drafting is grafted onto them.
+
 On an i7-9700K with eight threads and Q4_0 weights: Gemma E2B draws 22.6 tokens a second and reads 204, the 12B does 5.0 and 42, the 26B A4B does 13.1 and 51, Qwen3 4B does 14.6 and 110. Against llama.cpp on the same machine those four are a tie on generation and between ×1.06 and ×1.33 reading a prompt.
 
 The one model golem loses is Qwen3 0.6B, and [`qwen/README.md`](qwen/README.md) says why: at 320 MB the weights fit close enough that memory stops being the limit, and what is left is arithmetic. This engine is built for the regime where reading the weights is the cost, and it says so where it is not.
@@ -165,7 +174,7 @@ Two fifths of the pool buys four fifths of the tokens, and the answers are ident
 
 The Qwen3.8 checkpoint ships a sixty-fifth block whose job is to guess the token *after* the one just decided. Guess right and the next pass verifies two tokens for the price of one, because the card reads a block's weights once whether the pass carries one column or two. Guess wrong and it costs nothing beyond the pass it rode on. Every token returned is drawn from the model's own distribution, so none of the accept-reject correction that drafting with a separate model needs applies here, and a test asserts the answer is the same either way.
 
-On an RX 9070 XT: 27.6 tokens a second one at a time, **40.1 drafting**, 70% of drafts accepted. On the CPU it is refused rather than offered, and [`qwen35/README.md`](qwen35/README.md) has the measurement that settles it.
+On an RX 9070 XT: 27.6 tokens a second one at a time, **40.1 drafting**, 70% of drafts accepted. Bonsai 2 ships without the block, and the original model's grafts onto it unchanged: 47.4 tokens a second becomes 71.4, 86% of drafts accepted. On the CPU it is refused rather than offered, and [`qwen35/README.md`](qwen35/README.md) has the measurement that settles it.
 
 ### Its own weight format
 
@@ -197,7 +206,7 @@ For `gemma/` the reference is llama.cpp itself, instrumented, because a bf16 ref
 
 ## Who wrote this
 
-The code in this repository was written by an AI agent, [Claude](https://claude.com/claude-code), directed and reviewed by a human. The git history says so on the commits themselves.
+The code in this repository was written by an AI agent, [Claude](https://claude.com/claude-code), directed and reviewed by a human. Some of the Bonsai 2 work was written by Gemini under Claude's review. The git history says so on the commits themselves.
 
 That is worth stating plainly rather than leaving to be discovered, and it is also the reason the section above exists. An agent will happily produce a layer that runs, returns plausible tokens and is quietly wrong in the fourth decimal place, and reading the diff does not catch that. Recorded activations do. Every claim in these files is either a test in the repository or a benchmark in it, because on this project that is the only kind of claim worth making.
 

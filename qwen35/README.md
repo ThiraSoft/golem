@@ -143,3 +143,61 @@ projector carries no audio encoder.
 ./golem-cli -model Qwen3.8-27B-Q4_0.gguf -mmproj mmproj-F16.gguf \
     -image photo.png -p "Describe this image in one sentence."
 ```
+
+## Bonsai 2, the same model in ternary
+
+Prism ML's [Bonsai 2 27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
+is this architecture with every projection, the embedding and the head in
+weights of -1, 0 and +1 times one fp16 scale a hundred and twenty-eight. The
+file says `qwen35` and this package opens it; what differs is two weight
+formats and a rotation.
+
+**The formats.** PQ2_0 is a trit in two bits, 34 bytes a block. PTQ1_0 packs
+five trits a byte, 28 bytes a block. Both files hold the same trits, and a
+tensor read from one is the same floats to the bit as read from the other.
+
+**The rotation.** Every matrix was multiplied offline by a Walsh-Hadamard
+transform of 1024 with a fixed sign vector, so its activation has to meet the
+same transform before the product: `y = W·H(s ⊙ x)`. That is
+`nn.PrepareGolem` with a group of 1024, which `.golem` checkpoints already
+needed at 128. The embedding table is stored rotated too and is brought back
+a row at a time. And the delta net's output is reordered from llama.cpp's tiled
+head order to the grouped one before its rotation, which `nn.Matrix.Gather`
+carries. `prism.go` reads all of it from the file's `prism.hadamard.*` keys and
+refuses a file whose ternary matrix it could not bind: a projection left
+unrotated answers fluently and wrongly.
+
+On the card each of the five sites a block is one dispatch of
+`vk/shaders/rotate_q8.comp`, from the floats the kernel in front wrote to the
+Q8_0 form the projections read. The floats stay unrotated, because the delta
+net's two decay projections read them and those are not rotated in the file.
+
+`TestVulkanBonsaiMatchesLlamaCpp` holds both files to the logits of Prism's own
+llama.cpp fork at every position of a 31-token prompt: 0.0001 nats, the same
+top-1 at every position.
+
+| RX 9070 XT, 2026-09-23 | one at a time | drafting | pp512 |
+| --- | ---: | ---: | ---: |
+| PQ2_0 | 47.4 t/s | **71.4** | 810 |
+| PTQ1_0 | 19.9 t/s | 32.4 | 765 |
+
+PTQ1_0 reads 17 % fewer bytes and is two and a half times slower, because its
+mat-vec takes a weight at a time out of a byte of five where PQ2_0 spreads four
+with two instructions. On this card the product is not waiting on memory.
+
+**Drafting is grafted.** Prism ships no prediction block. The original model's
+`blk.64` works unchanged: the residual stream between blocks is not rotated,
+only what each projection reads, so the block sees what it was trained on
+within the ternary model's error. Copied into the file with `block_count` at
+65 and `nextn_predict_layers` at 1, 79 to 86 % of drafts are accepted on
+English and code and 48 % on a French prompt, and the text is the same with
+drafting on and off. The grafted block's own matrices are Q4_0 and unrotated,
+which is why the pipeline decides the rotation per block and not per model.
+
+```bash
+golem-cli -vulkan -model Ternary-Bonsai-2-27B-PQ2_0-mtp.gguf
+```
+
+`-vulkan` matters more than usual here: on eight cores this model draws 0.2
+tokens a second.
+
