@@ -195,9 +195,24 @@ tokens and nothing else on the card:
 The prompt figure was 804/s before the width followed the device, and two
 clients drew 100/s together before the mixture's threshold moved.
 
-Qwen3.8's GPU pipeline is the exception and still refuses `-parallel` above 1:
-its delta-net blocks keep a state matrix a head rather than a ring, and there
-is nothing there to cut into slots.
+Qwen3.8's pipeline holds its slots the same way, with one difference: a delta
+net keeps a state matrix a head rather than a ring, so a slot's share of the
+buffer is a whole copy of every recurrence. The slot travels beside the
+position all the same, and a pass carries several conversations, a run of
+columns each; only the recurrences and the scores are dispatched a run at a
+time. Bonsai 2 27B, one token for each conversation drawing:
+
+| conversations | pass | head |
+|---|---|---|
+| 1 | 22ms | 1.6ms |
+| 2 | 24ms | 2.6ms |
+| 4 | 33ms | 3.9ms |
+| 5 | 44ms | 5.7ms |
+
+Five clients drawing two hundred tokens each went from 36.5 tokens a second
+together, when every conversation was a pass of its own, to 79.6. Past four
+the ternary mat-vec stops being a reading of the weights and becomes
+arithmetic, which is where the next gain is.
 
 ### Waiting for a pass
 
@@ -246,6 +261,23 @@ remembers which position each slot last received and resumes at the latest
 position whose window is intact, feeding everything after it again. A rewind
 that wrapped nothing feeds only the divergence, and appending, the common case,
 rewinds nothing.
+
+A recurrent model cannot rewind at all: a delta net's state has read every
+position it holds, and there is no taking one back out. A prompt that parts
+from what a slot holds used to be read again from nothing. So a slot keeps a
+few copies of its state, `-checkpoints` of them, taken where a prompt parted
+from the one before it and every thousand and twenty-four positions of a long
+one, and a prompt that parts starts from the latest copy it shares. The
+attention's keys below that position are still the conversation's own; the
+copy is all it takes. A copy is a hundred and fifty-one megabytes on the 27B,
+and the card grants fewer than asked when they would push the head off it.
+
+What it is worth is what a village is: five characters, each asked a prompt
+that starts with the same long sheet and then says what is happening now,
+which is new every time. Fifteen answers on Bonsai 2 27B took 196 seconds and
+44 with the copies, the median wait from 61 seconds to 8.6: after its first
+turn a character's prompt is read from where its sheet ends, four hundred
+positions where it was three thousand eight hundred.
 
 `-cache-ttl` bounds how long a conversation's tokens stay in memory. Say plainly
 what it does not do: the cache is allocated once at startup and this frees none
@@ -426,6 +458,7 @@ file is not in the page cache.
 | `-parallel` | conversations at once; 1 by default |
 | `-n` | most tokens for one answer, when the request names no `max_tokens` |
 | `-cache-ttl` | forget a conversation's tokens after this long idle; `0` never |
+| `-checkpoints` | copies of a recurrent model's state each conversation keeps; 3 by default, and the card may grant fewer |
 
 Sampling follows the file's own values unless the request names `temperature`,
 `top_p`, `top_k` or `seed`.

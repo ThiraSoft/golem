@@ -256,6 +256,41 @@ func (r *Runner) ForwardEmbedded(slot int, tokens []int32, embeds [][]float32, p
 	<-p.reply
 }
 
+// checkpointer is an engine that can copy a slot's recurrent state aside and
+// put it back: qwen35 on a card.
+type checkpointer interface {
+	Checkpoints() int
+	SaveCheckpoint(k int) error
+	RestoreCheckpoint(k int) error
+}
+
+// Checkpoints is how many copies of its state a slot may keep, and zero for an
+// engine that keeps none.
+func (r *Runner) Checkpoints() int {
+	if c, ok := r.engine.(checkpointer); ok {
+		return c.Checkpoints()
+	}
+	return 0
+}
+
+// SaveCheckpoint keeps the state of one slot as its checkpoint k.
+func (r *Runner) SaveCheckpoint(slot, k int) (err error) {
+	r.do(func() {
+		r.engine.UseSlot(slot)
+		err = r.engine.(checkpointer).SaveCheckpoint(k)
+	})
+	return err
+}
+
+// RestoreCheckpoint puts one slot back to its checkpoint k.
+func (r *Runner) RestoreCheckpoint(slot, k int) (err error) {
+	r.do(func() {
+		r.engine.UseSlot(slot)
+		err = r.engine.(checkpointer).RestoreCheckpoint(k)
+	})
+	return err
+}
+
 // Reset forgets what one slot holds.
 func (r *Runner) Reset(slot int) {
 	r.do(func() {

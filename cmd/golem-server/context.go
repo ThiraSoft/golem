@@ -26,6 +26,8 @@ package main
 
 import (
 	"fmt"
+	"slices"
+	"sort"
 	"time"
 
 	"github.com/ThiraSoft/golem/engine"
@@ -84,7 +86,32 @@ type Context struct {
 	// would take a new picture for the one already read.
 	media [][]float32
 	last  time.Time
+
+	// checkpoints are the copies of a recurrent state this slot keeps, and
+	// where each was taken. See PrefillPromptState.
+	checkpoints []checkpoint
+	uses        int // a clock for which checkpoint was used last
 }
+
+// A checkpoint is a copy of the slot's recurrent state after the tokens it was
+// taken over. They are its proof: a prompt that starts with them can start
+// from the copy.
+type checkpoint struct {
+	k      int // which of the engine's copies
+	tokens []int32
+	used   int
+}
+
+// checkpointFloor is the fewest positions a checkpoint is worth taking at.
+// Below it the prompt is read again in less time than it takes to say so.
+const checkpointFloor = 256
+
+// checkpointEvery is how far apart the checkpoints a long prompt leaves behind
+// are, beside the one at the point where it parted from what the slot held.
+// A conversation that grows by a turn and changes what comes near its end —
+// memories recalled for the last message, say — parts from its own history a
+// little before the end, and this is how much of it may have to be read again.
+const checkpointEvery = 1024
 
 func NewContext(r *Runner, window, maxContext int, now func() time.Time, ttl time.Duration) *Context {
 	return &Context{runner: r, window: window, maxContext: maxContext, now: now, ttl: ttl}
@@ -191,14 +218,13 @@ func (c *Context) PrefillPromptState(p engine.Prompt, logits []float32, state *[
 		// A delta net's state has read every position held, and there is no
 		// taking a position back out of it. So the cache is continued only
 		// when the prompt is what is held and more; anything else, a prompt
-		// that parts from it early or one that is all of it, starts the slot
-		// again. The second is what the rule below would otherwise do to it:
-		// feed the last position again, into a state that already has it,
-		// and the model answered an identical request with nothing at all.
+		// that parts from it early or one that is all of it, goes back to the
+		// latest checkpoint it shares, or starts the slot again. The second
+		// is what the rule below would otherwise do to it: feed the last
+		// position again, into a state that already has it, and the model
+		// answered an identical request with nothing at all.
 		if shared < len(c.held) || shared >= len(ids) {
-			c.runner.Reset(c.slot)
-			c.held, c.media, c.owner = nil, nil, nil
-			from = 0
+			from = c.resume(ids, embeds, min(shared, len(ids)-1))
 		}
 	} else {
 		if from >= len(ids) {
@@ -209,11 +235,24 @@ func (c *Context) PrefillPromptState(p engine.Prompt, logits []float32, state *[
 		from = c.intactFrom(from)
 	}
 
+	// Whatever is fed from here on writes over what the checkpoints past it
+	// stood on: the attention's keys at those positions are this prompt's now.
+	c.forgetFrom(from)
+	saves := c.savesFor(ids, embeds, from, shared)
+
 	for at := from; at < len(ids); {
 		// A batch may not be cut inside a picture: every key of a span has to
 		// be in the cache before any of its queries is scored, which holds
 		// within one pass and not across two.
 		to := p.Boundary(at, at+c.runner.PassWidth())
+		// And it ends where a checkpoint is to be taken, which is a state
+		// between two passes and not inside one.
+		for len(saves) > 0 && saves[0] <= at {
+			saves = saves[1:]
+		}
+		if len(saves) > 0 && saves[0] < to {
+			to = saves[0]
+		}
 		// Only the chunk that ends the prompt is scored: the ones before it
 		// are read for their keys and values alone.
 		var out []float32
@@ -236,12 +275,117 @@ func (c *Context) PrefillPromptState(p engine.Prompt, logits []float32, state *[
 			}
 		}
 		c.wrote(at, to-at)
+		if len(saves) > 0 && saves[0] == to {
+			c.save(ids[:to])
+		}
 		at = to
 	}
 	c.held = append(c.held[:0], ids...)
 	c.media = embeds
 	c.last = c.now()
 	return len(ids) - from, nil
+}
+
+// resume brings a recurrent slot back to the latest of its checkpoints that
+// ids starts with and that is no further than limit, and says where the prompt
+// is to be read from. With none, the slot starts again from nothing.
+func (c *Context) resume(ids []int32, embeds [][]float32, limit int) int {
+	var best *checkpoint
+	if embeds == nil {
+		for i := range c.checkpoints {
+			ck := &c.checkpoints[i]
+			if len(ck.tokens) > limit || (best != nil && len(ck.tokens) <= len(best.tokens)) {
+				continue
+			}
+			if commonPrefix(ck.tokens, ids) == len(ck.tokens) {
+				best = ck
+			}
+		}
+	}
+	if best != nil {
+		if err := c.runner.RestoreCheckpoint(c.slot, best.k); err == nil {
+			c.uses++
+			best.used = c.uses
+			c.held = append(c.held[:0], best.tokens...)
+			c.media = nil
+			return len(best.tokens)
+		}
+	}
+	c.runner.Reset(c.slot)
+	c.held, c.media, c.owner = nil, nil, nil
+	return 0
+}
+
+// forgetFrom drops the checkpoints taken past a position about to be written
+// again.
+func (c *Context) forgetFrom(from int) {
+	kept := c.checkpoints[:0]
+	for _, ck := range c.checkpoints {
+		if len(ck.tokens) <= from {
+			kept = append(kept, ck)
+		}
+	}
+	c.checkpoints = kept
+}
+
+// savesFor is where this prompt leaves checkpoints, rising: where it parted
+// from what the slot held, which is where the next prompt like it will part
+// too, and every checkpointEvery positions of a long one.
+func (c *Context) savesFor(ids []int32, embeds [][]float32, from, parted int) []int {
+	if !c.recurrent || embeds != nil || c.runner.Checkpoints() == 0 {
+		return nil
+	}
+	var out []int
+	for at := (from/checkpointEvery + 1) * checkpointEvery; at < len(ids); at += checkpointEvery {
+		out = append(out, at)
+	}
+	if parted > from && parted >= checkpointFloor && parted < len(ids) {
+		out = append(out, parted)
+	}
+	sort.Ints(out)
+	return slices.Compact(out)
+}
+
+// save takes a checkpoint of the slot after tokens, in a copy nobody holds or
+// the one used longest ago.
+func (c *Context) save(tokens []int32) {
+	if len(tokens) < checkpointFloor {
+		return
+	}
+	c.uses++
+	for i := range c.checkpoints {
+		if len(c.checkpoints[i].tokens) == len(tokens) {
+			// Taken again at the same place: forgetFrom has already dropped
+			// any whose tokens could differ.
+			c.checkpoints[i].used = c.uses
+			return
+		}
+	}
+	k := c.freeCopy()
+	if k < 0 {
+		oldest := 0
+		for i := range c.checkpoints {
+			if c.checkpoints[i].used < c.checkpoints[oldest].used {
+				oldest = i
+			}
+		}
+		k = c.checkpoints[oldest].k
+		c.checkpoints = slices.Delete(c.checkpoints, oldest, oldest+1)
+	}
+	if err := c.runner.SaveCheckpoint(c.slot, k); err != nil {
+		return
+	}
+	c.checkpoints = append(c.checkpoints, checkpoint{k: k, tokens: slices.Clone(tokens), used: c.uses})
+}
+
+// freeCopy is a copy of the engine's no checkpoint holds, or -1.
+func (c *Context) freeCopy() int {
+	for k := 0; k < c.runner.Checkpoints(); k++ {
+		if !slices.ContainsFunc(c.checkpoints, func(ck checkpoint) bool { return ck.k == k }) {
+			return k
+		}
+	}
+	return -1
 }
 
 // Advance feeds one drawn token and scores what it produced.

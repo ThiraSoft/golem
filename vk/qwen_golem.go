@@ -202,7 +202,8 @@ func (p *QwenPipeline) newGolemAttn(d QwenAttnData) (*qwenGolemAttn, error) {
 	return b, nil
 }
 
-func (p *QwenPipeline) recordGolemAttn(r *Recorder, b *qwenGolemAttn, a *qwenAttnBlock, columns int) {
+func (p *QwenPipeline) recordGolemAttn(r *Recorder, b *qwenGolemAttn, a *qwenAttnBlock, runs []span) {
+	columns := widthOf(runs)
 	p.prepare(r, b.preIn, columns)
 	r.Barrier()
 
@@ -212,7 +213,7 @@ func (p *QwenPipeline) recordGolemAttn(r *Recorder, b *qwenGolemAttn, a *qwenAtt
 	r.Barrier()
 	p.tl.Stamp(r, "attn qkv")
 
-	p.recordAttnMix(r, a, columns)
+	p.recordAttnMix(r, a, runs)
 
 	p.prepare(r, b.preMix, columns)
 	r.Barrier()
@@ -273,7 +274,8 @@ func (p *QwenPipeline) newGolemSSM(b *qwenSSMBlock, d QwenSSMData) (*qwenGolemSS
 	return g, nil
 }
 
-func (p *QwenPipeline) recordGolemSSM(r *Recorder, g *qwenGolemSSM, b *qwenSSMBlock, columns, snapAt int) {
+func (p *QwenPipeline) recordGolemSSM(r *Recorder, g *qwenGolemSSM, b *qwenSSMBlock, runs []span, snapAt int) {
+	columns := widthOf(runs)
 	p.prepare(r, g.preIn, columns)
 	r.Barrier()
 
@@ -284,7 +286,7 @@ func (p *QwenPipeline) recordGolemSSM(r *Recorder, g *qwenGolemSSM, b *qwenSSMBl
 	r.Barrier()
 	p.tl.Stamp(r, "ssm in")
 
-	p.recordSSMState(r, b, columns, snapAt)
+	p.recordSSMState(r, b, runs, snapAt)
 
 	p.prepare(r, g.preOut, columns)
 	r.Barrier()

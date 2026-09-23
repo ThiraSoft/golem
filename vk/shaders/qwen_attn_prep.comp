@@ -42,6 +42,9 @@ layout(std430, binding = 8) readonly buffer Pos { uint posv[]; };
 // because Pos is the cache index and the two are not the same number — an
 // image gives several columns one t while Pos goes on rising.
 layout(std430, binding = 9) readonly buffer MPos { uvec4 mposv[]; };
+// The conversation each column belongs to. Every conversation's cache is laid
+// end to end in the one buffer, maxContext positions each, as gemma's are.
+layout(std430, binding = 10) readonly buffer Slots { uint slotv[]; };
 
 layout(push_constant) uniform Push {
     uint maxContext;
@@ -147,7 +150,7 @@ void main() {
         // rmsOf has folded across the whole workgroup, so every thread has the
         // scale; from here the even ones do the writing, a pair each.
         if ((j & 1u) == 0u) {
-            uint at = ((kv * p.maxContext + pos) * 256u + j) >> 1;
+            uint at = (((slotv[COL] * p.kvHeads + kv) * p.maxContext + pos) * 256u + j) >> 1;
             kCache[at] = packHalf2x16(vec2(rotatedK(j, kBase, inv, pos, half_),
                                            rotatedK(j + 1u, kBase, inv, pos, half_)));
             vCache[at] = packHalf2x16(vec2(vIn[kBase + j], vIn[kBase + j + 1u]));

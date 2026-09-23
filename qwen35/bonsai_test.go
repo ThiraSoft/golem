@@ -180,3 +180,173 @@ func TestVulkanSlotsAreIndependent(t *testing.T) {
 		}
 	}
 }
+
+// TestVulkanSlotsShareAPass holds a pass that carries several conversations to
+// the same conversations run one at a time. Each brings what golem-server
+// gathers: a token drawn, or the next stretch of a prompt beside the others'
+// tokens. What the pass shares is the reading of the weights; the recurrences
+// and the caches are each conversation's own, and a column read against the
+// wrong one answers fluently and wrongly, so the states are compared and not
+// a sample.
+func TestVulkanSlotsShareAPass(t *testing.T) {
+	path := bonsaiDir + "Ternary-Bonsai-2-27B-PQ2_0.gguf"
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("no checkpoint: %v", err)
+	}
+	tokens := bonsaiTokens(t)
+	prompts := [][]int32{tokens[:9], tokens[9:21], tokens[21:26]}
+	// What each conversation is given next, all in one pass: a token, a
+	// stretch of five, a token.
+	next := [][]int32{tokens[26:27], tokens[3:8], tokens[1:2]}
+
+	m, err := Open(path, 3*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.SetSlots(3); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UseVulkan(); err != nil {
+		t.Fatalf("vulkan: %v", err)
+	}
+	prefill := func() {
+		for s, p := range prompts {
+			m.UseSlot(s)
+			m.Reset()
+			m.ForwardBatch(p, 0)
+		}
+	}
+
+	// Each conversation on its own, a pass each.
+	prefill()
+	var alone [][]float32
+	for s, n := range next {
+		m.UseSlot(s)
+		alone = append(alone, m.ForwardBatch(n, len(prompts[s]))...)
+	}
+
+	// The same, in one pass.
+	prefill()
+	var ids []int32
+	var slots, positions []int
+	for s, n := range next {
+		for i, id := range n {
+			ids = append(ids, id)
+			slots = append(slots, s)
+			positions = append(positions, len(prompts[s])+i)
+		}
+	}
+	shared := m.ForwardSlots(ids, slots, positions)
+
+	for c := range alone {
+		worst := 0.0
+		for i := range alone[c] {
+			worst = math.Max(worst, math.Abs(float64(alone[c][i]-shared[c][i])))
+		}
+		if worst > 1e-3 {
+			t.Errorf("column %d (slot %d, position %d) is %g away from the same token run alone", c, slots[c], positions[c], worst)
+		}
+	}
+
+	logits := func(h []float32) []float32 {
+		out := make([]float32, m.Cfg.Vocab)
+		m.Logits(h, out)
+		return out
+	}
+
+	// The head scores every column in one reading, and each answer is the
+	// one it gives alone.
+	batch := make([][]float32, len(shared))
+	for c := range batch {
+		batch[c] = make([]float32, m.Cfg.Vocab)
+	}
+	m.LogitsBatch(shared, batch)
+	for c := range shared {
+		one := logits(shared[c])
+		for i := range one {
+			if one[i] != batch[c][i] {
+				t.Fatalf("column %d, logit %d: %g scored with the others and %g alone", c, i, batch[c][i], one[i])
+			}
+		}
+	}
+
+	// And the pass after it reads the states the shared one left, which is
+	// where a state written to the wrong slot would show.
+	after := make([][]float32, len(next))
+	for s := range next {
+		m.UseSlot(s)
+		after[s] = logits(m.ForwardBatch(tokens[30:31], len(prompts[s])+len(next[s]))[0])
+	}
+	prefill()
+	for s, n := range next {
+		m.UseSlot(s)
+		m.ForwardBatch(n, len(prompts[s]))
+	}
+	for s := range next {
+		m.UseSlot(s)
+		want := logits(m.ForwardBatch(tokens[30:31], len(prompts[s])+len(next[s]))[0])
+		if a, b := argmax(after[s]), argmax(want); a != b {
+			t.Errorf("slot %d draws %d after a shared pass and %d after its own", s, a, b)
+		}
+	}
+}
+
+// TestVulkanCheckpointResumes holds a prompt resumed from a checkpoint to the
+// same prompt read from nothing. The copy is the delta nets' state alone, and
+// the attention's cache below it is trusted to be the conversation's own, so
+// a slot that went elsewhere after the copy — another prompt read past it —
+// is what the test resumes, and another slot runs in between.
+func TestVulkanCheckpointResumes(t *testing.T) {
+	path := bonsaiDir + "Ternary-Bonsai-2-27B-PQ2_0.gguf"
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("no checkpoint: %v", err)
+	}
+	tokens := bonsaiTokens(t)
+	shared, first, second := tokens[:14], tokens[14:22], tokens[22:30]
+
+	m, err := Open(path, 2*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.SetSlots(2); err != nil {
+		t.Fatal(err)
+	}
+	m.SetCheckpoints(2)
+	if err := m.UseVulkan(); err != nil {
+		t.Fatalf("vulkan: %v", err)
+	}
+	if m.Checkpoints() != 2 {
+		t.Fatalf("%d checkpoints granted, want 2", m.Checkpoints())
+	}
+	last := func(hs [][]float32) []float32 {
+		out := make([]float32, m.Cfg.Vocab)
+		m.Logits(hs[len(hs)-1], out)
+		return out
+	}
+
+	m.UseSlot(1)
+	m.Reset()
+	want := last(m.ForwardBatch(append(append([]int32(nil), shared...), second...), 0))
+
+	m.Reset()
+	m.ForwardBatch(shared, 0)
+	if err := m.SaveCheckpoint(1); err != nil {
+		t.Fatal(err)
+	}
+	m.ForwardBatch(first, len(shared))
+	m.UseSlot(0)
+	m.Reset()
+	m.ForwardBatch(tokens[3:20], 0)
+	m.UseSlot(1)
+	if err := m.RestoreCheckpoint(1); err != nil {
+		t.Fatal(err)
+	}
+	got := last(m.ForwardBatch(second, len(shared)))
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("logit %d is %g resumed from the copy and %g read from nothing", i, got[i], want[i])
+		}
+	}
+}

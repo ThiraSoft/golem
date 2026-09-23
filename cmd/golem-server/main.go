@@ -44,6 +44,7 @@ func main() {
 	context := flag.Int("context", 4096, "positions to keep; the files declare far more than any machine here would survive")
 	maxTokens := flag.Int("n", 1024, "most tokens to draw for one answer, when the request names no limit")
 	parallel := flag.Int("parallel", 1, "conversations to keep at once; the context is cut into that many slots, each holding its own")
+	checkpoints := flag.Int("checkpoints", 3, "copies of a recurrent model's state each conversation keeps, so that a prompt parting from what is held starts from the last one it shares rather than from nothing; the card may grant fewer")
 	ttl := flag.Duration("cache-ttl", 0, "forget a conversation's tokens after this long idle; 0 never forgets. The memory is allocated at startup and is released by neither")
 	vulkan := flag.Bool("vulkan", false, "put the logit head and the expert stacks on a Vulkan device")
 	sttStreams := flag.Int("stt-parallel", 1, "transcriptions to carry at once; they are stepped together, so the trunk's weights are read once for all of them")
@@ -88,6 +89,7 @@ func main() {
 		}
 	}
 	m.SetDraftDepth(*draftN)
+	m.SetCheckpoints(*checkpoints)
 	if *vulkan {
 		if err := m.UseVulkan(); err != nil {
 			fail(err)

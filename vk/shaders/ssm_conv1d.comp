@@ -14,12 +14,17 @@ layout(std430, binding = 3) writeonly buffer Out    { float out_[];   }; // [102
 // See ssm_scan.comp: the window is copied aside between the committed columns
 // and the drafted one.
 layout(std430, binding = 4) writeonly buffer Shadow { float shadow[]; }; // [3, 10240]
+// Every conversation's window, laid end to end, and which of them each column
+// of the pass belongs to. A dispatch answers one run of one conversation, so
+// the slot of its first column is the slot of all of them.
+layout(std430, binding = 5) readonly buffer Slots { uint slotv[]; };
 
 layout(push_constant) uniform Push {
     uint channels; // 10240
     uint kernel;   // 4
     uint columns;  // tokens carried by this pass
     uint snapAt;   // the column at whose start to copy the window aside; ~0 for none
+    uint first;    // the run's first column in the pass
 } p;
 
 // The window slides, so the columns of a pass are done in order inside one
@@ -37,15 +42,16 @@ void main() {
     float w2 = weight[wb + 2u];
     float w3 = weight[wb + 3u];
 
-    float s0 = state[0 * p.channels + c];
-    float s1 = state[1 * p.channels + c];
-    float s2 = state[2 * p.channels + c];
+    uint sb = slotv[p.first] * 3u * p.channels + c;
+    float s0 = state[sb + 0 * p.channels];
+    float s1 = state[sb + 1 * p.channels];
+    float s2 = state[sb + 2 * p.channels];
 
-    for (uint col = 0u; col < p.columns; col++) {
+    for (uint col = p.first; col < p.first + p.columns; col++) {
         if (col == p.snapAt) {
-            shadow[0 * p.channels + c] = s0;
-            shadow[1 * p.channels + c] = s1;
-            shadow[2 * p.channels + c] = s2;
+            shadow[sb + 0 * p.channels] = s0;
+            shadow[sb + 1 * p.channels] = s1;
+            shadow[sb + 2 * p.channels] = s2;
         }
         float s3 = qkv[col * p.channels + c];
         float sum = w0*s0 + w1*s1 + w2*s2 + w3*s3;
@@ -56,7 +62,7 @@ void main() {
         s2 = s3;
     }
 
-    state[0 * p.channels + c] = s0;
-    state[1 * p.channels + c] = s1;
-    state[2 * p.channels + c] = s2;
+    state[sb + 0 * p.channels] = s0;
+    state[sb + 1 * p.channels] = s1;
+    state[sb + 2 * p.channels] = s2;
 }

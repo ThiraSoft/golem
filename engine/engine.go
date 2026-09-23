@@ -143,6 +143,20 @@ func (m *Model) SkipDraftBlock() {
 	}
 }
 
+// checkpointer is an engine whose recurrent state can be copied aside and put
+// back. Only Qwen3.8 on a card has one.
+type checkpointer interface{ SetCheckpoints(n int) }
+
+// SetCheckpoints asks a recurrent engine to keep n copies of each
+// conversation's state, so that a prompt parting from what a slot holds is not
+// read again from nothing. Like SkipDraftBlock it has to come before UseVulkan,
+// and it is a no-op for an engine that has no such state.
+func (m *Model) SetCheckpoints(n int) {
+	if c, ok := m.Forward.(checkpointer); ok {
+		c.SetCheckpoints(n)
+	}
+}
+
 func (m *Model) UseVulkan() error {
 	h, ok := m.Forward.(vulkanHead)
 	if !ok {

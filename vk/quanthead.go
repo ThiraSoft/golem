@@ -61,6 +61,8 @@ type QuantHead struct {
 	pipe   *Pipeline
 	set    *Set
 	groups uint32
+	// width is how many columns aq, as and out hold; see widen.
+	width int
 }
 
 // NewQuantHead uploads a head matrix. data is the tensor exactly as the file
@@ -75,7 +77,7 @@ func NewQuantHead(d *Device, q nn.Quant, data []byte, rows, cols int) (*QuantHea
 	if err != nil {
 		return nil, err
 	}
-	h := &QuantHead{d: d, q: q, rows: rows, cols: cols}
+	h := &QuantHead{d: d, q: q, rows: rows, cols: cols, width: 1}
 	fail := func(err error) (*QuantHead, error) {
 		h.Close()
 		return nil, err
@@ -170,6 +172,108 @@ func (h *QuantHead) MatVec(b *nn.Batch, column int, out []float32) error {
 		return err
 	}
 	copy(out, h.out.Floats())
+	return nil
+}
+
+// MatVecs is MatVec for several activations at once, each a batch of one that
+// already carries its Q8_0 form, into outs in the same order.
+//
+// The head is the largest matrix a token reads, and a quarter of a million
+// rows read once for four conversations rather than four times is what
+// scoring them together is worth: the columns go up side by side and the
+// door's wide binaries answer them in one reading of the weights, sixteen at
+// most a dispatch.
+func (h *QuantHead) MatVecs(bs []*nn.Batch, outs [][]float32) error {
+	n := len(bs)
+	if n != len(outs) {
+		return fmt.Errorf("vk: %d activations and %d answers", n, len(outs))
+	}
+	if n == 1 {
+		return h.MatVec(bs[0], 0, outs[0])
+	}
+	// The narrowest binary that covers every column, so that the head is read
+	// once: the columns past n are answered and thrown away.
+	wide := n
+	if c := h.set.cover(n, n+narrowChunk); c > 0 && h.set.widest(n) < n {
+		wide = c
+	}
+	if err := h.widen(wide); err != nil {
+		return err
+	}
+	nb := h.cols / nn.QuantBlock
+	dst := h.aq.Bytes()
+	scales := h.as.Floats()
+	for c, b := range bs {
+		if b.Q == nil || b.Size != 1 || b.Width != h.cols {
+			return fmt.Errorf("vk: the head reads batches of one of %d inputs in their Q8_0 form", h.cols)
+		}
+		if len(outs[c]) != h.rows {
+			return fmt.Errorf("vk: the head writes %d outputs, given %d", h.rows, len(outs[c]))
+		}
+		for i, v := range b.Q[:h.cols] {
+			dst[c*h.cols+i] = byte(v)
+		}
+		copy(scales[c*2*nb:c*2*nb+nb], b.Scales[:nb])
+		copy(scales[c*2*nb+nb:(c+1)*2*nb], b.Corr[:nb])
+	}
+	err := h.d.Submit(func(r *Recorder) {
+		for at := 0; at < n; {
+			w := h.set.widest(wide - at)
+			push := moePush{dim: uint32(h.rows), ffn: uint32(h.cols), used: 1, col: uint32(at)}
+			if w <= 1 {
+				w = 1
+				r.Dispatch(h.set, h.groups, unsafe.Pointer(&push))
+			} else {
+				r.DispatchWide(h.set, w, h.groups, unsafe.Pointer(&push))
+			}
+			at += w
+		}
+	})
+	if err != nil {
+		return err
+	}
+	got := h.out.Floats()
+	for c := range outs {
+		copy(outs[c], got[c*h.rows:(c+1)*h.rows])
+	}
+	return nil
+}
+
+// widen makes the activation and answer buffers hold n columns. They are one
+// column wide until a caller scores several at once, and a quarter of a
+// million floats a column is not worth holding for a model that never does.
+func (h *QuantHead) widen(n int) error {
+	if h.width >= n {
+		return nil
+	}
+	nb := h.cols / nn.QuantBlock
+	aq, err := h.d.Host(n*h.cols, bufferUsageStorage)
+	if err != nil {
+		return err
+	}
+	as, err := h.d.Host(n*2*nb*4, bufferUsageStorage)
+	if err != nil {
+		aq.Close()
+		return err
+	}
+	out, err := h.d.Readback(n*h.rows*4, bufferUsageStorage)
+	if err != nil {
+		aq.Close()
+		as.Close()
+		return err
+	}
+	set, err := h.pipe.NewSet([]*Buffer{h.weights, aq, as, out})
+	if err != nil {
+		aq.Close()
+		as.Close()
+		out.Close()
+		return err
+	}
+	h.set.Close()
+	h.aq.Close()
+	h.as.Close()
+	h.out.Close()
+	h.aq, h.as, h.out, h.set, h.width = aq, as, out, set, n
 	return nil
 }
 

@@ -39,13 +39,18 @@ layout(std430, binding = 3) readonly  buffer QIn    { float qIn[];    }; // [col
 layout(std430, binding = 4) writeonly buffer Out    { float out_[];   }; // [cols*heads*256]
 // See qwen_attn_prep.comp: the position is a buffer so the pass compiles once.
 layout(std430, binding = 5) readonly  buffer Pos    { uint  posv[];   };
+// The conversation each column belongs to; see qwen_attn_prep.comp. A tile
+// never straddles two, because a position is a different key in each: a
+// dispatch answers one run, and its slot is its first column's.
+layout(std430, binding = 6) readonly  buffer Slots  { uint  slotv[];  };
 
 layout(push_constant) uniform Push {
     uint maxContext;
     uint headsPerKV; // 6
     uint heads;      // 24
     float scale;     // 1/sqrt(headDim)
-    uint columns;    // how many columns the pass carries, for the tail tile
+    uint columns;    // how many columns the run carries, for the tail tile
+    uint first;      // the run's first column in the pass
 } p;
 
 // QTILE columns of the pass to a workgroup. Eight holds ninety-odd registers a
@@ -79,15 +84,16 @@ void main() {
     uint lane = t % LANES;
     uint slot = t / LANES;
 
-    uint col0 = gl_WorkGroupID.y * QTILE;
-    uint cacheBase = kv * p.maxContext * DIM;
+    uint col0 = p.first + gl_WorkGroupID.y * QTILE;
+    uint end  = p.first + p.columns;
+    uint cacheBase = (slotv[p.first] * (p.heads / p.headsPerKV) + kv) * p.maxContext * DIM;
 
     // How far each of this workgroup's queries may look. A column past the end
     // of the pass looks nowhere and is never written.
     uint n[QTILE];
     uint nMax = 0u;
     [[unroll]] for (uint q = 0u; q < QTILE; q++) {
-        n[q] = (col0 + q < p.columns) ? posv[col0 + q] + 1u : 0u;
+        n[q] = (col0 + q < end) ? posv[col0 + q] + 1u : 0u;
         nMax = max(nMax, n[q]);
     }
 
@@ -120,7 +126,7 @@ void main() {
 
         [[unroll]] for (uint q = 0u; q < QTILE; q++) {
             float part = 0.0;
-            if (col0 + q < p.columns && have) {
+            if (col0 + q < end && have) {
                 uint qb = (col0 + q) * p.heads * DIM + h * DIM;
                 [[unroll]] for (uint j = 0u; j < PERL; j++) {
                     part += qOut[qb + lane + j * LANES] * kreg[j];
@@ -185,7 +191,7 @@ void main() {
     // 5. the output gate, which sits after this head's queries
     [[unroll]] for (uint q = 0u; q < QTILE; q++) {
         uint c = col0 + q;
-        if (c >= p.columns) continue;
+        if (c >= end) continue;
         float g = qIn[c * p.heads * 512u + h * 512u + DIM + t];
         out_[c * p.heads * DIM + h * DIM + t] = (acc[q] / runSum[q]) / (1.0 + exp(-g));
     }

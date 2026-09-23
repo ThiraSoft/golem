@@ -351,6 +351,21 @@ func (p *Pipeline) widestUpTo(n int) int {
 // widest is widestUpTo for the pipeline behind a set.
 func (s *Set) widest(n int) int { return s.p.widestUpTo(n) }
 
+// cover is the narrowest binary of the set's pipeline that answers at least n
+// columns and at most room, or zero if there is none. A dispatch is one reading
+// of the weights whatever its width, so three columns are cheaper answered by
+// the four-wide binary, one of them thrown away, than by the two and the one
+// in turn: that reads the matrix twice.
+func (s *Set) cover(n, room int) int {
+	best := 0
+	for w := range s.p.wide {
+		if w >= n && w <= room && (best == 0 || w < best) {
+			best = w
+		}
+	}
+	return best
+}
+
 // sortedWidths is what a pipeline was built for, for that message.
 // HasWidth says whether this pipeline carries a binary that answers exactly
 // that many columns in one pass. A caller that must not fall back — one sizing
@@ -408,6 +423,13 @@ func (r *Recorder) Copy(dst *Buffer, offset int, src *Buffer, size int) {
 // and re-uploading it would be the same bytes across the bus.
 func (r *Recorder) Fill(b *Buffer, word uint32) {
 	vkCmdFillBuffer(r.cb, b.handle, 0, ^uint64(0), word)
+}
+
+// FillRange is Fill over size bytes from offset, which is how one
+// conversation's share of a buffer every conversation's state lies in is
+// cleared without touching the others'.
+func (r *Recorder) FillRange(b *Buffer, offset, size int, word uint32) {
+	vkCmdFillBuffer(r.cb, b.handle, uint64(offset), uint64(size), word)
 }
 
 // CopyFrom is Copy from somewhere other than the start of the source, which is

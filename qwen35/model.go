@@ -31,6 +31,9 @@ type Model struct {
 	// argument: what a caller wants is known when the model is opened, and the
 	// upload happens later and elsewhere.
 	noDraft bool
+	// checkpoints is how many state copies a slot was asked to keep; see
+	// SetCheckpoints.
+	checkpoints int
 
 	// Vulkan GPU acceleration
 	dev     *vk.Device
@@ -231,20 +234,20 @@ func (m *Model) ForwardSlots(tokens []int32, slots, positions []int) [][]float32
 func (m *Model) ForwardPlaces(tokens []int32, at []Place) [][]float32 {
 	out := make([][]float32, len(tokens))
 	if m.gpuPipe != nil {
-		// A pass on the card runs in one slot, so the tokens go up a run at a
-		// time: consecutive tokens of one conversation, which is what a
-		// prompt is, in passes as wide as the pipeline takes. Token by token
-		// a prompt read at fifteen positions a second through the server
-		// where golem-cli read it at a hundred and twenty.
-		for t := 0; t < len(tokens); {
-			end := t + 1
-			for end < len(tokens) && at[end].Slot == at[t].Slot {
-				end++
-			}
-			m.UseSlot(at[t].Slot)
-			m.forwardCard(tokens[t:end], at[t:end], out[t:end])
-			t = end
+		// One conversation is a run, and goes up in passes as wide as the
+		// pipeline takes. Token by token a prompt read at fifteen positions a
+		// second through the server where golem-cli read it at a hundred and
+		// twenty.
+		if sameSlot(at) {
+			m.UseSlot(at[0].Slot)
+			m.forwardCard(tokens, at, out)
+			return out
 		}
+		// Several conversations share a pass: the weights are read once for
+		// all of them, and only the recurrences and the caches are read per
+		// conversation. golem-server gathers one token from each conversation
+		// drawing, and that used to be one pass each.
+		m.forwardMixed(tokens, at, out)
 		return out
 	}
 	for t, tok := range tokens {
@@ -342,6 +345,18 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 
 // LogitsBatch calculates logits for multiple hidden states in parallel.
 func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
+	// A head on the card scores every column in one reading of it, which is
+	// most of what scoring several conversations together is worth: the head
+	// is the largest matrix a token reads.
+	if m.quantHead != nil && len(hidden) > 1 {
+		bs := make([]*nn.Batch, len(hidden))
+		for i, h := range hidden {
+			bs[i] = m.headBatch(h)
+		}
+		if m.quantHead.MatVecs(bs, out) == nil {
+			return
+		}
+	}
 	batch := len(hidden)
 	batchH := nn.NewBatch(m.Cfg.Dim, batch)
 	for i := 0; i < batch; i++ {
@@ -379,13 +394,19 @@ func (m *Model) quantHeadLogits(hidden, out []float32) bool {
 	if m.quantHead == nil {
 		return false
 	}
+	return m.quantHead.MatVec(m.headBatch(hidden), 0, out) == nil
+}
+
+// headBatch is a hidden state in the form the card's head reads: rotated when
+// the head is Prism's, and quantized.
+func (m *Model) headBatch(hidden []float32) *nn.Batch {
 	b := nn.NewBatch(m.Cfg.Dim, 1)
 	copy(b.F[0], hidden)
 	if head := m.W.OutputHead; head.Pre != nil {
 		nn.PrepareGolem(b.F[0], head.Pre, head.HadGroup)
 	}
 	m.quantHead.Prepare(b)
-	return m.quantHead.MatVec(b, 0, out) == nil
+	return b
 }
 
 // forwardCard is a run of one conversation's tokens through the card, in
@@ -394,6 +415,59 @@ func (m *Model) quantHeadLogits(hidden, out []float32) bool {
 // the next position continue from.
 func (m *Model) forwardCard(tokens []int32, at []Place, out [][]float32) {
 	m.forwardCardRows(tokens, nil, at, out)
+}
+
+// sameSlot reports whether every place is in one conversation.
+func sameSlot(at []Place) bool {
+	for _, a := range at[1:] {
+		if a.Slot != at[0].Slot {
+			return false
+		}
+	}
+	return true
+}
+
+// forwardMixed carries tokens of several conversations through the card, as
+// many columns to a pass as the pipeline takes. Each conversation's tokens are
+// contiguous and its positions consecutive, which is how golem-server builds a
+// batch; a pass cut through one of them leaves the rest for the next.
+func (m *Model) forwardMixed(tokens []int32, at []Place, out [][]float32) {
+	widest := m.gpuPipe.Columns()
+	n := min(len(tokens), widest)
+	embeds := make([][]float32, n)
+	for i := range embeds {
+		embeds[i] = make([]float32, m.Cfg.Dim)
+	}
+	for t := 0; t < len(tokens); {
+		n := min(len(tokens)-t, widest)
+		places := make([]vk.QwenPlace, n)
+		slots := make([]int, n)
+		for c := 0; c < n; c++ {
+			m.W.TokenEmbd.Row(int(tokens[t+c]), embeds[c])
+			places[c] = at[t+c].gpu()
+			slots[c] = at[t+c].Slot
+		}
+		hs, err := m.gpuPipe.ForwardSlots(embeds[:n], places, slots)
+		if err != nil {
+			panic(fmt.Sprintf("qwen35: the GPU pipeline failed on a pass of %d conversations: %v", len(distinctSlots(slots)), err))
+		}
+		for c := 0; c < n; c++ {
+			out[t+c] = append([]float32(nil), hs[c]...)
+		}
+		copy(m.x, m.gpuPipe.HiddenColumn(n-1))
+		t += n
+	}
+	// The pipeline's own slot is left where the last column was, which is
+	// where UseSlot would have left it had the runs gone up one by one.
+	m.UseSlot(at[len(at)-1].Slot)
+}
+
+func distinctSlots(slots []int) map[int]bool {
+	seen := map[int]bool{}
+	for _, s := range slots {
+		seen[s] = true
+	}
+	return seen
 }
 
 // forwardCardRows is forwardCard for a run some of whose positions are given a

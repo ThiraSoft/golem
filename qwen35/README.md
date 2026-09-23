@@ -125,15 +125,23 @@ ways. It is not done the way gemma and qwen do it, by cutting the attention's
 ring into slots: forty-eight of the sixty-four blocks are delta nets, whose
 state is a matrix a head that every token rewrites, and there is nothing to cut.
 So each slot owns a copy of every recurrence, its convolution window, its
-shadows and its attention caches, and a pass runs in one slot. On the 27B that
-is 151 MB of state a slot, twice that where drafting keeps shadows.
+shadows and its attention caches. On the 27B that is 151 MB of state a slot,
+twice that where drafting keeps shadows.
 
-Two consequences a caller sees. Several conversations in one batch go up one
-run of a conversation's tokens at a time rather than in one shared pass. And a
-state cannot be rewound, so golem-server continues a slot only when the prompt
-is what the slot holds and more, and starts it again otherwise.
-`TestVulkanSlotsAreIndependent` checks that one conversation run between two
-steps of another changes nothing, to the bit.
+The copies are laid end to end, one buffer a block, and the slot travels beside
+the position in a buffer the pass writes, as gemma's does. A recording names no
+slot, so a pass carries several conversations: the projections read the weights
+once for all of them, and the convolution, the recurrence and the scores are
+dispatched once a conversation, side by side. `TestVulkanSlotsShareAPass` holds
+such a pass to the same conversations run one at a time, to the bit.
+
+A state cannot be rewound, so golem-server continues a slot when the prompt is
+what the slot holds and more. Otherwise it goes back to a checkpoint, a copy of
+the slot's state taken where an earlier prompt parted or every thousand and
+twenty-four positions (`SetCheckpoints`, `SaveCheckpoint`), or starts the slot
+again. `TestVulkanCheckpointResumes` holds a resumed prompt to the same prompt
+read from nothing, and `TestVulkanSlotsAreIndependent` checks that one
+conversation run between two steps of another changes nothing, to the bit.
 
 On the processor it holds slots like every other engine here.
 

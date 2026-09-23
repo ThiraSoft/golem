@@ -146,12 +146,13 @@ func (m *Model) UseVulkanStack() error {
 	// delta net's recurrence, which together are most of a gigabyte.
 	drafts := m.HasMTP() && !m.noDraft
 	shape := vk.QwenShape{
-		Snapshots:  drafts,
-		Dim:        cfg.Dim,
-		FFN:        cfg.Blocks[0].FFN,
-		MaxContext: m.SlotContext(),
-		Slots:      m.Slots(),
-		Eps:        cfg.Eps,
+		Snapshots:   drafts,
+		Dim:         cfg.Dim,
+		FFN:         cfg.Blocks[0].FFN,
+		MaxContext:  m.SlotContext(),
+		Slots:       m.Slots(),
+		Checkpoints: m.checkpoints,
+		Eps:         cfg.Eps,
 		// vk takes the widths as a plain array: it has no reason to import nn
 		// for a type, and this is the one place the two spellings meet.
 		RoPESections: [4]int(cfg.RoPESections),
@@ -180,8 +181,8 @@ func (m *Model) UseVulkanStack() error {
 
 	// What this card can afford: whether the prediction block goes over, and
 	// how wide a prompt pass the scratch may be. Both asked of the device.
-	drafts, width := m.deviceBudget(d, shape, numBlocks, drafts)
-	shape.Snapshots, shape.PassWidth = drafts, width
+	drafts, width, checkpoints := m.deviceBudget(d, shape, numBlocks, drafts)
+	shape.Snapshots, shape.PassWidth, shape.Checkpoints = drafts, width, checkpoints
 
 	pipe, err := vk.NewQwenPipeline(d, shape)
 	if err != nil {
@@ -379,6 +380,34 @@ func (m *Model) closeVulkan() {
 // weights are already there.
 func (m *Model) SkipDraftBlock() { m.noDraft = true }
 
+// SetCheckpoints asks for n copies of the delta nets' state per conversation,
+// kept aside so that a prompt parting from what a slot holds starts from the
+// latest copy it shares rather than from nothing. It must be called before
+// UseVulkan; the card may grant fewer, and Checkpoints says how many.
+func (m *Model) SetCheckpoints(n int) { m.checkpoints = max(n, 0) }
+
+// Checkpoints is how many copies a slot may keep, which is none off the card.
+func (m *Model) Checkpoints() int {
+	if m.gpuPipe == nil {
+		return 0
+	}
+	return m.gpuPipe.Checkpoints()
+}
+
+// SaveCheckpoint keeps the state of the slot in use as its checkpoint k.
+func (m *Model) SaveCheckpoint(k int) error { return m.gpuPipe.SaveCheckpoint(k) }
+
+// RestoreCheckpoint puts the slot in use back to its checkpoint k. The
+// prediction block's cache is not the trunk's and is not in the copy, so it is
+// forgotten, as a new conversation forgets it.
+func (m *Model) RestoreCheckpoint(k int) error {
+	if err := m.gpuPipe.RestoreCheckpoint(k); err != nil {
+		return err
+	}
+	m.ResetMTP()
+	return nil
+}
+
 // deviceWeightBytes is what this model will put on the card, exactly: every
 // matrix the upload below walks, plus the logit head as the packing will hold
 // it. It is summed rather than taken from the file's size, because the token
@@ -446,7 +475,7 @@ func (m *Model) deviceWeightBytes(blocks int, drafts bool) uint64 {
 // browser on it measured five hundred mebibytes here and the driver keeps some
 // of the heap for itself, so this leaves three quarters of a gigabyte. A margin
 // too large costs prefill; one too small costs seven eighths of the generation.
-func (m *Model) deviceBudget(d *vk.Device, shape vk.QwenShape, blocks int, wantDraft bool) (bool, int) {
+func (m *Model) deviceBudget(d *vk.Device, shape vk.QwenShape, blocks int, wantDraft bool) (bool, int, int) {
 	const margin = 768 << 20
 	heap := d.DeviceLocalBytes()
 	attn, ssm := 0, 0
@@ -463,6 +492,7 @@ func (m *Model) deviceBudget(d *vk.Device, shape vk.QwenShape, blocks int, wantD
 	fits := func(drafts bool, floor int) bool {
 		s := shape
 		s.Snapshots = drafts
+		s.Checkpoints = 0
 		extra := 0
 		if drafts {
 			extra = 1 // the prediction block's own attention keeps a cache
@@ -488,19 +518,34 @@ func (m *Model) deviceBudget(d *vk.Device, shape vk.QwenShape, blocks int, wantD
 	if drafts {
 		extra = 1
 	}
+	// Then the checkpoints, as many of those asked for as leave the card room
+	// for a pass of sixty-four. They are prefill saved, like the width, and a
+	// narrower pass is prefill lost: a copy is worth a whole prompt read again
+	// and a halving of the width is worth a fraction of one, so the copies go
+	// first down to that floor.
+	for ; shape.Checkpoints > 0; shape.Checkpoints-- {
+		if m.deviceWeightBytes(blocks, drafts)+
+			vk.QwenBufferBytes(shape, max(floor, 64), attn+extra, ssm)+margin <= heap {
+			break
+		}
+	}
+	if shape.Checkpoints < m.checkpoints {
+		fmt.Fprintf(os.Stderr, "qwen35: %d of the %d checkpoints a conversation asked for fit on this card\n",
+			shape.Checkpoints, m.checkpoints)
+	}
 	for _, w := range []int{512, 256, 128, 64, 32, 16, 8, 4, 2, 1} {
 		if w < floor {
 			break
 		}
 		if m.deviceWeightBytes(blocks, drafts)+
 			vk.QwenBufferBytes(shape, w, attn+extra, ssm)+margin <= heap {
-			return drafts, w
+			return drafts, w, shape.Checkpoints
 		}
 	}
 	// Nothing fits with room to spare. Take the narrowest and let the driver
 	// place what it can: a model that answers slowly is better than one that
 	// refuses.
-	return drafts, floor
+	return drafts, floor, shape.Checkpoints
 }
 
 // prismRotation is what the card needs of a Prism checkpoint's rotation: one

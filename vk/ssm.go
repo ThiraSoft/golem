@@ -42,6 +42,9 @@ type ssmConvPush struct {
 	Kernel   uint32
 	Columns  uint32
 	SnapAt   uint32
+	// First is the run's first column: a dispatch walks one conversation's
+	// run of the pass, and the shader reads its slot out of that column.
+	First uint32
 }
 
 // ssmScanPush is shaders/ssm_scan.comp's block, and the order of these fields
@@ -58,6 +61,7 @@ type ssmScanPush struct {
 	ConvDim   uint32
 	Inner     uint32
 	Rank      uint32
+	First     uint32 // see ssmConvPush
 }
 
 type matvecKPush struct {

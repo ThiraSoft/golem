@@ -294,6 +294,7 @@ type attnGQAPush struct {
 	Heads      uint32
 	Scale      float32
 	Columns    uint32
+	First      uint32 // the run's first column; see recordAttnMix
 }
 
 // qAttnTile is shaders/qwen_attn_gqa.comp's QTILE: how many columns of the
@@ -389,14 +390,25 @@ type QwenShape struct {
 	// one means one. Each has its own delta net states, convolution windows,
 	// shadows and key-value caches, MaxContext positions of them: a caller
 	// cutting a context between conversations passes the cut here, not the
-	// whole. A pass runs in one slot, the one UseSlot last named.
+	// whole. A pass that names no slots runs in the one UseSlot last named.
 	//
 	// It is not the attention's ring cut into slots, which is how gemma and
 	// qwen hold several conversations: a delta net's state is a matrix a head
 	// that every token rewrites, so there is nothing to cut and it has to be
 	// copied. A hundred and fifty-one megabytes a slot on the 27B, more with
-	// the shadows a draft needs.
+	// the shadows a draft needs. A pass may carry several of them, a run of
+	// columns each; see ForwardSlots.
 	Slots int
+
+	// Checkpoints is how many copies of its delta nets' state each slot may
+	// keep aside, and zero keeps none. A state cannot be rewound: a prompt
+	// that parts from what a slot holds at position P used to be read again
+	// from nothing, because the state had read everything after P too. A copy
+	// taken at P is where such a prompt starts instead — every attention's
+	// cache below P is still the conversation's own, so the copy is all it
+	// takes. A slot's worth on the 27B, a hundred and fifty-one megabytes a
+	// copy; see SaveCheckpoint.
+	Checkpoints int
 
 	// Rotation describes the activation sign vectors and Hadamard transform
 	// used by Prism ML Bonsai models before ternary weight projections. Nil
@@ -543,6 +555,9 @@ type qwenSSMBlock struct {
 	shadowState, shadowConv *Buffer
 	dtBias, ssmA, ssmNorm   *Buffer
 	ssmState                *Buffer
+	// ckState and ckConv are the checkpoints, every slot's laid end to end
+	// and a slot's own Checkpoints of them in a row; see QwenShape.
+	ckState, ckConv *Buffer
 
 	setQKV, setGate, setAlpha, setBeta *Set
 	setConv, setScan, setOut           *Set
@@ -556,25 +571,19 @@ type qwenSSMBlock struct {
 	// projection — the convolution, the recurrence, the two norms — is the
 	// same either way and is used by both.
 	golem *qwenGolemSSM
-	// slots is every conversation's recurrence and the two sets that read
-	// it. The fields above of the same names are the active slot's, which
-	// is what every recording reads; useSlot moves them.
-	slots []qwenSSMSlot
 }
 
-// qwenSSMSlot is what one conversation owns of a delta net.
-type qwenSSMSlot struct {
-	convState, ssmState     *Buffer
-	shadowState, shadowConv *Buffer
-	setConv, setScan        *Set
-}
+// The four state buffers of a delta net hold every conversation's, laid end to
+// end, as gemma's caches do: a slot is an offset and not a buffer. That is what
+// lets one pass carry several conversations — a recording names buffers, and
+// with a buffer a slot it named the slots too, so a pass could only ever be
+// one conversation's and four conversations drawing a token each read the
+// weights four times. The kernels read which slot a column is out of a buffer
+// the pass writes, like its position.
 
-func (b *qwenSSMBlock) useSlot(i int) {
-	c := &b.slots[i]
-	b.convState, b.ssmState = c.convState, c.ssmState
-	b.shadowState, b.shadowConv = c.shadowState, c.shadowConv
-	b.setConv, b.setScan = c.setConv, c.setScan
-}
+// convStateBytes and ssmStateBytes are one slot's share of those buffers.
+func (s QwenShape) convStateBytes() int { return s.ConvDim * 4 * 3 }
+func (s QwenShape) ssmStateBytes() int  { return s.Rank * s.StateSize * s.StateSize * 4 }
 
 type qwenAttnBlock struct {
 	index int // see qwenSSMBlock
@@ -594,22 +603,12 @@ type qwenAttnBlock struct {
 	// block's and not the shape's because a prediction block grafted from the
 	// unrotated model sits in a Prism pipeline and must read plain Q8_0.
 	rotated bool
-	// slots is every conversation's cache and the two sets that read it; see
-	// qwenSSMBlock's.
-	slots []qwenAttnSlot
 }
 
-// qwenAttnSlot is what one conversation owns of a full attention.
-type qwenAttnSlot struct {
-	kCache, vCache  *Buffer
-	setPrep, setGQA *Set
-}
-
-func (b *qwenAttnBlock) useSlot(i int) {
-	c := &b.slots[i]
-	b.kCache, b.vCache = c.kCache, c.vCache
-	b.setPrep, b.setGQA = c.setPrep, c.setGQA
-}
+// cacheBytes is one slot's share of a full attention's key cache, or of its
+// value cache: every conversation's is laid end to end in one buffer, as the
+// delta nets' states are.
+func (s QwenShape) cacheBytes() int { return s.KVHeads * s.MaxContext * s.HeadDim * 2 }
 
 type qwenFFNBlock struct {
 	index int // see qwenSSMBlock
@@ -712,7 +711,13 @@ type QwenPipeline struct {
 	// into it. shaders/qwen_attn_prep.comp says why they cannot be one number.
 	mposIn  *Buffer
 	mposBuf *Buffer
-	pass    map[int]*Program
+	// The conversation each column belongs to, one uint a column, beside the
+	// position for the same reason: so that the recording names no slot.
+	slotIn  *Buffer
+	slotBuf *Buffer
+	// pass is the recordings, named by how a pass divides between
+	// conversations — vk/stack.go's shapeKey — and whether it drafts.
+	pass map[string]*Program
 
 	// The scratch a block passes through, which is the pipeline's and not the
 	// block's: sixty-four blocks go through one command buffer with a barrier
@@ -826,12 +831,12 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		{&p.pipeMatF32, matvecF32SPIRV, 3, unsafe.Sizeof(matvecKPush{})},
 		{&p.pipeSwiglu, swigluActSPIRV, 5, unsafe.Sizeof(swigluPush{})},
 		{&p.pipeQuant, quantQ80SPIRV, 3, unsafe.Sizeof(swigluPush{})},
-		{&p.pipeConv, ssmConv1dSPIRV, 5, unsafe.Sizeof(ssmConvPush{})},
-		{&p.pipeScan, ssmScanSPIRV, 9, unsafe.Sizeof(ssmScanPush{})},
+		{&p.pipeConv, ssmConv1dSPIRV, 6, unsafe.Sizeof(ssmConvPush{})},
+		{&p.pipeScan, ssmScanSPIRV, 10, unsafe.Sizeof(ssmScanPush{})},
 		{&p.pipeQKNorm, ssmQKNormSPIRV, 2, unsafe.Sizeof(ssmQKNormPush{})},
 		{&p.pipeGate, ssmGateSPIRV, 3, unsafe.Sizeof(ssmGatePush{})},
-		{&p.pipeAttnPrep, qwenAttnPrepSPIRV, 10, unsafe.Sizeof(attnPrepPush{})},
-		{&p.pipeAttnGQA, qwenAttnGQASPIRV, 6, unsafe.Sizeof(attnGQAPush{})},
+		{&p.pipeAttnPrep, qwenAttnPrepSPIRV, 11, unsafe.Sizeof(attnPrepPush{})},
+		{&p.pipeAttnGQA, qwenAttnGQASPIRV, 7, unsafe.Sizeof(attnGQAPush{})},
 	} {
 		if *b.into, err = d.NewPipeline(b.spirv, b.binds, uint32(b.pushSz)); err != nil {
 			return nil, err
@@ -952,6 +957,12 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		return nil, err
 	}
 	if p.posBuf, err = d.Local(wide*4, bufferUsageStorage); err != nil {
+		return nil, err
+	}
+	if p.slotIn, err = d.Host(wide*4, bufferUsageStorage|bufferUsageTransferSrc); err != nil {
+		return nil, err
+	}
+	if p.slotBuf, err = d.Local(wide*4, bufferUsageStorage|bufferUsageTransferDst); err != nil {
 		return nil, err
 	}
 	for _, into := range []**Buffer{&p.xs, &p.resid, &p.normed, &p.normedQ, &p.normedS, &p.ffnNorm, &p.ffnNormQ, &p.ffnNormS, &p.ffnOut, &p.none} {
@@ -1138,35 +1149,33 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 			return err
 		}
 	}
-	b.slots = make([]qwenSSMSlot, s.slots())
-	for i := range b.slots {
-		c := &b.slots[i]
-		for _, u := range []struct {
-			into **Buffer
-			data []byte
-		}{
-			{&c.convState, make([]byte, (s.ConvDim*4)*3)},
-			{&c.ssmState, make([]byte, s.Rank*s.StateSize*s.StateSize*4)},
-			// The shadows, or four bytes standing in for them where nothing
-			// drafts. They stay bound either way — a descriptor set names
-			// every binding whether or not a pass writes it — and nothing
-			// writes them unless a pass says which column to snapshot at,
-			// which only a speculative one does.
-			{&c.shadowConv, make([]byte, shadowBytes(s.Snapshots, (s.ConvDim*4)*3))},
-			{&c.shadowState, make([]byte, shadowBytes(s.Snapshots, s.Rank*s.StateSize*s.StateSize*4))},
-		} {
-			if *u.into, err = p.upload(u.data); err != nil {
-				return err
-			}
-		}
-		if c.setConv, err = p.pipeConv.NewSet([]*Buffer{b.convWeight, p.qkvBuf, c.convState, p.convOut, c.shadowConv}); err != nil {
-			return err
-		}
-		if c.setScan, err = p.pipeScan.NewSet([]*Buffer{p.convOut, p.qkNorm, p.alphaBuf, b.dtBias, b.ssmA, p.betaBuf, c.ssmState, p.ySSM, c.shadowState}); err != nil {
+	slots := s.slots()
+	for _, u := range []struct {
+		into **Buffer
+		data []byte
+	}{
+		{&b.convState, make([]byte, slots*s.convStateBytes())},
+		{&b.ssmState, make([]byte, slots*s.ssmStateBytes())},
+		// The shadows, or four bytes standing in for them where nothing
+		// drafts. They stay bound either way — a descriptor set names
+		// every binding whether or not a pass writes it — and nothing
+		// writes them unless a pass says which column to snapshot at,
+		// which only a speculative one does.
+		{&b.shadowConv, make([]byte, shadowBytes(s.Snapshots, slots*s.convStateBytes()))},
+		{&b.shadowState, make([]byte, shadowBytes(s.Snapshots, slots*s.ssmStateBytes()))},
+		{&b.ckConv, make([]byte, max(4, slots*s.Checkpoints*s.convStateBytes()))},
+		{&b.ckState, make([]byte, max(4, slots*s.Checkpoints*s.ssmStateBytes()))},
+	} {
+		if *u.into, err = p.upload(u.data); err != nil {
 			return err
 		}
 	}
-	b.useSlot(p.slot)
+	if b.setConv, err = p.pipeConv.NewSet([]*Buffer{b.convWeight, p.qkvBuf, b.convState, p.convOut, b.shadowConv, p.slotBuf}); err != nil {
+		return err
+	}
+	if b.setScan, err = p.pipeScan.NewSet([]*Buffer{p.convOut, p.qkNorm, p.alphaBuf, b.dtBias, b.ssmA, p.betaBuf, b.ssmState, p.ySSM, b.shadowState, p.slotBuf}); err != nil {
+		return err
+	}
 	if b.setNormGate, err = p.pipeGate.NewSet([]*Buffer{p.ySSM, p.gateZBuf, b.ssmNorm}); err != nil {
 		return err
 	}
@@ -1332,25 +1341,20 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 			}
 		}
 	}
-	b.slots = make([]qwenAttnSlot, s.slots())
-	for i := range b.slots {
-		c := &b.slots[i]
-		// Two bytes a number, not four: shaders/qwen_attn_prep.comp holds the
-		// cache in halves, which is what every other attention here does and
-		// what decides whether the 27B's head stays on the card.
-		for _, into := range []**Buffer{&c.kCache, &c.vCache} {
-			if *into, err = p.upload(make([]byte, s.KVHeads*s.MaxContext*s.HeadDim*2)); err != nil {
-				return nil, err
-			}
-		}
-		if c.setPrep, err = p.pipeAttnPrep.NewSet([]*Buffer{p.qIn, p.kIn, p.vIn, b.qNorm, b.kNorm, p.qOut, c.kCache, c.vCache, p.posBuf, p.mposBuf}); err != nil {
-			return nil, err
-		}
-		if c.setGQA, err = p.pipeAttnGQA.NewSet([]*Buffer{p.qOut, c.kCache, c.vCache, p.qIn, p.attnOut, p.posBuf}); err != nil {
+	// Two bytes a number, not four: shaders/qwen_attn_prep.comp holds the
+	// cache in halves, which is what every other attention here does and
+	// what decides whether the 27B's head stays on the card.
+	for _, into := range []**Buffer{&b.kCache, &b.vCache} {
+		if *into, err = p.upload(make([]byte, s.slots()*s.cacheBytes())); err != nil {
 			return nil, err
 		}
 	}
-	b.useSlot(p.slot)
+	if b.setPrep, err = p.pipeAttnPrep.NewSet([]*Buffer{p.qIn, p.kIn, p.vIn, b.qNorm, b.kNorm, p.qOut, b.kCache, b.vCache, p.posBuf, p.mposBuf, p.slotBuf}); err != nil {
+		return nil, err
+	}
+	if b.setGQA, err = p.pipeAttnGQA.NewSet([]*Buffer{p.qOut, b.kCache, b.vCache, p.qIn, p.attnOut, p.posBuf, p.slotBuf}); err != nil {
+		return nil, err
+	}
 	if b.f32 {
 		// The mix arrives in floats and stays there: nothing quantizes it on
 		// the float path, so this projection reads what the attention wrote.
@@ -1531,7 +1535,7 @@ func (p *QwenPipeline) Forward(x []float32, pos int) ([]float32, error) {
 // attention's cache are both walked in the order given, and a column reads the
 // keys the columns before it wrote.
 func (p *QwenPipeline) ForwardColumns(xs [][]float32, positions []int) ([][]float32, error) {
-	return p.forward(xs, RunColumns(positions), false)
+	return p.forward(xs, RunColumns(positions), nil, false)
 }
 
 // QwenPlace is one column's cache index and the three axes its rotation reads.
@@ -1555,7 +1559,21 @@ func RunColumns(positions []int) []QwenPlace {
 // ForwardPlaces is ForwardColumns for a pass whose axes do not all follow the
 // cache index.
 func (p *QwenPipeline) ForwardPlaces(xs [][]float32, at []QwenPlace) ([][]float32, error) {
-	return p.forward(xs, at, false)
+	return p.forward(xs, at, nil, false)
+}
+
+// ForwardSlots is ForwardPlaces for a pass that carries several conversations:
+// slots says whose each column is. A conversation's columns are contiguous and
+// their positions consecutive, and what differs from one conversation to the
+// next is only which state and which cache the stateful kernels read — the
+// weights are read once for all of them, which is the point. Four
+// conversations drawing a token each cost one reading of the model rather than
+// four.
+func (p *QwenPipeline) ForwardSlots(xs [][]float32, at []QwenPlace, slots []int) ([][]float32, error) {
+	if len(slots) != len(xs) {
+		return nil, fmt.Errorf("vk: %d columns need %d slots, given %d", len(xs), len(xs), len(slots))
+	}
+	return p.forward(xs, at, slots, false)
 }
 
 // ForwardSpeculative is ForwardColumns for a pass whose last column is a draft:
@@ -1563,13 +1581,13 @@ func (p *QwenPipeline) ForwardPlaces(xs [][]float32, at []QwenPlace) ([][]float3
 // columns into the drafted one, so that RestoreState can put it back if the
 // draft is refused.
 func (p *QwenPipeline) ForwardSpeculative(xs [][]float32, positions []int) ([][]float32, error) {
-	return p.forward(xs, RunColumns(positions), true)
+	return p.forward(xs, RunColumns(positions), nil, true)
 }
 
 // ForwardSpeculativeAt is ForwardSpeculative for places whose axes do not
 // follow the cache index.
 func (p *QwenPipeline) ForwardSpeculativeAt(xs [][]float32, at []QwenPlace) ([][]float32, error) {
-	return p.forward(xs, at, true)
+	return p.forward(xs, at, nil, true)
 }
 
 // width is the widest pass this shape was built for.
@@ -1593,10 +1611,11 @@ func QwenBufferBytes(s QwenShape, width, attn, ssm int) uint64 {
 	n := QwenScratchBytes(s, width)
 	n += uint64(attn) * uint64(2*s.KVHeads*s.MaxContext*s.HeadDim*2) * uint64(s.slots())
 	state := uint64((s.ConvDim*4)*3 + s.Rank*s.StateSize*s.StateSize*4)
+	copies := uint64(1 + s.Checkpoints)
 	if s.Snapshots {
-		state *= 2
+		copies++
 	}
-	return n + uint64(ssm)*state*uint64(s.slots())
+	return n + uint64(ssm)*state*copies*uint64(s.slots())
 }
 
 // QwenScratchBytes is what a pipeline of that shape spends on working memory at
@@ -1621,7 +1640,7 @@ func QwenScratchBytes(s QwenShape, width int) uint64 {
 	return uint64(n)
 }
 
-func (p *QwenPipeline) forward(xs [][]float32, at []QwenPlace, speculative bool) ([][]float32, error) {
+func (p *QwenPipeline) forward(xs [][]float32, at []QwenPlace, slots []int, speculative bool) ([][]float32, error) {
 	s := p.shape
 	columns := len(xs)
 	if columns == 0 || columns > s.width() {
@@ -1630,16 +1649,29 @@ func (p *QwenPipeline) forward(xs [][]float32, at []QwenPlace, speculative bool)
 	if len(at) != columns {
 		return nil, fmt.Errorf("vk: %d columns need %d positions, given %d", columns, columns, len(at))
 	}
+	slotOf := func(c int) int {
+		if slots == nil {
+			return p.slot
+		}
+		return slots[c]
+	}
 	stream := p.xin.Floats()
 	pos := unsafe.Slice((*uint32)(unsafe.Pointer(&p.posIn.Bytes()[0])), s.width())
 	mpos := unsafe.Slice((*uint32)(unsafe.Pointer(&p.mposIn.Bytes()[0])), s.width()*4)
+	slotv := unsafe.Slice((*uint32)(unsafe.Pointer(&p.slotIn.Bytes()[0])), s.width())
+	col := make([]int, columns)
 	for c, x := range xs {
 		if at[c].Pos >= s.MaxContext {
 			return nil, fmt.Errorf("vk: position %d is past the %d the pipeline was built for", at[c].Pos, s.MaxContext)
 		}
-		// The cache index is what must be consecutive. The rotation's axes
-		// need not be, and an image is exactly the case where they are not.
-		if c > 0 && at[c].Pos != at[c-1].Pos+1 {
+		sl := slotOf(c)
+		if sl < 0 || sl >= s.slots() {
+			return nil, fmt.Errorf("vk: slot %d of a pipeline holding %d", sl, s.slots())
+		}
+		// The cache index is what must be consecutive within a conversation.
+		// The rotation's axes need not be, and an image is exactly the case
+		// where they are not.
+		if c > 0 && sl == slotOf(c-1) && at[c].Pos != at[c-1].Pos+1 {
 			return nil, fmt.Errorf("vk: a pass needs consecutive cache positions, given %v", at)
 		}
 		copy(stream[c*s.Dim:(c+1)*s.Dim], x)
@@ -1648,28 +1680,45 @@ func (p *QwenPipeline) forward(xs [][]float32, at []QwenPlace, speculative bool)
 		mpos[4*c+1] = uint32(at[c].H)
 		mpos[4*c+2] = uint32(at[c].W)
 		mpos[4*c+3] = 0
+		slotv[c] = uint32(sl)
+		col[c] = sl
+	}
+	runs := spansOf(col)
+	// A conversation's columns are one run: its state walks them in order, and
+	// two runs of one slot in a pass would each start from the state the pass
+	// began with.
+	seen := map[int]bool{}
+	for _, run := range runs {
+		if seen[col[run.first]] {
+			return nil, fmt.Errorf("vk: slot %d appears twice in one pass, given %v", col[run.first], col)
+		}
+		seen[col[run.first]] = true
 	}
 
 	snapAt := int(noSnapshot)
-	key := columns
+	key := shapeKey(runs)
 	if speculative {
-		if columns < 2 {
-			return nil, fmt.Errorf("vk: a speculative pass needs a committed column and a drafted one")
+		if columns < 2 || len(runs) > 1 {
+			return nil, fmt.Errorf("vk: a speculative pass is one conversation's committed column and a drafted one")
 		}
 		snapAt = columns - 1
-		key = -columns
+		key += "?"
 	}
-	// A recording names the slot's buffers, so each slot keeps its own. The
-	// widths are at most a few thousand either way; a slot is a multiple past
-	// them.
-	key += p.slot * qwenSlotKey
 	if p.pass == nil {
-		p.pass = map[int]*Program{}
+		p.pass = map[string]*Program{}
 	}
 	prog, ok := p.pass[key]
 	if !ok {
+		// A pass of four conversations is a shape of its own, and so is every
+		// way a prompt's chunk can meet the tokens of the others: the
+		// recordings are dropped together once there are too many of them,
+		// which vk/stack.go does for the same reason.
+		if len(p.pass) >= programCap {
+			p.forgetPasses()
+			p.pass = map[string]*Program{}
+		}
 		var err error
-		if prog, err = p.d.Compile(func(r *Recorder) { p.record(r, columns, snapAt) }); err != nil {
+		if prog, err = p.d.Compile(func(r *Recorder) { p.record(r, runs, snapAt) }); err != nil {
 			return nil, err
 		}
 		p.pass[key] = prog
@@ -1692,8 +1741,12 @@ const noSnapshot = ^uint32(0)
 // record lays down one token's whole pass. It is separate from Forward so that
 // the same sequence can be compiled once and replayed, which is what tells a
 // recording's cost apart from the card's.
-func (p *QwenPipeline) record(r *Recorder, columns, snapAt int) {
+func (p *QwenPipeline) record(r *Recorder, runs []span, snapAt int) {
 	s := p.shape
+	columns := 0
+	for _, run := range runs {
+		columns += run.count
+	}
 	dim := uint32(s.Dim)
 	cols := uint32(columns)
 	normFirst := normPush{n: dim, flags: normGain | normFloat | normQuant, eps: s.Eps, scalar: 1}
@@ -1709,8 +1762,7 @@ func (p *QwenPipeline) record(r *Recorder, columns, snapAt int) {
 		tl.Stamp(r, "start")
 	}
 	r.Copy(p.xs, 0, p.xin, s.Dim*columns*4)
-	r.Copy(p.posBuf, 0, p.posIn, 4*columns)
-	r.Copy(p.mposBuf, 0, p.mposIn, 16*columns)
+	p.copyPlaces(r, columns)
 	r.Barrier()
 
 	for i := 0; i < blocks; i++ {
@@ -1724,9 +1776,9 @@ func (p *QwenPipeline) record(r *Recorder, columns, snapAt int) {
 		p.accumulate(r, i, "qkv", columns)
 
 		if p.isSSM[i] {
-			p.recordSSM(r, p.ssmBlocks[i], columns, snapAt)
+			p.recordSSM(r, p.ssmBlocks[i], runs, snapAt)
 		} else {
-			p.recordAttn(r, p.attnBlocks[i], columns)
+			p.recordAttn(r, p.attnBlocks[i], runs)
 		}
 		r.Barrier()
 		if p.isSSM[i] {
@@ -1777,10 +1829,7 @@ func (p *QwenPipeline) product(r *Recorder, set *Set, rows, columns int, push mo
 		// binaries bound and never dispatched — dispatchAt only reaches them
 		// at thirty-two columns or more — so a pass of a hundred and
 		// twenty-eight was eight passes of sixteen and the table flattened.
-		w := set.widest(columns - at)
-		if w == 0 {
-			w = 1
-		}
+		w := p.span(set, columns-at, at, 0)
 		push.col = uint32(at)
 		p.dispatchAt(r, set, rows, w, true, matvecOuts, unsafe.Pointer(&push))
 		at += w
@@ -1792,14 +1841,38 @@ func (p *QwenPipeline) product(r *Recorder, set *Set, rows, columns int, push mo
 // the mat-vec.
 func (p *QwenPipeline) productK(r *Recorder, set *Set, rows, columns int, push matvecKPush) {
 	for at := 0; at < columns; {
-		w := set.widest(min(columns-at, narrowChunk))
-		if w == 0 {
-			w = 1
-		}
+		w := p.span(set, columns-at, at, narrowChunk)
 		push.Col = uint32(at)
 		p.dispatchAt(r, set, rows, w, false, matvecRows, unsafe.Pointer(&push))
 		at += w
 	}
+}
+
+// span is how many columns the next dispatch of a projection answers, from
+// column at with left still to go, no wider than limit when limit is set.
+//
+// The widest binary that fits is what a prompt takes, and a prompt's passes
+// are widths that have one. A pass of several conversations is whatever they
+// brought — three tokens, five — and there the widest that fits leaves a tail
+// that reads the matrix a second time. So a tail is answered by the narrowest
+// binary that covers it, when the scratch has the room: the columns past the
+// pass are computed and never read, and the weights are read once.
+func (p *QwenPipeline) span(set *Set, left, at, limit int) int {
+	fit := left
+	if limit > 0 {
+		fit = min(left, limit)
+	}
+	w := set.widest(fit)
+	if w < fit {
+		room := p.shape.width() - at
+		if limit > 0 {
+			room = min(room, limit)
+		}
+		if c := set.cover(fit, room); c > 0 {
+			return c
+		}
+	}
+	return max(w, 1)
 }
 
 // dispatchAt issues one of those, with the workgroup count the binary bound at
@@ -1855,7 +1928,7 @@ func (p *QwenPipeline) CompileAt(columns int) (*Program, error) {
 	if columns < 1 || columns > p.shape.width() {
 		return nil, fmt.Errorf("vk: a qwen pass carries one to %d columns, given %d", p.shape.width(), columns)
 	}
-	return p.d.Compile(func(r *Recorder) { p.record(r, columns, int(noSnapshot)) })
+	return p.d.Compile(func(r *Recorder) { p.record(r, []span{{first: 0, count: columns}}, int(noSnapshot)) })
 }
 
 // Probe runs the first n blocks of a token and returns the stream as it stands
@@ -1874,8 +1947,7 @@ func (p *QwenPipeline) Probe(x []float32, pos, blocks int) ([]float32, error) {
 
 	err := p.d.Submit(func(r *Recorder) {
 		r.Copy(p.xs, 0, p.xin, s.Dim*4)
-		r.Copy(p.posBuf, 0, p.posIn, 4)
-		r.Copy(p.mposBuf, 0, p.mposIn, 16)
+		p.copyPlaces(r, 1)
 		r.Barrier()
 		for i := 0; i < blocks; i++ {
 			push := &normAttn
@@ -1885,9 +1957,9 @@ func (p *QwenPipeline) Probe(x []float32, pos, blocks int) ([]float32, error) {
 			r.Dispatch(p.setAttnNorms[i], 1, unsafe.Pointer(push))
 			r.Barrier()
 			if p.isSSM[i] {
-				p.recordSSM(r, p.ssmBlocks[i], 1, int(noSnapshot))
+				p.recordSSM(r, p.ssmBlocks[i], oneRun, int(noSnapshot))
 			} else {
-				p.recordAttn(r, p.attnBlocks[i], 1)
+				p.recordAttn(r, p.attnBlocks[i], oneRun)
 			}
 			r.Barrier()
 			r.Dispatch(p.setFFNNorms[i], 1, unsafe.Pointer(&normFFN))
@@ -1921,8 +1993,7 @@ func (p *QwenPipeline) ProbeMixer(x []float32, pos, block int) ([]float32, error
 
 	err := p.d.Submit(func(r *Recorder) {
 		r.Copy(p.xs, 0, p.xin, s.Dim*4)
-		r.Copy(p.posBuf, 0, p.posIn, 4)
-		r.Copy(p.mposBuf, 0, p.mposIn, 16)
+		p.copyPlaces(r, 1)
 		r.Barrier()
 		for i := 0; i <= block; i++ {
 			push := &normAttn
@@ -1932,9 +2003,9 @@ func (p *QwenPipeline) ProbeMixer(x []float32, pos, block int) ([]float32, error
 			r.Dispatch(p.setAttnNorms[i], 1, unsafe.Pointer(push))
 			r.Barrier()
 			if p.isSSM[i] {
-				p.recordSSM(r, p.ssmBlocks[i], 1, int(noSnapshot))
+				p.recordSSM(r, p.ssmBlocks[i], oneRun, int(noSnapshot))
 			} else {
-				p.recordAttn(r, p.attnBlocks[i], 1)
+				p.recordAttn(r, p.attnBlocks[i], oneRun)
 			}
 			r.Barrier()
 			if i == block {
@@ -1964,8 +2035,7 @@ func (p *QwenPipeline) ProbeNormed(x []float32, pos, block int) ([]float32, erro
 	normAttn := normPush{n: dim, flags: normGain | normFloat | normQuant, eps: s.Eps, scalar: 1}
 	err := p.d.Submit(func(r *Recorder) {
 		r.Copy(p.xs, 0, p.xin, s.Dim*4)
-		r.Copy(p.posBuf, 0, p.posIn, 4)
-		r.Copy(p.mposBuf, 0, p.mposIn, 16)
+		p.copyPlaces(r, 1)
 		r.Barrier()
 		r.Dispatch(p.setProbeNorms[block], 1, unsafe.Pointer(&normAttn))
 		r.Barrier()
@@ -2050,15 +2120,14 @@ func (p *QwenPipeline) ProbeRaw(x []float32, pos, block int, what string) ([]flo
 
 	err := p.d.Submit(func(r *Recorder) {
 		r.Copy(p.xs, 0, p.xin, s.Dim*4)
-		r.Copy(p.posBuf, 0, p.posIn, 4)
-		r.Copy(p.mposBuf, 0, p.mposIn, 16)
+		p.copyPlaces(r, 1)
 		r.Barrier()
 		r.Dispatch(p.setProbeNorms[block], 1, unsafe.Pointer(&normAttn))
 		r.Barrier()
 		if p.isSSM[block] {
-			p.recordSSM(r, p.ssmBlocks[block], 1, int(noSnapshot))
+			p.recordSSM(r, p.ssmBlocks[block], oneRun, int(noSnapshot))
 		} else {
-			p.recordAttn(r, p.attnBlocks[block], 1)
+			p.recordAttn(r, p.attnBlocks[block], oneRun)
 		}
 		r.Barrier()
 		r.Copy(dst, 0, pick, n*4)
@@ -2084,9 +2153,24 @@ func (p *QwenPipeline) setPos(pos int) {
 func (p *QwenPipeline) setPlace(at QwenPlace) {
 	w := unsafe.Slice((*uint32)(unsafe.Pointer(&p.posIn.Bytes()[0])), p.shape.width())
 	w[0] = uint32(at.Pos)
+	// And the slot, which a one-column pass takes from UseSlot.
+	sl := unsafe.Slice((*uint32)(unsafe.Pointer(&p.slotIn.Bytes()[0])), p.shape.width())
+	sl[0] = uint32(p.slot)
 	m := unsafe.Slice((*uint32)(unsafe.Pointer(&p.mposIn.Bytes()[0])), p.shape.width()*4)
 	m[0], m[1], m[2], m[3] = uint32(at.T), uint32(at.H), uint32(at.W), 0
 }
+
+// copyPlaces carries the columns' positions, axes and slots from their host
+// ends to the card, at the head of a recording.
+func (p *QwenPipeline) copyPlaces(r *Recorder, columns int) {
+	r.Copy(p.posBuf, 0, p.posIn, 4*columns)
+	r.Copy(p.mposBuf, 0, p.mposIn, 16*columns)
+	r.Copy(p.slotBuf, 0, p.slotIn, 4*columns)
+}
+
+// oneRun is the runs of a one-column pass: the probes' and the prediction
+// block's, which run in the slot UseSlot named.
+var oneRun = []span{{first: 0, count: 1}}
 
 // Hidden is the last pass's state before the output norm. The
 // multi-token-prediction block reads it, and so does the block after it.
@@ -2118,12 +2202,13 @@ func (p *QwenPipeline) rotate(r *Recorder, set *Set, n, columns int) bool {
 	return true
 }
 
-func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt int) {
+func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, runs []span, snapAt int) {
 	if b.golem != nil {
-		p.recordGolemSSM(r, b.golem, b, columns, snapAt)
+		p.recordGolemSSM(r, b.golem, b, runs, snapAt)
 		return
 	}
 	s := p.shape
+	columns := widthOf(runs)
 	qkv := moePush{dim: uint32(s.ConvDim), ffn: uint32(s.Dim), used: 1}
 	gate := moePush{dim: uint32(s.Inner), ffn: uint32(s.Dim), used: 1}
 	small := matvecKPush{Dim: uint32(s.Rank), FFN: uint32(s.Dim)}
@@ -2142,7 +2227,7 @@ func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt i
 	r.Barrier()
 	p.tl.Stamp(r, "ssm in")
 
-	p.recordSSMState(r, b, columns, snapAt)
+	p.recordSSMState(r, b, runs, snapAt)
 	p.accumulate(r, b.index, "o", columns)
 
 	if b.f32 {
@@ -2168,25 +2253,20 @@ func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, columns, snapAt i
 // output one: the convolution, the two norms and the recurrence. None of them
 // reads a quantized weight — a delta net's convolution, its decay and its norms
 // are floats in every checkpoint — so all of it is shared with the Golem path.
-func (p *QwenPipeline) recordSSMState(r *Recorder, b *qwenSSMBlock, columns, snapAt int) {
+func (p *QwenPipeline) recordSSMState(r *Recorder, b *qwenSSMBlock, runs []span, snapAt int) {
 	s := p.shape
-	conv := ssmConvPush{Channels: uint32(s.ConvDim), Kernel: 4, Columns: uint32(columns), SnapAt: uint32(snapAt)}
-	scan := ssmScanPush{
-		NumHeads:  uint32(s.Rank),
-		StateSize: uint32(s.StateSize),
-		Eps:       s.Eps,
-		Scale:     float32(1 / sqrtOf(s.StateSize)),
-		Columns:   uint32(columns),
-		ConvDim:   uint32(s.ConvDim),
-		Inner:     uint32(s.Inner),
-		Rank:      uint32(s.Rank),
-		SnapAt:    uint32(snapAt),
-	}
+	columns := widthOf(runs)
 
 	// The convolution and the scan carry the columns inside themselves: both
 	// hold state that runs from one token to the next, so a column cannot
-	// start before the one before it has finished.
-	r.Dispatch(b.setConv, uint32((s.ConvDim+255)/256), unsafe.Pointer(&conv))
+	// start before the one before it has finished. Each conversation's run is
+	// a dispatch of its own, reading its own state; they touch nothing in
+	// common, so they run side by side with no barrier between them.
+	for _, run := range runs {
+		conv := ssmConvPush{Channels: uint32(s.ConvDim), Kernel: 4, Columns: uint32(run.count),
+			SnapAt: uint32(snapAt), First: uint32(run.first)}
+		r.Dispatch(b.setConv, uint32((s.ConvDim+255)/256), unsafe.Pointer(&conv))
+	}
 	r.Barrier()
 	p.tl.Stamp(r, "ssm conv")
 
@@ -2199,7 +2279,21 @@ func (p *QwenPipeline) recordSSMState(r *Recorder, b *qwenSSMBlock, columns, sna
 
 	// One workgroup a head and COLS state columns of it: 48 by 16 rather than
 	// the 48 this kernel ran in for the life of the engine.
-	r.DispatchColumns(b.setScan, uint32(s.Rank), uint32(s.StateSize/scanColumns), unsafe.Pointer(&scan))
+	for _, run := range runs {
+		scan := ssmScanPush{
+			NumHeads:  uint32(s.Rank),
+			StateSize: uint32(s.StateSize),
+			Eps:       s.Eps,
+			Scale:     float32(1 / sqrtOf(s.StateSize)),
+			Columns:   uint32(run.count),
+			ConvDim:   uint32(s.ConvDim),
+			Inner:     uint32(s.Inner),
+			Rank:      uint32(s.Rank),
+			SnapAt:    uint32(snapAt),
+			First:     uint32(run.first),
+		}
+		r.DispatchColumns(b.setScan, uint32(s.Rank), uint32(s.StateSize/scanColumns), unsafe.Pointer(&scan))
+	}
 	r.Barrier()
 	p.tl.Stamp(r, "ssm scan")
 
@@ -2209,12 +2303,13 @@ func (p *QwenPipeline) recordSSMState(r *Recorder, b *qwenSSMBlock, columns, sna
 	p.tl.Stamp(r, "ssm gate")
 }
 
-func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
+func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, runs []span) {
 	if b.golem != nil {
-		p.recordGolemAttn(r, b.golem, b, columns)
+		p.recordGolemAttn(r, b.golem, b, runs)
 		return
 	}
 	s := p.shape
+	columns := widthOf(runs)
 	q := moePush{dim: uint32(s.qFullDim()), ffn: uint32(s.Dim), used: 1}
 	kv := moePush{dim: uint32(s.kvDim()), ffn: uint32(s.Dim), used: 1}
 	out := matvecKPush{Dim: uint32(s.Dim), FFN: uint32(s.qDim())}
@@ -2228,7 +2323,7 @@ func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
 		p.productK(r, b.setV, s.kvDim(), columns, matvecKPush{Dim: uint32(s.kvDim()), FFN: uint32(s.Dim)})
 		r.Barrier()
 		p.tl.Stamp(r, "attn qkv")
-		p.recordAttnMix(r, b, columns)
+		p.recordAttnMix(r, b, runs)
 		p.accumulate(r, b.index, "o", columns)
 		p.productK(r, b.setO, s.Dim, columns, out)
 		return
@@ -2240,7 +2335,7 @@ func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
 	r.Barrier()
 	p.tl.Stamp(r, "attn qkv")
 
-	p.recordAttnMix(r, b, columns)
+	p.recordAttnMix(r, b, runs)
 	p.accumulate(r, b.index, "o", columns)
 
 	// The mix in eight bits, then the output projection over it, at every
@@ -2259,8 +2354,9 @@ func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
 // a weight matrix, so both are the same kernels over the same buffers whatever
 // the projections around them are stored as — which is what lets the Golem path
 // in vk/qwen_golem.go be four matrices and two transforms rather than a block.
-func (p *QwenPipeline) recordAttnMix(r *Recorder, b *qwenAttnBlock, columns int) {
+func (p *QwenPipeline) recordAttnMix(r *Recorder, b *qwenAttnBlock, runs []span) {
 	s := p.shape
+	columns := widthOf(runs)
 	prep := attnPrepPush{
 		MaxContext: uint32(s.MaxContext),
 		Heads:      uint32(s.Heads),
@@ -2273,13 +2369,7 @@ func (p *QwenPipeline) recordAttnMix(r *Recorder, b *qwenAttnBlock, columns int)
 		Sect2:      uint32(s.RoPESections[2]),
 		Sect3:      uint32(s.RoPESections[3]),
 	}
-	gqa := attnGQAPush{
-		MaxContext: uint32(s.MaxContext),
-		HeadsPerKV: uint32(s.Heads / s.KVHeads),
-		Heads:      uint32(s.Heads),
-		Scale:      float32(1 / sqrtOf(s.HeadDim)),
-		Columns:    uint32(columns),
-	}
+
 	// Every column's keys and values go into the cache before any column reads
 	// them, which is why this is a dispatch of its own and not the head of the
 	// one below: a barrier inside a workgroup does not order two workgroups.
@@ -2287,7 +2377,20 @@ func (p *QwenPipeline) recordAttnMix(r *Recorder, b *qwenAttnBlock, columns int)
 	r.Barrier()
 	p.tl.Stamp(r, "attn prep")
 
-	r.DispatchColumns(b.setGQA, uint32(s.Heads), uint32((columns+qAttnTile-1)/qAttnTile), unsafe.Pointer(&gqa))
+	// A tile of queries shares its reading of the keys, which two
+	// conversations cannot: a position is a different key in each. So the
+	// scores are a dispatch a run, as gemma's are.
+	for _, run := range runs {
+		gqa := attnGQAPush{
+			MaxContext: uint32(s.MaxContext),
+			HeadsPerKV: uint32(s.Heads / s.KVHeads),
+			Heads:      uint32(s.Heads),
+			Scale:      float32(1 / sqrtOf(s.HeadDim)),
+			Columns:    uint32(run.count),
+			First:      uint32(run.first),
+		}
+		r.DispatchColumns(b.setGQA, uint32(s.Heads), uint32((run.count+qAttnTile-1)/qAttnTile), unsafe.Pointer(&gqa))
+	}
 	r.Barrier()
 	p.tl.Stamp(r, "attn gqa")
 }
@@ -2352,10 +2455,11 @@ func (p *QwenPipeline) recordFFN(r *Recorder, b *qwenFFNBlock, columns int) {
 // matrices and their convolution windows. The attention caches need no
 // clearing, because a pass only ever reads the positions it has written.
 func (p *QwenPipeline) ResetState() error {
+	s := p.shape
 	return p.d.Submit(func(r *Recorder) {
 		for _, b := range p.ssmBlocks {
-			r.Fill(b.ssmState, 0)
-			r.Fill(b.convState, 0)
+			r.FillRange(b.ssmState, p.slot*s.ssmStateBytes(), s.ssmStateBytes(), 0)
+			r.FillRange(b.convState, p.slot*s.convStateBytes(), s.convStateBytes(), 0)
 		}
 	})
 }
@@ -2443,6 +2547,9 @@ func (p *QwenPipeline) Close() {
 	}
 	if p.mposIn != nil {
 		p.mposIn.Close()
+	}
+	if p.slotIn != nil {
+		p.slotIn.Close()
 	}
 	for _, pl := range []*Pipeline{
 		p.pipeNorm, p.pipeMatQ4K, p.pipeMatQ6K,
@@ -2731,8 +2838,7 @@ func (p *QwenPipeline) recordMTP(r *Recorder) {
 	normFinal := normPush{n: dim, flags: normAdd | normSum | normGain | normFloat, eps: s.Eps, scalar: 1}
 
 	r.Copy(b.ehBuf, 0, b.ehIn, s.Dim*2*4)
-	r.Copy(p.posBuf, 0, p.posIn, 4)
-	r.Copy(p.mposBuf, 0, p.mposIn, 16)
+	p.copyPlaces(r, 1)
 	r.Barrier()
 
 	if b.golemEH != nil {
@@ -2747,7 +2853,7 @@ func (p *QwenPipeline) recordMTP(r *Recorder) {
 	r.Dispatch(b.setAttnNorm, 1, unsafe.Pointer(&normAttn))
 	r.Barrier()
 
-	p.recordAttn(r, b.attn, 1)
+	p.recordAttn(r, b.attn, oneRun)
 	r.Barrier()
 
 	r.Dispatch(b.setFFNNorm, 1, unsafe.Pointer(&normFFN))
@@ -2767,9 +2873,10 @@ func (p *QwenPipeline) ResetMTPCache() error {
 	if p.mtp == nil {
 		return nil
 	}
+	n := p.shape.cacheBytes()
 	return p.d.Submit(func(r *Recorder) {
-		r.Fill(p.mtp.attn.kCache, 0)
-		r.Fill(p.mtp.attn.vCache, 0)
+		r.FillRange(p.mtp.attn.kCache, p.slot*n, n, 0)
+		r.FillRange(p.mtp.attn.vCache, p.slot*n, n, 0)
 	})
 }
 
@@ -2800,11 +2907,49 @@ func (p *QwenPipeline) RestoreState() error {
 }
 
 func (p *QwenPipeline) recordRestore(r *Recorder) {
+	s := p.shape
+	state, conv := s.ssmStateBytes(), s.convStateBytes()
 	for _, b := range p.ssmBlocks {
-		r.Copy(b.ssmState, 0, b.shadowState, b.shadowState.Size())
-		r.Copy(b.convState, 0, b.shadowConv, b.shadowConv.Size())
+		r.CopyFrom(b.ssmState, p.slot*state, b.shadowState, p.slot*state, state)
+		r.CopyFrom(b.convState, p.slot*conv, b.shadowConv, p.slot*conv, conv)
 	}
 	r.Barrier()
+}
+
+// Checkpoints is how many copies of its state each slot may keep aside.
+func (p *QwenPipeline) Checkpoints() int { return p.shape.Checkpoints }
+
+// SaveCheckpoint copies the delta nets' state of the slot in use aside, as its
+// checkpoint k. The attentions need nothing: a cache is indexed by position,
+// and the positions below the one the state stopped at are not written again
+// by a conversation that goes back to it.
+func (p *QwenPipeline) SaveCheckpoint(k int) error {
+	return p.checkpoint(k, true)
+}
+
+// RestoreCheckpoint puts the slot in use back to its checkpoint k.
+func (p *QwenPipeline) RestoreCheckpoint(k int) error {
+	return p.checkpoint(k, false)
+}
+
+func (p *QwenPipeline) checkpoint(k int, save bool) error {
+	s := p.shape
+	if k < 0 || k >= s.Checkpoints {
+		return fmt.Errorf("vk: checkpoint %d of the %d a slot keeps", k, s.Checkpoints)
+	}
+	state, conv := s.ssmStateBytes(), s.convStateBytes()
+	at := p.slot*s.Checkpoints + k
+	return p.d.Submit(func(r *Recorder) {
+		for _, b := range p.ssmBlocks {
+			if save {
+				r.CopyFrom(b.ckState, at*state, b.ssmState, p.slot*state, state)
+				r.CopyFrom(b.ckConv, at*conv, b.convState, p.slot*conv, conv)
+			} else {
+				r.CopyFrom(b.ssmState, p.slot*state, b.ckState, at*state, state)
+				r.CopyFrom(b.convState, p.slot*conv, b.ckConv, at*conv, conv)
+			}
+		}
+	})
 }
 
 // DeviceBytes is what this pipeline has allocated on the card so far: its own
@@ -2822,15 +2967,12 @@ func (p *QwenPipeline) DeviceBytes() uint64 {
 	return n
 }
 
-// qwenSlotKey spaces the pass cache's keys a slot apart: a key is a width,
-// negated for a speculative pass, and no width comes near this.
-const qwenSlotKey = 1 << 16
-
-// UseSlot makes the next pass run in conversation i: every delta net's state
-// and every attention's cache are that conversation's from here on. It costs
-// nothing on the card; the passes compiled for a slot are kept, and the two
-// small recordings that are not, the restore and the prediction block's, are
-// laid down again the next time they are wanted.
+// UseSlot makes the next pass that names no slots run in conversation i:
+// every delta net's state and every attention's cache are that
+// conversation's from here on. It costs nothing on the card. The passes read
+// the slot out of a buffer and are kept; the restore, which copies one slot's
+// share of the states by offset, is laid down again the next time it is
+// wanted.
 func (p *QwenPipeline) UseSlot(i int) error {
 	if i < 0 || i >= p.shape.slots() {
 		return fmt.Errorf("vk: slot %d of a pipeline holding %d", i, p.shape.slots())
@@ -2839,23 +2981,6 @@ func (p *QwenPipeline) UseSlot(i int) error {
 		return nil
 	}
 	p.slot = i
-	for _, b := range p.ssmBlocks {
-		if b != nil {
-			b.useSlot(i)
-		}
-	}
-	for _, b := range p.attnBlocks {
-		if b != nil {
-			b.useSlot(i)
-		}
-	}
-	if p.mtp != nil {
-		p.mtp.attn.useSlot(i)
-		if p.mtp.pass != nil {
-			p.mtp.pass.Close()
-			p.mtp.pass = nil
-		}
-	}
 	if p.restoreProg != nil {
 		p.restoreProg.Close()
 		p.restoreProg = nil

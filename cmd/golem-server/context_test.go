@@ -402,3 +402,72 @@ func TestARecurrentCacheIsContinuedOrStartedAgain(t *testing.T) {
 		})
 	}
 }
+
+// An engine that keeps copies of its state, as qwen35 on a card does. The
+// state of a slot is the tokens it has read, which is what a test can check a
+// restore against.
+type checkpointEngine struct {
+	recordingEngine
+	copies   int
+	saved    map[int]int // copy → how many tokens had been fed when it was taken
+	restored []int
+}
+
+func (e *checkpointEngine) Checkpoints() int { return e.copies }
+func (e *checkpointEngine) SaveCheckpoint(k int) error {
+	if e.saved == nil {
+		e.saved = map[int]int{}
+	}
+	e.saved[k] = len(e.fed)
+	return nil
+}
+func (e *checkpointEngine) RestoreCheckpoint(k int) error {
+	e.restored = append(e.restored, k)
+	return nil
+}
+
+// A village asks each character a prompt that begins with the same sheet and
+// then parts from the last one: the context changed. The first time it parts,
+// the slot starts over and keeps a copy where it parted; every time after, it
+// starts from that copy.
+func TestARecurrentCacheResumesFromWhereItLastParted(t *testing.T) {
+	sheet := make([]int32, 600)
+	for i := range sheet {
+		sheet[i] = int32(1000 + i)
+	}
+	prompt := func(context int32) []int32 {
+		return append(append([]int32(nil), sheet...), context, context, context)
+	}
+	e := &checkpointEngine{copies: 2}
+	c := NewContext(running(t, e), 0, 4096, time.Now, 0)
+	c.SetRecurrent(true)
+
+	for i, want := range []int{603, 603, 3, 3} {
+		fed, err := c.Prefill(prompt(int32(i+1)), scores())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fed != want {
+			t.Fatalf("prompt %d: fed %d, want %d", i, fed, want)
+		}
+	}
+	if len(e.restored) != 2 {
+		t.Fatalf("%d restores, want 2", len(e.restored))
+	}
+	if got := e.posOf[len(e.posOf)-3]; got != len(sheet) {
+		t.Fatalf("the last feed began at position %d, want %d", got, len(sheet))
+	}
+
+	// A prompt that parts inside the sheet cannot use a copy taken past it,
+	// and one that shares nothing starts over.
+	e.restored = nil
+	other := append([]int32{7}, sheet[1:]...)
+	if fed, _ := c.Prefill(other, scores()); fed != len(other) || len(e.restored) != 0 {
+		t.Fatalf("a prompt sharing nothing fed %d with %d restores", fed, len(e.restored))
+	}
+	// And what it wrote over the sheet's positions is not what the copy stood
+	// on: going back to the village's prompt starts over too.
+	if fed, _ := c.Prefill(prompt(9), scores()); fed != len(sheet)+3 || len(e.restored) != 0 {
+		t.Fatalf("after the sheet was written over, fed %d with %d restores", fed, len(e.restored))
+	}
+}

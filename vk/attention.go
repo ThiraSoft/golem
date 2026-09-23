@@ -681,6 +681,15 @@ type span struct {
 	first, count int
 }
 
+// widthOf is how many columns the runs of a pass carry between them.
+func widthOf(runs []span) int {
+	n := 0
+	for _, run := range runs {
+		n += run.count
+	}
+	return n
+}
+
 // spansOf cuts a pass into runs of columns that share a slot. The columns of
 // one conversation are contiguous — cmd/golem-server/runner.go builds a batch
 // by appending each conversation's tokens — so this is a walk and not a sort.
