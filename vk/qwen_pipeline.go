@@ -1889,7 +1889,7 @@ func (p *QwenPipeline) span(set *Set, left, at, limit int) int {
 // wrong kernel looks like a fast one.
 func (p *QwenPipeline) dispatchAt(r *Recorder, set *Set, rows, columns int, tiled bool, outs int, push unsafe.Pointer) {
 	if tiled && columns >= tiledColumns {
-		r.DispatchWide(set, columns, coopProductGroups(p.coop, columns, rows), push)
+		r.DispatchWide(set, columns, set.tiledGroups(p.coop, columns, rows), push)
 		return
 	}
 	groups := groupsOf(rows, outs)

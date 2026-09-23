@@ -195,12 +195,23 @@ top-1 at every position.
 
 | RX 9070 XT, 2026-09-23 | one at a time | drafting | pp512 |
 | --- | ---: | ---: | ---: |
-| PQ2_0 | 47.4 t/s | **71.4** | 810 |
-| PTQ1_0 | 19.9 t/s | 32.4 | 765 |
+| PQ2_0 | 46.0 t/s | **62.8** | 1253 |
+| PTQ1_0 | 15.8 t/s | 22.7 | 1128 |
 
-PTQ1_0 reads 17 % fewer bytes and is two and a half times slower, because its
-mat-vec takes a weight at a time out of a byte of five where PQ2_0 spreads four
-with two instructions. On this card the product is not waiting on memory.
+Greedy, 128 tokens of a short English paragraph with 57 % of drafts kept, the
+median of three runs; pp512 is the median of three passes after a first one
+that is not counted. The card is held at `high` and the desktop at the
+`performance` power profile. With the card on `auto` and the desktop on
+`power-saver`, the same code draws 32.6 tokens a second.
+
+PTQ1_0 reads 17 % fewer bytes and is three times slower, because its mat-vec
+takes a weight at a time out of a byte of five where PQ2_0 spreads four with
+two instructions. On this card the product is not waiting on memory.
+
+A prompt read five hundred and twelve at a time goes through the int8 form of
+`vk/shaders/matmul_coop.comp`: trits and Q8_0 magnitudes are exact in eight
+bits, so the matrix cores take them as they are rather than as fp16. It is
+worth 14 % on PQ2_0 and 10 % on PTQ1_0; the kernel's header has the shapes.
 
 **Drafting is grafted.** Prism ships no prediction block. The original model's
 `blk.64` works unchanged: the residual stream between blocks is not rotated,

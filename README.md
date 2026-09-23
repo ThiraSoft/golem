@@ -142,10 +142,10 @@ Bonsai 2 27B is Qwen3.8 27B in ternary weights, 6.7 GiB for two bits a weight an
 
 | | golem gen | fork gen | golem pp512 | fork pp512 |
 | --- | ---: | ---: | ---: | ---: |
-| Bonsai 2 27B PQ2_0 | **47.4** | 9.3 | 810 | **1046** |
-| Bonsai 2 27B PTQ1_0 | **19.9** | 9.5 | **765** | 535 |
+| Bonsai 2 27B PQ2_0 | **46.0** | 9.2 | **1253** | 924 |
+| Bonsai 2 27B PTQ1_0 | **15.8** | 9.4 | **1128** | 423 |
 
-Both packings hold the same trits. The dense one reads 17 % fewer bytes and decodes five weights a byte one at a time, which on this card costs more than the bytes save: take PQ2_0 unless memory is what is short. Held against the fork's logits at every position of a prompt, both answer within 0.0001 nats. The golem prefill figures are one cold pass each, not a repeated benchmark. [`qwen35/README.md`](qwen35/README.md) has the rotation these files carry and how drafting is grafted onto them.
+Both packings hold the same trits. The dense one reads 17 % fewer bytes and decodes five weights a byte one at a time, which on this card costs more than the bytes save: take PQ2_0 unless memory is what is short. Held against the fork's logits at every position of a prompt, both answer within 0.0001 nats. Both prefill columns are warm, the median of three passes after one that is not counted, as `llama-bench` does it. [`qwen35/README.md`](qwen35/README.md) has the rotation these files carry and how drafting is grafted onto them.
 
 On an i7-9700K with eight threads and Q4_0 weights: Gemma E2B draws 22.6 tokens a second and reads 204, the 12B does 5.0 and 42, the 26B A4B does 13.1 and 51, Qwen3 4B does 14.6 and 110. Against llama.cpp on the same machine those four are a tie on generation and between ×1.06 and ×1.33 reading a prompt.
 
@@ -174,7 +174,7 @@ Two fifths of the pool buys four fifths of the tokens, and the answers are ident
 
 The Qwen3.8 checkpoint ships a sixty-fifth block whose job is to guess the token *after* the one just decided. Guess right and the next pass verifies two tokens for the price of one, because the card reads a block's weights once whether the pass carries one column or two. Guess wrong and it costs nothing beyond the pass it rode on. Every token returned is drawn from the model's own distribution, so none of the accept-reject correction that drafting with a separate model needs applies here, and a test asserts the answer is the same either way.
 
-On an RX 9070 XT: 27.6 tokens a second one at a time, **40.1 drafting**, 70% of drafts accepted. Bonsai 2 ships without the block, and the original model's grafts onto it unchanged: 47.4 tokens a second becomes 71.4, 86% of drafts accepted. On the CPU it is refused rather than offered, and [`qwen35/README.md`](qwen35/README.md) has the measurement that settles it.
+On an RX 9070 XT: 27.6 tokens a second one at a time, **40.1 drafting**, 70% of drafts accepted. Bonsai 2 ships without the block, and the original model's grafts onto it unchanged: 46.0 tokens a second becomes 62.8, 57% of drafts accepted. On the CPU it is refused rather than offered, and [`qwen35/README.md`](qwen35/README.md) has the measurement that settles it.
 
 ### Its own weight format
 

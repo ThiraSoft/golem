@@ -88,7 +88,7 @@ import (
 //go:generate glslc -O -DPQ20 -DCOLUMNS=64 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_pq2064.spv
 //go:generate glslc -O -DPQ20 -DCOLUMNS=128 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_pq20128.spv
 //go:generate glslc -O -DPQ20 -DCOLUMNS=256 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_pq20256.spv
-//go:generate glslc -O -DPQ20 -DCOLUMNS=512 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_pq20512.spv
+//go:generate glslc -O -DPQ20 -DI8 -DCOLUMNS=512 -DBN=128 -DBM=64 -DBK=64 -DPAD8=2 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.3 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_pq20i8512.spv
 
 //go:generate glslc -O -DPTQ10 -DLANES=16 -DOUTS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_ptq10q8.spv
 //go:generate glslc -O -DPTQ10 -DLANES=16 -DOUTS=8 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_ptq10q8_2.spv
@@ -99,7 +99,7 @@ import (
 //go:generate glslc -O -DPTQ10 -DCOLUMNS=64 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_ptq1064.spv
 //go:generate glslc -O -DPTQ10 -DCOLUMNS=128 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_ptq10128.spv
 //go:generate glslc -O -DPTQ10 -DCOLUMNS=256 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_ptq10256.spv
-//go:generate glslc -O -DPTQ10 -DCOLUMNS=512 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_ptq10512.spv
+//go:generate glslc -O -DPTQ10 -DI8 -DCOLUMNS=512 -DBN=128 -DBM=64 -DBK=64 -DPAD8=2 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.3 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_ptq10i8512.spv
 
 //go:generate glslc -O -DQ4K -DCOLUMNS=32 -DBN=32 -DBM=64 -DBK=128 -DWAVE_M=4 -DWAVE_N=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q4k32.spv
 //go:generate glslc -O -DQ6K -DCOLUMNS=32 -DBN=32 -DBM=64 -DBK=128 -DWAVE_M=4 -DWAVE_N=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q6k32.spv
@@ -332,8 +332,11 @@ var matmulCoopPQ20128SPIRV []byte
 //go:embed shaders/matmul_coop_pq20256.spv
 var matmulCoopPQ20256SPIRV []byte
 
-//go:embed shaders/matmul_coop_pq20512.spv
-var matmulCoopPQ20512SPIRV []byte
+//go:embed shaders/matmul_coop_pq20i8512.spv
+var matmulCoopPQ20I8512SPIRV []byte
+
+//go:embed shaders/matmul_coop_ptq10i8512.spv
+var matmulCoopPTQ10I8512SPIRV []byte
 
 //go:embed shaders/matvec_ptq10q8.spv
 var matvecPTQ10Q8SPIRV []byte
@@ -361,9 +364,6 @@ var matmulCoopPTQ10128SPIRV []byte
 
 //go:embed shaders/matmul_coop_ptq10256.spv
 var matmulCoopPTQ10256SPIRV []byte
-
-//go:embed shaders/matmul_coop_ptq10512.spv
-var matmulCoopPTQ10512SPIRV []byte
 
 // QuantReadable says whether a projection stored this way has a kernel here.
 //
@@ -682,7 +682,7 @@ func newQuantProduct(d *Device, q nn.Quant, coop bool) (*Pipeline, error) {
 				spirv   []byte
 			}{
 				{tiledColumns, matmulCoopPQ2032SPIRV}, {64, matmulCoopPQ2064SPIRV},
-				{128, matmulCoopPQ20128SPIRV}, {256, matmulCoopPQ20256SPIRV}, {wideColumns, matmulCoopPQ20512SPIRV},
+				{128, matmulCoopPQ20128SPIRV}, {256, matmulCoopPQ20256SPIRV}, {wideColumns, matmulCoopPQ20I8512SPIRV},
 			}
 		case nn.PTQ1_0:
 			tiled = []struct {
@@ -690,7 +690,7 @@ func newQuantProduct(d *Device, q nn.Quant, coop bool) (*Pipeline, error) {
 				spirv   []byte
 			}{
 				{tiledColumns, matmulCoopPTQ1032SPIRV}, {64, matmulCoopPTQ1064SPIRV},
-				{128, matmulCoopPTQ10128SPIRV}, {256, matmulCoopPTQ10256SPIRV}, {wideColumns, matmulCoopPTQ10512SPIRV},
+				{128, matmulCoopPTQ10128SPIRV}, {256, matmulCoopPTQ10256SPIRV}, {wideColumns, matmulCoopPTQ10I8512SPIRV},
 			}
 		}
 	} else if q == nn.Q4_0 {
@@ -724,6 +724,10 @@ func newQuantProduct(d *Device, q nn.Quant, coop bool) (*Pipeline, error) {
 		if err := p.WideWave(w.columns, w.spirv, wave); err != nil {
 			p.Close()
 			return nil, err
+		}
+		if coop && ternaryInt8(q, w.columns) {
+			rows, cols := productTile(q, w.columns)
+			p.WideTile(w.columns, rows, cols)
 		}
 	}
 	return p, nil

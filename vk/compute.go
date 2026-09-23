@@ -43,6 +43,9 @@ type Pipeline struct {
 	// mat-vec carries eight, the tiled product thirty-two.
 	wideModules map[int]uint64
 	wide        map[int]uint64
+	// tiles is the rows by columns a workgroup of a tiled binary answers,
+	// where it is not the width's usual one — see WideTile.
+	tiles map[int][2]int
 }
 
 // NewPipeline compiles one SPIR-V compute shader that reads the given number
@@ -165,6 +168,26 @@ func (d *Device) newPipeline(spirv []byte, bindings int, pushBytes uint32, wave 
 // in registers. shaders/matvec.comp says why.
 func (p *Pipeline) Wide(columns int, spirv []byte) error {
 	return p.wideAt(columns, spirv, 0)
+}
+
+// WideTile records that the binary at that width answers a tile of rows by
+// cols rather than the cooperative product's usual one for the width, so that
+// a dispatch of it covers the whole answer. A tile the dispatch does not know
+// about covers part of it and leaves the rest as it was, and measures faster.
+func (p *Pipeline) WideTile(columns, rows, cols int) {
+	if p.tiles == nil {
+		p.tiles = map[int][2]int{}
+	}
+	p.tiles[columns] = [2]int{rows, cols}
+}
+
+// tiledGroups is the workgroup count the tiled binary at that width needs for
+// that many outputs.
+func (s *Set) tiledGroups(coop bool, width, outputs int) uint32 {
+	if t, ok := s.p.tiles[width]; ok {
+		return uint32((outputs+t[0]-1)/t[0]) * uint32(colGroupsOf(width, t[1]))
+	}
+	return coopProductGroups(coop, width, outputs)
 }
 
 // WideWave is Wide for a binary that has to run at a named wave width.

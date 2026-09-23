@@ -111,6 +111,23 @@ func matmulCoopColBlock(width int) int {
 	return 128
 }
 
+// productTile is the rows by columns one workgroup of the cooperative product
+// answers, for that format at that width. The ternary formats run the int8
+// form of shaders/matmul_coop.comp at the widest pass, and that form is at its
+// best on a tile of 64 by 128 where the fp16 one wants 128 by 128; everywhere
+// else it is matmulCoopRows by matmulCoopColBlock.
+func productTile(q nn.Quant, width int) (rows, cols int) {
+	if ternaryInt8(q, width) {
+		return 64, 128
+	}
+	return matmulCoopRows(width), matmulCoopColBlock(width)
+}
+
+// ternaryInt8 says whether that format at that width is bound to the int8 form.
+func ternaryInt8(q nn.Quant, width int) bool {
+	return (q == nn.PQ2_0 || q == nn.PTQ1_0) && width == wideColumns
+}
+
 // coopSplit is the slicing of the shared dimension a matrix of that many rows
 // takes. The cooperative product's tile is wider than the integer one's, so a
 // row-poor matrix leaves it fewer workgroups and wants the split; a row-rich
@@ -142,7 +159,12 @@ func coopProductGroups(coop bool, width, outputs int) uint32 {
 
 // matmulCoopColGroups is how many of those a pass of that width makes.
 func matmulCoopColGroups(width int) int {
-	block := matmulCoopColBlock(width)
+	return colGroupsOf(width, matmulCoopColBlock(width))
+}
+
+// colGroupsOf is how many blocks of that many columns a pass of that width is
+// cut into.
+func colGroupsOf(width, block int) int {
 	if width <= block {
 		return 1
 	}
@@ -155,8 +177,10 @@ type MatMul struct {
 	d          *Device
 	rows, cols int
 	columns    int
-	// perGroup is how many rows one workgroup of the chosen kernel writes.
+	// perGroup is how many rows one workgroup of the chosen kernel writes,
+	// and colBlock how many columns, where it is the cooperative product.
 	perGroup int
+	colBlock int
 
 	weights, aq, as, out *Buffer
 	// back is where Run copies the answer to read it, and out is device
@@ -250,7 +274,7 @@ func NewMatMulQuant(d *Device, data []byte, rows, cols, columns int, coop bool, 
 	} else if !coop || !d.Coopmat() {
 		return nil, fmt.Errorf("vk: the %s tiled product is built for the cooperative kernel alone", q)
 	}
-	perGroup, wave := matmulRows, uint32(0)
+	perGroup, wave, colBlock := matmulRows, uint32(0), 0
 	if coop && d.Coopmat() {
 		wave = coopmatWave
 		if rows%coopTile != 0 {
@@ -274,7 +298,7 @@ func NewMatMulQuant(d *Device, data []byte, rows, cols, columns int, coop bool, 
 		if err != nil {
 			return nil, err
 		}
-		perGroup = matmulCoopRows(columns)
+		perGroup, colBlock = productTile(q, columns)
 	}
 
 	// The cooperative product takes the same split as the integer one: its
@@ -282,7 +306,7 @@ func NewMatMulQuant(d *Device, data []byte, rows, cols, columns int, coop bool, 
 	// shaders/matmul.comp's, and its own header says the split and the column
 	// blocking together are what first put it ahead of the dot products.
 	split := coopSplit(rows, columns, coop)
-	m := &MatMul{d: d, rows: rows, cols: cols, columns: columns, perGroup: perGroup, split: split, coop: coop && d.Coopmat()}
+	m := &MatMul{d: d, rows: rows, cols: cols, columns: columns, perGroup: perGroup, colBlock: colBlock, split: split, coop: coop && d.Coopmat()}
 	layout := relayout(data, rows, cols)
 	if m.weights, err = d.Upload(layout); err != nil {
 		return nil, err
@@ -579,7 +603,7 @@ func matmulCoopPQ20SPIRV(columns int) ([]byte, error) {
 	case 256:
 		return matmulCoopPQ20256SPIRV, nil
 	case 512:
-		return matmulCoopPQ20512SPIRV, nil
+		return matmulCoopPQ20I8512SPIRV, nil
 	}
 	return nil, fmt.Errorf("vk: the cooperative PQ2_0 product is built at 32, 64, 128, 256, 512 columns, not %d", columns)
 }
@@ -596,7 +620,7 @@ func matmulCoopPTQ10SPIRV(columns int) ([]byte, error) {
 	case 256:
 		return matmulCoopPTQ10256SPIRV, nil
 	case 512:
-		return matmulCoopPTQ10512SPIRV, nil
+		return matmulCoopPTQ10I8512SPIRV, nil
 	}
 	return nil, fmt.Errorf("vk: the cooperative PTQ1_0 product is built at 32, 64, 128, 256, 512 columns, not %d", columns)
 }
@@ -694,7 +718,7 @@ func (m *MatMul) pass(r *Recorder) {
 	push := moePush{dim: uint32(m.rows), ffn: uint32(m.cols), used: 1, split: uint32(m.split)}
 	cols := matmulColGroups(m.columns)
 	if m.coop {
-		cols = matmulCoopColGroups(m.columns)
+		cols = colGroupsOf(m.columns, m.colBlock)
 	}
 	groups := uint32((m.rows+m.perGroup-1)/m.perGroup) * uint32(cols) * uint32(m.split)
 	r.Dispatch(m.set, groups, unsafe.Pointer(&push))

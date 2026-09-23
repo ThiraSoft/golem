@@ -4,6 +4,10 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_control_flow_attributes : enable
+#ifdef I8
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#endif
 
 // y = W * X on the matrix cores, for one Q4_0 matrix against a batch of Q8_0
 // activations.
@@ -237,6 +241,22 @@
 // 26B, against golem's 1659 and 1979. golem is ahead at sixty-four columns and
 // level at a hundred and twenty-eight, and then it plateaus where they keep
 // climbing. This kernel is no longer the reason: what is left is above it.
+//
+// **The ternary formats in int8, 2026-09-23.** -DI8 is a second form for
+// PQ2_0 and PTQ1_0 at five hundred and twelve columns. A trit and a Q8_0
+// magnitude are both exact in eight bits, and RADV offers int8 by int8 into
+// int32 on this card, so the tile is staged as bytes: half the shared memory
+// of fp16 and no conversion on the way in. Each block of thirty-two is an int32
+// answer; it is scaled by its activation scale, and the weight scale, which a
+// ternary file holds for a hundred and twenty-eight, is paid once a step.
+// Scaling every block by both at once was as slow as fp16, because the
+// conversion and the two products share the pipe with the matrix instructions.
+// On Bonsai 2 27B at five hundred and twelve columns, milliseconds, fp16
+// against int8: ffn_up 1.19 against 0.97, ffn_down 1.34 against 1.05, at BM
+// 64, BN 128, BK 64 and a padding of two words, the best of fifteen shapes. The
+// whole pass: pp512 1102 to 1253 on PQ2_0 and 1021 to 1128 on PTQ1_0, with the
+// fork's logits held as closely as before. It agrees with the processor to a
+// part in two hundred thousand where fp16 agreed to one in two thousand.
 
 #ifndef COLUMNS
 #define COLUMNS 32
@@ -339,8 +359,26 @@ layout(push_constant) uniform Push {
     uint bycol; // 1: input activation is indexed by column (gate/up); 0: by pair (down)
 } p;
 
+#ifdef I8
+// The int8 form, for the ternary formats alone: a trit and a Q8_0 magnitude
+// are both exact in eight bits, so the tile holds them as they are, four to a
+// word, and the scales wait beside it for the int32 answer of each block of
+// thirty-two. LEN is a lane's share of a sixteen by sixteen tile at the wave
+// of sixty-four vk/device.go's coopmatWave asks for.
+#define LEN (TILE * TILE / 64)
+#ifndef PAD8
+#define PAD8 4
+#endif
+#define SA8 (BK / 4 + PAD8)
+#define SB8 (BK / 4 + PAD8)
+shared uint  sa8[BM * SA8];
+shared uint  sb8[BN * SB8];
+shared vec4  swv[BM / 4];
+shared float sas[BN * (BK / 32)];
+#else
 shared float16_t sa[BM * SA_STRIDE];
 shared float16_t sb[BN * SB_STRIDE];
+#endif
 
 // The answer goes straight out. A cooperative matrix is stored to a stride the
 // whole sixteen-row tile has to exist for, which is why vk/matmul.go refuses a
@@ -598,6 +636,41 @@ void prefetch(uint kb) {
 // through shared memory: read straight from a buffer instead, as fp16 written
 // once by the kernel upstream, a thirty-two column pass measured worse and
 // only a hundred-and-twenty-eight column pass measured better.
+#ifdef I8
+void stageTile() {
+    [[unroll]] for (uint i = 0u; i < uint(WPT); i++) {
+        uint idx = t + i * uint(THREADS);
+        if (idx >= uint(BM * KBC)) break;
+        uint r  = idx & (uint(BM) - 1u);
+        uint k  = idx / uint(BM);
+        uint at = r * uint(SA8) + k * 8u;
+        // A ternary scale covers a hundred and twenty-eight, and a step of
+        // BK sixty-four starts on one of those, so it is the whole step's.
+        if (k == 0u) swv[r >> 2u][r & 3u] = pws[i];
+        [[unroll]] for (uint u = 0u; u < 4u; u++) {
+            uint x0 = (pw[i].x >> (8u * u)) & 0xFFu;
+            uint x1 = (pw[i].y >> (8u * u)) & 0xFFu;
+            uint w0 = (x0 & 3u) | ((x0 & 12u) << 6u) | ((x0 & 48u) << 12u) | ((x0 & 192u) << 18u);
+            uint w1 = (x1 & 3u) | ((x1 & 12u) << 6u) | ((x1 & 48u) << 12u) | ((x1 & 192u) << 18u);
+            // Each byte less one, with no borrow crossing into the next.
+            sa8[at + u]      = ((w0 | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
+            sa8[at + 4u + u] = ((w1 | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
+        }
+    }
+    [[unroll]] for (uint i = 0u; i < uint(APT); i++) {
+        uint idx = t + i * uint(THREADS);
+        if (idx >= uint(BN * KBC)) break;
+        uint k    = idx % uint(KBC);
+        uint c    = idx / uint(KBC);
+        uint base = c * uint(SB8) + k * 8u;
+        sas[c * uint(KBC) + k] = pas[i];
+        [[unroll]] for (uint u = 0u; u < 4u; u++) {
+            sb8[base + u]      = plo[i][u];
+            sb8[base + 4u + u] = phi[i][u];
+        }
+    }
+}
+#else
 void stageTile() {
     [[unroll]] for (uint i = 0u; i < uint(WPT); i++) {
         uint idx = t + i * uint(THREADS);
@@ -735,6 +808,7 @@ void stageTile() {
         }
     }
 }
+#endif
 
 void main() {
     t         = gl_LocalInvocationID.x;
@@ -815,6 +889,22 @@ void main() {
             acc[r][c] = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
         }
     }
+#ifdef I8
+    // Which row and column of a tile each of this lane's elements is. The
+    // layout is the driver's; loading a tile of its own indices asks it.
+    // The weight tile is free until the first staging, and big enough.
+    for (uint k = t; k < uint(TILE * TILE); k += uint(THREADS)) sa8[k] = k;
+    barrier();
+    coopmat<int32_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> where;
+    coopMatLoad(where, sa8, 0u, uint(TILE), gl_CooperativeMatrixLayoutRowMajor);
+    // On RADV a lane holds one column of a tile and LEN consecutive rows of it,
+    // the first on a multiple of four. Nothing in the extension promises that,
+    // so it is read here and not assumed, and the parity tests in pq20_test.go
+    // and ptq10_test.go are what would catch a driver that lays it out
+    // otherwise.
+    uint lcol = uint(where[0]) & 15u;
+    uint lrow = uint(where[0]) >> 4u;
+#endif
 
     prefetch(kb0);
     for (uint kb = kb0; kb < kbn; kb += KB) {
@@ -825,6 +915,49 @@ void main() {
         if (kb + KB < kbn) prefetch(kb + KB);
         barrier();
 
+#ifdef I8
+        {
+            // Every block of thirty-two is an int32 answer times its own
+            // activation scale; the weight scale is the step's and is paid once.
+            // Scaling each block by both, as the first form of this did, put a
+            // conversion, a product and a fused add behind every pair of
+            // multiplies, and on RDNA4 those share the pipe with the matrix
+            // instructions: it was no faster than fp16.
+            coopmat<int8_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> B0[KBC][CSUB], B1[KBC][CSUB];
+            float asc[KBC][CSUB];
+            [[unroll]] for (uint kq = 0u; kq < uint(KBC); kq++) {
+                [[unroll]] for (uint c = 0u; c < CSUB; c++) {
+                    uint o = (cbase + c) * uint(TILE) * uint(SB8) + kq * 8u;
+                    coopMatLoad(B0[kq][c], sb8, o,      uint(SB8), gl_CooperativeMatrixLayoutColumnMajor);
+                    coopMatLoad(B1[kq][c], sb8, o + 4u, uint(SB8), gl_CooperativeMatrixLayoutColumnMajor);
+                    asc[kq][c] = sas[((cbase + c) * uint(TILE) + lcol) * uint(KBC) + kq];
+                }
+            }
+            [[unroll]] for (uint r = 0u; r < RSUB; r++) {
+                coopmat<int8_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> A0[KBC], A1[KBC];
+                [[unroll]] for (uint kq = 0u; kq < uint(KBC); kq++) {
+                    uint o = (rbase + r) * uint(TILE) * uint(SA8) + kq * 8u;
+                    coopMatLoad(A0[kq], sa8, o,      uint(SA8), gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(A1[kq], sa8, o + 4u, uint(SA8), gl_CooperativeMatrixLayoutRowMajor);
+                }
+                // A lane's LEN rows are consecutive and start on a multiple of
+                // four, so their scales are one read.
+                vec4 wsr = swv[((rbase + r) * uint(TILE) + lrow) >> 2u];
+                [[unroll]] for (uint c = 0u; c < CSUB; c++) {
+                    float part[LEN];
+                    [[unroll]] for (uint e = 0u; e < uint(LEN); e++) part[e] = 0.0;
+                    [[unroll]] for (uint kq = 0u; kq < uint(KBC); kq++) {
+                        coopmat<int32_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> ci =
+                            coopmat<int32_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0);
+                        ci = coopMatMulAdd(A0[kq], B0[kq][c], ci);
+                        ci = coopMatMulAdd(A1[kq], B1[kq][c], ci);
+                        [[unroll]] for (uint e = 0u; e < uint(LEN); e++) part[e] += float(ci[e]) * asc[kq][c];
+                    }
+                    [[unroll]] for (uint e = 0u; e < uint(LEN); e++) acc[r][c][e] += part[e] * wsr[e];
+                }
+            }
+        }
+#else
         // The cores.
         //
         // The order of these three loops is the kernel. A cooperative load and
@@ -851,6 +984,7 @@ void main() {
                 }
             }
         }
+#endif
     }
 
 #ifdef BYID
