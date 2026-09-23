@@ -64,6 +64,16 @@ func (g *Generator) WithMaxTokens(n int) *Generator {
 	return &out
 }
 
+// endsInThought says whether the prompt's last words open a thought, blank
+// lines aside. A few tokens are enough to hold the marker.
+func (g *Generator) endsInThought(ids []int32, open string) bool {
+	var tail strings.Builder
+	for _, id := range ids[max(0, len(ids)-8):] {
+		tail.WriteString(g.vocab.Piece(id, false))
+	}
+	return strings.HasSuffix(strings.TrimRight(tail.String(), " \n"), open)
+}
+
 // Delta is what one step of the drawing adds for the client: prose or
 // reasoning, never both.
 type Delta struct {
@@ -103,6 +113,11 @@ func (g *Generator) GeneratePrompt(ctx context.Context, prompt engine.Prompt, p 
 	var drawn strings.Builder // everything drawn, calls and reasoning included
 	open, close := g.tpl.ReasoningMarkers()
 	sorted := sorter{open: open, close: close, call: g.tpl.CallOpen(), emit: emit}
+	// A template that turns thinking on ends the prompt inside an open
+	// thought, and the model writes only its close.
+	if open != "" && g.endsInThought(prompt.Tokens(), open) {
+		sorted.thinking, sorted.trim = true, true
+	}
 
 	// take puts one drawn token into the answer and says whether the answer
 	// ends there. A stop string is the one ending that decides what the answer

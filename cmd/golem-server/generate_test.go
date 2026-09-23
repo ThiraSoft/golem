@@ -387,3 +387,23 @@ func TestGenerationSeedsThePenaltyWindowWithThePrompt(t *testing.T) {
 		t.Fatalf("the answer is %q, and hello was already in the prompt", answer.Text)
 	}
 }
+
+// A prompt that already opened the thought, as a template does when thinking
+// is on, has the answer begin inside it: what comes before the close is
+// reasoning, not prose.
+func TestGenerateBeginsInsideAThoughtThePromptOpened(t *testing.T) {
+	g, v := newGenerator(t, []string{"pondering", "\n", "</think>", "\n\n", "Answer.", "<turn|>"}, 32)
+	prompt := []int32{int32(v.id("a")), int32(v.id("<think>")), int32(v.id("\n"))}
+	var content, reasoning strings.Builder
+	answer, err := g.Generate(context.Background(), prompt, greedy(), nil, func(d Delta) error {
+		content.WriteString(d.Content)
+		reasoning.WriteString(d.Reasoning)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer.Text != "Answer." || answer.Reasoning != "pondering" || content.String() != "Answer." || reasoning.String() != "pondering" {
+		t.Fatalf("text %q, reasoning %q, streamed %q and %q", answer.Text, answer.Reasoning, content.String(), reasoning.String())
+	}
+}

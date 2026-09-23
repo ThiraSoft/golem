@@ -169,6 +169,7 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 	prompt, err := s.tpl.Render(req.Messages, chat.Options{
 		Tools:               req.Tools,
 		AddGenerationPrompt: true,
+		EnableThinking:      req.ChatTemplateKwargs.EnableThinking,
 	})
 	if err != nil {
 		refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())

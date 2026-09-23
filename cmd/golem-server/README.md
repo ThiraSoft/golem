@@ -315,6 +315,10 @@ The four penalty fields — `repeat_penalty`, `repeat_last_n`,
 `frequency_penalty`, `presence_penalty` — are llama.cpp's, and the window is
 seeded with the prompt before the first draw, as llama-server does.
 
+A model that reasons answers without it unless the request asks,
+llama-server's way: `"chat_template_kwargs": {"enable_thinking": true}`. The
+reasoning then streams apart, as `reasoning_content`.
+
 ## What it refuses
 
 With a 400 and OpenAI's error envelope, rather than answering something else:

@@ -38,6 +38,11 @@ type completionRequest struct {
 	Grammar        string          `json:"grammar"`
 	N              *int            `json:"n"`
 	LogProbs       *bool           `json:"logprobs"`
+	// What the template is given beyond the conversation, as llama-server
+	// reads it; only enable_thinking is heard, and it is off unless asked.
+	ChatTemplateKwargs struct {
+		EnableThinking bool `json:"enable_thinking"`
+	} `json:"chat_template_kwargs"`
 }
 
 // responseFormat is what a client asks the answer to be: any JSON object, or

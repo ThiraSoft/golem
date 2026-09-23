@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ThiraSoft/golem/chat"
 	"github.com/ThiraSoft/golem/sample"
 )
 
@@ -326,5 +327,33 @@ func TestAnUnconstrainedRequestBuildsNoTokenTable(t *testing.T) {
 	post(t, s, `{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`)
 	if s.tokens != nil {
 		t.Fatal("a request that asked for no grammar built the vocabulary table anyway")
+	}
+}
+
+// thinkingSpy is the word template, remembering whether the last request
+// asked for the reasoning to be opened.
+type thinkingSpy struct {
+	wordTemplate
+	asked *bool
+}
+
+func (s thinkingSpy) Render(msgs []chat.Message, opt chat.Options) (string, error) {
+	*s.asked = opt.EnableThinking
+	return s.wordTemplate.Render(msgs, opt)
+}
+
+// Thinking stays off unless the request asks for it, the way llama-server
+// reads it: chat_template_kwargs.enable_thinking.
+func TestARequestTurnsThinkingOn(t *testing.T) {
+	var asked bool
+	s := newTestServer(t, []string{"a", "<turn|>", "b", "<turn|>"})
+	s.tpl = thinkingSpy{asked: &asked}
+	post(t, s, `{"messages":[{"role":"user","content":"hi"}]}`)
+	if asked {
+		t.Fatal("a request that asked nothing opened the reasoning")
+	}
+	w := post(t, s, `{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}`)
+	if w.Code != http.StatusOK || !asked {
+		t.Fatalf("enable_thinking true did not reach the template (%d: %s)", w.Code, w.Body)
 	}
 }
