@@ -127,3 +127,56 @@ func bonsaiArgmax(l []float32) int {
 	}
 	return bi
 }
+
+// TestVulkanSlotsAreIndependent holds two conversations on the card and checks
+// that one does not leak into the other. A delta net's state is rewritten by
+// every token, so a pipeline that ran slot 1 through slot 0's state would
+// continue slot 0 from the wrong recurrence and answer something else; the
+// comparison is to the same continuation with nothing run in between, and it
+// is exact, because the two runs are the same dispatches on the same buffers.
+func TestVulkanSlotsAreIndependent(t *testing.T) {
+	path := bonsaiDir + "Ternary-Bonsai-2-27B-PQ2_0.gguf"
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("no checkpoint: %v", err)
+	}
+	tokens := bonsaiTokens(t)
+	a, next, b := tokens[:12], tokens[12], tokens[13:25]
+
+	m, err := Open(path, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.SetSlots(2); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UseVulkan(); err != nil {
+		t.Fatalf("vulkan: %v", err)
+	}
+	if got := m.SlotContext(); got != 1024 {
+		t.Fatalf("a slot holds %d positions, want 1024", got)
+	}
+
+	continued := func(interleave bool) []float32 {
+		m.UseSlot(0)
+		m.Reset()
+		m.ForwardBatch(a, 0)
+		if interleave {
+			m.UseSlot(1)
+			m.Reset()
+			m.ForwardBatch(b, 0)
+			m.UseSlot(0)
+		}
+		hs := m.ForwardBatch([]int32{next}, len(a))
+		out := make([]float32, m.Cfg.Vocab)
+		m.Logits(hs[0], out)
+		return out
+	}
+	alone := continued(false)
+	between := continued(true)
+	for i := range alone {
+		if alone[i] != between[i] {
+			t.Fatalf("logit %d is %g with another conversation run in between and %g without", i, between[i], alone[i])
+		}
+	}
+}

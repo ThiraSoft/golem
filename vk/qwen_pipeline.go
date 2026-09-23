@@ -385,6 +385,19 @@ type QwenShape struct {
 	// only ever makes sense beside a window: see AddBlockWindow.
 	Float WideForm
 
+	// Slots is how many conversations the pipeline holds at once, and zero or
+	// one means one. Each has its own delta net states, convolution windows,
+	// shadows and key-value caches, MaxContext positions of them: a caller
+	// cutting a context between conversations passes the cut here, not the
+	// whole. A pass runs in one slot, the one UseSlot last named.
+	//
+	// It is not the attention's ring cut into slots, which is how gemma and
+	// qwen hold several conversations: a delta net's state is a matrix a head
+	// that every token rewrites, so there is nothing to cut and it has to be
+	// copied. A hundred and fifty-one megabytes a slot on the 27B, more with
+	// the shadows a draft needs.
+	Slots int
+
 	// Rotation describes the activation sign vectors and Hadamard transform
 	// used by Prism ML Bonsai models before ternary weight projections. Nil
 	// for any non-Prism model.
@@ -419,6 +432,9 @@ const (
 	// WideBF16 is two, read as the top half of one.
 	WideBF16
 )
+
+// slots is how many conversations the shape holds, never less than one.
+func (s QwenShape) slots() int { return max(s.Slots, 1) }
 
 // wide says the model takes the float path in either of its forms.
 func (s QwenShape) wide() bool { return s.Float != NotWide }
@@ -540,6 +556,24 @@ type qwenSSMBlock struct {
 	// projection — the convolution, the recurrence, the two norms — is the
 	// same either way and is used by both.
 	golem *qwenGolemSSM
+	// slots is every conversation's recurrence and the two sets that read
+	// it. The fields above of the same names are the active slot's, which
+	// is what every recording reads; useSlot moves them.
+	slots []qwenSSMSlot
+}
+
+// qwenSSMSlot is what one conversation owns of a delta net.
+type qwenSSMSlot struct {
+	convState, ssmState     *Buffer
+	shadowState, shadowConv *Buffer
+	setConv, setScan        *Set
+}
+
+func (b *qwenSSMBlock) useSlot(i int) {
+	c := &b.slots[i]
+	b.convState, b.ssmState = c.convState, c.ssmState
+	b.shadowState, b.shadowConv = c.shadowState, c.shadowConv
+	b.setConv, b.setScan = c.setConv, c.setScan
 }
 
 type qwenAttnBlock struct {
@@ -560,6 +594,21 @@ type qwenAttnBlock struct {
 	// block's and not the shape's because a prediction block grafted from the
 	// unrotated model sits in a Prism pipeline and must read plain Q8_0.
 	rotated bool
+	// slots is every conversation's cache and the two sets that read it; see
+	// qwenSSMBlock's.
+	slots []qwenAttnSlot
+}
+
+// qwenAttnSlot is what one conversation owns of a full attention.
+type qwenAttnSlot struct {
+	kCache, vCache  *Buffer
+	setPrep, setGQA *Set
+}
+
+func (b *qwenAttnBlock) useSlot(i int) {
+	c := &b.slots[i]
+	b.kCache, b.vCache = c.kCache, c.vCache
+	b.setPrep, b.setGQA = c.setPrep, c.setGQA
 }
 
 type qwenFFNBlock struct {
@@ -736,6 +785,8 @@ type QwenPipeline struct {
 
 	// The pass that puts the delta nets back when a draft is refused.
 	restoreProg *Program
+	// slot is the conversation the next pass runs in; see QwenShape.Slots.
+	slot int
 
 	owned []*Buffer
 }
@@ -1082,26 +1133,40 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 		{&b.convWeight, asBytes(d.ConvWeight)},
 		{&b.dtBias, asBytes(d.SSMDtBias)}, {&b.ssmA, asBytes(d.SSMA)},
 		{&b.ssmNorm, asBytes(d.SSMNorm)},
-		{&b.convState, make([]byte, (s.ConvDim*4)*3)},
-		{&b.ssmState, make([]byte, s.Rank*s.StateSize*s.StateSize*4)},
-		// The shadows, or four bytes standing in for them where nothing drafts.
-		// They stay bound either way — a descriptor set names every binding
-		// whether or not a pass writes it — and nothing writes them unless a
-		// pass says which column to snapshot at, which only a speculative one
-		// does.
-		{&b.shadowConv, make([]byte, shadowBytes(s.Snapshots, (s.ConvDim*4)*3))},
-		{&b.shadowState, make([]byte, shadowBytes(s.Snapshots, s.Rank*s.StateSize*s.StateSize*4))},
 	} {
 		if *u.into, err = p.upload(u.data); err != nil {
 			return err
 		}
 	}
-	if b.setConv, err = p.pipeConv.NewSet([]*Buffer{b.convWeight, p.qkvBuf, b.convState, p.convOut, b.shadowConv}); err != nil {
-		return err
+	b.slots = make([]qwenSSMSlot, s.slots())
+	for i := range b.slots {
+		c := &b.slots[i]
+		for _, u := range []struct {
+			into **Buffer
+			data []byte
+		}{
+			{&c.convState, make([]byte, (s.ConvDim*4)*3)},
+			{&c.ssmState, make([]byte, s.Rank*s.StateSize*s.StateSize*4)},
+			// The shadows, or four bytes standing in for them where nothing
+			// drafts. They stay bound either way — a descriptor set names
+			// every binding whether or not a pass writes it — and nothing
+			// writes them unless a pass says which column to snapshot at,
+			// which only a speculative one does.
+			{&c.shadowConv, make([]byte, shadowBytes(s.Snapshots, (s.ConvDim*4)*3))},
+			{&c.shadowState, make([]byte, shadowBytes(s.Snapshots, s.Rank*s.StateSize*s.StateSize*4))},
+		} {
+			if *u.into, err = p.upload(u.data); err != nil {
+				return err
+			}
+		}
+		if c.setConv, err = p.pipeConv.NewSet([]*Buffer{b.convWeight, p.qkvBuf, c.convState, p.convOut, c.shadowConv}); err != nil {
+			return err
+		}
+		if c.setScan, err = p.pipeScan.NewSet([]*Buffer{p.convOut, p.qkNorm, p.alphaBuf, b.dtBias, b.ssmA, p.betaBuf, c.ssmState, p.ySSM, c.shadowState}); err != nil {
+			return err
+		}
 	}
-	if b.setScan, err = p.pipeScan.NewSet([]*Buffer{p.convOut, p.qkNorm, p.alphaBuf, b.dtBias, b.ssmA, p.betaBuf, b.ssmState, p.ySSM, b.shadowState}); err != nil {
-		return err
-	}
+	b.useSlot(p.slot)
 	if b.setNormGate, err = p.pipeGate.NewSet([]*Buffer{p.ySSM, p.gateZBuf, b.ssmNorm}); err != nil {
 		return err
 	}
@@ -1252,11 +1317,6 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 		data []byte
 	}{
 		{&b.qNorm, asBytes(d.QNorm)}, {&b.kNorm, asBytes(d.KNorm)},
-		// Two bytes a number, not four: shaders/qwen_attn_prep.comp holds the
-		// cache in halves, which is what every other attention here does and
-		// what decides whether the 27B's head stays on the card.
-		{&b.kCache, make([]byte, s.KVHeads*s.MaxContext*s.HeadDim*2)},
-		{&b.vCache, make([]byte, s.KVHeads*s.MaxContext*s.HeadDim*2)},
 	} {
 		if *u.into, err = p.upload(u.data); err != nil {
 			return nil, err
@@ -1272,12 +1332,25 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 			}
 		}
 	}
-	if b.setPrep, err = p.pipeAttnPrep.NewSet([]*Buffer{p.qIn, p.kIn, p.vIn, b.qNorm, b.kNorm, p.qOut, b.kCache, b.vCache, p.posBuf, p.mposBuf}); err != nil {
-		return nil, err
+	b.slots = make([]qwenAttnSlot, s.slots())
+	for i := range b.slots {
+		c := &b.slots[i]
+		// Two bytes a number, not four: shaders/qwen_attn_prep.comp holds the
+		// cache in halves, which is what every other attention here does and
+		// what decides whether the 27B's head stays on the card.
+		for _, into := range []**Buffer{&c.kCache, &c.vCache} {
+			if *into, err = p.upload(make([]byte, s.KVHeads*s.MaxContext*s.HeadDim*2)); err != nil {
+				return nil, err
+			}
+		}
+		if c.setPrep, err = p.pipeAttnPrep.NewSet([]*Buffer{p.qIn, p.kIn, p.vIn, b.qNorm, b.kNorm, p.qOut, c.kCache, c.vCache, p.posBuf, p.mposBuf}); err != nil {
+			return nil, err
+		}
+		if c.setGQA, err = p.pipeAttnGQA.NewSet([]*Buffer{p.qOut, c.kCache, c.vCache, p.qIn, p.attnOut, p.posBuf}); err != nil {
+			return nil, err
+		}
 	}
-	if b.setGQA, err = p.pipeAttnGQA.NewSet([]*Buffer{p.qOut, b.kCache, b.vCache, p.qIn, p.attnOut, p.posBuf}); err != nil {
-		return nil, err
-	}
+	b.useSlot(p.slot)
 	if b.f32 {
 		// The mix arrives in floats and stays there: nothing quantizes it on
 		// the float path, so this projection reads what the attention wrote.
@@ -1518,12 +1591,12 @@ func (s QwenShape) width() int {
 // which together are most of the gigabyte the model overflows the card by.
 func QwenBufferBytes(s QwenShape, width, attn, ssm int) uint64 {
 	n := QwenScratchBytes(s, width)
-	n += uint64(attn) * uint64(2*s.KVHeads*s.MaxContext*s.HeadDim*2)
+	n += uint64(attn) * uint64(2*s.KVHeads*s.MaxContext*s.HeadDim*2) * uint64(s.slots())
 	state := uint64((s.ConvDim*4)*3 + s.Rank*s.StateSize*s.StateSize*4)
 	if s.Snapshots {
 		state *= 2
 	}
-	return n + uint64(ssm)*state
+	return n + uint64(ssm)*state*uint64(s.slots())
 }
 
 // QwenScratchBytes is what a pipeline of that shape spends on working memory at
@@ -1586,6 +1659,10 @@ func (p *QwenPipeline) forward(xs [][]float32, at []QwenPlace, speculative bool)
 		snapAt = columns - 1
 		key = -columns
 	}
+	// A recording names the slot's buffers, so each slot keeps its own. The
+	// widths are at most a few thousand either way; a slot is a multiple past
+	// them.
+	key += p.slot * qwenSlotKey
 	if p.pass == nil {
 		p.pass = map[int]*Program{}
 	}
@@ -2744,3 +2821,47 @@ func (p *QwenPipeline) DeviceBytes() uint64 {
 	}
 	return n
 }
+
+// qwenSlotKey spaces the pass cache's keys a slot apart: a key is a width,
+// negated for a speculative pass, and no width comes near this.
+const qwenSlotKey = 1 << 16
+
+// UseSlot makes the next pass run in conversation i: every delta net's state
+// and every attention's cache are that conversation's from here on. It costs
+// nothing on the card; the passes compiled for a slot are kept, and the two
+// small recordings that are not, the restore and the prediction block's, are
+// laid down again the next time they are wanted.
+func (p *QwenPipeline) UseSlot(i int) error {
+	if i < 0 || i >= p.shape.slots() {
+		return fmt.Errorf("vk: slot %d of a pipeline holding %d", i, p.shape.slots())
+	}
+	if i == p.slot {
+		return nil
+	}
+	p.slot = i
+	for _, b := range p.ssmBlocks {
+		if b != nil {
+			b.useSlot(i)
+		}
+	}
+	for _, b := range p.attnBlocks {
+		if b != nil {
+			b.useSlot(i)
+		}
+	}
+	if p.mtp != nil {
+		p.mtp.attn.useSlot(i)
+		if p.mtp.pass != nil {
+			p.mtp.pass.Close()
+			p.mtp.pass = nil
+		}
+	}
+	if p.restoreProg != nil {
+		p.restoreProg.Close()
+		p.restoreProg = nil
+	}
+	return nil
+}
+
+// Slot is the conversation the next pass runs in.
+func (p *QwenPipeline) Slot() int { return p.slot }

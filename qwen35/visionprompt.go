@@ -2,8 +2,6 @@ package qwen35
 
 import (
 	"fmt"
-
-	"github.com/ThiraSoft/golem/vk"
 )
 
 // The markers this checkpoint writes a picture with. They are read by name
@@ -87,7 +85,6 @@ func (m *Model) BuildPrompt(tokens []int32, images [][][]float32, grids [][2]int
 	if next != len(images) {
 		return nil, fmt.Errorf("qwen35: %d pictures encoded and %d placed", len(images), next)
 	}
-	m.grids = m.grids[:0]
 	return p, nil
 }
 
@@ -141,31 +138,7 @@ func (m *Model) ForwardPrompt(p *Prompt, startPos int) [][]float32 {
 	out := make([][]float32, len(p.Tokens))
 
 	if m.gpuPipe != nil {
-		embeds := make([][]float32, m.gpuPipe.WidthFor(len(p.Tokens)))
-		for i := range embeds {
-			embeds[i] = make([]float32, m.Cfg.Dim)
-		}
-		for t := 0; t < len(p.Tokens); {
-			n := m.gpuPipe.WidthFor(len(p.Tokens) - t)
-			places := make([]vk.QwenPlace, n)
-			for c := 0; c < n; c++ {
-				if row := p.Embeds[t+c]; row != nil {
-					copy(embeds[c], row)
-				} else {
-					m.W.TokenEmbd.Row(int(p.Tokens[t+c]), embeds[c])
-				}
-				places[c] = at[t+c].gpu()
-			}
-			hs, err := m.gpuPipe.ForwardPlaces(embeds[:n], places)
-			if err != nil {
-				panic(fmt.Sprintf("qwen35: the GPU pipeline failed at position %d: %v", startPos+t, err))
-			}
-			for c := 0; c < n; c++ {
-				out[t+c] = append([]float32(nil), hs[c]...)
-			}
-			copy(m.x, m.gpuPipe.HiddenColumn(n-1))
-			t += n
-		}
+		m.forwardCardRows(p.Tokens, p.Embeds, at, out)
 		return out
 	}
 
@@ -233,38 +206,27 @@ func (m *Model) HasVisionMarkers() bool {
 // ForwardEmbeddedPlaces is one pass over tokens whose embeddings may be given
 // rather than looked up, at places that need not follow the cache index.
 //
-// It is what a server's batched pass reaches. On a card this model holds one
-// conversation — the delta net's state is a matrix a head and not a ring, so
-// there is nothing to cut into slots — and the pass is therefore one run of
-// consecutive cache positions, which is all the pipeline ever asked.
+// It is what a server's batched pass reaches. On a card a pass runs in one
+// slot, so the tokens go up a run of one conversation at a time, as
+// ForwardPlaces sends them; without that a picture sent to the second
+// conversation was read into the first one's state, and the model described
+// something it had never been shown.
 func (m *Model) ForwardEmbeddedPlaces(tokens []int32, embeds [][]float32, at []Place) [][]float32 {
 	out := make([][]float32, len(tokens))
 
 	if m.gpuPipe != nil {
-		xs := make([][]float32, m.gpuPipe.WidthFor(len(tokens)))
-		for i := range xs {
-			xs[i] = make([]float32, m.Cfg.Dim)
-		}
 		for t := 0; t < len(tokens); {
-			n := m.gpuPipe.WidthFor(len(tokens) - t)
-			places := make([]vk.QwenPlace, n)
-			for c := 0; c < n; c++ {
-				if embeds != nil && embeds[t+c] != nil {
-					copy(xs[c], embeds[t+c])
-				} else {
-					m.W.TokenEmbd.Row(int(tokens[t+c]), xs[c])
-				}
-				places[c] = at[t+c].gpu()
+			end := t + 1
+			for end < len(tokens) && at[end].Slot == at[t].Slot {
+				end++
 			}
-			hs, err := m.gpuPipe.ForwardPlaces(xs[:n], places)
-			if err != nil {
-				panic(fmt.Sprintf("qwen35: the GPU pipeline failed at position %d: %v", at[t].Pos, err))
+			var rows [][]float32
+			if embeds != nil {
+				rows = embeds[t:end]
 			}
-			for c := 0; c < n; c++ {
-				out[t+c] = append([]float32(nil), hs[c]...)
-			}
-			copy(m.x, m.gpuPipe.HiddenColumn(n-1))
-			t += n
+			m.UseSlot(at[t].Slot)
+			m.forwardCardRows(tokens[t:end], rows, at[t:end], out[t:end])
+			t = end
 		}
 		return out
 	}

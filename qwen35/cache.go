@@ -37,6 +37,14 @@ type BlockCache struct {
 
 type Cache struct {
 	Blocks []BlockCache
+	// used says a pass on the processor has written to the cache since it
+	// was last cleared. A model on the card never writes here, and clearing
+	// what nobody wrote is not free: a full attention's keys and values are
+	// float32, four and a half gigabytes a conversation at 32768 positions on
+	// the 27B, reserved and never touched until a clear writes every page.
+	// golem-server holding two conversations sat at twenty-three gigabytes
+	// resident and spent two seconds restarting a slot for exactly that.
+	used bool
 }
 
 func NewCache(cfg *Config) *Cache {
@@ -67,6 +75,10 @@ func newBlockCacheInto(b *BlockCache, cfg *Config, bc BlockConfig) *BlockCache {
 }
 
 func (c *Cache) Reset() {
+	if !c.used {
+		return
+	}
+	c.used = false
 	for i := range c.Blocks {
 		b := &c.Blocks[i]
 		clear(b.Keys)

@@ -51,7 +51,7 @@ func TestVulkanDescribesAnImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	grid, _ := m.GridOf(0)
+	grid, _ := m.GridFor(rows)
 
 	tpl := NewTemplate()
 	rendered, err := tpl.Render([]chat.Message{{

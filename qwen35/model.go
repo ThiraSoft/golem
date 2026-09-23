@@ -54,9 +54,9 @@ type Model struct {
 	imagePadID    int32
 	visionEndID   int32
 
-	// grids are the shapes the pictures encoded since the last prompt came
-	// from, in that order. A row count does not say which way round a grid was.
-	grids [][2]int
+	// grids is the shape each encoded picture came from, keyed by its first
+	// row. A row count does not say which way round a grid was.
+	grids map[*float32][2]int
 
 	vision *VisionTower
 }
@@ -128,22 +128,25 @@ func (m *Model) Slots() int {
 	return len(m.caches)
 }
 
+// SlotContext is the positions one conversation may use: the context cut
+// between the slots, which is what golem-server's -parallel promises and what
+// the card holds a key-value cache of for each.
 func (m *Model) SlotContext() int {
-	return m.Cfg.MaxContext
+	return m.Cfg.MaxContext / m.Slots()
 }
 
 func (m *Model) SetSlots(n int) error {
-	// The card holds one delta net's state per block, and it is not indexed by
-	// slot. The attention blocks could be cut the way gemma's and qwen's now
-	// are — the position buffer carries the slot and vk/attention.go lays one
-	// ring a conversation — but a recurrent block has no ring to cut: its
-	// state is a matrix a head that every token rewrites, and the copies the
-	// speculation path makes of it would each need a slot too. Answering
-	// several conversations off one state mixes them together, which is a
-	// wrong answer and not a slow one, so it is refused rather than fallen
-	// back from. Slots on the processor are unaffected.
-	if n > 1 && m.gpuPipe != nil {
-		return fmt.Errorf("qwen35: the GPU pipeline holds one conversation, not %d", n)
+	// The card holds a delta net's state, its shadows and an attention's cache
+	// for each slot, and they are allocated when the model goes up: a recurrent
+	// block has no ring to cut, so a slot is a copy and not a share, and the
+	// copies are sized once. Changing the count after that would leave the
+	// pipeline holding the old one, so it is refused. Slots on the processor
+	// are unaffected.
+	if m.gpuPipe != nil {
+		if n != m.Slots() {
+			return fmt.Errorf("qwen35: the GPU pipeline was built for %d conversations; set the slots before UseVulkan", m.Slots())
+		}
+		return nil
 	}
 	if n <= 1 {
 		m.caches = nil
@@ -161,6 +164,11 @@ func (m *Model) SetSlots(n int) error {
 
 func (m *Model) UseSlot(i int) {
 	m.slot = i
+	if m.gpuPipe != nil {
+		if err := m.gpuPipe.UseSlot(i); err != nil {
+			panic(fmt.Sprintf("qwen35: %v", err))
+		}
+	}
 	if len(m.caches) > i {
 		m.cache = m.caches[i]
 	}
@@ -197,32 +205,7 @@ func (m *Model) Forward(token int32, pos int) []float32 {
 func (m *Model) ForwardBatch(tokens []int32, startPos int) [][]float32 {
 	out := make([][]float32, len(tokens))
 	if m.gpuPipe != nil {
-		// One row a column of the widest pass this run will actually take,
-		// which is not the widest the pipeline can take: a card that reads a
-		// prompt a hundred and twenty-eight positions at a time would
-		// otherwise allocate and clear that many rows to draw one token.
-		embeds := make([][]float32, m.gpuPipe.WidthFor(len(tokens)))
-		for i := range embeds {
-			embeds[i] = make([]float32, m.Cfg.Dim)
-		}
-		for t := 0; t < len(tokens); {
-			n := m.gpuPipe.WidthFor(len(tokens) - t)
-			at := make([]vk.QwenPlace, n)
-			for c := 0; c < n; c++ {
-				m.W.TokenEmbd.Row(int(tokens[t+c]), embeds[c])
-				p := startPos + t + c
-				at[c] = vk.QwenPlace{Pos: p, T: p, H: p, W: p}
-			}
-			hs, err := m.gpuPipe.ForwardPlaces(embeds[:n], at)
-			if err != nil {
-				panic(fmt.Sprintf("qwen35: the GPU pipeline failed at position %d: %v", startPos+t, err))
-			}
-			for c := 0; c < n; c++ {
-				out[t+c] = append([]float32(nil), hs[c]...)
-			}
-			copy(m.x, m.gpuPipe.HiddenColumn(n-1))
-			t += n
-		}
+		m.forwardCard(tokens, Run(m.slot, startPos, len(tokens)), out)
 		return out
 	}
 	places := Run(m.slot, startPos, len(tokens))
@@ -247,6 +230,23 @@ func (m *Model) ForwardSlots(tokens []int32, slots, positions []int) [][]float32
 // Run, and gets places whose axes follow the cache index.
 func (m *Model) ForwardPlaces(tokens []int32, at []Place) [][]float32 {
 	out := make([][]float32, len(tokens))
+	if m.gpuPipe != nil {
+		// A pass on the card runs in one slot, so the tokens go up a run at a
+		// time: consecutive tokens of one conversation, which is what a
+		// prompt is, in passes as wide as the pipeline takes. Token by token
+		// a prompt read at fifteen positions a second through the server
+		// where golem-cli read it at a hundred and twenty.
+		for t := 0; t < len(tokens); {
+			end := t + 1
+			for end < len(tokens) && at[end].Slot == at[t].Slot {
+				end++
+			}
+			m.UseSlot(at[t].Slot)
+			m.forwardCard(tokens[t:end], at[t:end], out[t:end])
+			t = end
+		}
+		return out
+	}
 	for t, tok := range tokens {
 		m.UseSlot(at[t].Slot)
 		out[t] = m.step(tok, at[t])
@@ -268,6 +268,7 @@ func (m *Model) stepEmbedded(row []float32, at Place) []float32 {
 		return append([]float32(nil), h[0]...)
 	}
 
+	m.cache.used = true
 	for i, n := 0, m.trunk(); i < n; i++ {
 		Block(m.Cfg, m.Cfg.Blocks[i], &m.W.Blocks[i], &m.cache.Blocks[i], m.rope, at, m.x, m.scratch)
 	}
@@ -298,6 +299,7 @@ func (m *Model) step(token int32, at Place) []float32 {
 		return append([]float32(nil), h[0]...)
 	}
 
+	m.cache.used = true
 	for i, n := 0, m.trunk(); i < n; i++ {
 		Block(m.Cfg, m.Cfg.Blocks[i], &m.W.Blocks[i], &m.cache.Blocks[i], m.rope, at, m.x, m.scratch)
 	}
@@ -384,4 +386,47 @@ func (m *Model) quantHeadLogits(hidden, out []float32) bool {
 	}
 	m.quantHead.Prepare(b)
 	return m.quantHead.MatVec(b, 0, out) == nil
+}
+
+// forwardCard is a run of one conversation's tokens through the card, in
+// passes as wide as the pipeline takes, each hidden state into out. It leaves
+// the last position's un-normed state in m.x, which the prediction block and
+// the next position continue from.
+func (m *Model) forwardCard(tokens []int32, at []Place, out [][]float32) {
+	m.forwardCardRows(tokens, nil, at, out)
+}
+
+// forwardCardRows is forwardCard for a run some of whose positions are given a
+// row rather than a token, which is how a picture goes in: where rows has one,
+// it is the embedding, and elsewhere the token is looked up.
+func (m *Model) forwardCardRows(tokens []int32, rows [][]float32, at []Place, out [][]float32) {
+	// One row a column of the widest pass this run will actually take, which
+	// is not the widest the pipeline can take: a card that reads a prompt a
+	// hundred and twenty-eight positions at a time would otherwise allocate
+	// and clear that many rows to draw one token.
+	embeds := make([][]float32, m.gpuPipe.WidthFor(len(tokens)))
+	for i := range embeds {
+		embeds[i] = make([]float32, m.Cfg.Dim)
+	}
+	for t := 0; t < len(tokens); {
+		n := m.gpuPipe.WidthFor(len(tokens) - t)
+		places := make([]vk.QwenPlace, n)
+		for c := 0; c < n; c++ {
+			if rows != nil && rows[t+c] != nil {
+				copy(embeds[c], rows[t+c])
+			} else {
+				m.W.TokenEmbd.Row(int(tokens[t+c]), embeds[c])
+			}
+			places[c] = at[t+c].gpu()
+		}
+		hs, err := m.gpuPipe.ForwardPlaces(embeds[:n], places)
+		if err != nil {
+			panic(fmt.Sprintf("qwen35: the GPU pipeline failed at position %d: %v", at[t].Pos, err))
+		}
+		for c := 0; c < n; c++ {
+			out[t+c] = append([]float32(nil), hs[c]...)
+		}
+		copy(m.x, m.gpuPipe.HiddenColumn(n-1))
+		t += n
+	}
 }

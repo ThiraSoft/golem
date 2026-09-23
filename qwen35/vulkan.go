@@ -149,7 +149,8 @@ func (m *Model) UseVulkanStack() error {
 		Snapshots:  drafts,
 		Dim:        cfg.Dim,
 		FFN:        cfg.Blocks[0].FFN,
-		MaxContext: cfg.MaxContext,
+		MaxContext: m.SlotContext(),
+		Slots:      m.Slots(),
 		Eps:        cfg.Eps,
 		// vk takes the widths as a plain array: it has no reason to import nn
 		// for a type, and this is the one place the two spellings meet.

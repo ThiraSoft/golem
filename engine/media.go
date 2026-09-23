@@ -120,7 +120,7 @@ func (v qwenMedia) Prompt(tokens []int32, images, audio [][][]float32) (Prompt, 
 	}
 	grids := make([][2]int, len(images))
 	for i := range images {
-		g, ok := v.m.GridOf(i)
+		g, ok := v.m.GridFor(images[i])
 		if !ok {
 			return nil, fmt.Errorf("engine: picture %d was not encoded by this model", i)
 		}
