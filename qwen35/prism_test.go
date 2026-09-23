@@ -156,7 +156,7 @@ func TestPrismBinding(t *testing.T) {
 	}
 
 	// Block 0 SSMOut has Gather of length 6144 that is a permutation
-	gather := w.Blocks[0].SSMOut.Gather
+	gather := w.Blocks[0].SSMOutGather
 	if len(gather) != 6144 {
 		t.Fatalf("expected block 0 SSMOut.Gather length 6144, got %d", len(gather))
 	}
@@ -291,14 +291,18 @@ func TestPrismAlgebra(t *testing.T) {
 		Cols:     cols,
 		Pre:      signs,
 		HadGroup: 1024,
-		Gather:   gather,
 	}
 
+	// The reordering is qwen35's own (ssm.go), done before the product.
+	xGathered := make([]float32, cols)
+	for i, src := range gather {
+		xGathered[i] = x[src]
+	}
 	gotYGather := make([]float32, rows)
 	batchGather := &nn.Batch{
 		Size:  1,
 		Width: cols,
-		F:     [][]float32{x},
+		F:     [][]float32{xGathered},
 	}
 	mGather.MatVec(batchGather, gotYGather)
 

@@ -553,8 +553,8 @@ func (m *Model) prismRotation(blocks int) (*vk.QwenRotation, error) {
 				w    nn.Matrix
 			}{{"delta net input", &rot.Dim, bw.QKV}, {"delta net gate", &rot.Dim, bw.AttnGate}, {"delta net output", &rot.Inner, bw.SSMOut}}...)
 			if !gathered {
-				rot.GatherOut, gathered = bw.SSMOut.Gather, true
-			} else if !slices.Equal(rot.GatherOut, bw.SSMOut.Gather) {
+				rot.GatherOut, gathered = bw.SSMOutGather, true
+			} else if !slices.Equal(rot.GatherOut, bw.SSMOutGather) {
 				return nil, fmt.Errorf("qwen35: block %d's delta net gathers its output differently from the first", i)
 			}
 		}

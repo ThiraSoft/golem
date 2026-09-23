@@ -170,6 +170,12 @@ func ForwardSSMToken(
 	}
 
 	// 8. Output Projection: out = bw.SSMOut * ySSM -> [Dim = 5120]
+	if bw.SSMOutGather != nil {
+		for i, src := range bw.SSMOutGather {
+			scratch.yGathered[i] = ySSM[src]
+		}
+		ySSM = scratch.yGathered
+	}
 	load(scratch.batchYSSM, ySSM)
 	calib(bc.Index, "o", ySSM)
 	bw.SSMOut.MatVec(scratch.batchYSSM, out)

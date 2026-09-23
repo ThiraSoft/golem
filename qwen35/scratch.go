@@ -23,6 +23,8 @@ type Scratch struct {
 	beta    []float32 // [48]
 	decay   []float32 // [48]
 	ySSM    []float32 // [6144]
+	// yGathered is ySSM reordered for a Prism output projection.
+	yGathered []float32
 
 	// Full attention scratch
 	qFull  []float32 // [24*256*2 = 12288], per head [q | gate]
@@ -66,6 +68,8 @@ func NewScratch(cfg *Config) *Scratch {
 		beta:    make([]float32, rank),
 		decay:   make([]float32, rank),
 		ySSM:    make([]float32, inner),
+
+		yGathered: make([]float32, inner),
 
 		qFull:  make([]float32, qDim*2),
 		k:      make([]float32, kvHeads*headDim),

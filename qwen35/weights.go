@@ -29,6 +29,12 @@ type BlockWeights struct {
 	SSMDtBias []float32 // [48]
 	SSMNorm   []float32 // [128]
 	SSMOut    nn.Matrix // [6144, 5120] (Q5_K or Q4_K)
+	// SSMOutGather reorders the output projection's input before it is read,
+	// input[i] = y[SSMOutGather[i]], and is nil unless a Prism file asks for
+	// it: see prism.go. It lives here and not on nn.Matrix because a closure
+	// copies a Matrix by value only up to 128 bytes, and one more slice put it
+	// past that and every product on the processor allocated once more.
+	SSMOutGather []int32
 
 	// FFN weights (shared by both block types)
 	Gate nn.Matrix // [5120, 17408]

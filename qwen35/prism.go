@@ -170,7 +170,7 @@ func bindPrism(g *tensors.GGUF, w *Weights, cfg *Config) error {
 					}
 				}
 			}
-			w.Blocks[i].SSMOut.Gather = gather
+			w.Blocks[i].SSMOutGather = gather
 		}
 	}
 

@@ -171,7 +171,7 @@ same transform before the product: `y = W·H(s ⊙ x)`. That is
 `nn.PrepareGolem` with a group of 1024, which `.golem` checkpoints already
 needed at 128. The embedding table is stored rotated too and is brought back
 a row at a time. And the delta net's output is reordered from llama.cpp's tiled
-head order to the grouped one before its rotation, which `nn.Matrix.Gather`
+head order to the grouped one before its rotation, which `BlockWeights.SSMOutGather`
 carries. `prism.go` reads all of it from the file's `prism.hadamard.*` keys and
 refuses a file whose ternary matrix it could not bind: a projection left
 unrotated answers fluently and wrongly.
