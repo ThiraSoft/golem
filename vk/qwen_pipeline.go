@@ -556,6 +556,10 @@ type qwenAttnBlock struct {
 	f32 bool
 	// golem is the four projections in their .golem form; see qwenSSMBlock.
 	golem *qwenGolemAttn
+	// rotated says this block's projections read Prism's rotation. It is the
+	// block's and not the shape's because a prediction block grafted from the
+	// unrotated model sits in a Prism pipeline and must read plain Q8_0.
+	rotated bool
 }
 
 type qwenFFNBlock struct {
@@ -574,6 +578,8 @@ type qwenFFNBlock struct {
 	// golem is the three projections in their .golem form, and nil for a
 	// checkpoint of any other type. See qwenSSMBlock.
 	golem *qwenGolemFFN
+	// rotated is qwenAttnBlock's.
+	rotated bool
 }
 
 type QwenPipeline struct {
@@ -1198,7 +1204,7 @@ func (p *QwenPipeline) AddAttnBlock(i int, d QwenAttnData) error {
 
 func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 	s := p.shape
-	b := &qwenAttnBlock{index: -1}
+	b := &qwenAttnBlock{index: -1, rotated: s.Rotation != nil && d.PreQKV != nil}
 	var err error
 
 	if p.usesGolem() {
@@ -1295,7 +1301,7 @@ func (p *QwenPipeline) AddFFNBlock(d QwenFFNData) error {
 
 func (p *QwenPipeline) newFFNBlock(d QwenFFNData) (*qwenFFNBlock, error) {
 	s := p.shape
-	b := &qwenFFNBlock{index: -1}
+	b := &qwenFFNBlock{index: -1, rotated: s.Rotation != nil && d.PreGateUp != nil}
 	var err error
 	if p.usesGolem() {
 		if b.golem, err = p.newGolemFFN(d); err != nil {
@@ -2135,7 +2141,9 @@ func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
 	q := moePush{dim: uint32(s.qFullDim()), ffn: uint32(s.Dim), used: 1}
 	kv := moePush{dim: uint32(s.kvDim()), ffn: uint32(s.Dim), used: 1}
 	out := matvecKPush{Dim: uint32(s.Dim), FFN: uint32(s.qDim())}
-	p.rotate(r, p.setRotNormed, s.Dim, columns)
+	if b.rotated {
+		p.rotate(r, p.setRotNormed, s.Dim, columns)
+	}
 
 	if b.f32 {
 		p.productK(r, b.setQ, s.qFullDim(), columns, matvecKPush{Dim: uint32(s.qFullDim()), FFN: uint32(s.Dim)})
@@ -2161,7 +2169,7 @@ func (p *QwenPipeline) recordAttn(r *Recorder, b *qwenAttnBlock, columns int) {
 	// The mix in eight bits, then the output projection over it, at every
 	// width — recordSSM says why that is no longer a decision.
 	quant := swigluPush{N: uint32(s.qDim()), Columns: uint32(columns)}
-	if !p.rotate(r, p.setRotAttnOut, s.qDim(), columns) {
+	if !b.rotated || !p.rotate(r, p.setRotAttnOut, s.qDim(), columns) {
 		r.Dispatch(p.setQuantAttn, uint32((s.qDim()/quantBlock*columns+255)/256), unsafe.Pointer(&quant))
 		r.Barrier()
 	}
@@ -2218,7 +2226,9 @@ func (p *QwenPipeline) recordFFN(r *Recorder, b *qwenFFNBlock, columns int) {
 	// pass is the same kernel over more of the buffer.
 	act := swigluPush{N: uint32(s.FFN), Columns: uint32(columns)}
 	down := matvecKPush{Dim: uint32(s.Dim), FFN: uint32(s.FFN)}
-	p.rotate(r, p.setRotFFNNorm, s.Dim, columns)
+	if b.rotated {
+		p.rotate(r, p.setRotFFNNorm, s.Dim, columns)
+	}
 
 	if b.f32 {
 		// The float projections have no tiled form: productK is the mat-vec at
@@ -2246,7 +2256,9 @@ func (p *QwenPipeline) recordFFN(r *Recorder, b *qwenFFNBlock, columns int) {
 	blocks := s.FFN / quantBlock * columns
 	r.Dispatch(p.setAct, uint32((blocks+255)/256), unsafe.Pointer(&act))
 	r.Barrier()
-	p.rotate(r, p.setRotAct, s.FFN, columns)
+	if b.rotated {
+		p.rotate(r, p.setRotAct, s.FFN, columns)
+	}
 	p.tl.Stamp(r, "ffn act")
 	p.accumulate(r, b.index, "down", columns)
 
