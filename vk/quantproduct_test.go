@@ -91,6 +91,8 @@ func TestQuantProductMatchesReference(t *testing.T) {
 		// it. A signed byte against a signed byte and no offset in either, so
 		// this is the one format in the table with no correction term.
 		{nn.Q8_0, cols / nn.QuantBlock * 34, 1e-3},
+		{nn.PQ2_0, cols / nn.TernaryBlock * 34, 1e-3},
+		{nn.PTQ1_0, cols / nn.TernaryBlock * 28, 1e-3},
 	} {
 		t.Run(f.q.String(), func(t *testing.T) {
 			rng := rand.New(rand.NewSource(int64(f.q)))
@@ -149,7 +151,7 @@ func sane(tb testing.TB, m nn.Matrix, rng *rand.Rand) {
 	put := func(at int) {
 		binary.LittleEndian.PutUint16(m.Data[at:], nn.Narrow(rng.Float32()*0.05))
 	}
-	nb, nsb := m.Cols/nn.QuantBlock, m.Cols/nn.SuperBlock
+	nb, nsb, ntb := m.Cols/nn.QuantBlock, m.Cols/nn.SuperBlock, m.Cols/nn.TernaryBlock
 	for r := 0; r < m.Rows; r++ {
 		base := r * m.RowBytes()
 		switch m.Quant {
@@ -183,6 +185,14 @@ func sane(tb testing.TB, m nn.Matrix, rng *rand.Rand) {
 		case nn.Q6_K:
 			for sb := 0; sb < nsb; sb++ {
 				put(base + sb*210 + 208)
+			}
+		case nn.PQ2_0:
+			for tb := 0; tb < ntb; tb++ {
+				put(base + tb*34 + 32)
+			}
+		case nn.PTQ1_0:
+			for tb := 0; tb < ntb; tb++ {
+				put(base + tb*28 + 26)
 			}
 		}
 	}

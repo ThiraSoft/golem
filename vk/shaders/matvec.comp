@@ -75,6 +75,21 @@ int sbyte(uint at) { return bitfieldExtract(int(w[at >> 2]), int((at & 3u) * 8u)
 uint ubyte(uint at) { return bitfieldExtract(w[at >> 2], int((at & 3u) * 8u), 8); }
 #endif
 
+#ifdef PTQ10
+uint decodeTrit(uint b, uint p) {
+    uint q = (b * p) & 0xFFu;
+    return (q * 3u) >> 8u;
+}
+
+uint decodeWord4(uint wVal, uint p) {
+    uint t0 = decodeTrit(wVal & 0xFFu, p);
+    uint t1 = decodeTrit((wVal >> 8u) & 0xFFu, p);
+    uint t2 = decodeTrit((wVal >> 16u) & 0xFFu, p);
+    uint t3 = decodeTrit((wVal >> 24u), p);
+    return t0 | (t1 << 8u) | (t2 << 16u) | (t3 << 24u);
+}
+#endif
+
 // RECENTRE is what a magnitude of this format is offset by: a Q6_K weight is
 // its magnitude less thirty-two and a Q3_K weight its magnitude less four.
 // Neither can be folded into the block's own scale, because the two halves of
@@ -94,6 +109,8 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
     uint ntb  = p.ffn >> 7;
     uint magB = rowBase;
     uint nib  = rowBase + (((2u * ntb + 3u) & ~3u));
+#elif defined(PTQ10)
+    uint tbBase = rowBase >> 2;
 #elif defined(Q2K)
     // Sixteen scale-and-minimum bytes and an fp16 pair to a superblock, both
     // already a whole number of words, so nothing here is rounded.
@@ -151,6 +168,10 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
         uint tb = b >> 2u;
         vec2 dm = unpackHalf2x16(w[(magB + 2u * tb) >> 2]);
         float ws = dm[tb & 1u];
+#elif defined(PTQ10)
+        uint tb = b >> 2u;
+        uint blkBase = tbBase + tb * 7u;
+        float ws = unpackHalf2x16(w[blkBase + 6u]).y;
 #elif defined(Q2K)
         // Four numbers a block, where every other format here has two: each
         // half of a block carries its own scale *and* its own minimum, and the
@@ -228,6 +249,49 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
             lo[u] = (x0 & 3u) | ((x0 & 12u) << 6u) | ((x0 & 48u) << 12u) | ((x0 & 192u) << 18u);
             hi[u] = (x1 & 3u) | ((x1 & 12u) << 6u) | ((x1 & 48u) << 12u) | ((x1 & 192u) << 18u);
         }
+#elif defined(PTQ10)
+        uint sub = b & 3u;
+        uint lo[4], hi[4];
+        if (sub == 0u) {
+            lo[0] = decodeWord4(w[blkBase + 0u], 1u);
+            lo[1] = decodeWord4(w[blkBase + 1u], 1u);
+            lo[2] = decodeWord4(w[blkBase + 2u], 1u);
+            lo[3] = decodeWord4(w[blkBase + 3u], 1u);
+            hi[0] = decodeWord4(w[blkBase + 0u], 3u);
+            hi[1] = decodeWord4(w[blkBase + 1u], 3u);
+            hi[2] = decodeWord4(w[blkBase + 2u], 3u);
+            hi[3] = decodeWord4(w[blkBase + 3u], 3u);
+        } else if (sub == 1u) {
+            lo[0] = decodeWord4(w[blkBase + 0u], 9u);
+            lo[1] = decodeWord4(w[blkBase + 1u], 9u);
+            lo[2] = decodeWord4(w[blkBase + 2u], 9u);
+            lo[3] = decodeWord4(w[blkBase + 3u], 9u);
+            hi[0] = decodeWord4(w[blkBase + 0u], 27u);
+            hi[1] = decodeWord4(w[blkBase + 1u], 27u);
+            hi[2] = decodeWord4(w[blkBase + 2u], 27u);
+            hi[3] = decodeWord4(w[blkBase + 3u], 27u);
+        } else if (sub == 2u) {
+            lo[0] = decodeWord4(w[blkBase + 0u], 81u);
+            lo[1] = decodeWord4(w[blkBase + 1u], 81u);
+            lo[2] = decodeWord4(w[blkBase + 2u], 81u);
+            lo[3] = decodeWord4(w[blkBase + 3u], 81u);
+            hi[0] = decodeWord4(w[blkBase + 4u], 1u);
+            hi[1] = decodeWord4(w[blkBase + 5u], 1u);
+            hi[2] = decodeWord4(w[blkBase + 4u], 3u);
+            hi[3] = decodeWord4(w[blkBase + 5u], 3u);
+        } else {
+            lo[0] = decodeWord4(w[blkBase + 4u], 9u);
+            lo[1] = decodeWord4(w[blkBase + 5u], 9u);
+            lo[2] = decodeWord4(w[blkBase + 4u], 27u);
+            lo[3] = decodeWord4(w[blkBase + 5u], 27u);
+            hi[0] = decodeWord4(w[blkBase + 4u], 81u);
+            hi[1] = decodeWord4(w[blkBase + 5u], 81u);
+            uint h0 = w[blkBase + 6u] & 0xFFu;
+            uint h1 = (w[blkBase + 6u] >> 8u) & 0xFFu;
+            hi[2] = decodeTrit(h0, 1u) | (decodeTrit(h1, 1u) << 8u) | (decodeTrit(h0, 3u) << 16u) | (decodeTrit(h1, 3u) << 24u);
+            hi[3] = decodeTrit(h0, 9u) | (decodeTrit(h1, 9u) << 8u) | (decodeTrit(h0, 27u) << 16u) | (decodeTrit(h1, 27u) << 24u);
+        }
+        uint ab = b * 8u;
 #elif defined(Q2K)
         // Two loads a block against the activation's eight, which is the
         // narrowest weight this kernel reads. The spread is Q3_K's without the
@@ -358,7 +422,7 @@ void lanePart(uint rowBase, uint lane, out float answer[COLUMNS]) {
             // the answer below is sum less corr, so this one goes the other
             // way. It is the sign llama.cpp's own dequantiser has: d*q + m.
             corr[c] -= wm * as_[sc + nb + b] * 0.125;
-#elif defined(PQ20)
+#elif defined(PQ20) || defined(PTQ10)
             corr[c] += ws * as_[sc + nb + b] * 0.125;
 #else
             corr[c] += ws * as_[sc + nb + b];
@@ -378,6 +442,8 @@ void main() {
 #if defined(PQ20)
     uint ntb = p.ffn >> 7;
     uint rowBytes = (((2u * ntb + 3u) & ~3u) + ntb * 32u);
+#elif defined(PTQ10)
+    uint rowBytes = (p.ffn >> 7) * 28u;
 #elif defined(Q6K)
     uint rowBytes = (((p.ffn >> 8) * 210u) + 3u) & ~3u;
 #elif defined(Q3K)

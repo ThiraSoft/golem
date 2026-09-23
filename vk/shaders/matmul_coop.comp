@@ -397,6 +397,19 @@ float pas[APT];
 // two calls a step is noise.
 uint t, nb, row0, rowBytes, wbase, aw, col0;
 
+#ifdef PTQ10
+uint decodeTrit(uint b, uint p) {
+    return (((b * p) & 0xFFu) * 3u) >> 8u;
+}
+uint packByte4(uint w, uint p) {
+    uint t0 = (((w & 0xFFu) * p & 0xFFu) * 3u) >> 8u;
+    uint t1 = ((((w >> 8u) & 0xFFu) * p & 0xFFu) * 3u) >> 8u;
+    uint t2 = ((((w >> 16u) & 0xFFu) * p & 0xFFu) * 3u) >> 8u;
+    uint t3 = (((w >> 24u) * p & 0xFFu) * 3u) >> 8u;
+    return t0 | (t1 << 2u) | (t2 << 4u) | (t3 << 6u);
+}
+#endif
+
 // prefetch issues the global reads of step kb into the registers above.
 void prefetch(uint kb) {
     [[unroll]] for (uint i = 0u; i < uint(WPT); i++) {
@@ -456,6 +469,32 @@ void prefetch(uint kb) {
                 pw[i]      = uvec4(w[at4], w[at4 + 1u], 0u, 0u);
                 vec2 dm    = unpackHalf2x16(w[(base + 2u * (b >> 2u)) >> 2]);
                 pws[i]     = dm[(b >> 2u) & 1u];
+#elif defined(PTQ10)
+                uint tb = b >> 2u;
+                uint sub = b & 3u;
+                uint blkBase = (base >> 2) + tb * 7u;
+                pws[i] = unpackHalf2x16(w[blkBase + 6u]).y;
+                if (sub == 0u) {
+                    uint px = packByte4(w[blkBase + 0u], 1u) | (packByte4(w[blkBase + 1u], 1u) << 8u) | (packByte4(w[blkBase + 2u], 1u) << 16u) | (packByte4(w[blkBase + 3u], 1u) << 24u);
+                    uint py = packByte4(w[blkBase + 0u], 3u) | (packByte4(w[blkBase + 1u], 3u) << 8u) | (packByte4(w[blkBase + 2u], 3u) << 16u) | (packByte4(w[blkBase + 3u], 3u) << 24u);
+                    pw[i] = uvec4(px, py, 0u, 0u);
+                } else if (sub == 1u) {
+                    uint px = packByte4(w[blkBase + 0u], 9u) | (packByte4(w[blkBase + 1u], 9u) << 8u) | (packByte4(w[blkBase + 2u], 9u) << 16u) | (packByte4(w[blkBase + 3u], 9u) << 24u);
+                    uint py = packByte4(w[blkBase + 0u], 27u) | (packByte4(w[blkBase + 1u], 27u) << 8u) | (packByte4(w[blkBase + 2u], 27u) << 16u) | (packByte4(w[blkBase + 3u], 27u) << 24u);
+                    pw[i] = uvec4(px, py, 0u, 0u);
+                } else if (sub == 2u) {
+                    uint px = packByte4(w[blkBase + 0u], 81u) | (packByte4(w[blkBase + 1u], 81u) << 8u) | (packByte4(w[blkBase + 2u], 81u) << 16u) | (packByte4(w[blkBase + 3u], 81u) << 24u);
+                    uint py = packByte4(w[blkBase + 4u], 1u) | (packByte4(w[blkBase + 5u], 1u) << 8u) | (packByte4(w[blkBase + 4u], 3u) << 16u) | (packByte4(w[blkBase + 5u], 3u) << 24u);
+                    pw[i] = uvec4(px, py, 0u, 0u);
+                } else {
+                    uint px = packByte4(w[blkBase + 4u], 9u) | (packByte4(w[blkBase + 5u], 9u) << 8u) | (packByte4(w[blkBase + 4u], 27u) << 16u) | (packByte4(w[blkBase + 5u], 27u) << 24u);
+                    uint h0 = w[blkBase + 6u] & 0xFFu;
+                    uint h1 = (w[blkBase + 6u] >> 8u) & 0xFFu;
+                    uint b2 = decodeTrit(h0, 1u) | (decodeTrit(h1, 1u) << 2u) | (decodeTrit(h0, 3u) << 4u) | (decodeTrit(h1, 3u) << 6u);
+                    uint b3 = decodeTrit(h0, 9u) | (decodeTrit(h1, 9u) << 2u) | (decodeTrit(h0, 27u) << 4u) | (decodeTrit(h1, 27u) << 6u);
+                    uint py = packByte4(w[blkBase + 4u], 81u) | (packByte4(w[blkBase + 5u], 81u) << 8u) | (b2 << 16u) | (b3 << 24u);
+                    pw[i] = uvec4(px, py, 0u, 0u);
+                }
 #elif defined(Q2K)
                 // vk/split_q2k.go. Q2_K wants four numbers a block where every
                 // other format here wants two — a scale and a minimum for each
@@ -577,11 +616,11 @@ void stageTile() {
         uint  wh2 = pwh2[i];
 #endif
         [[unroll]] for (uint u = 0u; u < 4u; u++) {
-#if !defined(Q3K) && !defined(Q2K) && !defined(PQ20)
+#if !defined(Q3K) && !defined(Q2K) && !defined(PQ20) && !defined(PTQ10)
             uint w0 = pw[i][u] & 0x0F0F0F0Fu;
             uint w1 = (pw[i][u] >> 4u) & 0x0F0F0F0Fu;
 #endif
-#if defined(PQ20)
+#if defined(PQ20) || defined(PTQ10)
             uint x0 = (pw[i].x >> (8u * u)) & 0xFFu;
             uint x1 = (pw[i].y >> (8u * u)) & 0xFFu;
             uint w0 = (x0 & 3u) | ((x0 & 12u) << 6u) | ((x0 & 48u) << 12u) | ((x0 & 192u) << 18u);
@@ -740,6 +779,8 @@ void main() {
 #if defined(PQ20)
     uint ntb  = nb >> 2;
     rowBytes  = (((2u * ntb + 3u) & ~3u) + ntb * 32u);
+#elif defined(PTQ10)
+    rowBytes  = (nb >> 2) * 28u;
 #elif defined(Q5K)
     rowBytes  = nb * 24u;
 #elif defined(Q41)

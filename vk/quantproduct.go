@@ -90,6 +90,17 @@ import (
 //go:generate glslc -O -DPQ20 -DCOLUMNS=256 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_pq20256.spv
 //go:generate glslc -O -DPQ20 -DCOLUMNS=512 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_pq20512.spv
 
+//go:generate glslc -O -DPTQ10 -DLANES=16 -DOUTS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_ptq10q8.spv
+//go:generate glslc -O -DPTQ10 -DLANES=16 -DOUTS=8 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_ptq10q8_2.spv
+//go:generate glslc -O -DPTQ10 -DLANES=16 -DOUTS=8 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_ptq10q8_4.spv
+//go:generate glslc -O -DPTQ10 -DLANES=16 -DOUTS=8 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_ptq10q8_8.spv
+//go:generate glslc -O -DPTQ10 -DLANES=16 -DOUTS=8 -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_ptq10q8_16.spv
+//go:generate glslc -O -DPTQ10 -DCOLUMNS=32 -DBN=32 -DBM=64 -DBK=128 -DWAVE_M=4 -DWAVE_N=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_ptq1032.spv
+//go:generate glslc -O -DPTQ10 -DCOLUMNS=64 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_ptq1064.spv
+//go:generate glslc -O -DPTQ10 -DCOLUMNS=128 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_ptq10128.spv
+//go:generate glslc -O -DPTQ10 -DCOLUMNS=256 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_ptq10256.spv
+//go:generate glslc -O -DPTQ10 -DCOLUMNS=512 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_ptq10512.spv
+
 //go:generate glslc -O -DQ4K -DCOLUMNS=32 -DBN=32 -DBM=64 -DBK=128 -DWAVE_M=4 -DWAVE_N=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q4k32.spv
 //go:generate glslc -O -DQ6K -DCOLUMNS=32 -DBN=32 -DBM=64 -DBK=128 -DWAVE_M=4 -DWAVE_N=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q6k32.spv
 //go:generate glslc -O -DQ6K -DCOLUMNS=64 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q6k64.spv
@@ -324,6 +335,36 @@ var matmulCoopPQ20256SPIRV []byte
 //go:embed shaders/matmul_coop_pq20512.spv
 var matmulCoopPQ20512SPIRV []byte
 
+//go:embed shaders/matvec_ptq10q8.spv
+var matvecPTQ10Q8SPIRV []byte
+
+//go:embed shaders/matvec_ptq10q8_2.spv
+var matvecPTQ10Q8_2SPIRV []byte
+
+//go:embed shaders/matvec_ptq10q8_4.spv
+var matvecPTQ10Q8_4SPIRV []byte
+
+//go:embed shaders/matvec_ptq10q8_8.spv
+var matvecPTQ10Q8_8SPIRV []byte
+
+//go:embed shaders/matvec_ptq10q8_16.spv
+var matvecPTQ10Q8_16SPIRV []byte
+
+//go:embed shaders/matmul_coop_ptq1032.spv
+var matmulCoopPTQ1032SPIRV []byte
+
+//go:embed shaders/matmul_coop_ptq1064.spv
+var matmulCoopPTQ1064SPIRV []byte
+
+//go:embed shaders/matmul_coop_ptq10128.spv
+var matmulCoopPTQ10128SPIRV []byte
+
+//go:embed shaders/matmul_coop_ptq10256.spv
+var matmulCoopPTQ10256SPIRV []byte
+
+//go:embed shaders/matmul_coop_ptq10512.spv
+var matmulCoopPTQ10512SPIRV []byte
+
 // QuantReadable says whether a projection stored this way has a kernel here.
 //
 // It is asked before a matrix is uploaded rather than inferred from its length,
@@ -334,7 +375,7 @@ var matmulCoopPQ20512SPIRV []byte
 // tensor instead.
 func QuantReadable(q nn.Quant) bool {
 	switch q {
-	case nn.Q4_0, nn.Q4_1, nn.Q2_K, nn.Q3_K, nn.Q4_K, nn.Q5_K, nn.Q6_K, nn.Q8_0, nn.PQ2_0:
+	case nn.Q4_0, nn.Q4_1, nn.Q2_K, nn.Q3_K, nn.Q4_K, nn.Q5_K, nn.Q6_K, nn.Q8_0, nn.PQ2_0, nn.PTQ1_0:
 		return true
 	}
 	return false
@@ -377,6 +418,8 @@ func quantRowBytes(q nn.Quant, cols int) (int, error) {
 		return cols / nn.QuantBlock * 34, nil
 	case nn.PQ2_0:
 		return rowBytesPQ2_0(cols), nil
+	case nn.PTQ1_0:
+		return rowBytesPTQ1_0(cols), nil
 	}
 	return 0, fmt.Errorf("vk: there is no projection kernel for %s", q)
 }
@@ -387,10 +430,10 @@ func quantLayout(q nn.Quant, data []byte, rows, cols int) ([]byte, error) {
 	if (q == nn.Q2_K || q == nn.Q3_K || q == nn.Q4_K || q == nn.Q5_K || q == nn.Q6_K) && cols%nn.SuperBlock != 0 {
 		return nil, fmt.Errorf("vk: a %s row needs a multiple of %d columns, given %d", q, nn.SuperBlock, cols)
 	}
-	if q == nn.PQ2_0 && cols%nn.TernaryBlock != 0 {
+	if (q == nn.PQ2_0 || q == nn.PTQ1_0) && cols%nn.TernaryBlock != 0 {
 		return nil, fmt.Errorf("vk: a %s row needs a multiple of %d columns, given %d", q, nn.TernaryBlock, cols)
 	}
-	if q != nn.PQ2_0 && cols%nn.QuantBlock != 0 {
+	if q != nn.PQ2_0 && q != nn.PTQ1_0 && cols%nn.QuantBlock != 0 {
 		return nil, fmt.Errorf("vk: a quantized row needs a multiple of %d columns, given %d", nn.QuantBlock, cols)
 	}
 	fileRow, err := quantFileRow(q, cols)
@@ -417,6 +460,8 @@ func quantLayout(q nn.Quant, data []byte, rows, cols int) ([]byte, error) {
 		return splitQ8_0(data, rows, cols), nil
 	case nn.PQ2_0:
 		return splitPQ2_0(data, rows, cols), nil
+	case nn.PTQ1_0:
+		return splitPTQ1_0(data, rows, cols), nil
 	default:
 		return splitQ6_K(data, rows, cols), nil
 	}
@@ -463,6 +508,8 @@ func quantFileRow(q nn.Quant, cols int) (int, error) {
 		return cols / nn.QuantBlock * 34, nil
 	case nn.PQ2_0:
 		return cols / nn.TernaryBlock * 34, nil
+	case nn.PTQ1_0:
+		return cols / nn.TernaryBlock * 28, nil
 	}
 	return 0, fmt.Errorf("vk: there is no projection kernel for %s", q)
 }
@@ -559,6 +606,14 @@ func newQuantProduct(d *Device, q nn.Quant, coop bool) (*Pipeline, error) {
 		}{{2, matvecPQ20Q8_2SPIRV}, {4, matvecPQ20Q8_4SPIRV}, {smallColumns, matvecPQ20Q8_8SPIRV}, {16, matvecPQ20Q8_16SPIRV}} {
 			narrow = append(narrow, w)
 		}
+	case nn.PTQ1_0:
+		base = matvecPTQ10Q8SPIRV
+		for _, w := range []struct {
+			columns int
+			spirv   []byte
+		}{{2, matvecPTQ10Q8_2SPIRV}, {4, matvecPTQ10Q8_4SPIRV}, {smallColumns, matvecPTQ10Q8_8SPIRV}, {16, matvecPTQ10Q8_16SPIRV}} {
+			narrow = append(narrow, w)
+		}
 	default:
 		return nil, fmt.Errorf("vk: there is no projection kernel for %s", q)
 	}
@@ -628,6 +683,14 @@ func newQuantProduct(d *Device, q nn.Quant, coop bool) (*Pipeline, error) {
 			}{
 				{tiledColumns, matmulCoopPQ2032SPIRV}, {64, matmulCoopPQ2064SPIRV},
 				{128, matmulCoopPQ20128SPIRV}, {256, matmulCoopPQ20256SPIRV}, {wideColumns, matmulCoopPQ20512SPIRV},
+			}
+		case nn.PTQ1_0:
+			tiled = []struct {
+				columns int
+				spirv   []byte
+			}{
+				{tiledColumns, matmulCoopPTQ1032SPIRV}, {64, matmulCoopPTQ1064SPIRV},
+				{128, matmulCoopPTQ10128SPIRV}, {256, matmulCoopPTQ10256SPIRV}, {wideColumns, matmulCoopPTQ10512SPIRV},
 			}
 		}
 	} else if q == nn.Q4_0 {

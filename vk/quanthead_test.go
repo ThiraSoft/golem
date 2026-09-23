@@ -57,6 +57,7 @@ func headOf(tb testing.TB, path string) (*tensors.GGUF, nn.Matrix) {
 var headCheckpoints = []string{
 	"GOLEM_MODEL", "GOLEM_MODEL_12B", "GOLEM_MODEL_26B", "GOLEM_MODEL_26B_Q8",
 	"GOLEM_MODEL_QWEN_Q4", "GOLEM_MODEL_Q4KM", "GOLEM_MODEL_Q3KM",
+	"GOLEM_MODEL_BONSAI_PQ20", "GOLEM_MODEL_BONSAI_PTQ10",
 }
 
 func TestQuantHeadComputesItsProduct(t *testing.T) {

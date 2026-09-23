@@ -219,13 +219,15 @@ func NewMatMulQuant(d *Device, data []byte, rows, cols, columns int, coop bool, 
 		relayout = splitQ2_K
 	case nn.PQ2_0:
 		relayout = splitPQ2_0
+	case nn.PTQ1_0:
+		relayout = splitPTQ1_0
 	default:
 		return nil, fmt.Errorf("vk: the tiled product has no staging for %s", q)
 	}
-	if q != nn.Q4_0 && q != nn.PQ2_0 && cols%nn.SuperBlock != 0 {
+	if q != nn.Q4_0 && q != nn.PQ2_0 && q != nn.PTQ1_0 && cols%nn.SuperBlock != 0 {
 		return nil, fmt.Errorf("vk: a %s row needs a multiple of %d columns, given %d", q, nn.SuperBlock, cols)
 	}
-	if q == nn.PQ2_0 && cols%nn.TernaryBlock != 0 {
+	if (q == nn.PQ2_0 || q == nn.PTQ1_0) && cols%nn.TernaryBlock != 0 {
 		return nil, fmt.Errorf("vk: a %s row needs a multiple of %d columns, given %d", q, nn.TernaryBlock, cols)
 	}
 	// The file's own row and not the packed one. data is the tensor as the file
@@ -264,6 +266,8 @@ func NewMatMulQuant(d *Device, data []byte, rows, cols, columns int, coop bool, 
 			spirv, err = matmulCoopQ2KSPIRV(columns)
 		} else if q == nn.PQ2_0 {
 			spirv, err = matmulCoopPQ20SPIRV(columns)
+		} else if q == nn.PTQ1_0 {
+			spirv, err = matmulCoopPTQ10SPIRV(columns)
 		} else {
 			spirv, err = matmulCoopSPIRV(columns)
 		}
@@ -578,6 +582,23 @@ func matmulCoopPQ20SPIRV(columns int) ([]byte, error) {
 		return matmulCoopPQ20512SPIRV, nil
 	}
 	return nil, fmt.Errorf("vk: the cooperative PQ2_0 product is built at 32, 64, 128, 256, 512 columns, not %d", columns)
+}
+
+// matmulCoopPTQ10SPIRV is the cooperative PTQ1_0 product at that width.
+func matmulCoopPTQ10SPIRV(columns int) ([]byte, error) {
+	switch columns {
+	case 32:
+		return matmulCoopPTQ1032SPIRV, nil
+	case 64:
+		return matmulCoopPTQ1064SPIRV, nil
+	case 128:
+		return matmulCoopPTQ10128SPIRV, nil
+	case 256:
+		return matmulCoopPTQ10256SPIRV, nil
+	case 512:
+		return matmulCoopPTQ10512SPIRV, nil
+	}
+	return nil, fmt.Errorf("vk: the cooperative PTQ1_0 product is built at 32, 64, 128, 256, 512 columns, not %d", columns)
 }
 
 // matmulSPIRV is the binary built for that many columns.
