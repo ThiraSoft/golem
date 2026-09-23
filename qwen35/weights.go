@@ -50,6 +50,9 @@ type Weights struct {
 	OutputHead nn.Matrix
 	Blocks     []BlockWeights
 	MTP        MTPWeights
+
+	// Rotated says the file's projections carry Prism's activation rotation.
+	Rotated bool
 }
 
 func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
@@ -159,6 +162,10 @@ func LoadWeights(g *tensors.GGUF, cfg *Config) (*Weights, error) {
 		w.MTP.SharedHeadNorm, _ = t.F32()
 	}
 	bindMatrix(g, "blk.64.nextn.eh_proj.weight", &w.MTP.EHProj, cfg.Dim, cfg.Dim*2)
+
+	if err := bindPrism(g, w, cfg); err != nil {
+		return nil, err
+	}
 
 	return w, nil
 }

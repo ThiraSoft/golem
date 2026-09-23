@@ -42,6 +42,11 @@ type Matrix struct {
 	// leave them unset and do the transform once, which is what qwen does.
 	Pre      []float32
 	HadGroup int
+
+	// Gather is an index permutation applied to the activation before Pre and
+	// the rotation. When non-nil, the activation handed to the product is first
+	// permuted, x'[i] = x[Gather[i]], before Pre and the rotation.
+	Gather []int32
 }
 
 // Repack builds the interleaved form of a Q4_0 matrix, which nn/pack_q4_0.go
@@ -133,7 +138,7 @@ func (m Matrix) MatVecRows(b *Batch, ys [][]float32, start, end int) {
 // the caller's thread. The format is decided once for the whole call, and the
 // batch is the innermost loop so that a row is read from memory once.
 func (m Matrix) rows(b *Batch, ys [][]float32, start, end int) {
-	if m.Pre != nil {
+	if m.Pre != nil || m.Gather != nil {
 		b = m.prepare(b)
 	}
 	switch m.Quant {
@@ -235,8 +240,16 @@ func (m Matrix) prepare(b *Batch) *Batch {
 	out := &Batch{Size: b.Size, Width: b.Width, F: make([][]float32, b.Size)}
 	for c := 0; c < b.Size; c++ {
 		out.F[c] = make([]float32, b.Width)
-		copy(out.F[c], b.F[c])
-		PrepareGolem(out.F[c], m.Pre, m.HadGroup)
+		if m.Gather != nil {
+			for i, src := range m.Gather {
+				out.F[c][i] = b.F[c][src]
+			}
+		} else {
+			copy(out.F[c], b.F[c])
+		}
+		if m.Pre != nil {
+			PrepareGolem(out.F[c], m.Pre, m.HadGroup)
+		}
 	}
 	return out
 }
@@ -302,8 +315,10 @@ func (m Matrix) Row(index int, out []float32) {
 		dequantizeQ8_0Row(row, m.Cols, out)
 	case PQ2_0:
 		DequantizePQ2_0(row, m.Cols, out)
+		m.unrotate(out)
 	case PTQ1_0:
 		DequantizePTQ1_0(row, m.Cols, out)
+		m.unrotate(out)
 	}
 }
 

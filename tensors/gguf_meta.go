@@ -107,6 +107,60 @@ func (g *GGUF) Uint32Slice(key string) ([]uint32, error) {
 	return out, nil
 }
 
+// asInt32 converts any of the integer types the format may have used.
+func asInt32(key string, v any) (int32, error) {
+	switch n := v.(type) {
+	case int8:
+		return int32(n), nil
+	case int16:
+		return int32(n), nil
+	case int32:
+		return n, nil
+	case int64:
+		return int32(n), nil
+	case uint8:
+		return int32(n), nil
+	case uint16:
+		return int32(n), nil
+	case uint32:
+		return int32(n), nil
+	case uint64:
+		return int32(n), nil
+	}
+	return 0, fmt.Errorf("metadata %q is %T, not an integer", key, v)
+}
+
+func (g *GGUF) Int32(key string) (int32, error) {
+	v, err := g.raw(key)
+	if err != nil {
+		return 0, err
+	}
+	return asInt32(key, v)
+}
+
+// Int32Slice reads an array, or a scalar as an array of one.
+func (g *GGUF) Int32Slice(key string) ([]int32, error) {
+	v, err := g.raw(key)
+	if err != nil {
+		return nil, err
+	}
+	items, ok := v.([]any)
+	if !ok {
+		n, err := asInt32(key, v)
+		if err != nil {
+			return nil, err
+		}
+		return []int32{n}, nil
+	}
+	out := make([]int32, len(items))
+	for i, item := range items {
+		if out[i], err = asInt32(key, item); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 func (g *GGUF) BoolSlice(key string) ([]bool, error) {
 	v, err := g.raw(key)
 	if err != nil {
