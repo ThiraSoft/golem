@@ -1,6 +1,7 @@
 package qwen35
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/ThiraSoft/golem/nn"
@@ -89,7 +90,33 @@ func visionMatrix(g *tensors.GGUF, name string, inputs, outputs int) (nn.Matrix,
 	if !ok {
 		return nn.Matrix{}, fmt.Errorf("qwen35: %s is %s, which nn does not read", name, t.DType)
 	}
-	return nn.Matrix{Data: t.Raw, Quant: q, Rows: t.Shape[1], Cols: t.Shape[0]}, nil
+	m := nn.Matrix{Data: t.Raw, Quant: q, Rows: t.Shape[1], Cols: t.Shape[0]}
+	switch q {
+	case nn.F16:
+		return m, nil
+	case nn.Q8_0:
+		return widenToHalf(m), nil
+	}
+	return nn.Matrix{}, fmt.Errorf("qwen35: %s is %s, and the tower reads F16 or Q8_0", name, q)
+}
+
+// widenToHalf is a Q8_0 matrix in the fp16 every product of this tower reads,
+// on the processor and on the card. Qwen's projector is fp16 in the file;
+// Prism's Bonsai ships the same weights in Q8_0. A signed byte times an fp16
+// scale needs up to eighteen bits of mantissa and gets eleven, a rounding of
+// 2.4e-4 at worst against the 1/254 the eight bits already cost. The tower then
+// holds two bytes a weight where the file held 1.06, 0.93 GB against 0.63, for
+// not writing a Q8_0 form of every one of its kernels.
+func widenToHalf(m nn.Matrix) nn.Matrix {
+	out := make([]byte, m.Rows*m.Cols*2)
+	row := make([]float32, m.Cols)
+	for r := 0; r < m.Rows; r++ {
+		m.Row(r, row)
+		for c, v := range row {
+			binary.LittleEndian.PutUint16(out[2*(r*m.Cols+c):], nn.FloatToHalf(v))
+		}
+	}
+	return nn.Matrix{Data: out, Quant: nn.F16, Rows: m.Rows, Cols: m.Cols}
 }
 
 // visionFloats copies an F32 tensor out of the mapping and checks its length.

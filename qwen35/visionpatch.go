@@ -154,8 +154,8 @@ func (cfg *VisionConfig) PatchesTraced(w *VisionWeights, im *imageio.Image, v *V
 	for slot, raster := range order {
 		py, px := raster/cols, raster%cols
 		gatherPatch(gathered, pixels, im.W, im.H, px, py, cfg.Patch)
-		nn.MatVecF16(w.PatchA.Data, gathered, w.PatchA.Rows, w.PatchA.Cols, rowA)
-		nn.MatVecF16(w.PatchB.Data, gathered, w.PatchB.Rows, w.PatchB.Cols, rowB)
+		patchProduct(w.PatchA, gathered, rowA)
+		patchProduct(w.PatchB, gathered, rowB)
 		dst := out[slot*cfg.Dim : (slot+1)*cfg.Dim]
 		for d := range dst {
 			dst[d] = rowA[d] + rowB[d] + w.PatchBias[d]
@@ -190,4 +190,18 @@ func gatherPatch(dst, pixels []float32, w, h, px, py, size int) {
 			}
 		}
 	}
+}
+
+// patchProduct is one of the two patch convolutions over a gathered patch.
+// Qwen's projector stores them in F16 and Prism's Bonsai in F32; reading the
+// second through the F16 kernel is not an error anywhere; it hands the tower
+// half-width garbage and the model describes a picture it was never shown.
+func patchProduct(m nn.Matrix, x, y []float32) {
+	if m.Quant == nn.F16 {
+		nn.MatVecF16(m.Data, x, m.Rows, m.Cols, y)
+		return
+	}
+	b := nn.NewBatch(m.Cols, 1)
+	copy(b.F[0], x)
+	m.MatVec(b, y)
 }
