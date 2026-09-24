@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-// fieldsAt makes a morpher's decision by hand: a square of alpha in the
-// middle of a 64×64 field, the eyes painted one colour and everything under
+// fieldsAt makes a morpher's decision by hand: two squares of alpha, the
+// eyes, either side of the middle of a 64×64 field, the eyes painted one colour and everything under
 // them another, both in light.
 func fieldsAt(paint, skin [3]float32) (faceFields, Tensor) {
 	const n = 64
@@ -32,9 +32,11 @@ func fieldsAt(paint, skin [3]float32) (faceFields, Tensor) {
 			f.eyeColor.Plane(c)[i] = p*2 - 1
 		}
 	}
-	for y := 16; y < 48; y++ {
-		for x := 16; x < 48; x++ {
-			f.eyeAlpha.Plane(0)[y*n+x] = 1
+	for y := 16; y < 32; y++ {
+		for x := 8; x < 56; x++ {
+			if x < 24 || x >= 40 {
+				f.eyeAlpha.Plane(0)[y*n+x] = 1
+			}
 		}
 	}
 	return f, under
@@ -89,6 +91,54 @@ func TestEyeToneHeldInRange(t *testing.T) {
 	}
 }
 
+// A blue skin is followed, however far from the networks' beige.
+func TestEyeToneFollowsABlueSkin(t *testing.T) {
+	paint := [3]float32{0.8, 0.6, 0.45}
+	skin := [3]float32{0.3, 0.5, 0.9}
+	f, under := fieldsAt(paint, skin)
+	g := eyeTone(f, under, 1)
+	for c := range 3 {
+		if want := skin[c] / paint[c]; math.Abs(float64(g[c]-want)) > 1e-3 {
+			t.Errorf("channel %d: gain %v, want %v", c, g[c], want)
+		}
+	}
+}
+
+// Cyan locks brighter than a tanned face all round the eyes: the skin is
+// still read, between them.
+func TestEyeToneReadsBetweenTheEyesPastBrightHair(t *testing.T) {
+	const n = 64
+	paint := [3]float32{0.4, 0.28, 0.2}
+	skin := [3]float32{0.38, 0.25, 0.27}
+	hair := [3]float32{0.2, 0.9, 1}
+	f, under := fieldsAt(paint, hair)
+	a := f.eyeAlpha.Plane(0)
+	for i := range a {
+		a[i] = 0
+	}
+	for y := 24; y < 40; y++ {
+		for x := 8; x < 60; x++ {
+			if x < 24 || x >= 44 {
+				a[y*n+x] = 1
+			}
+		}
+	}
+	for y := 31; y < 40+toneBelow; y++ {
+		for x := 24; x < 44; x++ {
+			for c := range 3 {
+				under.Plane(c)[y*n+x] = skin[c]*2 - 1
+			}
+		}
+	}
+	g := eyeTone(f, under, 1)
+	for c := range 3 {
+		want := min(max(skin[c]/paint[c], toneLow), toneHigh)
+		if math.Abs(float64(g[c]-want)) > 1e-3 {
+			t.Errorf("channel %d: gain %v, want %v", c, g[c], want)
+		}
+	}
+}
+
 func TestEyeToneKeepsAPictureItCannotMeasure(t *testing.T) {
 	f, under := fieldsAt([3]float32{0.8, 0.6, 0.5}, [3]float32{0.8, 0.66, 0.6})
 	// Nothing painted: no lid to read.
@@ -126,11 +176,13 @@ func TestTonedKeepsTheAlpha(t *testing.T) {
 }
 
 // lidOffset is how far the skin a frame shows over a closed eye sits from the
-// skin around it, channel by channel: what the eye tone is there to shrink.
+// skin between the eyes, channel by channel: what the eye tone is there to
+// shrink.
 func lidOffset(frame Tensor, f faceFields) [3]float32 {
 	k := frame.H / Size
 	a := resize(f.eyeAlpha, 192*k, 192*k)
-	lid, ring := maskRegions(a)
+	lid, _ := maskRegions(a)
+	ring := between(a, lid)
 	at := func(r []int) []int {
 		out := make([]int, 0, len(r))
 		for _, i := range r {

@@ -13,11 +13,11 @@ import (
 // that drift once, on the picture itself, and the morpher's colour is
 // multiplied by it from then on.
 
-// toneLow and toneHigh are how far the gain may pull a channel. The drift measured on the
-// characters at hand is within a sixth either way; further than this means
-// the measurement found something that is not skin, and the colour is better
-// left alone than dragged.
-const toneLow, toneHigh = 0.75, 1.35
+// toneLow and toneHigh are how far the gain may pull a channel. The drift
+// measured on the characters at hand is within a third either way, but a
+// character with blue or green skin is far from the networks' beige, and the
+// skin between the eyes is skin: only a gain past these is not followed.
+const toneLow, toneHigh = 0.3, 3
 
 // noTone is the gain that changes nothing.
 var noTone = [3]float32{1, 1, 1}
@@ -28,29 +28,44 @@ var noTone = [3]float32{1, 1, 1}
 // picture it painted them on, warped and with the mouth done, so that what is
 // compared is what the frame would have shown.
 //
-// The lid is the mask's inside, the skin around it the ring of untouched
-// picture just outside; each is read at its bright end, so that the lashes in
-// one and the hair in the other weigh nothing. A picture where either is too
-// small to measure keeps its colour.
+// The lid is the mask's inside, read at its bright end so that the lashes
+// weigh nothing. The skin is read between the eyes and a little below them,
+// at its bright end too: the ring all round a lid holds the fringe, and locks
+// brighter than the face, cyan on a tanned skin, read there as skin. A
+// picture where either is too small to measure keeps its colour.
 func eyeTone(f faceFields, under Tensor, amount float32) [3]float32 {
 	if amount <= 0 {
 		return noTone
 	}
-	lid, ring := maskRegions(f.eyeAlpha)
-	if len(lid) < toneFloor || len(ring) < toneFloor {
+	lid, _ := maskRegions(f.eyeAlpha)
+	if len(lid) < toneFloor {
 		return noTone
 	}
-	painted, skin := brightMean(f.eyeColor, lid), brightMean(under, ring)
-	var g [3]float32
+	painted := brightMean(f.eyeColor, lid)
 	for c := range 3 {
 		if painted[c] <= 0 {
 			return noTone
 		}
-		g[c] = min(max(skin[c]/painted[c], toneLow), toneHigh)
+	}
+	bridge := between(f.eyeAlpha, lid)
+	if len(bridge) < toneFloor {
+		return noTone
+	}
+	skin := brightMean(under, bridge)
+	var g [3]float32
+	for c := range 3 {
+		g[c] = skin[c] / painted[c]
+	}
+	for c := range 3 {
+		g[c] = min(max(g[c], toneLow), toneHigh)
 		g[c] = 1 + amount*(g[c]-1)
 	}
 	return g
 }
+
+// toneBelow is how far below the lids the skin between the eyes is read, in
+// pixels of the fields.
+const toneBelow = 6
 
 // toneFloor is how many pixels of the 192×192 fields a region needs before
 // its mean says anything. A shut eye paints some seven hundred.
@@ -118,6 +133,37 @@ func brightMean(t Tensor, at []int) [3]float32 {
 		sum[c] /= float32(len(bright))
 	}
 	return sum
+}
+
+// between is the skin between the eyes: the untouched pixels of the mask
+// that lie right of the one lid and left of the other, from the lids' middle
+// down to a little below them, where a lock of the fringe seldom reaches.
+func between(mask Tensor, lid []int) []int {
+	a, w := mask.Plane(0), mask.W
+	var mid float32
+	for _, i := range lid {
+		mid += float32(i % w)
+	}
+	mid /= float32(len(lid))
+	left, right, top, bottom := 0, w, mask.H, 0
+	for _, i := range lid {
+		x, y := i%w, i/w
+		if float32(x) < mid {
+			left = max(left, x)
+		} else {
+			right = min(right, x)
+		}
+		top, bottom = min(top, y), max(bottom, y)
+	}
+	var in []int
+	for y := (top + bottom) / 2; y <= min(bottom+toneBelow, mask.H-1); y++ {
+		for x := left + 1; x < right; x++ {
+			if a[y*w+x] <= 0.02 {
+				in = append(in, y*w+x)
+			}
+		}
+	}
+	return in
 }
 
 // toned is the colour the morpher paints over the eyes, multiplied channel by
