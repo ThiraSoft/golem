@@ -315,11 +315,22 @@ func (m *Model) UseVulkanStack() error {
 		// integer back; see vk/draft_head.go. A format the door cannot read
 		// leaves the guesses to the model's head, as they always were.
 		head := m.W.OutputHead
-		if vk.QuantReadable(head.Quant) && (head.Pre == nil || head.HadGroup == vk.RotateQ8Group) {
-			if err := pipe.AddDraftHead(head.Data, head.Quant, head.Rows, head.Cols, head.Pre, nil); err != nil {
-				pipe.Close()
-				return fmt.Errorf("qwen35: draft head: %w", err)
+		var err error
+		ids, rows := m.guessRows()
+		if m.golemHead != nil {
+			err = pipe.AddGolemDraftHead(m.golemHead, head.Pre)
+			if err == nil && ids != nil {
+				err = pipe.AddGolemGuessHead(m.golemKernels, rows, len(ids), head.Cols, head.Pre, ids)
 			}
+		} else if vk.QuantReadable(head.Quant) && (head.Pre == nil || head.HadGroup == vk.RotateQ8Group) {
+			err = pipe.AddDraftHead(head.Data, head.Quant, head.Rows, head.Cols, head.Pre, nil)
+			if err == nil && ids != nil {
+				err = pipe.AddDraftHead(rows, head.Quant, len(ids), head.Cols, head.Pre, ids)
+			}
+		}
+		if err != nil {
+			pipe.Close()
+			return fmt.Errorf("qwen35: draft head: %w", err)
 		}
 	}
 

@@ -429,6 +429,29 @@ func NewGolemMatrixOn(k *GolemKernels, data []byte, rows, cols int, act, out *Bu
 	return m, nil
 }
 
+// newGolemMatrixShared binds weights another matrix already holds to a new pair
+// of stages, so that the same tensor can be read from two places without being
+// on the card twice. It owns nothing but its sets.
+func newGolemMatrixShared(k *GolemKernels, weights *Buffer, rows, cols int, act, out *Buffer) (*GolemMatrix, error) {
+	m := &GolemMatrix{d: k.d, k: k, rows: rows, cols: cols, sets: map[int]*Set{}, weights: weights}
+	var err error
+	for columns, pipe := range k.pipes {
+		if m.sets[columns], err = pipe.NewSet([]*Buffer{weights, k.table, act, out}); err != nil {
+			m.Close()
+			return nil, err
+		}
+	}
+	m.groups = map[int]uint32{}
+	for _, columns := range GolemWidths {
+		per := golemRowsPerGroup(columns)
+		m.groups[columns] = uint32((rows + per - 1) / per)
+	}
+	for _, columns := range GolemTiledWidths {
+		m.groups[columns] = golemTiledGroups(rows, columns)
+	}
+	return m, nil
+}
+
 // Set is the descriptor for a pass of that many columns, and Push the block
 // that goes with it. A recording dispatches the two; MatVec below is what a
 // caller with a host buffer does instead.

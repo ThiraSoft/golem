@@ -2,6 +2,8 @@ package qwen35
 
 import (
 	"fmt"
+	"os"
+	"strconv"
 
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/vk"
@@ -249,4 +251,30 @@ func (s *Speculator) StepAt(token int32, hidden []float32, at Place, pick func([
 		}
 	}
 	return decided, states[kept], nil
+}
+
+// guessRows are the tokens the prediction block's guesses are drawn from and
+// the head's rows for them, or nil for all of them. A byte-pair vocabulary
+// numbers its tokens in the order they were merged, which is roughly the order
+// of how common they are, so the first GOLEM_GUESS_VOCAB of them and the
+// control tokens at the end are most of what a model says.
+func (m *Model) guessRows() ([]int32, []byte) {
+	n, _ := strconv.Atoi(os.Getenv("GOLEM_GUESS_VOCAB"))
+	head := m.W.OutputHead
+	if n <= 0 || n >= head.Rows {
+		return nil, nil
+	}
+	rowBytes := len(head.Data) / head.Rows
+	const control = 248044
+	var ids []int32
+	for i := 0; i < head.Rows; i++ {
+		if i < n || i >= control {
+			ids = append(ids, int32(i))
+		}
+	}
+	rows := make([]byte, 0, len(ids)*rowBytes)
+	for _, id := range ids {
+		rows = append(rows, head.Data[int(id)*rowBytes:int(id+1)*rowBytes]...)
+	}
+	return ids, rows
 }

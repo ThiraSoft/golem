@@ -698,8 +698,8 @@ type QwenPipeline struct {
 	snaps int
 	// restoreProgs are RestoreStateAt's recordings, one per copy.
 	restoreProgs map[int]*Program
-	d     *Device
-	shape QwenShape
+	d            *Device
+	shape        QwenShape
 	// tl is where a recording writes the card's clock, when one is installed.
 	// Qwen3.8 is the only pipeline here that never had one: every number this
 	// model's performance work has ever rested on came from ablation — remove
@@ -864,8 +864,10 @@ type QwenPipeline struct {
 	attnBlocks map[int]*qwenAttnBlock
 	ffnBlocks  []*qwenFFNBlock
 	mtp        *qwenMTPBlock
-	// draft is the prediction block's own head; see vk/draft_head.go.
-	draft *draftHead
+	// draft is the model's whole head read on the card, and guess a smaller
+	// one the prediction block's guesses may read instead; see
+	// vk/draft_head.go.
+	draft, guess *draftHead
 
 	// slot is the conversation the next pass runs in; see QwenShape.Slots.
 	slot int
@@ -2637,10 +2639,12 @@ func (p *QwenPipeline) Close() {
 		prog.Close()
 	}
 	p.restoreProgs = nil
-	if p.draft != nil {
-		p.draft.close()
-		p.draft = nil
+	for _, h := range []*draftHead{p.draft, p.guess} {
+		if h != nil {
+			h.close()
+		}
 	}
+	p.draft, p.guess = nil, nil
 	if p.mtp != nil {
 		if p.mtp.pass != nil {
 			p.mtp.pass.Close()
