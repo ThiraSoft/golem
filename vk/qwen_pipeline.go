@@ -1912,15 +1912,15 @@ func (p *QwenPipeline) product(r *Recorder, set *Set, rows, columns int, push mo
 	}
 }
 
-// productK is product for the kernels that take vk/ssm.go's push block: the
-// K-quant, Q4_1 and float projections, which have no tiled form and are always
-// the mat-vec.
 // productRows is a product of few rows, answered by shaders/matvec_rows.comp.
 func (p *QwenPipeline) productRows(r *Recorder, set *Set, rows, cols, columns int) {
 	push := rowsPush{Dim: uint32(rows), FFN: uint32(cols), Columns: uint32(columns)}
 	r.DispatchColumns(set, uint32(rows), uint32((columns+rowsBlock-1)/rowsBlock), unsafe.Pointer(&push))
 }
 
+// productK is product for the kernels that take vk/ssm.go's push block: the
+// K-quant, Q4_1 and float projections, which have no tiled form and are always
+// the mat-vec.
 func (p *QwenPipeline) productK(r *Recorder, set *Set, rows, columns int, push matvecKPush) {
 	for at := 0; at < columns; {
 		w := p.span(set, columns-at, at, narrowChunk)

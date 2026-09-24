@@ -1,0 +1,106 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// y = W * X for one PQ2_0 matrix against a few columns of a Q8_0 activation,
+// with every lane carrying ROWS rows.
+//
+// shaders/matvec.comp gives a lane one row. Past a couple of columns what it
+// spends is not the weights, which are two bits a value, but the activation:
+// ten loads a column for every thirty-two weights, against two for the
+// weights themselves, and the same ten again for every row of the workgroup.
+// Here a lane loads a column's block once, as two sixteen-byte reads, and
+// spends it on ROWS rows before moving on. The eight output rows of a
+// workgroup are what vk/qwen_pipeline.go's dispatch expects, so ROWS times
+// GROUPS is eight.
+
+#ifndef COLUMNS
+#define COLUMNS 8
+#endif
+#ifndef LANES
+#define LANES 32u
+#endif
+#ifndef ROWS
+#define ROWS 2u
+#endif
+#define GROUPS (8u / ROWS)
+
+layout(local_size_x = LANES * GROUPS) in;
+
+layout(std430, binding = 0) readonly  buffer W   { uint  w[];   };
+layout(std430, binding = 1) readonly  buffer AQ  { uvec4 aq4[]; };
+layout(std430, binding = 2) readonly  buffer AS  { float as_[]; };
+layout(std430, binding = 3) writeonly buffer Y   { float y[];   };
+
+layout(push_constant) uniform Push {
+    uint dim;
+    uint ffn;
+    uint used;
+    uint act;
+    uint col;
+} p;
+
+// spread puts the four two-bit values of a byte one to a byte.
+uint spread(uint x) {
+    return (x & 3u) | ((x & 12u) << 6u) | ((x & 48u) << 12u) | ((x & 192u) << 18u);
+}
+
+void main() {
+    uint t     = gl_LocalInvocationID.x;
+    uint lane  = t % LANES;
+    uint first = gl_WorkGroupID.x * 8u + (t / LANES) * ROWS;
+
+    uint nb  = p.ffn >> 5;
+    uint ntb = p.ffn >> 7;
+    uint rowBytes = ((2u * ntb + 3u) & ~3u) + ntb * 32u;
+    uint aw4 = p.ffn >> 4;   // one column of the activation, in uvec4
+
+    float sum[ROWS][COLUMNS];
+    [[unroll]] for (uint r = 0u; r < ROWS; r++)
+        [[unroll]] for (uint c = 0u; c < COLUMNS; c++) sum[r][c] = 0.0;
+
+    uint base[ROWS];
+    [[unroll]] for (uint r = 0u; r < ROWS; r++) base[r] = min(first + r, p.dim - 1u) * rowBytes;
+
+    for (uint b = lane; b < nb; b += LANES) {
+        uint tb = b >> 2u;
+        uint lo[ROWS][4], hi[ROWS][4];
+        float ws[ROWS];
+        [[unroll]] for (uint r = 0u; r < ROWS; r++) {
+            vec2 dm = unpackHalf2x16(w[(base[r] + 2u * tb) >> 2]);
+            ws[r] = dm[tb & 1u];
+            uint at = (base[r] + ((2u * ntb + 3u) & ~3u) + 8u * b) >> 2;
+            uint q0 = w[at], q1 = w[at + 1u];
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                lo[r][u] = spread((q0 >> (8u * u)) & 0xFFu);
+                hi[r][u] = spread((q1 >> (8u * u)) & 0xFFu);
+            }
+        }
+        [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+            uint col = p.col + c;
+            uvec4 a0 = aq4[col * aw4 + 2u * b];
+            uvec4 a1 = aq4[col * aw4 + 2u * b + 1u];
+            float sc = as_[col * 2u * nb + b];
+            float cs = as_[col * 2u * nb + nb + b] * 0.125;
+            [[unroll]] for (uint r = 0u; r < ROWS; r++) {
+                int acc = 0;
+                acc = dotPacked4x8AccSatEXT(lo[r][0], int(a0.x), acc);
+                acc = dotPacked4x8AccSatEXT(lo[r][1], int(a0.y), acc);
+                acc = dotPacked4x8AccSatEXT(lo[r][2], int(a0.z), acc);
+                acc = dotPacked4x8AccSatEXT(lo[r][3], int(a0.w), acc);
+                acc = dotPacked4x8AccSatEXT(hi[r][0], int(a1.x), acc);
+                acc = dotPacked4x8AccSatEXT(hi[r][1], int(a1.y), acc);
+                acc = dotPacked4x8AccSatEXT(hi[r][2], int(a1.z), acc);
+                acc = dotPacked4x8AccSatEXT(hi[r][3], int(a1.w), acc);
+                sum[r][c] += ws[r] * (float(acc) * sc - cs);
+            }
+        }
+    }
+    [[unroll]] for (uint r = 0u; r < ROWS; r++) {
+        [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+            float s = subgroupClusteredAdd(sum[r][c], LANES);
+            if (lane == 0u && first + r < p.dim) y[(p.col + c) * p.dim + first + r] = s;
+        }
+    }
+}

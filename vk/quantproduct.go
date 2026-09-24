@@ -79,11 +79,11 @@ import (
 //go:generate glslc -O -DQ2K -DCOLUMNS=256 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q2k256.spv
 //go:generate glslc -O -DQ2K -DCOLUMNS=512 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q2k512.spv
 
-//go:generate glslc -O -DPQ20 -DLANES=16 -DOUTS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_pq20q8.spv
-//go:generate glslc -O -DPQ20 -DLANES=16 -DOUTS=8 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_pq20q8_2.spv
-//go:generate glslc -O -DPQ20 -DLANES=16 -DOUTS=8 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_pq20q8_4.spv
-//go:generate glslc -O -DPQ20 -DLANES=16 -DOUTS=8 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_pq20q8_8.spv
-//go:generate glslc -O -DPQ20 -DLANES=16 -DOUTS=8 -DCOLUMNS=16 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_pq20q8_16.spv
+//go:generate glslc -O -DCOLUMNS=1 -DLANES=64u -DROWS=2u --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_pq20_rows.comp -o shaders/matvec_pq20q8.spv
+//go:generate glslc -O -DCOLUMNS=2 -DLANES=32u -DROWS=2u --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_pq20_rows.comp -o shaders/matvec_pq20q8_2.spv
+//go:generate glslc -O -DCOLUMNS=4 -DLANES=32u -DROWS=2u --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_pq20_rows.comp -o shaders/matvec_pq20q8_4.spv
+//go:generate glslc -O -DCOLUMNS=8 -DLANES=32u -DROWS=2u --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_pq20_rows.comp -o shaders/matvec_pq20q8_8.spv
+//go:generate glslc -O -DCOLUMNS=16 -DLANES=32u -DROWS=4u --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_pq20_rows.comp -o shaders/matvec_pq20q8_16.spv
 //go:generate glslc -O -DPQ20 -DCOLUMNS=32 -DBN=32 -DBM=64 -DBK=128 -DWAVE_M=4 -DWAVE_N=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_pq2032.spv
 //go:generate glslc -O -DPQ20 -DCOLUMNS=64 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_pq2064.spv
 //go:generate glslc -O -DPQ20 -DCOLUMNS=128 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_pq20128.spv
