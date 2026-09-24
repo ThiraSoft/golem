@@ -18,6 +18,7 @@ import (
 	_ "embed"
 	"fmt"
 	"os"
+	"time"
 	"unsafe"
 
 	"github.com/ThiraSoft/golem/nn"
@@ -2853,14 +2854,21 @@ func (p *QwenPipeline) WidthFor(n int) int { return p.WidthAt(n, 0) }
 // pass is one submission, and the driver resets the card when a submission
 // runs past about two seconds; what grows with the position is the
 // attention, where every column reads every key before it. So the width is
-// the widest that also keeps the pass's attention under its budget.
+// the widest that also keeps the pass's attention under the room its fixed
+// part leaves it, which roomFor says.
 func (p *QwenPipeline) WidthAt(n, pos int) int {
-	return widthAt(n, pos, p.widestPass(), p.attendBudget())
+	return widthWith(n, pos, p.widestPass(), p.roomFor)
 }
 
 func widthAt(n, pos, widest, budget int) int {
+	return widthWith(n, pos, widest, func(int) int { return budget })
+}
+
+// widthWith is widthAt where the attention a pass has room for depends on
+// its width.
+func widthWith(n, pos, widest int, room func(columns int) int) int {
 	for _, w := range qwenWidths {
-		if w <= n && w <= widest && fits(w, pos, budget) {
+		if w <= n && w <= widest && fits(w, pos, room(w)) {
 			return w
 		}
 	}
@@ -2868,14 +2876,74 @@ func widthAt(n, pos, widest, budget int) int {
 }
 
 // FitsAt reports whether a pass of that many columns, the furthest at pos,
-// keeps its attention under the budget WidthAt keeps to. One column always
+// keeps its attention under the room WidthAt keeps to. One column always
 // does: there is nothing narrower to fall back on.
 func (p *QwenPipeline) FitsAt(columns, pos int) bool {
-	return fits(columns, pos, p.attendBudget())
+	return fits(columns, pos, p.roomFor(columns))
 }
 
 func fits(columns, pos, budget int) bool {
 	return columns <= 1 || columns*(pos+columns) <= budget
+}
+
+// The line attendBudget was drawn to: a pass of 512 columns on Bonsai costs
+// 380 ms before any attention, and three million column-positions of it are
+// 0.8 s more, so a pass on that model ends by 1.18 s whatever its width.
+const (
+	budgetFixed     = 380 * time.Millisecond
+	budgetAttention = 800 * time.Millisecond
+	passLine        = budgetFixed + budgetAttention
+)
+
+// roomFor is how many column-positions a pass of that many columns may
+// attend over. A model whose pass costs no more than Bonsai's before its
+// attention keeps the whole budget; one that costs more gives up the
+// attention its fixed part eats into, so that the pass as a whole still ends
+// by passLine.
+func (p *QwenPipeline) roomFor(columns int) int {
+	return roomAfter(p.attendBudget(), p.passFixed(columns))
+}
+
+func roomAfter(budget int, fixed time.Duration) int {
+	if fixed <= budgetFixed {
+		return budget
+	}
+	left := passLine - fixed
+	if left <= 0 {
+		return 0
+	}
+	return int(int64(budget) * int64(left) / int64(budgetAttention))
+}
+
+// passFixed is what a pass of that many columns costs before its attention,
+// where that is more than budgetFixed. Only a .golem pass is: a quantized
+// one reads its weights by the tiled products attendBudget was measured on.
+func (p *QwenPipeline) passFixed(columns int) time.Duration {
+	if !p.usesGolem() {
+		return 0
+	}
+	return golemPassFixed(columns, p.shape, len(p.isSSM))
+}
+
+// golemPassFixed is a .golem pass's cost before its attention.
+//
+// Measured on Qwen3.8-27B in t3g, RX 9070 XT in high, performance profile,
+// the card's own clock around everything but the attention: 400 ms at 64
+// columns, 724 at 128, 1357 at 256, flat from position 1024 to 8192. That is
+// 81 ms and 4.98 ms a column, three and a half times Bonsai's 1.4 ms a column
+// at 128, because every weight is decoded again for every tile. A pass of 256
+// is past passLine before it attends to anything, and WidthAt let it through
+// up to position 12032: at 10496 its 1.36 s met 0.63 s of attention and the
+// driver reset the card.
+//
+// The part a column is the weights it multiplies, so a smaller model is
+// scaled by its feed forwards, which are two thirds of the 27B's weights.
+func golemPassFixed(columns int, s QwenShape, blocks int) time.Duration {
+	const base = 81 * time.Millisecond
+	const perColumn = 4980 * time.Microsecond
+	const measured = 5120 * 17408 * 64
+	fixed := base + time.Duration(columns)*perColumn
+	return time.Duration(float64(fixed) * float64(s.Dim*s.FFN*blocks) / measured)
 }
 
 // attendBudget is how many column-positions one pass may attend over.
@@ -2924,6 +2992,11 @@ func (p *QwenPipeline) attendBudget() int {
 // submitting. It is one submission taking two and a half seconds. So the line
 // is what a submission finishes in, and two hundred and fifty-six is the widest
 // that does.
+//
+// Only near the start, and only just: 1.43 s at position 1024. On the 27B
+// golemPassFixed puts it past passLine, so WidthAt never picks it there and
+// a prompt goes 128 at a time; the line stays for a smaller model, whose
+// pass costs less.
 const golemWidestPass = 256
 
 // golemMatvecWidestPass is the line that held before the tiled product, and it

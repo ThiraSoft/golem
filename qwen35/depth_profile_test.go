@@ -31,8 +31,9 @@ func TestVulkanDepthProfile(t *testing.T) {
 	}
 	// GOLEM_DEPTH_FILL caps how many tokens the fill hands ForwardBatch at
 	// once, and so the width of its passes. A .golem pass of 256 columns is
-	// 1.2 s before any attention, and WidthAt's budget, measured on Bonsai,
-	// let t3g reach 256 at position 10496 and reset the card there.
+	// 1.36 s before any attention, and WidthAt's budget, measured on Bonsai,
+	// let t3g reach 256 at position 10496 and reset the card there, until
+	// golemPassFixed counted that part.
 	fill := 2048
 	if s := os.Getenv("GOLEM_DEPTH_FILL"); s != "" {
 		fill, _ = strconv.Atoi(s)
