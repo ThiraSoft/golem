@@ -14,18 +14,23 @@ import (
 )
 
 type completionRequest struct {
-	Model       string          `json:"model"`
-	Messages    requestMessages `json:"messages"`
-	Tools       []chat.Tool     `json:"tools"`
-	ToolChoice  any             `json:"tool_choice"`
-	Stream      bool            `json:"stream"`
-	Temperature *float64        `json:"temperature"`
-	TopP        *float64        `json:"top_p"`
-	TopK        *int            `json:"top_k"`
-	MinP        *float64        `json:"min_p"`
-	MaxTokens   *int            `json:"max_tokens"`
-	Seed        *uint64         `json:"seed"`
-	Stop        stopStrings     `json:"stop"`
+	Model      string          `json:"model"`
+	Messages   requestMessages `json:"messages"`
+	Tools      []chat.Tool     `json:"tools"`
+	ToolChoice any             `json:"tool_choice"`
+	Stream     bool            `json:"stream"`
+	// StreamOptions asks, as OpenAI's API does, for a last chunk that says
+	// what the answer cost.
+	StreamOptions struct {
+		IncludeUsage bool `json:"include_usage"`
+	} `json:"stream_options"`
+	Temperature *float64    `json:"temperature"`
+	TopP        *float64    `json:"top_p"`
+	TopK        *int        `json:"top_k"`
+	MinP        *float64    `json:"min_p"`
+	MaxTokens   *int        `json:"max_tokens"`
+	Seed        *uint64     `json:"seed"`
+	Stop        stopStrings `json:"stop"`
 	// The penalties, under the names OpenAI gives two of them and llama.cpp
 	// the other two.
 	FrequencyPenalty *float64 `json:"frequency_penalty"`

@@ -245,7 +245,7 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 		gen = gen.WithMaxTokens(*req.MaxTokens)
 	}
 	if req.Stream {
-		s.stream(r.Context(), w, gen, id, built, params, req.Stop)
+		s.stream(r.Context(), w, gen, id, built, params, req.Stop, req.StreamOptions.IncludeUsage)
 		return
 	}
 	answer, err := gen.GeneratePrompt(r.Context(), built, params, req.Stop, nil)

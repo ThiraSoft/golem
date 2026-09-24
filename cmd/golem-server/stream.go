@@ -18,7 +18,7 @@ import (
 	"github.com/ThiraSoft/golem/sample"
 )
 
-func (s *Server) stream(ctx context.Context, w http.ResponseWriter, gen *Generator, id string, prompt engine.Prompt, p sample.Params, stop []string) {
+func (s *Server) stream(ctx context.Context, w http.ResponseWriter, gen *Generator, id string, prompt engine.Prompt, p sample.Params, stop []string, includeUsage bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		refuse(w, http.StatusInternalServerError, "server_error", "this connection cannot be streamed to")
@@ -87,5 +87,17 @@ func (s *Server) stream(ctx context.Context, w http.ResponseWriter, gen *Generat
 	}
 	reason := answer.Reason
 	send(choice{Delta: &responseMessage{}, FinishReason: &reason})
+	if includeUsage {
+		// OpenAI's shape: a chunk of its own, with no choices.
+		body, err := json.Marshal(completionResponse{
+			ID: id, Object: "chat.completion.chunk", Created: created, Model: s.name,
+			Choices: []choice{},
+			Usage: &usage{PromptTokens: answer.Prompt, CompletionTokens: answer.Generated,
+				TotalTokens: answer.Prompt + answer.Generated},
+		})
+		if err == nil {
+			fmt.Fprintf(w, "data: %s\n\n", body)
+		}
+	}
 	done()
 }

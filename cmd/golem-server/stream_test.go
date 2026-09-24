@@ -218,3 +218,28 @@ func TestStreamSendsAnErrorApartFromTheProse(t *testing.T) {
 		t.Fatalf("body %q", w.Body.String())
 	}
 }
+
+// With stream_options.include_usage, a last chunk before [DONE] says what the
+// answer cost, and has no choices.
+func TestStreamSendsUsageWhenAsked(t *testing.T) {
+	s := newTestServer(t, []string{"one", "two", "<turn|>"})
+	w := post(t, s, `{"messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}`)
+	f := frames(t, w.Body.String())
+	var chunk struct {
+		Choices []json.RawMessage `json:"choices"`
+		Usage   *struct {
+			Prompt     int `json:"prompt_tokens"`
+			Completion int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(f[len(f)-2]), &chunk); err != nil {
+		t.Fatal(err)
+	}
+	if chunk.Usage == nil || chunk.Usage.Completion == 0 || chunk.Usage.Prompt == 0 || len(chunk.Choices) != 0 {
+		t.Fatalf("usage chunk %s", f[len(f)-2])
+	}
+	w = post(t, s, `{"messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	if strings.Contains(w.Body.String(), "prompt_tokens") {
+		t.Fatal("usage sent unasked")
+	}
+}
