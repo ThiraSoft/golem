@@ -336,6 +336,57 @@ Both conversions ran on the card end to end — **27318 of 27321 M weights**, th
 remaining three million being the shapes no kernel is compiled for — in 34m25
 for T4G and 32m46 for T3G.
 
+### H3G: two weights a state
+
+T3G's product spends nine tenths of its time cutting a twelve-bit window per
+weight and looking it up. H3G (`nn/h3g.go`) is QTIP's HYB code: a
+fourteen-bit state moves six bits a *pair*, s·(s+1) picks one of 2048 half2
+pairs, and one window and one read make two weights. The codebook was trained
+once by Lloyd's algorithm through the trellis on a unit Gaussian
+(`cmd/h3gcodebook`, 400 rounds of 16 M weights on the card, 36 seconds for 40):
+17.58 dB held out, against 17.25 for T3G's 1MAD at the gain the format uses.
+128 weights in 51 bytes, 3.1875 bits a weight, no padding.
+
+At twelve bits of state a pair code loses 0.45 dB to T3G — a state covering two
+weights remembers half as far back — which is why the state is fourteen: level
+at 17.40 dB untrained, and the card's Viterbi (`vk/shaders/viterbi_hyb.comp`)
+holds its 16384 states in registers, sixteen a thread, where two cost planes in
+shared memory would not fit.
+
+Each pair of rows below comes from the same binary and the same salience file,
+`golemquant -bits 3` against `-bits 3 -code pair`, head and table T4G in both:
+
+| | size | PPL | KL | top-1 | top-5 |
+|---|---|---|---|---|---|
+| Qwen3-0.6B T3G | 249.3 MiB | 34.8554 | 0.2498 | 73.6 % | 96.4 % |
+| Qwen3-0.6B H3G | 246.0 MiB | 34.9618 | 0.2471 | 74.3 % | 96.4 % |
+| Qwen3-4B T3G | 1.57 GiB | 21.1069 | 0.1771 | 83.1 % | 98.3 % |
+| Qwen3-4B H3G | 1.54 GiB | 21.8573 | **0.1720** | **84.4 %** | **98.5 %** |
+| Qwen3.8-27B T3G | 10.63 GiB | 9.9676 | 0.0738 | 87.4 % | 99.3 % |
+| Qwen3.8-27B H3G | **10.46 GiB** | **9.8248** | **0.0660** | **88.0 %** | **99.4 %** |
+
+The 4B's perplexity gap is the paired test's to judge and it does not pass it:
+0.035 nats a window, t = 1.18 over the eight windows, and on 16352 tokens of
+`eval-long.txt` in 32 windows the two read 17.3794 (T3G) and 17.3631 (H3G), H3G
+ahead in 18 of 32, t = −0.06. The divergence is the reliable number and it goes
+H3G's way on all three models.
+
+What it buys on the card, Qwen3.8-27B, `golem-cli -vulkan -temp 0 -n 256`,
+best of three rotated rounds, two prompts:
+
+| | T3G | H3G | Q4_0 |
+|---|---|---|---|
+| tokens a second | 35.4 | **39.2** | 34.1 |
+| `-draft-n 3`, prose | 46.3 | **59.8** | — |
+| `-draft-n 3`, code | 54.7 | **66.7** | — |
+
+T3G is read with `GOLEM_MATVEC_SHAPE="1:256,true,false 2:256,true,false"`, its
+best; the default reads 34.7 and 35.0. The Q4_0 file's prediction projection is
+Q8_0 and it does not draft here. The draft's gain is larger than the token's
+because `vk/shaders/matvec_h3g.comp` also carries two rows a lane, which halves
+the activation traffic past one column; `vk/hyb_bench_test.go` separates the two
+and most of the four-column gain is the rows, which T3G could have too.
+
 ### Tail-biting: built, measured, and not taken
 
 The seven padding bits and the twelve priming bits are what a **tail-biting**
