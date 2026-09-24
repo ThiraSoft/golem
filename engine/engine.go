@@ -278,6 +278,9 @@ func (m *Model) SetDraftDepth(n int) {
 	if g, ok := m.Forward.(*gemma.Model); ok {
 		g.SetDraftDepth(n)
 	}
+	if q, ok := m.Forward.(*qwen35.Model); ok {
+		q.SetDraftDepth(n)
+	}
 }
 
 // NewSpeculator is the model's way of drafting, or nil when it has none, which

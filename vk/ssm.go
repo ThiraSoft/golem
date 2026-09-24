@@ -45,6 +45,9 @@ type ssmConvPush struct {
 	// First is the run's first column: a dispatch walks one conversation's
 	// run of the pass, and the shader reads its slot out of that column.
 	First uint32
+	// Snaps is how many columns from SnapAt on copy their state aside, the
+	// first into copy zero, and Depth how many copies a slot's shadow holds.
+	Snaps, Depth uint32
 }
 
 // ssmScanPush is shaders/ssm_scan.comp's block, and the order of these fields
@@ -62,6 +65,8 @@ type ssmScanPush struct {
 	Inner     uint32
 	Rank      uint32
 	First     uint32 // see ssmConvPush
+	Snaps     uint32 // see ssmConvPush
+	Depth     uint32
 }
 
 type matvecKPush struct {

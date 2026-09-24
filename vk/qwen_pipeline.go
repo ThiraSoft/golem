@@ -389,6 +389,13 @@ type QwenShape struct {
 	// somebody else's checkpoint, which this file has been wrong about before.
 	Snapshots bool
 
+	// Drafts is how many drafted columns a speculative pass may carry, and so
+	// how many copies of the recurrence the shadows hold: a pass of a token
+	// and k guesses copies the state aside at the start of every guess, and a
+	// refusal after the a-th puts copy a back. Zero means one, which is what
+	// the prediction block's single guess has always needed.
+	Drafts int
+
 	// PassWidth is the widest pass this pipeline is built for, and zero means
 	// qwenWide. It is a field because it is memory: every scratch buffer below
 	// is a width times a dimension times four bytes, and on Qwen3.8-27B the set
@@ -493,6 +500,14 @@ const (
 
 // slots is how many conversations the shape holds, never less than one.
 func (s QwenShape) slots() int { return max(s.Slots, 1) }
+
+// depth is how many copies of its state a slot's shadow holds.
+func (s QwenShape) depth() int {
+	if !s.Snapshots {
+		return 0
+	}
+	return max(s.Drafts, 1)
+}
 
 // wide says the model takes the float path in either of its forms.
 func (s QwenShape) wide() bool { return s.Float != NotWide }
@@ -678,6 +693,11 @@ type qwenFFNBlock struct {
 }
 
 type QwenPipeline struct {
+	// snaps is how many columns the pass being recorded copies aside; see
+	// QwenShape.Drafts. It is read while a recording is laid down.
+	snaps int
+	// restoreProgs are RestoreStateAt's recordings, one per copy.
+	restoreProgs map[int]*Program
 	d     *Device
 	shape QwenShape
 	// tl is where a recording writes the card's clock, when one is installed.
@@ -845,8 +865,6 @@ type QwenPipeline struct {
 	ffnBlocks  []*qwenFFNBlock
 	mtp        *qwenMTPBlock
 
-	// The pass that puts the delta nets back when a draft is refused.
-	restoreProg *Program
 	// slot is the conversation the next pass runs in; see QwenShape.Slots.
 	slot int
 
@@ -1234,8 +1252,8 @@ func (p *QwenPipeline) AddSSMBlock(i int, d QwenSSMData) error {
 		// every binding whether or not a pass writes it — and nothing
 		// writes them unless a pass says which column to snapshot at,
 		// which only a speculative one does.
-		{&b.shadowConv, make([]byte, shadowBytes(s.Snapshots, slots*s.convStateBytes()))},
-		{&b.shadowState, make([]byte, shadowBytes(s.Snapshots, slots*s.ssmStateBytes()))},
+		{&b.shadowConv, make([]byte, shadowBytes(s.Snapshots, s.depth()*slots*s.convStateBytes()))},
+		{&b.shadowState, make([]byte, shadowBytes(s.Snapshots, s.depth()*slots*s.ssmStateBytes()))},
 		{&b.ckConv, make([]byte, max(4, slots*s.Checkpoints*s.convStateBytes()))},
 		{&b.ckState, make([]byte, max(4, slots*s.Checkpoints*s.ssmStateBytes()))},
 	} {
@@ -1687,10 +1705,7 @@ func QwenBufferBytes(s QwenShape, width, attn, ssm int) uint64 {
 	n := QwenScratchBytes(s, width)
 	n += uint64(attn) * uint64(2*s.KVHeads*s.MaxContext*s.HeadDim*2) * uint64(s.slots())
 	state := uint64((s.ConvDim*4)*3 + s.Rank*s.StateSize*s.StateSize*4)
-	copies := uint64(1 + s.Checkpoints)
-	if s.Snapshots {
-		copies++
-	}
+	copies := uint64(1 + s.Checkpoints + s.depth())
 	return n + uint64(ssm)*state*copies*uint64(s.slots())
 }
 
@@ -1774,12 +1789,13 @@ func (p *QwenPipeline) forward(xs [][]float32, at []QwenPlace, slots []int, spec
 	snapAt := int(noSnapshot)
 	key := shapeKey(runs)
 	if speculative {
-		if columns < 2 || len(runs) > 1 {
-			return nil, fmt.Errorf("vk: a speculative pass is one conversation's committed column and a drafted one")
+		if columns < 2 || len(runs) > 1 || columns-1 > s.depth() {
+			return nil, fmt.Errorf("vk: a speculative pass is one conversation's committed column and one to %d drafted ones, given %d columns", s.depth(), columns)
 		}
-		snapAt = columns - 1
+		snapAt = 1
 		key += "?"
 	}
+	p.snaps = columns - 1
 	if p.pass == nil {
 		p.pass = map[string]*Program{}
 	}
@@ -1809,6 +1825,14 @@ func (p *QwenPipeline) forward(xs [][]float32, at []QwenPlace, slots []int, spec
 		out[c] = normed[c*s.Dim : (c+1)*s.Dim]
 	}
 	return out, nil
+}
+
+// snapsOf is how many columns a pass snapshotting from snapAt copies aside.
+func (p *QwenPipeline) snapsOf(snapAt int) int {
+	if uint32(snapAt) == noSnapshot {
+		return 0
+	}
+	return p.snaps
 }
 
 // noSnapshot is the snapAt that never matches a column.
@@ -2349,7 +2373,8 @@ func (p *QwenPipeline) recordSSMState(r *Recorder, b *qwenSSMBlock, runs []span,
 	// common, so they run side by side with no barrier between them.
 	for _, run := range runs {
 		conv := ssmConvPush{Channels: uint32(s.ConvDim), Kernel: 4, Columns: uint32(run.count),
-			SnapAt: uint32(snapAt), First: uint32(run.first)}
+			SnapAt: uint32(snapAt), First: uint32(run.first),
+			Snaps: uint32(p.snapsOf(snapAt)), Depth: uint32(s.depth())}
 		r.Dispatch(b.setConv, uint32((s.ConvDim+255)/256), unsafe.Pointer(&conv))
 	}
 	r.Barrier()
@@ -2376,6 +2401,8 @@ func (p *QwenPipeline) recordSSMState(r *Recorder, b *qwenSSMBlock, runs []span,
 			Rank:      uint32(s.Rank),
 			SnapAt:    uint32(snapAt),
 			First:     uint32(run.first),
+			Snaps:     uint32(p.snapsOf(snapAt)),
+			Depth:     uint32(s.depth()),
 		}
 		r.DispatchColumns(b.setScan, uint32(s.Rank), uint32(s.StateSize/scanColumns), unsafe.Pointer(&scan))
 	}
@@ -2604,10 +2631,10 @@ func (p *QwenPipeline) Close() {
 		prog.Close()
 	}
 	p.pass = nil
-	if p.restoreProg != nil {
-		p.restoreProg.Close()
-		p.restoreProg = nil
+	for _, prog := range p.restoreProgs {
+		prog.Close()
 	}
+	p.restoreProgs = nil
 	if p.mtp != nil {
 		if p.mtp.pass != nil {
 			p.mtp.pass.Close()
@@ -3153,23 +3180,37 @@ func (p *QwenPipeline) ResetMTPCache() error {
 // aside — the one after the committed columns and before the drafted one. It is
 // what a refused draft needs, and only that: the attention's keys at the
 // refused position are overwritten by the token that does occupy it.
-func (p *QwenPipeline) RestoreState() error {
-	if p.restoreProg == nil {
-		prog, err := p.d.Compile(p.recordRestore)
-		if err != nil {
+func (p *QwenPipeline) RestoreState() error { return p.RestoreStateAt(0) }
+
+// RestoreStateAt puts back the state a speculative pass copied aside at the
+// start of its drafted column k+1: the state after the committed column and
+// the first k guesses, which is where a step that kept k of them stands.
+func (p *QwenPipeline) RestoreStateAt(k int) error {
+	if k < 0 || k >= p.shape.depth() {
+		return fmt.Errorf("vk: copy %d of the %d a shadow holds", k, p.shape.depth())
+	}
+	key := p.slot*1024 + k
+	prog, ok := p.restoreProgs[key]
+	if !ok {
+		var err error
+		if prog, err = p.d.Compile(func(r *Recorder) { p.recordRestore(r, k) }); err != nil {
 			return err
 		}
-		p.restoreProg = prog
+		if p.restoreProgs == nil {
+			p.restoreProgs = map[int]*Program{}
+		}
+		p.restoreProgs[key] = prog
 	}
-	return p.restoreProg.Run()
+	return prog.Run()
 }
 
-func (p *QwenPipeline) recordRestore(r *Recorder) {
+func (p *QwenPipeline) recordRestore(r *Recorder, k int) {
 	s := p.shape
 	state, conv := s.ssmStateBytes(), s.convStateBytes()
+	at := p.slot*s.depth() + k
 	for _, b := range p.ssmBlocks {
-		r.CopyFrom(b.ssmState, p.slot*state, b.shadowState, p.slot*state, state)
-		r.CopyFrom(b.convState, p.slot*conv, b.shadowConv, p.slot*conv, conv)
+		r.CopyFrom(b.ssmState, p.slot*state, b.shadowState, at*state, state)
+		r.CopyFrom(b.convState, p.slot*conv, b.shadowConv, at*conv, conv)
 	}
 	r.Barrier()
 }
@@ -3239,10 +3280,6 @@ func (p *QwenPipeline) UseSlot(i int) error {
 		return nil
 	}
 	p.slot = i
-	if p.restoreProg != nil {
-		p.restoreProg.Close()
-		p.restoreProg = nil
-	}
 	return nil
 }
 

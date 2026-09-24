@@ -147,6 +147,7 @@ func (m *Model) UseVulkanStack() error {
 	drafts := m.HasMTP() && !m.noDraft
 	shape := vk.QwenShape{
 		Snapshots:   drafts,
+		Drafts:      max(m.draftDepth, 1),
 		Dim:         cfg.Dim,
 		FFN:         cfg.Blocks[0].FFN,
 		MaxContext:  m.SlotContext(),

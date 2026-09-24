@@ -25,6 +25,8 @@ layout(push_constant) uniform Push {
     uint columns;  // tokens carried by this pass
     uint snapAt;   // the column at whose start to copy the window aside; ~0 for none
     uint first;    // the run's first column in the pass
+    uint snaps;    // how many columns from snapAt on copy their window aside, one a copy
+    uint depth;    // how many copies a slot's shadow holds
 } p;
 
 // The window slides, so the columns of a pass are done in order inside one
@@ -48,10 +50,11 @@ void main() {
     float s2 = state[sb + 2 * p.channels];
 
     for (uint col = p.first; col < p.first + p.columns; col++) {
-        if (col == p.snapAt) {
-            shadow[sb + 0 * p.channels] = s0;
-            shadow[sb + 1 * p.channels] = s1;
-            shadow[sb + 2 * p.channels] = s2;
+        if (col >= p.snapAt && col < p.snapAt + p.snaps) {
+            uint hb = (slotv[p.first] * p.depth + (col - p.snapAt)) * 3u * p.channels + c;
+            shadow[hb + 0 * p.channels] = s0;
+            shadow[hb + 1 * p.channels] = s1;
+            shadow[hb + 2 * p.channels] = s2;
         }
         float s3 = qkv[col * p.channels + c];
         float sum = w0*s0 + w1*s1 + w2*s2 + w3*s3;

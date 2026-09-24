@@ -60,6 +60,10 @@ import (
 // state is copied aside before the pass and copied back when the draft is
 // refused, which vk/qwen_pipeline.go does on the card.
 
+// SetDraftDepth says how many tokens a step guesses, which has to be said
+// before the upload; see Model.draftDepth.
+func (m *Model) SetDraftDepth(n int) { m.draftDepth = n }
+
 func argmax(v []float32) int32 {
 	best, at := float32(-1e30), 0
 	for i, x := range v {
@@ -74,11 +78,13 @@ func argmax(v []float32) int32 {
 type Speculator struct {
 	m *Model
 
+	// depth is how many tokens a step guesses.
+	depth int
+
 	eh     []float32
 	draft  []float32
-	verify [2][]float32
-	embed  [2][]float32
-	states [][]float32
+	verify [][]float32
+	embed  [][]float32
 
 	// Accepted and Drafted count what the run has done, so a caller can report
 	// the acceptance rate the speedup actually came from.
@@ -88,8 +94,8 @@ type Speculator struct {
 // Rate is what the run has drafted and what it kept.
 func (s *Speculator) Rate() (accepted, drafted int) { return s.Accepted, s.Drafted }
 
-// Span is the most positions a step writes: the token and the one guess.
-func (s *Speculator) Span() int { return 2 }
+// Span is the most positions a step writes: the token and its guesses.
+func (s *Speculator) Span() int { return s.depth + 1 }
 
 // Speculate reports whether the model can draft: it needs the prediction block
 // and a card, because a draft made on the processor costs half a token and
@@ -103,9 +109,11 @@ func (m *Model) NewSpeculator() (*Speculator, error) {
 	if !m.Speculate() {
 		return nil, fmt.Errorf("qwen35: this model cannot draft (prediction block on the card: %v)", m.HasMTP())
 	}
-	s := &Speculator{m: m}
+	s := &Speculator{m: m, depth: max(m.draftDepth, 1)}
 	s.eh = make([]float32, m.Cfg.Dim*2)
 	s.draft = make([]float32, m.Cfg.Vocab)
+	s.verify = make([][]float32, s.depth+1)
+	s.embed = make([][]float32, s.depth+1)
 	for i := range s.verify {
 		s.verify[i] = make([]float32, m.Cfg.Vocab)
 		s.embed[i] = make([]float32, m.Cfg.Dim)
@@ -113,21 +121,21 @@ func (m *Model) NewSpeculator() (*Speculator, error) {
 	return s, nil
 }
 
-// Step advances the conversation by one or two tokens.
+// Step advances the conversation by one token or more.
 //
 // token sits at pos and has already been decided; hidden is the trunk's
 // output-normed state for the token before it. pick turns a distribution into a
 // token and is the caller's own sampler.
 //
-// Every token returned is drawn from the model's own distribution: the draft
-// decides only whether a second token comes back for free, never what either of
-// them is. So this needs none of the accept-reject correction that speculating
-// with a *different* model does — a refused draft costs the pass it rode on and
+// Every token returned is drawn from the model's own distribution: the drafts
+// decide only how many tokens come back for one pass, never what any of them
+// is. So this needs none of the accept-reject correction that speculating with
+// a *different* model does — a refused draft costs the pass it rode on and
 // nothing else.
 //
-// The draft itself is taken at the peak rather than through pick, because a
-// sampler with a temperature drafting against itself would agree with itself
-// about as often as chance allows.
+// The drafts themselves are taken at the peak rather than through pick,
+// because a sampler with a temperature drafting against itself would agree
+// with itself about as often as chance allows.
 //
 // It returns the tokens decided after `token`, and the hidden state belonging
 // to the last of them.
@@ -136,53 +144,79 @@ func (s *Speculator) Step(token int32, hidden []float32, pos int, pick func([]fl
 }
 
 // StepAt is Step for a conversation whose axes do not follow the cache index.
-// The drafted column sits one further on every axis, which is what a text token
+// The drafted columns sit one further on every axis each, which is what text
 // after an image does: the picture is behind it, and what follows a picture
 // advances the way text always has.
 func (s *Speculator) StepAt(token int32, hidden []float32, at Place, pick func([]float32) int32) ([]int32, []float32, error) {
 	m := s.m
 	dim := m.Cfg.Dim
 
-	// 1. Draft the token after `token`, from `token` and the state before it.
-	m.W.TokenEmbd.Row(int(token), s.eh[:dim])
-	nn.RMSNormPlain(s.eh[:dim], m.W.MTP.ENorm, m.Cfg.Eps)
-	copy(s.eh[dim:], hidden)
-	nn.RMSNormPlain(s.eh[dim:], m.W.MTP.HNorm, m.Cfg.Eps)
-
-	h, err := m.gpuPipe.DraftMTPAt(s.eh, at.gpu())
-	if err != nil {
-		return nil, nil, err
+	// 1. Draft depth tokens, the prediction block run on its own output: the
+	//    first from `token` and the trunk's state before it, every later one
+	//    from the guess before it and the block's own output-normed state,
+	//    which is the same kind of vector the trunk hands it.
+	places := make([]Place, s.depth+1)
+	places[0] = at
+	for i := 1; i <= s.depth; i++ {
+		places[i] = places[i-1].Next()
 	}
-	m.Logits(h, s.draft)
-	guess := argmax(s.draft)
-
-	// 2. Run `token` and the guess through the trunk together. One reading of
-	//    the weights answers both, which is the whole of the bargain.
-	m.W.TokenEmbd.Row(int(token), s.embed[0])
-	m.W.TokenEmbd.Row(int(guess), s.embed[1])
-	next := at.Next()
-	out, err := m.gpuPipe.ForwardSpeculativeAt(
-		[][]float32{s.embed[0], s.embed[1]}, []vk.QwenPlace{at.gpu(), next.gpu()})
-	if err != nil {
-		return nil, nil, err
-	}
-	first := append([]float32(nil), out[0]...)
-	second := append([]float32(nil), out[1]...)
-
-	m.Logits(first, s.verify[0])
-	truth := pick(s.verify[0])
-	s.Drafted++
-
-	if truth != guess {
-		// The guess was wrong, so the second column never happened: the keys
-		// it wrote will be overwritten, and the delta nets go back.
-		if err := m.gpuPipe.RestoreState(); err != nil {
+	guesses := make([]int32, s.depth)
+	prev, h := token, hidden
+	for i := 0; i < s.depth; i++ {
+		m.W.TokenEmbd.Row(int(prev), s.eh[:dim])
+		nn.RMSNormPlain(s.eh[:dim], m.W.MTP.ENorm, m.Cfg.Eps)
+		copy(s.eh[dim:], h)
+		nn.RMSNormPlain(s.eh[dim:], m.W.MTP.HNorm, m.Cfg.Eps)
+		out, err := m.gpuPipe.DraftMTPAt(s.eh, places[i].gpu())
+		if err != nil {
 			return nil, nil, err
 		}
-		return []int32{truth}, first, nil
+		h = append([]float32(nil), out...)
+		m.Logits(h, s.draft)
+		guesses[i] = argmax(s.draft)
+		prev = guesses[i]
 	}
 
-	s.Accepted++
-	m.Logits(second, s.verify[1])
-	return []int32{truth, pick(s.verify[1])}, second, nil
+	// 2. Run `token` and the guesses through the trunk together. One reading
+	//    of the weights answers all of them, which is the whole of the bargain.
+	m.W.TokenEmbd.Row(int(token), s.embed[0])
+	for i, g := range guesses {
+		m.W.TokenEmbd.Row(int(g), s.embed[i+1])
+	}
+	gpu := make([]vk.QwenPlace, len(places))
+	for i, pl := range places {
+		gpu[i] = pl.gpu()
+	}
+	out, err := m.gpuPipe.ForwardSpeculativeAt(s.embed, gpu)
+	if err != nil {
+		return nil, nil, err
+	}
+	states := make([][]float32, len(out))
+	for i := range out {
+		states[i] = append([]float32(nil), out[i]...)
+	}
+	m.LogitsBatch(states, s.verify)
+
+	// 3. Keep the guesses the model agrees with, up to the first it does not.
+	decided := make([]int32, 0, s.depth+1)
+	kept := 0
+	for i := 0; ; i++ {
+		truth := pick(s.verify[i])
+		decided = append(decided, truth)
+		if i == s.depth || truth != guesses[i] {
+			break
+		}
+		kept++
+	}
+	s.Drafted += s.depth
+	s.Accepted += kept
+	if kept < s.depth {
+		// The columns past the last kept guess never happened: the keys they
+		// wrote will be overwritten, and the delta nets go back to the copy
+		// taken at the start of the first of them.
+		if err := m.gpuPipe.RestoreStateAt(kept); err != nil {
+			return nil, nil, err
+		}
+	}
+	return decided, states[kept], nil
 }

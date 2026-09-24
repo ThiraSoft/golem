@@ -74,6 +74,8 @@ layout(push_constant) uniform Push {
     uint inner;      // the stride of the output
     uint rank;       // the stride of alpha and beta
     uint first;      // the run's first column in the pass
+    uint snaps;      // how many columns from snapAt on copy the state aside, one a copy
+    uint depth;      // how many copies a slot's shadow holds
 } p;
 
 const uint LANES = 8u;               // lanes to a state column
@@ -97,8 +99,9 @@ void main() {
     [[unroll]] for (uint r = 0u; r < PER; r++) s[r] = ssmState[base + r * LANES + lane];
 
     for (uint col = p.first; col < p.first + p.columns; col++) {
-        if (col == p.snapAt) {
-            [[unroll]] for (uint r = 0u; r < PER; r++) shadow[base + r * LANES + lane] = s[r];
+        if (col >= p.snapAt && col < p.snapAt + p.snaps) {
+            uint hb = ((slotv[p.first] * p.depth + (col - p.snapAt)) * p.numHeads + h) * 16384u + j * 128u;
+            [[unroll]] for (uint r = 0u; r < PER; r++) shadow[hb + r * LANES + lane] = s[r];
         }
 
         uint cr = col * p.rank;

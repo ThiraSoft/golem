@@ -31,6 +31,11 @@ type Model struct {
 	// argument: what a caller wants is known when the model is opened, and the
 	// upload happens later and elsewhere.
 	noDraft bool
+	// draftDepth is how many tokens a speculative step guesses, the
+	// prediction block run on its own output that many times; zero means one.
+	// Like noDraft it has to be known before the upload, because every guess
+	// past the first is another copy of the recurrence on the card.
+	draftDepth int
 	// checkpoints is how many state copies a slot was asked to keep; see
 	// SetCheckpoints.
 	checkpoints int
