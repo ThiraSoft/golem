@@ -2735,13 +2735,64 @@ func (p *QwenPipeline) Columns() int { return p.widestPass() }
 // WidthFor is the widest pass that fits n remaining tokens. A run is read in
 // passes of these rather than one width and a ragged tail of single columns:
 // the mat-vec binaries exist at four widths and the largest that fits wins.
-func (p *QwenPipeline) WidthFor(n int) int {
+//
+// It says nothing of where the run starts; WidthAt does, and a run read far
+// into a conversation has to go through it.
+func (p *QwenPipeline) WidthFor(n int) int { return p.WidthAt(n, 0) }
+
+// WidthAt is WidthFor for a run whose first column sits at position pos. A
+// pass is one submission, and the driver resets the card when a submission
+// runs past about two seconds; what grows with the position is the
+// attention, where every column reads every key before it. So the width is
+// the widest that also keeps the pass's attention under its budget.
+func (p *QwenPipeline) WidthAt(n, pos int) int {
+	return widthAt(n, pos, p.widestPass(), p.attendBudget())
+}
+
+func widthAt(n, pos, widest, budget int) int {
 	for _, w := range qwenWidths {
-		if w <= n && w <= p.widestPass() {
+		if w <= n && w <= widest && fits(w, pos, budget) {
 			return w
 		}
 	}
 	return 1
+}
+
+// FitsAt reports whether a pass of that many columns, the furthest at pos,
+// keeps its attention under the budget WidthAt keeps to. One column always
+// does: there is nothing narrower to fall back on.
+func (p *QwenPipeline) FitsAt(columns, pos int) bool {
+	return fits(columns, pos, p.attendBudget())
+}
+
+func fits(columns, pos, budget int) bool {
+	return columns <= 1 || columns*(pos+columns) <= budget
+}
+
+// attendBudget is how many column-positions one pass may attend over.
+//
+// Measured on Ternary-Bonsai-2-27B (Qwen3.8's shape: sixteen full attention
+// blocks of twenty-four heads of 256) on the RX 9070 XT in the power-saver
+// profile, a pass costs a fixed part — 180 ms at 128 columns, 380 at 512 —
+// and 0.26 µs for every column and every position before it. A pass of 512
+// columns reached 1.7 s at position 9728 and reset the card at 12288. Three
+// million column-positions is 0.8 s of attention, which leaves a pass of any
+// width under half the driver's line; a model with less attention a column
+// gets proportionally more.
+func (p *QwenPipeline) attendBudget() int {
+	const measured = 3 << 20
+	const measuredCost = 16 * 24 * 256
+	blocks := 0
+	for _, ssm := range p.isSSM {
+		if !ssm {
+			blocks++
+		}
+	}
+	cost := blocks * p.shape.Heads * p.shape.HeadDim
+	if cost <= 0 {
+		return measured
+	}
+	return int(int64(measured) * measuredCost / int64(cost))
 }
 
 // golemWidestPass is how wide a pass a .golem model takes.

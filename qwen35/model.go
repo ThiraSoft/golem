@@ -440,6 +440,18 @@ func (m *Model) forwardMixed(tokens []int32, at []Place, out [][]float32) {
 	}
 	for t := 0; t < len(tokens); {
 		n := min(len(tokens)-t, widest)
+		// The furthest conversation in the pass is what its attention costs
+		// at most, so the pass narrows until that fits.
+		for n > 1 {
+			far := 0
+			for _, p := range at[t : t+n] {
+				far = max(far, p.Pos)
+			}
+			if m.gpuPipe.FitsAt(n, far) {
+				break
+			}
+			n /= 2
+		}
 		places := make([]vk.QwenPlace, n)
 		slots := make([]int, n)
 		for c := 0; c < n; c++ {
@@ -483,7 +495,7 @@ func (m *Model) forwardCardRows(tokens []int32, rows [][]float32, at []Place, ou
 		embeds[i] = make([]float32, m.Cfg.Dim)
 	}
 	for t := 0; t < len(tokens); {
-		n := m.gpuPipe.WidthFor(len(tokens) - t)
+		n := m.gpuPipe.WidthAt(len(tokens)-t, at[t].Pos)
 		places := make([]vk.QwenPlace, n)
 		for c := 0; c < n; c++ {
 			if rows != nil && rows[t+c] != nil {

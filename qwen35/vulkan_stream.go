@@ -346,7 +346,7 @@ func (m *Model) CalibrateStreamed(runs [][]int32, window, ctx int) (map[string][
 			// walks the positions, so a window sees them exactly once and
 			// exactly in sequence, which is what a resident stack does too.
 			for t := 0; t < len(run); {
-				n := pipe.WidthFor(len(run) - t)
+				n := pipe.WidthAt(len(run)-t, t)
 				at := make([]vk.QwenPlace, n)
 				for c := 0; c < n; c++ {
 					p := t + c
@@ -466,7 +466,7 @@ func (m *Model) ForwardStreamed(runs [][]int32, window, ctx int) ([][][]float32,
 				return nil, err
 			}
 			for t := 0; t < len(run); {
-				n := pipe.WidthFor(len(run) - t)
+				n := pipe.WidthAt(len(run)-t, t)
 				at := make([]vk.QwenPlace, n)
 				for c := 0; c < n; c++ {
 					p := t + c
