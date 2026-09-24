@@ -147,6 +147,13 @@ func (s *Sampler) Pick(logits []float32) int32 {
 	return id
 }
 
+// Plain says a draw is the row's peak and nothing else: greedy, with no
+// penalty and no grammar. A caller that can find the peak where the row was
+// written may then skip reading the row at all.
+func (s *Sampler) Plain() bool {
+	return s.p.Temperature <= 0 && !s.pen.active() && s.con == nil
+}
+
 // draw is Pick without the bookkeeping.
 func (s *Sampler) draw(logits []float32) int32 {
 	row, penalise := logits, s.pen.active()

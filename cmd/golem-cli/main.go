@@ -68,7 +68,7 @@ func main() {
 	presPenalty := flag.Float64("presence-penalty", -1, "subtract this once for any appearance at all; negative takes the file's own value")
 	mmproj := flag.String("mmproj", os.Getenv("GOLEM_MMPROJ"), "projector GGUF, which is what lets a model see (or GOLEM_MMPROJ)")
 	assistant := flag.String("assistant", os.Getenv("GOLEM_ASSISTANT"), "gemma4-assistant GGUF that drafts for a Gemma 4 model (or GOLEM_ASSISTANT)")
-	draftN := flag.Int("draft-n", 0, "tokens the assistant guesses a step, 1 to 3; 0 takes the default")
+	draftN := flag.Int("draft-n", 0, "tokens drafted a step: 1 to 3 for a Gemma assistant, any number for a qwen35 prediction block (3 measured best on Bonsai 2); 0 takes the model's default")
 	var images stringList
 	flag.Var(&images, "image", "a picture to put in the first turn; repeat for several")
 	var recordings stringList

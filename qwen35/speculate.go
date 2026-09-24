@@ -80,6 +80,9 @@ type Speculator struct {
 
 	// depth is how many tokens a step guesses.
 	depth int
+	// peak says the caller's pick is the row's peak and nothing else, so the
+	// card can find it where the row is written; see SetPeak.
+	peak bool
 
 	eh     []float32
 	draft  []float32
@@ -90,6 +93,11 @@ type Speculator struct {
 	// the acceptance rate the speedup actually came from.
 	Accepted, Drafted int
 }
+
+// SetPeak says whether the caller's pick is plain greedy — no penalty, no
+// grammar — for the steps that follow. When it is, the verifying pass's
+// answers are found on the card and pick is not called.
+func (s *Speculator) SetPeak(on bool) { s.peak = on }
 
 // Rate is what the run has drafted and what it kept.
 func (s *Speculator) Rate() (accepted, drafted int) { return s.Accepted, s.Drafted }
@@ -167,6 +175,16 @@ func (s *Speculator) StepAt(token int32, hidden []float32, at Place, pick func([
 		nn.RMSNormPlain(s.eh[:dim], m.W.MTP.ENorm, m.Cfg.Eps)
 		copy(s.eh[dim:], h)
 		nn.RMSNormPlain(s.eh[dim:], m.W.MTP.HNorm, m.Cfg.Eps)
+		if m.gpuPipe.HasDraftHead() {
+			tok, out, err := m.gpuPipe.DraftTokenAt(s.eh, places[i].gpu())
+			if err != nil {
+				return nil, nil, err
+			}
+			h = append(h[:0:0], out...)
+			guesses[i] = tok
+			prev = guesses[i]
+			continue
+		}
 		out, err := m.gpuPipe.DraftMTPAt(s.eh, places[i].gpu())
 		if err != nil {
 			return nil, nil, err
@@ -195,13 +213,25 @@ func (s *Speculator) StepAt(token int32, hidden []float32, at Place, pick func([
 	for i := range out {
 		states[i] = append([]float32(nil), out[i]...)
 	}
-	m.LogitsBatch(states, s.verify)
+	var peaks []int32
+	if s.peak && m.gpuPipe.HasDraftHead() {
+		if peaks, err = m.gpuPipe.PeaksOf(len(out)); err != nil {
+			return nil, nil, err
+		}
+	} else {
+		m.LogitsBatch(states, s.verify)
+	}
 
 	// 3. Keep the guesses the model agrees with, up to the first it does not.
 	decided := make([]int32, 0, s.depth+1)
 	kept := 0
 	for i := 0; ; i++ {
-		truth := pick(s.verify[i])
+		var truth int32
+		if peaks != nil {
+			truth = peaks[i]
+		} else {
+			truth = pick(s.verify[i])
+		}
 		decided = append(decided, truth)
 		if i == s.depth || truth != guesses[i] {
 			break

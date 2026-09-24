@@ -864,6 +864,8 @@ type QwenPipeline struct {
 	attnBlocks map[int]*qwenAttnBlock
 	ffnBlocks  []*qwenFFNBlock
 	mtp        *qwenMTPBlock
+	// draft is the prediction block's own head; see vk/draft_head.go.
+	draft *draftHead
 
 	// slot is the conversation the next pass runs in; see QwenShape.Slots.
 	slot int
@@ -2635,6 +2637,10 @@ func (p *QwenPipeline) Close() {
 		prog.Close()
 	}
 	p.restoreProgs = nil
+	if p.draft != nil {
+		p.draft.close()
+		p.draft = nil
+	}
 	if p.mtp != nil {
 		if p.mtp.pass != nil {
 			p.mtp.pass.Close()

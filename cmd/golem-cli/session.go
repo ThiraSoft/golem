@@ -339,6 +339,9 @@ func (s *Session) AskWithMedia(text string, images, audio [][]byte, w io.Writer)
 		}
 
 		if draft != nil && turn.Generated+draft.Span()-1 < s.maxTokens && len(s.held)+draft.Span() <= s.maxContext {
+			if p, ok := draft.(interface{ SetPeak(bool) }); ok {
+				p.SetPeak(s.sampler.Plain())
+			}
 			next, h, err := draft.Step(id, hidden, len(s.held), s.sampler.Pick)
 			if err != nil {
 				return turn, err

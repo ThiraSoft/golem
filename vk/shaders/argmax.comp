@@ -1,0 +1,42 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// The index of the largest of n floats, lowest on a tie, a workgroup to each
+// column of n.
+//
+// A draft wants a token and not a distribution: reading a quarter of a million
+// logits back to the processor to find their peak costs more than the head
+// that wrote them.
+
+layout(local_size_x = 1024) in;
+
+layout(std430, binding = 0) readonly  buffer L { float logits[]; };
+layout(std430, binding = 1) writeonly buffer O { uint best[]; };
+
+layout(push_constant) uniform Push { uint n; } p;
+
+shared float sv[64];
+shared uint  si[64];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    float v = -3.0e38;
+    uint at = 0xFFFFFFFFu;
+    uint col = gl_WorkGroupID.y;
+    for (uint i = t; i < p.n; i += 1024u) {
+        float x = logits[col * p.n + i];
+        if (x > v) { v = x; at = i; }
+    }
+    float m = subgroupMax(v);
+    uint mi = subgroupMin(v == m ? at : 0xFFFFFFFFu);
+    if (subgroupElect()) { sv[gl_SubgroupID] = m; si[gl_SubgroupID] = mi; }
+    barrier();
+    if (t == 0u) {
+        float bv = sv[0];
+        uint bi = si[0];
+        for (uint g = 1u; g < gl_NumSubgroups; g++) {
+            if (sv[g] > bv || (sv[g] == bv && si[g] < bi)) { bv = sv[g]; bi = si[g]; }
+        }
+        best[col] = bi;
+    }
+}

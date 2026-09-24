@@ -311,6 +311,16 @@ func (m *Model) UseVulkanStack() error {
 			pipe.Close()
 			return fmt.Errorf("qwen35: prediction block: %w", err)
 		}
+		// The block's own head, so that a guess is one recording and one
+		// integer back; see vk/draft_head.go. A format the door cannot read
+		// leaves the guesses to the model's head, as they always were.
+		head := m.W.OutputHead
+		if vk.QuantReadable(head.Quant) && (head.Pre == nil || head.HadGroup == vk.RotateQ8Group) {
+			if err := pipe.AddDraftHead(head.Data, head.Quant, head.Rows, head.Cols, head.Pre, nil); err != nil {
+				pipe.Close()
+				return fmt.Errorf("qwen35: draft head: %w", err)
+			}
+		}
 	}
 
 	m.gpuPipe = pipe

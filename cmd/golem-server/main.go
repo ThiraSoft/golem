@@ -39,7 +39,7 @@ func main() {
 	embedPath := flag.String("embed", os.Getenv("GOLEM_EMBED"), "nomic-bert-moe GGUF to answer /v1/embeddings and ollama's /api/embed with (or GOLEM_EMBED)")
 	mmproj := flag.String("mmproj", os.Getenv("GOLEM_MMPROJ"), "projector GGUF, which is what lets a model see (or GOLEM_MMPROJ)")
 	assistant := flag.String("assistant", os.Getenv("GOLEM_ASSISTANT"), "gemma4-assistant GGUF that drafts for a Gemma 4 model (or GOLEM_ASSISTANT)")
-	draftN := flag.Int("draft-n", 0, "tokens the assistant guesses a step, 1 to 3; 0 takes the default")
+	draftN := flag.Int("draft-n", 0, "tokens drafted a step: 1 to 3 for a Gemma assistant, any number for a qwen35 prediction block (3 measured best on Bonsai 2); 0 takes the model's default")
 	addr := flag.String("addr", "127.0.0.1:8080", "address to listen on")
 	context := flag.Int("context", 4096, "positions to keep; the files declare far more than any machine here would survive")
 	maxTokens := flag.Int("n", 1024, "most tokens to draw for one answer, when the request names no limit")
