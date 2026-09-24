@@ -1,0 +1,49 @@
+#version 450
+
+// The slices of a split attention folded into one answer a head and a column,
+// and the output gate after it. shaders/qwen_attn_gqa.comp built with SPLIT
+// writes the slices and says why there are any.
+//
+// Each slice carries the maximum its exponentials were taken against, so the
+// fold rescales every slice to the largest of them before adding: the same
+// step the online softmax takes from one tile to the next, taken once across
+// slices instead of in order along them.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer Part  { float part[];  }; // [cols*heads*splits*256]
+layout(std430, binding = 1) readonly  buffer Stats { float stats[]; }; // [cols*heads*splits*2]
+layout(std430, binding = 2) readonly  buffer QIn   { float qIn[];   }; // [cols*heads*512], the gate at +256
+layout(std430, binding = 3) writeonly buffer Out   { float out_[];  }; // [cols*heads*256]
+
+layout(push_constant) uniform Push {
+    uint heads;
+    uint splits;
+} p;
+
+const uint DIM = 256u;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint c = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    uint base = (c * p.heads + h) * p.splits;
+
+    float top = -1.0 / 0.0;
+    for (uint s = 0u; s < p.splits; s++) top = max(top, stats[2u * (base + s)]);
+
+    // A slice past every position the column sees has a maximum of minus
+    // infinity and weighs nothing; the first slice always holds position
+    // nought, so top is finite.
+    float sum = 0.0, acc = 0.0;
+    for (uint s = 0u; s < p.splits; s++) {
+        float m = stats[2u * (base + s)];
+        if (m == -1.0 / 0.0) continue;
+        float w = exp(m - top);
+        sum += w * stats[2u * (base + s) + 1u];
+        acc += w * part[(base + s) * DIM + t];
+    }
+
+    float g = qIn[c * p.heads * 512u + h * 512u + DIM + t];
+    out_[c * p.heads * DIM + h * DIM + t] = (acc / sum) / (1.0 + exp(-g));
+}

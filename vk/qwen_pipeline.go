@@ -17,6 +17,7 @@ package vk
 import (
 	_ "embed"
 	"fmt"
+	"os"
 	"unsafe"
 
 	"github.com/ThiraSoft/golem/nn"
@@ -30,6 +31,8 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/quant_q80.comp -o shaders/quant_q80.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/qwen_attn_prep.comp -o shaders/qwen_attn_prep.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/qwen_attn_gqa.comp -o shaders/qwen_attn_gqa.spv
+//go:generate glslc -O -DSPLIT -DQTILE=2u --target-env=vulkan1.1 -fshader-stage=compute shaders/qwen_attn_gqa.comp -o shaders/qwen_attn_split.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/qwen_attn_merge.comp -o shaders/qwen_attn_merge.spv
 
 //go:embed shaders/matvec_q40.spv
 var matvecQ40SPIRV []byte
@@ -243,6 +246,15 @@ var qwenAttnPrepSPIRV []byte
 //go:embed shaders/qwen_attn_gqa.spv
 var qwenAttnGQASPIRV []byte
 
+// The same attention cut along the positions, and the fold of its slices; see
+// recordAttnSplit.
+//
+//go:embed shaders/qwen_attn_split.spv
+var qwenAttnSplitSPIRV []byte
+
+//go:embed shaders/qwen_attn_merge.spv
+var qwenAttnMergeSPIRV []byte
+
 // norm.spv built with a staging array wide enough for a 5120-wide hidden
 // state. The default binary stages 4096 and would overrun it.
 //
@@ -295,6 +307,12 @@ type attnGQAPush struct {
 	Scale      float32
 	Columns    uint32
 	First      uint32 // the run's first column; see recordAttnMix
+	Splits     uint32 // the split binary's only
+}
+
+type attnMergePush struct {
+	Heads  uint32
+	Splits uint32
 }
 
 // qAttnTile is shaders/qwen_attn_gqa.comp's QTILE: how many columns of the
@@ -303,6 +321,21 @@ type attnGQAPush struct {
 // traffic falls — it is quadratic in the context either way, but the constant
 // is this. The two have to agree: the grid is sized from here.
 const qAttnTile = 8
+
+// The split attention; recordAttnSplit says why it exists.
+//
+// qAttnSplitTile is the split binary's QTILE, qAttnSplits how many slices the
+// positions of a head are cut into, and qAttnSplitWidest the widest pass that
+// takes the split path. The slices' scratch is sized from the last two.
+//
+// The slice count hardly matters once there are slices. Bonsai PQ2_0, one
+// column, the sixteen attentions at position 24576: 10.0 ms at 16 slices,
+// 9.9 at 32, 8.3 at 64, 8.6 at 128; at 1024 all four sit between 0.6 and 0.9.
+const (
+	qAttnSplitTile   = 2
+	qAttnSplits      = 64
+	qAttnSplitWidest = 8
+)
 
 // QwenShape is the geometry every block of one model shares. It is passed once
 // rather than rediscovered per block because nothing in Qwen3.8 varies from
@@ -594,6 +627,7 @@ type qwenAttnBlock struct {
 
 	setQ, setK, setV *Set
 	setPrep, setGQA  *Set
+	setSplit         *Set
 	setO             *Set
 	// f32 is qwenFFNBlock's.
 	f32 bool
@@ -655,16 +689,18 @@ type QwenPipeline struct {
 	// for a WideBF16 model. It does not replace pipeMatF32: the delta net's
 	// decay projections are float32 in every checkpoint whatever the rest is,
 	// so both live here and wideProduct chooses between them.
-	pipeMatBF16  *Pipeline
-	pipeSwiglu   *Pipeline
-	pipeConv     *Pipeline
-	pipeScan     *Pipeline
-	pipeQKNorm   *Pipeline
-	pipeGate     *Pipeline
-	pipeAttnPrep *Pipeline
-	pipeAttnGQA  *Pipeline
-	pipeMatQ80   *Pipeline // the prediction block's front projection
-	pipeQuant    *Pipeline // floats to their Q8_0 form
+	pipeMatBF16   *Pipeline
+	pipeSwiglu    *Pipeline
+	pipeConv      *Pipeline
+	pipeScan      *Pipeline
+	pipeQKNorm    *Pipeline
+	pipeGate      *Pipeline
+	pipeAttnPrep  *Pipeline
+	pipeAttnGQA   *Pipeline
+	pipeAttnSplit *Pipeline
+	pipeAttnMerge *Pipeline
+	pipeMatQ80    *Pipeline // the prediction block's front projection
+	pipeQuant     *Pipeline // floats to their Q8_0 form
 	// quants is one pipeline per K-quant weight format, built as a block asks
 	// for it. vk/quantproduct.go owns it, and it is what vk/attention.go and
 	// vk/mixture.go read their K-quants through: the same four buffers and the
@@ -737,6 +773,11 @@ type QwenPipeline struct {
 	actQ, actS         *Buffer // the feed forward's activation in its Q8_0 form
 	ySSMQ, ySSMS       *Buffer // the delta net's output in its Q8_0 form
 	attnOutQ, attnOutS *Buffer // the attention's mix in its Q8_0 form
+	// attnPart and attnStats are the split attention's slices; setMerge
+	// folds them into attnOut. noSplit takes the split path out.
+	attnPart, attnStats *Buffer
+	setMerge            *Set
+	noSplit             bool
 
 	resid    *Buffer
 	normed   *Buffer
@@ -837,6 +878,8 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		{&p.pipeGate, ssmGateSPIRV, 3, unsafe.Sizeof(ssmGatePush{})},
 		{&p.pipeAttnPrep, qwenAttnPrepSPIRV, 11, unsafe.Sizeof(attnPrepPush{})},
 		{&p.pipeAttnGQA, qwenAttnGQASPIRV, 7, unsafe.Sizeof(attnGQAPush{})},
+		{&p.pipeAttnSplit, qwenAttnSplitSPIRV, 8, unsafe.Sizeof(attnGQAPush{})},
+		{&p.pipeAttnMerge, qwenAttnMergeSPIRV, 4, unsafe.Sizeof(attnMergePush{})},
 	} {
 		if *b.into, err = d.NewPipeline(b.spirv, b.binds, uint32(b.pushSz)); err != nil {
 			return nil, err
@@ -1028,6 +1071,19 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 	if p.setQuantAttn, err = p.pipeQuant.NewSet([]*Buffer{p.attnOut, p.attnOutQ, p.attnOutS}); err != nil {
 		return nil, err
 	}
+	// Twelve megabytes on the 27B, the same for every block since the
+	// blocks run one after the other.
+	splitCols := min(wide, qAttnSplitWidest)
+	if p.attnPart, err = p.local(splitCols * shape.Heads * qAttnSplits * shape.HeadDim * 4); err != nil {
+		return nil, err
+	}
+	if p.attnStats, err = p.local(splitCols * shape.Heads * qAttnSplits * 2 * 4); err != nil {
+		return nil, err
+	}
+	if p.setMerge, err = p.pipeAttnMerge.NewSet([]*Buffer{p.attnPart, p.attnStats, p.qIn, p.attnOut}); err != nil {
+		return nil, err
+	}
+	p.noSplit = os.Getenv("GOLEM_NO_SPLIT") != ""
 	if shape.Rotation != nil {
 		if p.setRotNormed, err = p.rotPipes.Bind(p.normed, p.rotDim, p.normedQ, p.normedS); err != nil {
 			return nil, err
@@ -1353,6 +1409,9 @@ func (p *QwenPipeline) newAttnBlock(d QwenAttnData) (*qwenAttnBlock, error) {
 		return nil, err
 	}
 	if b.setGQA, err = p.pipeAttnGQA.NewSet([]*Buffer{p.qOut, b.kCache, b.vCache, p.qIn, p.attnOut, p.posBuf, p.slotBuf}); err != nil {
+		return nil, err
+	}
+	if b.setSplit, err = p.pipeAttnSplit.NewSet([]*Buffer{p.qOut, b.kCache, b.vCache, p.qIn, p.attnPart, p.posBuf, p.slotBuf, p.attnStats}); err != nil {
 		return nil, err
 	}
 	if b.f32 {
@@ -2377,6 +2436,11 @@ func (p *QwenPipeline) recordAttnMix(r *Recorder, b *qwenAttnBlock, runs []span)
 	r.Barrier()
 	p.tl.Stamp(r, "attn prep")
 
+	if columns <= qAttnSplitWidest && !p.noSplit {
+		p.recordAttnSplit(r, b, runs, columns)
+		return
+	}
+
 	// A tile of queries shares its reading of the keys, which two
 	// conversations cannot: a position is a different key in each. So the
 	// scores are a dispatch a run, as gemma's are.
@@ -2393,6 +2457,51 @@ func (p *QwenPipeline) recordAttnMix(r *Recorder, b *qwenAttnBlock, runs []span)
 	}
 	r.Barrier()
 	p.tl.Stamp(r, "attn gqa")
+}
+
+// recordAttnSplit is the attention of a narrow pass: every head's positions
+// cut into qAttnSplits slices, each slice a workgroup, and a second dispatch
+// folding the slices together.
+//
+// The wide kernel gives a workgroup a head and QTILE columns, which a prompt
+// fills. A token fills twenty-four workgroups on a card of sixty-four compute
+// units, each walking every key of the conversation by itself, and the walk
+// is latency — a tile's keys, then its values, one dependent load after
+// another. Measured on Ternary-Bonsai-2-27B, one column, RX 9070 XT: that
+// attention was 8.6 ms of a 28 ms pass at position 1024, 135 of 154 at 16384
+// and 202 of 222 at 24576, everything else flat at twenty. This is llama.cpp's
+// flash-decoding split, and the slices' length follows the position so that
+// the grid, which is recorded once, does not have to.
+func (p *QwenPipeline) recordAttnSplit(r *Recorder, b *qwenAttnBlock, runs []span, columns int) {
+	s := p.shape
+	for _, run := range runs {
+		gqa := attnGQAPush{
+			MaxContext: uint32(s.MaxContext),
+			HeadsPerKV: uint32(s.Heads / s.KVHeads),
+			Heads:      uint32(s.Heads),
+			Scale:      float32(1 / sqrtOf(s.HeadDim)),
+			Columns:    uint32(run.count),
+			First:      uint32(run.first),
+			Splits:     qAttnSplits,
+		}
+		tiles := (run.count + qAttnSplitTile - 1) / qAttnSplitTile
+		r.DispatchColumns(b.setSplit, uint32(s.Heads), uint32(tiles*qAttnSplits), unsafe.Pointer(&gqa))
+	}
+	r.Barrier()
+	merge := attnMergePush{Heads: uint32(s.Heads), Splits: qAttnSplits}
+	r.DispatchColumns(p.setMerge, uint32(s.Heads), uint32(columns), unsafe.Pointer(&merge))
+	r.Barrier()
+	p.tl.Stamp(r, "attn gqa")
+}
+
+// SetSplitAttention puts the split attention in or takes it out, for the
+// tests that hold one against the other. GOLEM_NO_SPLIT takes it out for a
+// whole process.
+func (p *QwenPipeline) SetSplitAttention(on bool) {
+	if p.noSplit != !on {
+		p.noSplit = !on
+		p.forgetPasses()
+	}
 }
 
 func (p *QwenPipeline) recordFFN(r *Recorder, b *qwenFFNBlock, columns int) {
@@ -2554,7 +2663,7 @@ func (p *QwenPipeline) Close() {
 	for _, pl := range []*Pipeline{
 		p.pipeNorm, p.pipeMatQ4K, p.pipeMatQ6K,
 		p.pipeMatF32, p.pipeMatBF16, p.pipeSwiglu, p.pipeConv, p.pipeScan, p.pipeAttnPrep, p.pipeAttnGQA,
-		p.pipeMatQ80,
+		p.pipeAttnSplit, p.pipeAttnMerge, p.pipeMatQ80,
 	} {
 		if pl != nil {
 			pl.Close()

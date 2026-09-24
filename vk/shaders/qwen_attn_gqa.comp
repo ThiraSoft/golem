@@ -28,6 +28,14 @@
 // floats of its key. A lane per position instead, walking a whole key by
 // itself, reads the same bytes in as many separate transactions as there are
 // lanes.
+//
+// **Built with SPLIT it is the kernel of a narrow pass**, and the grid changes
+// meaning. Twenty-four workgroups is what a token gives this shape, one a
+// head, each walking every key alone; on Ternary-Bonsai-2-27B that was 202 ms
+// of a 222 ms token at position 24576. With SPLIT a workgroup walks one of
+// p.splits slices of the positions and writes its unnormalised mix, maximum
+// and sum; shaders/qwen_attn_merge.comp folds the slices and gates. Same
+// tiles, same arithmetic within a slice: 202 ms became 8.3.
 
 layout(local_size_x = 256) in;
 
@@ -36,7 +44,15 @@ layout(std430, binding = 0) readonly  buffer QOut   { float qOut[];   }; // [col
 layout(std430, binding = 1) readonly  buffer KCache { uint kCache[]; };
 layout(std430, binding = 2) readonly  buffer VCache { uint vCache[]; };
 layout(std430, binding = 3) readonly  buffer QIn    { float qIn[];    }; // [cols*heads*512], the gate at +256
+#ifdef SPLIT
+// A slice's unnormalised mix, and its running maximum and sum beside it;
+// shaders/qwen_attn_merge.comp folds the slices of a head into its answer and
+// applies the gate there. [cols*heads*splits*256] and [cols*heads*splits*2].
+layout(std430, binding = 4) writeonly buffer Part   { float part[];   };
+layout(std430, binding = 7) writeonly buffer Stats  { float stats[];  };
+#else
 layout(std430, binding = 4) writeonly buffer Out    { float out_[];   }; // [cols*heads*256]
+#endif
 // See qwen_attn_prep.comp: the position is a buffer so the pass compiles once.
 layout(std430, binding = 5) readonly  buffer Pos    { uint  posv[];   };
 // The conversation each column belongs to; see qwen_attn_prep.comp. A tile
@@ -51,6 +67,7 @@ layout(push_constant) uniform Push {
     float scale;     // 1/sqrt(headDim)
     uint columns;    // how many columns the run carries, for the tail tile
     uint first;      // the run's first column in the pass
+    uint splits;     // SPLIT only: how many slices the positions are cut into
 } p;
 
 // QTILE columns of the pass to a workgroup. Eight holds ninety-odd registers a
@@ -84,7 +101,12 @@ void main() {
     uint lane = t % LANES;
     uint slot = t / LANES;
 
+#ifdef SPLIT
+    uint split = gl_WorkGroupID.y % p.splits;
+    uint col0  = p.first + (gl_WorkGroupID.y / p.splits) * QTILE;
+#else
     uint col0 = p.first + gl_WorkGroupID.y * QTILE;
+#endif
     uint end  = p.first + p.columns;
     uint cacheBase = (slotv[p.first] * (p.heads / p.headsPerKV) + kv) * p.maxContext * DIM;
 
@@ -105,10 +127,21 @@ void main() {
         acc[q] = 0.0; runMax[q] = -1.0 / 0.0; runSum[q] = 0.0;
     }
 
-    for (uint i0 = 0u; i0 < nMax; i0 += TILE) {
-        uint rows = min(TILE, nMax - i0);
+    // The positions this workgroup walks. Without SPLIT that is all of them.
+    // With it, one of p.splits slices of whole tiles: the slice is sized from
+    // the positions and not fixed, because the grid is recorded once and
+    // replayed at every position of the conversation.
+    uint lo = 0u, hi = nMax;
+#ifdef SPLIT
+    uint chunk = ((nMax + p.splits - 1u) / p.splits + TILE - 1u) / TILE * TILE;
+    lo = min(split * chunk, nMax);
+    hi = min(lo + chunk, nMax);
+#endif
+
+    for (uint i0 = lo; i0 < hi; i0 += TILE) {
+        uint rows = min(TILE, hi - i0);
         uint i    = i0 + slot;
-        bool have = i < nMax;
+        bool have = i < hi;
 
         // 1. this lane's share of one position's key, held in registers and
         //    scored against every query. This is the read that used to happen
@@ -188,6 +221,21 @@ void main() {
         barrier();
     }
 
+#ifdef SPLIT
+    // 5. the slice as it stands. A query whose positions all lie before the
+    //    slice leaves a maximum of minus infinity and a sum of nought, which
+    //    the merge reads as a slice that weighs nothing.
+    [[unroll]] for (uint q = 0u; q < QTILE; q++) {
+        uint c = col0 + q;
+        if (c >= end) continue;
+        uint b = (c * p.heads + h) * p.splits + split;
+        part[b * DIM + t] = acc[q];
+        if (t == 0u) {
+            stats[2u * b]      = runMax[q];
+            stats[2u * b + 1u] = runSum[q];
+        }
+    }
+#else
     // 5. the output gate, which sits after this head's queries
     [[unroll]] for (uint q = 0u; q < QTILE; q++) {
         uint c = col0 + q;
@@ -195,4 +243,5 @@ void main() {
         float g = qIn[c * p.heads * 512u + h * 512u + DIM + t];
         out_[c * p.heads * DIM + h * DIM + t] = (acc[q] / runSum[q]) / (1.0 + exp(-g));
     }
+#endif
 }
