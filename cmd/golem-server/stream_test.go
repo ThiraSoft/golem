@@ -193,3 +193,28 @@ func TestReasoningLeavesApartFromTheContent(t *testing.T) {
 		t.Fatalf("content %q, reasoning %q", m.Content, m.Reasoning)
 	}
 }
+
+// An error once the stream is open goes as its own event, never in the prose,
+// where a client would show it as something the model said.
+func TestStreamSendsAnErrorApartFromTheProse(t *testing.T) {
+	s := newTestServer(t, []string{"Looking.", "CALL", "{city=Lyon}", "<turn|>"})
+	w := post(t, s, `{"messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	f := frames(t, w.Body.String())
+	last := f[len(f)-1]
+	var event struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+		Choices []json.RawMessage `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(last), &event); err != nil {
+		t.Fatalf("%q: %v", last, err)
+	}
+	if event.Error.Type != "server_error" || !strings.Contains(event.Error.Message, "no function name") || event.Choices != nil {
+		t.Fatalf("last frame %q", last)
+	}
+	if strings.Contains(w.Body.String(), "[golem") || strings.Contains(w.Body.String(), "[DONE]") {
+		t.Fatalf("body %q", w.Body.String())
+	}
+}

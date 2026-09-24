@@ -60,9 +60,20 @@ func (s *Server) stream(ctx context.Context, w http.ResponseWriter, gen *Generat
 			return // the client left; there is no stream to write to
 		}
 		// The status line is already out, so the error goes down the stream,
-		// which is the only place left for it.
-		send(choice{Delta: &responseMessage{Content: "\n[golem: " + err.Error() + "]"}})
-		done()
+		// which is the only place left for it. It goes as its own event, the
+		// way llama.cpp and OpenAI send one, and not in the prose, where a
+		// client would show it or read it aloud as if the model had said it.
+		// Like llama.cpp, nothing follows it, not even [DONE].
+		if rec, ok := w.(*recorder); ok {
+			rec.reason = err.Error()
+		}
+		var body apiError
+		body.Error.Message = err.Error()
+		body.Error.Type = "server_error"
+		if raw, err := json.Marshal(body); err == nil {
+			fmt.Fprintf(w, "data: %s\n\n", raw)
+			flusher.Flush()
+		}
 		return
 	}
 	note(w, answer)
