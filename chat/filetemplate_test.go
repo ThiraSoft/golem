@@ -36,10 +36,17 @@ type wireCase struct {
 }
 
 // message reads one wire message as a Message, or says it cannot be one: a
-// null content, a reasoning field, or parts in an order Message does not keep.
+// null content, an empty reasoning field, or parts in an order Message does not keep.
 func (w wireMessage) message() (Message, bool) {
 	m := Message{Role: w.Role, ToolCalls: w.ToolCalls, Name: w.Name, ToolCallID: w.ToolCallID}
-	if w.Reasoning != nil || string(w.Content) == "null" {
+	if w.Reasoning != nil {
+		// An empty one is a string to Jinja and nothing to Message.
+		if *w.Reasoning == "" {
+			return m, false
+		}
+		m.Reasoning = *w.Reasoning
+	}
+	if string(w.Content) == "null" {
 		return m, false
 	}
 	if err := json.Unmarshal(w.Content, &m.Content); err == nil {

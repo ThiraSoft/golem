@@ -44,9 +44,13 @@ type completionRequest struct {
 	N              *int            `json:"n"`
 	LogProbs       *bool           `json:"logprobs"`
 	// What the template is given beyond the conversation, as llama-server
-	// reads it; only enable_thinking is heard, and it is off unless asked.
+	// reads it; enable_thinking is heard, off unless asked, and
+	// preserve_thinking.
 	ChatTemplateKwargs struct {
 		EnableThinking bool `json:"enable_thinking"`
+		// PreserveThinking is Qwen3.5's: whether the reasoning of turns
+		// before the last question is rendered, which it is when unset.
+		PreserveThinking *bool `json:"preserve_thinking"`
 	} `json:"chat_template_kwargs"`
 }
 

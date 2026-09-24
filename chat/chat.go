@@ -13,6 +13,10 @@ type Message struct {
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 	// ToolCallID ties a tool result to the call it answers.
 	ToolCallID string `json:"tool_call_id,omitempty"`
+	// Reasoning is what a model turn thought before it answered, sent back
+	// the way llama.cpp takes it. The template decides whether it is
+	// rendered: Qwen's renders it for the turn under way.
+	Reasoning string `json:"reasoning_content,omitempty"`
 	// Images are pictures attached to this turn, each still in the bytes some
 	// encoder wrote — PNG, JPEG, GIF or WebP. They are rendered before the
 	// text, in this order. A template whose checkpoint cannot see refuses them
@@ -34,6 +38,10 @@ type Message struct {
 type Options struct {
 	// EnableThinking asks for the reasoning channel to be opened.
 	EnableThinking bool
+	// PreserveThinking, when set, tells a template that reads it whether
+	// the reasoning of turns before the last question is rendered too;
+	// Qwen3.5's does, and renders it when this is unset.
+	PreserveThinking *bool
 	// Tools are the functions declared to the model.
 	Tools []Tool
 	// AddGenerationPrompt appends the empty assistant turn the model is meant

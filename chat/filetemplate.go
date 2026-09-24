@@ -85,6 +85,9 @@ func (t *FileTemplate) Render(msgs []Message, opt Options) (string, error) {
 		"add_generation_prompt": opt.AddGenerationPrompt,
 		"enable_thinking":       opt.EnableThinking,
 	}
+	if opt.PreserveThinking != nil {
+		vars["preserve_thinking"] = *opt.PreserveThinking
+	}
 	for k, v := range t.tokens {
 		vars[k] = v
 	}
@@ -155,6 +158,9 @@ func messageValue(m Message) *jinja.Dict {
 	}
 	if m.ToolCallID != "" {
 		d.Set("tool_call_id", m.ToolCallID)
+	}
+	if m.Reasoning != "" {
+		d.Set("reasoning_content", m.Reasoning)
 	}
 	return d
 }

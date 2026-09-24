@@ -130,3 +130,20 @@ func TestInputAudioReadsAFile(t *testing.T) {
 		t.Fatalf("the file came out %q", req.Messages[0].Audio)
 	}
 }
+
+// An assistant turn's reasoning_content comes in as its Reasoning, and
+// preserve_thinking as the template's, the way llama-server takes both.
+func TestRequestReadsReasoningAndPreserveThinking(t *testing.T) {
+	var req completionRequest
+	raw := `{"messages":[{"role":"user","content":"q"},{"role":"assistant","content":"a","reasoning_content":"because"}],
+		"chat_template_kwargs":{"enable_thinking":true,"preserve_thinking":false}}`
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.Messages[1].Reasoning != "because" || req.Messages[0].Reasoning != "" {
+		t.Fatalf("messages %+v", req.Messages)
+	}
+	if p := req.ChatTemplateKwargs.PreserveThinking; p == nil || *p {
+		t.Fatalf("preserve_thinking %v", p)
+	}
+}

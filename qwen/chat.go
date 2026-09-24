@@ -158,6 +158,11 @@ func lastQueryIndex(msgs []chat.Message) int {
 // what keeps a long conversation from carrying every thought the model ever had.
 func writeAssistant(b *strings.Builder, m chat.Message, index int, last bool, lastQuery int) {
 	content, reasoning := splitThinking(m.Content)
+	// The template takes reasoning_content first, when the message has one,
+	// and the thought written into the content only when it has not.
+	if m.Reasoning != "" {
+		content, reasoning = m.Content, m.Reasoning
+	}
 	b.WriteString(imStart + roleAssistant + "\n")
 	if index > lastQuery && (last || strings.TrimSpace(reasoning) != "") {
 		b.WriteString(thinkOpen + "\n" + strings.Trim(reasoning, "\n") + "\n" + thinkClose + "\n\n")

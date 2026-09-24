@@ -170,6 +170,7 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 		Tools:               req.Tools,
 		AddGenerationPrompt: true,
 		EnableThinking:      req.ChatTemplateKwargs.EnableThinking,
+		PreserveThinking:    req.ChatTemplateKwargs.PreserveThinking,
 	})
 	if err != nil {
 		refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())

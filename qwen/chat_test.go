@@ -119,3 +119,25 @@ func TestStripThinking(t *testing.T) {
 		}
 	}
 }
+
+// A message's reasoning_content is what the template renders as its thought,
+// before anything written into the content, and only for a turn after the
+// last question: an agent's steps keep theirs, an old answer loses it.
+func TestRenderChatTakesTheReasoningField(t *testing.T) {
+	out, err := RenderChat([]chat.Message{
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", Content: "a1", Reasoning: "old thought"},
+		{Role: "user", Content: "q2"},
+		{Role: "assistant", Content: "", Reasoning: "look first", ToolCalls: []chat.ToolCall{{Name: "now", Arguments: map[string]any{}}}},
+		{Role: "tool", Content: "noon"},
+	}, chat.Options{AddGenerationPrompt: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "old thought") {
+		t.Fatalf("an answer before the last question kept its thought:\n%s", out)
+	}
+	if !strings.Contains(out, "<|im_start|>assistant\n<think>\nlook first\n</think>\n\n<tool_call>") {
+		t.Fatalf("the step lost its thought:\n%s", out)
+	}
+}
