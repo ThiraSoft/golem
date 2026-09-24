@@ -124,8 +124,13 @@ func TestGolemTypeNumbersSpellThemselves(t *testing.T) {
 		if id>>8 != golemTypeBase>>8 {
 			t.Fatalf("%s is %#x, which does not begin with ASCII \"glm\"", name, id)
 		}
-		if int(id&0xFF) != k {
-			t.Fatalf("%s is %#x, whose low byte says %d bits a weight and it codes %d", name, id, id&0xFF, k)
+		// The rate is the low nibble; the byte's top bit marks the pair
+		// trellis, which is the only other thing a tier has been.
+		if int(id&0x0F) != k || id&0x70 != 0 {
+			t.Fatalf("%s is %#x, whose low byte says %d bits a weight and it codes %d", name, id, id&0x0F, k)
+		}
+		if pair := id&0x80 != 0; pair != (name == "H3G") {
+			t.Fatalf("%s is %#x, and its pair bit says %t", name, id, pair)
 		}
 	}
 	// The retired numbering must not come back under another name.

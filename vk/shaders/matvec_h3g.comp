@@ -1,0 +1,172 @@
+#version 450
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// y = W * x for an H3G matrix against float activations: nn/h3g.go's pair
+// trellis, two weights a state.
+//
+// A sequence is 128 weights: two step codes and a 392-bit path of 64 states.
+// A state is the fourteen bits at 6t; s·(s+1) picks one of 2048 pairs out of
+// the codebook, which sits in shared memory as half2, eight kibibytes. So one
+// window, one multiply, one bitfield extract and one shared read make two
+// weights, where matvec_t4g.comp spends a window and a read on each.
+//
+// And every lane carries ROWS rows. Past one column what a mat-vec spends is
+// not the weights, three eighths of a byte each, but the activations, four
+// bytes each a column and read again for every row the workgroup answers; a
+// lane that loads a block of them once and spends it on two rows halves that.
+// Measured on Qwen3.8-27B's two shapes against T3G's kernel, vk/hyb_bench_test.go,
+// microseconds, each matrix several times over so none of it sits in the
+// Infinity Cache:
+//
+//	                 17408x5120          5120x17408
+//	columns        T3G      H3G        T3G      H3G
+//	      1       87.1     79.0       96.2     85.1
+//	      2      110.8     89.9      119.7    103.5
+//	      4      172.0    122.5      192.5    143.1
+//	      8      349.2    215.2      369.3    284.8
+//
+// Most of the gain past two columns is the rows and not the code: T3G given
+// the same two rows a lane reads 127.5 and 143.8 at four columns. What the pair
+// code buys by itself is the one-column pass, which is a token.
+//
+// LANES threads share a row group and walk its blocks, sixteen, and a
+// workgroup of 256 answers 256 / LANES · ROWS = 32 rows.
+
+#ifndef COLUMNS
+#define COLUMNS 1
+#endif
+#ifndef ROWS
+#define ROWS 2
+#endif
+#ifndef LANES
+#define LANES 16
+#endif
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer W { uint  w[]; };
+// Binding 1: the 256 step floats, then the codebook as 2048 pairs of floats,
+// each a half-precision number exactly.
+layout(std430, binding = 1) readonly  buffer T { float steps[]; };
+layout(std430, binding = 2) readonly  buffer X { vec4 x4[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint dim; // outputs
+    uint ffn; // inputs
+    uint col; // the first column of the pass this dispatch answers
+} p;
+
+const uint SEQ    = 128u;
+const uint BLOCK  = 64u;
+const uint PAIRS  = BLOCK / 2u;
+const uint L      = 14u;
+const uint STRIDE = 6u;    // bits a state adds
+const uint SEQB   = 49u;   // 14 + 63·6 = 392 bits
+const uint HALFB  = 24u;   // the first 32 states: 192 bits
+const uint ENTRIES = 2048u;
+// Words of stream a block's thirty-two windows reach into.
+const uint SD = ((PAIRS - 1u) * STRIDE + L + 31u) / 32u;
+
+uint bswap(uint v) {
+    return (v >> 24u) | ((v >> 8u) & 0xFF00u) | ((v << 8u) & 0xFF0000u) | (v << 24u);
+}
+
+shared uint book[ENTRIES];
+
+uint seqOf(uint codeBase, uint b) {
+    return codeBase + (b >> 1u) * SEQB + (b & 1u) * HALFB;
+}
+
+// pairOf decodes state j of a block whose stream is s.
+vec2 pairOf(uint s[SD], uint j) {
+    const uint o  = j * STRIDE;
+    const uint wi = o >> 5u;
+    const uint bi = o & 31u;
+    uint v;
+    if (bi <= 32u - L) {
+        v = bitfieldExtract(s[wi], int(32u - L - bi), int(L));
+    } else {
+        v = ((s[wi] << bi) | (s[wi + 1u] >> (32u - bi))) >> (32u - L);
+    }
+    // s·(s+1) fits thirty-two bits for a fourteen-bit s, and both factors
+    // fit the twenty-four bits of v_mul_u32_u24.
+    uint h = v * (v + 1u);
+    return unpackHalf2x16(book[bitfieldExtract(h, 5, 11)]);
+}
+
+void main() {
+    for (uint i = gl_LocalInvocationID.x; i < ENTRIES; i += gl_WorkGroupSize.x) {
+        book[i] = packHalf2x16(vec2(steps[256u + 2u * i], steps[256u + 2u * i + 1u]));
+    }
+    barrier();
+
+    const uint GROUPS = gl_WorkGroupSize.x / uint(LANES);
+    uint lane  = gl_LocalInvocationID.x % uint(LANES);
+    uint first = (gl_WorkGroupID.x * GROUPS + gl_LocalInvocationID.x / uint(LANES)) * uint(ROWS);
+
+    uint nb = p.ffn / BLOCK;
+    uint ns = p.ffn / SEQ;
+    uint rowBytes = nb + ns * SEQB;
+    uint rowBase[ROWS];
+    // A row past the end reads the last one and writes nothing.
+    [[unroll]] for (uint r = 0u; r < ROWS; r++) rowBase[r] = min(first + r, p.dim - 1u) * rowBytes;
+
+    float sum[ROWS][COLUMNS];
+    [[unroll]] for (uint r = 0u; r < ROWS; r++)
+        [[unroll]] for (uint c = 0u; c < COLUMNS; c++) sum[r][c] = 0.0;
+
+    for (uint b = lane; b < nb; b += uint(LANES)) {
+        uint s[ROWS][SD];
+        float step[ROWS];
+        [[unroll]] for (uint r = 0u; r < ROWS; r++) {
+            uint stepAt = rowBase[r] + b;
+            step[r] = steps[(w[stepAt >> 2u] >> ((stepAt & 3u) * 8u)) & 0xFFu];
+            uint seqAt = seqOf(rowBase[r] + nb, b);
+            uint at = seqAt >> 2u;
+            uint raw[SD + 1u];
+            [[unroll]] for (uint j = 0u; j <= SD; j++) raw[j] = w[at + j];
+            // The block's stream, in registers, in the format's bit order.
+            uint sh = (seqAt & 3u) * 8u;
+            uint prev = bswap(raw[0]);
+            [[unroll]] for (uint j = 0u; j < SD; j++) {
+                uint next = bswap(raw[j + 1u]);
+                s[r][j] = (prev << sh) | ((next >> 1u) >> (31u - sh));
+                prev = next;
+            }
+        }
+        // A block's products are summed before its step, which multiplies
+        // once a block rather than once a weight.
+        float part[ROWS][COLUMNS];
+        [[unroll]] for (uint r = 0u; r < ROWS; r++)
+            [[unroll]] for (uint c = 0u; c < COLUMNS; c++) part[r][c] = 0.0;
+
+        [[unroll]] for (uint g = 0u; g < PAIRS / 4u; g++) {
+            vec4 xa[COLUMNS], xb[COLUMNS];
+            [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+                uint at = ((p.col + c) * p.ffn + b * BLOCK + g * 8u) >> 2u;
+                xa[c] = x4[at];
+                xb[c] = x4[at + 1u];
+            }
+            [[unroll]] for (uint r = 0u; r < ROWS; r++) {
+                vec2 w0 = pairOf(s[r], g * 4u);
+                vec2 w1 = pairOf(s[r], g * 4u + 1u);
+                vec2 w2 = pairOf(s[r], g * 4u + 2u);
+                vec2 w3 = pairOf(s[r], g * 4u + 3u);
+                [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+                    part[r][c] += dot(vec4(w0, w1), xa[c]) + dot(vec4(w2, w3), xb[c]);
+                }
+            }
+        }
+        [[unroll]] for (uint r = 0u; r < ROWS; r++)
+            [[unroll]] for (uint c = 0u; c < COLUMNS; c++) sum[r][c] += part[r][c] * step[r];
+    }
+
+    [[unroll]] for (uint r = 0u; r < ROWS; r++) {
+        [[unroll]] for (uint c = 0u; c < COLUMNS; c++) {
+            float total = subgroupClusteredAdd(sum[r][c], uint(LANES));
+            if (lane == 0u && first + r < p.dim) y[(p.col + c) * p.dim + first + r] = total;
+        }
+    }
+}

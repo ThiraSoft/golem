@@ -215,6 +215,9 @@ const (
 	golemT3G      uint32 = golemTypeBase | 3
 	golemT4G      uint32 = golemTypeBase | 4
 	golemT5G      uint32 = golemTypeBase | 5
+	// golemH3G is the pair trellis at three bits. The low byte keeps the bits a
+	// weight in its low nibble; the high bit of it says two weights a state.
+	golemH3G uint32 = golemTypeBase | 0x80 | 3
 )
 
 // GolemFormat is the value of the `golem.format` key: the codec family and the
@@ -245,6 +248,7 @@ var ggmlTypes = map[uint32]string{
 	golemT3G: "T3G",
 	golemT4G: "T4G",
 	golemT5G: "T5G",
+	golemH3G: "H3G",
 	142:      "PQ2_0",
 	143:      "PTQ1_0",
 	// 1000-1004 are retired and never reused. They were, in turn, the lattice,
@@ -269,7 +273,12 @@ const (
 
 // golemTierBits is the bits a weight each private type codes at, which is by
 // construction the low byte of its type number.
-var golemTierBits = map[string]int{"T3G": 3, "T4G": 4, "T5G": 5}
+var golemTierBits = map[string]int{"T3G": 3, "T4G": 4, "T5G": 5, "H3G": 3}
+
+// golemPairState is the state of the pair trellis, which is its own and not
+// golem.trellis.state: that key describes the one-weight tiers a file's head
+// is still written in, and the pair tier's fourteen bits are fixed by its type.
+const golemPairState = 14
 
 // golemBlockBytes is what a block of seq weights occupies at k bits each with
 // a state of the given width: one step code per scale block, then the path,
@@ -351,8 +360,14 @@ func (g *GGUF) checkGolemFile() error {
 		// claims. Both sides are already pinned above, so this only fires when
 		// blockGeometry drifts from the arithmetic that produced it — which is
 		// the failure that reads every row at the wrong offset.
-		if want, got := blockGeometry[name][1], golemBlockBytes(int(seq), int(state), k); want != got {
-			return fmt.Errorf("gguf: %s reads %d bytes a block and a %d-weight path of %d bits with %d of state is %d", name, want, seq, k, state, got)
+		st, got := int(state), golemBlockBytes(int(seq), int(state), k)
+		if name == "H3G" {
+			// 14 + 63·6 is 127·3 + 11: the pair path is the one-weight
+			// arithmetic with eleven bits standing in for the state.
+			st, got = golemPairState, golemBlockBytes(int(seq), golemPairState-k, k)
+		}
+		if want := blockGeometry[name][1]; want != got {
+			return fmt.Errorf("gguf: %s reads %d bytes a block and a %d-weight path of %d bits with %d of state is %d", name, want, seq, k, st, got)
 		}
 	}
 	if !bodySeen {
@@ -378,6 +393,7 @@ var blockGeometry = map[string][2]int{
 	"T3G":    {128, 52},  // two step codes, then a 393-bit path in 400
 	"T4G":    {128, 67},  // two step codes, then a 520-bit trellis path
 	"T5G":    {128, 83},  // the same at five bits a weight, 648 of them
+	"H3G":    {128, 51},  // two step codes, then a 392-bit path of 64 pairs
 	"PQ2_0":  {128, 34},  // one fp16 scale, then 32 packed two-bit quants
 	"PTQ1_0": {128, 28},  // 24 bytes of trits, 2 bytes high trits, one fp16 scale
 }

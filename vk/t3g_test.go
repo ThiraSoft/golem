@@ -16,3 +16,9 @@ import (
 func TestT3GDecodeMatchesCPUExactly(t *testing.T) {
 	testGolemDecodeMatchesCPUExactly(t, nn.T3G)
 }
+
+// TestH3GDecodeMatchesCPUExactly holds the pair trellis's kernel to the same
+// contract: every weight, every position of a path, exactly.
+func TestH3GDecodeMatchesCPUExactly(t *testing.T) {
+	testGolemDecodeMatchesCPUExactly(t, nn.H3G)
+}

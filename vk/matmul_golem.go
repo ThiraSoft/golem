@@ -25,6 +25,15 @@ import (
 //go:generate glslc -O -DKBITS=5 -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_t5g_32.spv
 //go:generate glslc -O -DKBITS=5 -DCOLUMNS=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_t5g_64.spv
 
+//go:generate glslc -O -DKBITS=3 -DPAIRS=1 -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_h3g_32.spv
+//go:generate glslc -O -DKBITS=3 -DPAIRS=1 -DCOLUMNS=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_h3g_64.spv
+
+//go:embed shaders/matmul_h3g_32.spv
+var matmulH3G32SPIRV []byte
+
+//go:embed shaders/matmul_h3g_64.spv
+var matmulH3G64SPIRV []byte
+
 //go:embed shaders/matmul_t3g_32.spv
 var matmulT3G32SPIRV []byte
 
@@ -112,6 +121,8 @@ func golemTiledSPIRV(q nn.Quant) (map[int][]byte, bool) {
 		return map[int][]byte{32: matmulT4G32SPIRV, 64: matmulT4G64SPIRV}, true
 	case nn.T5G:
 		return map[int][]byte{32: matmulT5G32SPIRV, 64: matmulT5G64SPIRV}, true
+	case nn.H3G:
+		return map[int][]byte{32: matmulH3G32SPIRV, 64: matmulH3G64SPIRV}, true
 	}
 	return nil, false
 }

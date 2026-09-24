@@ -69,6 +69,28 @@ var matvecT3G4SPIRV []byte
 //go:embed shaders/matvec_t3g_8.spv
 var matvecT3G8SPIRV []byte
 
+//go:generate glslc -O -DCOLUMNS=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h3g_1.spv
+//go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h3g_2.spv
+//go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h3g_4.spv
+//go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h3g_8.spv
+
+//go:embed shaders/matvec_h3g_1.spv
+var matvecH3G1SPIRV []byte
+
+//go:embed shaders/matvec_h3g_2.spv
+var matvecH3G2SPIRV []byte
+
+//go:embed shaders/matvec_h3g_4.spv
+var matvecH3G4SPIRV []byte
+
+//go:embed shaders/matvec_h3g_8.spv
+var matvecH3G8SPIRV []byte
+
+// h3gRowsPerGroup is matvec_h3g.comp's: 256 threads, sixteen lanes to a row
+// group and two rows a lane. It is not GolemShapes' business — that kernel has
+// no specialization constants — and it is the same at every width.
+const h3gRowsPerGroup = 32
+
 //go:generate glslc -O -DKBITS=5 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t5g.spv
 //go:generate glslc -O -DKBITS=5 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t5g_2.spv
 //go:generate glslc -O -DKBITS=5 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t5g_4.spv
@@ -299,11 +321,17 @@ func NewGolemKernels(d *Device, q nn.Quant) (*GolemKernels, error) {
 	}
 	k := &GolemKernels{d: d, q: q, pipes: map[int]*Pipeline{}}
 	var err error
-	if k.table, err = d.Upload(golemTable()); err != nil {
+	if k.table, err = d.Upload(golemTableFor(q)); err != nil {
 		return nil, err
 	}
 	for _, columns := range GolemWidths {
-		p, err := d.NewPipelineSpec(spirv[columns], 4, golemPushSize, GolemShapes()[columns].Spec())
+		var p *Pipeline
+		var err error
+		if q == nn.H3G {
+			p, err = d.NewPipeline(spirv[columns], 4, golemPushSize)
+		} else {
+			p, err = d.NewPipelineSpec(spirv[columns], 4, golemPushSize, GolemShapes()[columns].Spec())
+		}
 		if err != nil {
 			k.Close()
 			return nil, err
@@ -336,8 +364,30 @@ func golemSPIRV(q nn.Quant) (map[int][]byte, bool) {
 		return map[int][]byte{1: matvecT4GSPIRV, 2: matvecT4G2SPIRV, 4: matvecT4G4SPIRV, 8: matvecT4G8SPIRV}, true
 	case nn.T5G:
 		return map[int][]byte{1: matvecT5GSPIRV, 2: matvecT5G2SPIRV, 4: matvecT5G4SPIRV, 8: matvecT5G8SPIRV}, true
+	case nn.H3G:
+		return map[int][]byte{1: matvecH3G1SPIRV, 2: matvecH3G2SPIRV, 4: matvecH3G4SPIRV, 8: matvecH3G8SPIRV}, true
 	}
 	return nil, false
+}
+
+// golemTableFor is golemTable, and for H3G the codebook after it: 2048 pairs
+// as floats, which the kernels narrow back to the half2 each one is exactly.
+func golemTableFor(q nn.Quant) []byte {
+	out := golemTable()
+	if q == nn.H3G {
+		for _, v := range nn.H3GCodebook() {
+			out = binary.LittleEndian.AppendUint32(out, math.Float32bits(v))
+		}
+	}
+	return out
+}
+
+// RowsPerGroup is how many rows a workgroup of a pass that wide answers.
+func (k *GolemKernels) RowsPerGroup(columns int) int {
+	if k.q == nn.H3G {
+		return h3gRowsPerGroup
+	}
+	return golemRowsPerGroup(columns)
 }
 
 // golemTable is what the second binding holds: the step grid, 256 floats, the
@@ -420,7 +470,7 @@ func NewGolemMatrixOn(k *GolemKernels, data []byte, rows, cols int, act, out *Bu
 	}
 	m.groups = map[int]uint32{}
 	for _, columns := range GolemWidths {
-		per := golemRowsPerGroup(columns)
+		per := k.RowsPerGroup(columns)
 		m.groups[columns] = uint32((rows + per - 1) / per)
 	}
 	for _, columns := range GolemTiledWidths {
@@ -443,7 +493,7 @@ func newGolemMatrixShared(k *GolemKernels, weights *Buffer, rows, cols int, act,
 	}
 	m.groups = map[int]uint32{}
 	for _, columns := range GolemWidths {
-		per := golemRowsPerGroup(columns)
+		per := k.RowsPerGroup(columns)
 		m.groups[columns] = uint32((rows + per - 1) / per)
 	}
 	for _, columns := range GolemTiledWidths {

@@ -1,0 +1,157 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// The Viterbi of nn/h3g.go's pair trellis, one sequence a workgroup.
+//
+// viterbi_tcq.comp keeps its two cost planes in shared memory, 4096 states
+// each. At fourteen bits of state a plane is 16384 floats, sixty-four
+// kibibytes, and two of them do not fit a workgroup. They do not have to: a
+// workgroup of 1024 threads holds the states in registers, sixteen a thread,
+// and the layout makes the step's two halves local.
+//
+// Thread t holds the states t + 1024·i. All sixteen end in the same eight
+// bits, t & 255, which is the prefix every successor of theirs is reached
+// through — a state's predecessors are exactly the states whose low L−2k bits
+// are its high ones. So the minimum over a prefix's 64 predecessors is a
+// minimum over one thread's sixteen registers and then over the four threads
+// that share t & 255, and only that last step goes through shared memory.
+// The new cost of state t + 1024·i then reads the best of prefix
+// (t >> 6) + 16·i: sixteen reads out of a table of 256.
+//
+// Ties go to the smallest predecessor and the smallest final state, because
+// the processor's encoder scans upward and keeps the first strict improvement.
+// And every cost is written out as a difference, a square, a sum — `precise`,
+// and no fused multiply-add — for the reason compress/hyb.go gives.
+
+layout(local_size_x = 1024) in;
+
+layout(std430, binding = 0) readonly  buffer Z    { float z[];    };
+layout(std430, binding = 1) writeonly buffer OUT  { float rec[];  };
+layout(std430, binding = 2) writeonly buffer PATH { uint  path[]; };
+layout(std430, binding = 3) readonly  buffer BOOK { float book[]; };
+
+layout(push_constant) uniform Push {
+    uint seqs;
+} p;
+
+const uint L = 14u;
+const uint KV = 6u;                  // bits a state adds: two weights of three
+const uint T = 64u;                  // states a sequence
+const uint NPREFIX = 1u << (L - KV); // 256
+const uint PER = 16u;                // states a thread
+
+shared float zs[2u * T];
+shared uint bp[T * NPREFIX / 4u];    // a byte a prefix a step
+shared float partC[1024];
+shared uint partJ[1024];
+shared float best[NPREFIX];
+shared uint redAt[1024];
+
+uint entry(uint s) {
+    uint h = s * (s + 1u);
+    return (h >> 5u) & 2047u;
+}
+
+void main() {
+    uint seq = gl_WorkGroupID.x;
+    if (seq >= p.seqs) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = seq * 2u * T;
+
+    for (uint i = tid; i < 2u * T; i += 1024u) zs[i] = z[base + i];
+    for (uint i = tid; i < T * NPREFIX / 4u; i += 1024u) bp[i] = 0u;
+
+    vec2 val[PER];
+    float cost[PER];
+    [[unroll]] for (uint i = 0u; i < PER; i++) {
+        uint e = entry(tid + 1024u * i);
+        val[i] = vec2(book[2u * e], book[2u * e + 1u]);
+    }
+    barrier();
+
+    [[unroll]] for (uint i = 0u; i < PER; i++) {
+        precise float d0 = zs[0] - val[i].x;
+        precise float d1 = zs[1] - val[i].y;
+        precise float a = d0 * d0;
+        precise float b = d1 * d1;
+        precise float c = a + b;
+        cost[i] = c;
+    }
+
+    [[loop]] for (uint t = 1u; t < T; t++) {
+        // This thread's best predecessor for its prefix. i ascending is j
+        // ascending, j being the state's top six bits: (tid >> 8) + 4·i.
+        float mc = cost[0];
+        uint mj = tid >> 8u;
+        [[unroll]] for (uint i = 1u; i < PER; i++) {
+            if (cost[i] < mc) { mc = cost[i]; mj = (tid >> 8u) + 4u * i; }
+        }
+        partC[tid] = mc;
+        partJ[tid] = mj;
+        barrier();
+        if (tid < NPREFIX) {
+            float bc = partC[tid];
+            uint bj = partJ[tid];
+            [[unroll]] for (uint q = 1u; q < 4u; q++) {
+                float c = partC[tid + 256u * q];
+                uint j = partJ[tid + 256u * q];
+                if (c < bc || (c == bc && j < bj)) { bc = c; bj = j; }
+            }
+            best[tid] = bc;
+            uint at = t * NPREFIX + tid;
+            atomicOr(bp[at >> 2u], bj << ((at & 3u) * 8u));
+        }
+        barrier();
+        float z0 = zs[2u * t], z1 = zs[2u * t + 1u];
+        [[unroll]] for (uint i = 0u; i < PER; i++) {
+            float bb = best[(tid >> 6u) + 16u * i];
+            precise float d0 = z0 - val[i].x;
+            precise float d1 = z1 - val[i].y;
+            precise float a = d0 * d0;
+            precise float b = d1 * d1;
+            precise float sq = a + b;
+            precise float c = bb + sq;
+            cost[i] = c;
+        }
+        // The next step's partC writes must not overtake this step's reads of
+        // best by a slower thread: they are different arrays, and best is only
+        // rewritten after the next barrier, so one barrier a step suffices.
+    }
+
+    // The cheapest final state, lowest state on a tie.
+    float mc = cost[0];
+    uint ms = tid;
+    [[unroll]] for (uint i = 1u; i < PER; i++) {
+        if (cost[i] < mc) { mc = cost[i]; ms = tid + 1024u * i; }
+    }
+    partC[tid] = mc;
+    redAt[tid] = ms;
+    barrier();
+    for (uint stride = 512u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            float c = partC[tid + stride];
+            uint s = redAt[tid + stride];
+            if (c < partC[tid] || (c == partC[tid] && s < redAt[tid])) {
+                partC[tid] = c;
+                redAt[tid] = s;
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        uint s = redAt[0];
+        for (uint k = T; k > 0u; k--) {
+            uint t = k - 1u;
+            uint e = entry(s);
+            rec[base + 2u * t] = book[2u * e];
+            rec[base + 2u * t + 1u] = book[2u * e + 1u];
+            path[seq * T + t] = s;
+            if (t > 0u) {
+                uint a = t * NPREFIX + (s >> KV);
+                uint j = (bp[a >> 2u] >> ((a & 3u) * 8u)) & 0xFFu;
+                s = (j << (L - KV)) | (s >> KV);
+            }
+        }
+    }
+}

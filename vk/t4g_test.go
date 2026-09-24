@@ -152,16 +152,21 @@ func TestT4GMatVecMatchesCPU(t *testing.T) {
 // hypothetical: the upload has to round up to a word or the last bytes of the
 // last row are read out of a word past the end of the buffer.
 func TestT4GUnalignedRowsDecode(t *testing.T) {
+	testUnalignedRowsDecode(t, nn.T4G)
+	testUnalignedRowsDecode(t, nn.H3G)
+}
+
+func testUnalignedRowsDecode(t *testing.T, kind nn.Quant) {
 	const rows, cols = 8, 1152
 	d := open(t)
 	defer d.Close()
 
-	data, _ := t4gMatrix(t, rows, cols)
-	if nn.T4GRowBytes(cols)%4 == 0 {
+	data, _ := t4gMatrixAs(t, rows, cols, kind)
+	m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols}
+	if m.RowBytes()%4 == 0 {
 		t.Fatalf("%d columns give a word-aligned row; this test is not testing anything", cols)
 	}
-	m := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols}
-	gpu, err := newHostGolemMatrix(d, data, rows, cols, nn.T4G)
+	gpu, err := newHostGolemMatrix(d, data, rows, cols, kind)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,6 +202,7 @@ func TestGolemWidePassesMatchCPU(t *testing.T) {
 	testGolemWidePassesMatchCPU(t, nn.T3G)
 	testGolemWidePassesMatchCPU(t, nn.T4G)
 	testGolemWidePassesMatchCPU(t, nn.T5G)
+	testGolemWidePassesMatchCPU(t, nn.H3G)
 }
 
 func testGolemWidePassesMatchCPU(t *testing.T, kind nn.Quant) {

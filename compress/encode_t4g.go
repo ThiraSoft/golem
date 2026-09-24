@@ -76,7 +76,12 @@ func EncodeT4G(w []float32, rows, cols int, q []float32, p GolemParams) []byte {
 // head and nothing else: a bit a weight over a tenth of a model is a tenth of
 // a bit, and it is the tensor that makes the logits rather than one whose
 // error the layers after it absorb.
+//
+// H3G is handed to EncodeH3G, which shares everything here but the trellis.
 func EncodeT4GAs(w []float32, rows, cols int, q []float32, p GolemParams, kind nn.Quant) []byte {
+	if kind == nn.H3G {
+		return EncodeH3G(w, rows, cols, q, p)
+	}
 	if cols%nn.T4GSeq != 0 {
 		panic("compress: a T4G row must be a multiple of 128 wide")
 	}
@@ -88,9 +93,37 @@ func EncodeT4GAs(w []float32, rows, cols int, q []float32, p GolemParams, kind n
 	seqBytes := nn.T4GSeqBytesN(kind)
 	out := make([]byte, rows*rowBytes)
 
+	prep, norm := golemNormalise(w, rows, cols, q, p)
+	nblk := n / nn.T4GBlock
+
+	// The path. norm comes back holding what it reconstructs, at unit scale.
+	states := make([]uint16, n)
+	QuantizeTrellisPath(norm, T4GOptsFor(kind), states)
+
+	steps := golemFitSteps(prep, norm, nblk)
+
+	Parallel(rows, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			plane, codes := nn.T4GPlanesN(out[r*rowBytes:(r+1)*rowBytes], cols, kind)
+			copy(plane, steps[r*cols/nn.T4GBlock:(r+1)*cols/nn.T4GBlock])
+			for s := 0; s*nn.T4GSeq < cols; s++ {
+				at := r*cols + s*nn.T4GSeq
+				nn.PutT4GStatesN(codes[s*seqBytes:], states[at:at+nn.T4GSeq], kind)
+			}
+		}
+	})
+	return out
+}
+
+// golemNormalise puts a matrix in the basis it is coded in — the site's vector,
+// then the rotation — and returns that, prep, beside norm, the same weights at
+// unit RMS per block, which is what the codebook is built to meet. prep is kept
+// because the step is fitted against it once the path exists.
+func golemNormalise(w []float32, rows, cols int, q []float32, p GolemParams) (prep, norm []float32) {
+	n := rows * cols
 	// The weights in the basis they are coded in: the site's vector, then the
 	// rotation. Kept, because the step is fitted against them at the end.
-	prep := make([]float32, n)
+	prep = make([]float32, n)
 	Parallel(rows, func(lo, hi int) {
 		for r := lo; r < hi; r++ {
 			row := prep[r*cols : (r+1)*cols]
@@ -103,7 +136,7 @@ func EncodeT4GAs(w []float32, rows, cols int, q []float32, p GolemParams, kind n
 
 	// Unit variance per block, so that the codebook — which is N(0,1) and the
 	// same for every tensor — meets a source of the size it was built for.
-	norm := make([]float32, n)
+	norm = make([]float32, n)
 	nblk := n / nn.T4GBlock
 	Parallel(nblk, func(lo, hi int) {
 		for b := lo; b < hi; b++ {
@@ -122,10 +155,12 @@ func EncodeT4GAs(w []float32, rows, cols int, q []float32, p GolemParams, kind n
 		}
 	})
 
-	// The path. norm comes back holding what it reconstructs, at unit scale.
-	states := make([]uint16, n)
-	QuantizeTrellisPath(norm, T4GOptsFor(kind), states)
+	return prep, norm
+}
 
+// golemFitSteps is each block's step, fitted by least squares to what the path
+// reconstructs at unit scale and rounded onto the eight-bit grid.
+func golemFitSteps(prep, norm []float32, nblk int) []byte {
 	// The step, per block, fitted to the path and then rounded onto the grid
 	// the eight bits name.
 	steps := make([]byte, nblk)
@@ -142,17 +177,7 @@ func EncodeT4GAs(w []float32, rows, cols int, q []float32, p GolemParams, kind n
 		}
 	})
 
-	Parallel(rows, func(lo, hi int) {
-		for r := lo; r < hi; r++ {
-			plane, codes := nn.T4GPlanesN(out[r*rowBytes:(r+1)*rowBytes], cols, kind)
-			copy(plane, steps[r*cols/nn.T4GBlock:(r+1)*cols/nn.T4GBlock])
-			for s := 0; s*nn.T4GSeq < cols; s++ {
-				at := r*cols + s*nn.T4GSeq
-				nn.PutT4GStatesN(codes[s*seqBytes:], states[at:at+nn.T4GSeq], kind)
-			}
-		}
-	})
-	return out
+	return steps
 }
 
 // RelErr is what the codes cost the matrix they stand for, in the basis they

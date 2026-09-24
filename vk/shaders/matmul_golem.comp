@@ -212,7 +212,18 @@ layout(push_constant) uniform Push {
 
 const uint SEQ   = 128u; // weights in one path
 const uint BLOCK = 64u;  // weights sharing one step
-#if KBITS == 5
+// PAIRS is nn/h3g.go's pair trellis: a fourteen-bit state a pair of weights,
+// six bits apart, and a codebook of 2048 pairs read from binding 1 after the
+// step grid. The tile decodes a weight once for BN columns, so the table is
+// read from memory rather than staged: its eight kibibytes stay in the cache.
+#ifndef PAIRS
+#define PAIRS 0
+#endif
+
+#if PAIRS
+const uint SEQB  = 49u;
+const uint HALFB = 24u;
+#elif KBITS == 5
 const uint SEQB  = 81u;
 const uint HALFB = 40u;
 #elif KBITS == 3
@@ -239,7 +250,11 @@ const uint HALFB = 32u;
 // SJ is how many words of realigned stream one thread's WPT weights lie in:
 // the last of them starts at bit (WPT-1)*KBITS and is twelve wide. One more
 // word than that is read, because the realignment pairs word j with word j+1.
+#if PAIRS
+#define SJ (((WPT / 2 - 1) * 2 * KBITS + 14 + 31) / 32)
+#else
 #define SJ (((WPT - 1) * KBITS + 12 + 31) / 32)
+#endif
 
 // VEC4 reads the staged tiles sixteen bytes at a time — one ds_read_b128 where
 // there are four scalar reads — which is the one axis that moves the ratio the
@@ -323,6 +338,34 @@ uint seqOf(uint codeBase, uint b) {
         v = (((s)[wi] << (bi)) | ((s)[(wi) + 1u] >> (32u - (bi)))) >> 20u; \
     }
 #endif
+#if PAIRS
+#define DECODE \
+        [[unroll]] for (uint n = 0u; n < uint(WPT) / 2u; n++) { \
+            const uint o  = n * 2u * uint(KBITS); \
+            const uint wi = o >> 5u; \
+            const uint bi = o & 31u; \
+            uint v; \
+            if (bi <= 18u) { \
+                v = bitfieldExtract(s[wi], int(18u - bi), 14); \
+            } else { \
+                v = ((s[wi] << bi) | (s[wi + 1u] >> (32u - bi))) >> 18u; \
+            } \
+            uint e = bitfieldExtract(v * (v + 1u), 5, 11); \
+            WSTORE(r, q * uint(WPT) + 2u * n, steps[256u + 2u * e] * wstep[i]) \
+            WSTORE(r, q * uint(WPT) + 2u * n + 1u, steps[257u + 2u * e] * wstep[i]) \
+        }
+#else
+#define DECODE \
+        [[unroll]] for (uint n = 0u; n < uint(WPT); n++) { \
+            const uint o  = n * uint(KBITS); \
+            const uint wi = o >> 5u; \
+            const uint bi = o & 31u; \
+            uint v; \
+            CUTV(v, s, wi, bi) \
+            WSTORE(r, q * uint(WPT) + n, HASH(v) * wstep[i]) \
+        }
+#endif
+
 #if ABLATE == 3
 #define XK(k) 0u                     // the shared walk across the tile, gone
 #else
@@ -439,14 +482,7 @@ void main() {
                 prev = next; \
             } \
         } \
-        [[unroll]] for (uint n = 0u; n < uint(WPT); n++) { \
-            const uint o  = n * uint(KBITS); \
-            const uint wi = o >> 5u; \
-            const uint bi = o & 31u; \
-            uint v; \
-            CUTV(v, s, wi, bi) \
-            WSTORE(r, q * uint(WPT) + n, HASH(v) * wstep[i]) \
-        } \
+        DECODE \
     } \
     [[unroll]] for (uint i = 0u; i < uint(ALOADS); i++) { \
         uint idx = t + i * uint(THREADS); \
