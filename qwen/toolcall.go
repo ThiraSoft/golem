@@ -40,7 +40,7 @@ func ParseToolCalls(text string) (string, []chat.ToolCall, error) {
 		rest = rest[len(toolCallOpen):]
 		end := strings.Index(rest, toolCallClose)
 		if end < 0 {
-			return before, nil, fmt.Errorf("qwen: a tool call that never closes")
+			return before, nil, fmt.Errorf("qwen: a tool call that never closes: %s", excerpt(rest))
 		}
 		body := rest[:end]
 		rest = rest[end+len(toolCallClose):]
@@ -162,4 +162,15 @@ func parameterValue(raw string) any {
 		}
 	}
 	return raw
+}
+
+// excerpt quotes the two ends of a call that could not be read, which is
+// usually enough to see where the model lost its way.
+func excerpt(s string) string {
+	const n = 160
+	if len(s) <= 2*n {
+		return fmt.Sprintf("%q", s)
+	}
+	head, tail := s[:n], s[len(s)-n:]
+	return fmt.Sprintf("%q ... %q (%d bytes)", strings.ToValidUTF8(head, ""), strings.ToValidUTF8(tail, ""), len(s))
 }

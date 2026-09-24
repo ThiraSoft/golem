@@ -407,3 +407,12 @@ func TestGenerateBeginsInsideAThoughtThePromptOpened(t *testing.T) {
 		t.Fatalf("text %q, reasoning %q, streamed %q and %q", answer.Text, answer.Reasoning, content.String(), reasoning.String())
 	}
 }
+
+// A call cut by max_tokens says so, rather than blaming how it was written.
+func TestGenerateSaysACallWasCutByTheLimit(t *testing.T) {
+	g, v := newGenerator(t, []string{"CALL", "{city=Lyon}", "more", "<turn|>"}, 2)
+	_, err := g.Generate(context.Background(), v.Encode("a b", false, true), greedy(), nil, func(Delta) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "reached max_tokens (2)") {
+		t.Fatalf("err %v", err)
+	}
+}

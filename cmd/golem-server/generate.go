@@ -214,6 +214,9 @@ func (g *Generator) finish(answer Answer, sorted *sorter) (Answer, error) {
 	answer.Reasoning = sorted.reasoning.String()
 	before, calls, err := g.tpl.ParseCalls(sorted.content.String())
 	if err != nil {
+		if answer.Reason == "length" {
+			return answer, fmt.Errorf("the answer reached max_tokens (%d) before its call was whole: %w", answer.Generated, err)
+		}
 		return answer, fmt.Errorf("the model wrote a call this server cannot read: %w", err)
 	}
 	answer.Text = before
