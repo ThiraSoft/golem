@@ -26,6 +26,7 @@ import (
 
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q40.comp -o shaders/matvec_q40.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_f32.comp -o shaders/matvec_f32.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_rows.comp -o shaders/matvec_rows.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q4k.comp -o shaders/matvec_q4k.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_q6k.comp -o shaders/matvec_q6k.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/swiglu_act.comp -o shaders/swiglu_act.spv
@@ -37,6 +38,17 @@ import (
 
 //go:embed shaders/matvec_q40.spv
 var matvecQ40SPIRV []byte
+
+//go:embed shaders/matvec_rows.spv
+var matvecRowsSPIRV []byte
+
+// rowsPush is shaders/matvec_rows.comp's.
+type rowsPush struct {
+	Dim, FFN, Col, Columns uint32
+}
+
+// rowsBlock is how many columns one of its workgroups answers.
+const rowsBlock = 4
 
 // The Q4_K mat-vec. It was compiled and embedded next to the delta net's
 // kernels for a year and bound to nothing, against a layout the split now
@@ -686,6 +698,9 @@ type QwenPipeline struct {
 	pipeMatQ4K *Pipeline
 	pipeMatQ6K *Pipeline
 	pipeMatF32 *Pipeline
+	// pipeMatRows is the float product for a matrix of few rows, the delta
+	// net's alpha and beta: a workgroup a row.
+	pipeMatRows *Pipeline
 	// pipeMatBF16 is the same product against half-width weights, built only
 	// for a WideBF16 model. It does not replace pipeMatF32: the delta net's
 	// decay projections are float32 in every checkpoint whatever the rest is,
@@ -871,6 +886,7 @@ func NewQwenPipeline(d *Device, shape QwenShape) (*QwenPipeline, error) {
 		{&p.pipeMatQ4K, matvecQ4KSPIRV, 3, unsafe.Sizeof(matvecKPush{})},
 		{&p.pipeMatQ6K, matvecQ6KSPIRV, 3, unsafe.Sizeof(matvecKPush{})},
 		{&p.pipeMatF32, matvecF32SPIRV, 3, unsafe.Sizeof(matvecKPush{})},
+		{&p.pipeMatRows, matvecRowsSPIRV, 3, unsafe.Sizeof(rowsPush{})},
 		{&p.pipeSwiglu, swigluActSPIRV, 5, unsafe.Sizeof(swigluPush{})},
 		{&p.pipeQuant, quantQ80SPIRV, 3, unsafe.Sizeof(swigluPush{})},
 		{&p.pipeConv, ssmConv1dSPIRV, 6, unsafe.Sizeof(ssmConvPush{})},
@@ -1311,13 +1327,13 @@ func (p *QwenPipeline) uploadSSMProjections(b *qwenSSMBlock, d QwenSSMData) erro
 			return err
 		}
 	}
-	// The decay's two projections keep the float kernel whatever the rest of the
+	// The decay's two projections keep a float kernel whatever the rest of the
 	// model is: they are float32 in every checkpoint, which is why they were
 	// uploaded above the branch that chose a form.
-	if b.setAlpha, err = p.pipeMatF32.NewSet([]*Buffer{b.wAlpha, p.normed, p.alphaBuf}); err != nil {
+	if b.setAlpha, err = p.pipeMatRows.NewSet([]*Buffer{b.wAlpha, p.normed, p.alphaBuf}); err != nil {
 		return err
 	}
-	if b.setBeta, err = p.pipeMatF32.NewSet([]*Buffer{b.wBeta, p.normed, p.betaBuf}); err != nil {
+	if b.setBeta, err = p.pipeMatRows.NewSet([]*Buffer{b.wBeta, p.normed, p.betaBuf}); err != nil {
 		return err
 	}
 	return nil
@@ -1899,6 +1915,12 @@ func (p *QwenPipeline) product(r *Recorder, set *Set, rows, columns int, push mo
 // productK is product for the kernels that take vk/ssm.go's push block: the
 // K-quant, Q4_1 and float projections, which have no tiled form and are always
 // the mat-vec.
+// productRows is a product of few rows, answered by shaders/matvec_rows.comp.
+func (p *QwenPipeline) productRows(r *Recorder, set *Set, rows, cols, columns int) {
+	push := rowsPush{Dim: uint32(rows), FFN: uint32(cols), Columns: uint32(columns)}
+	r.DispatchColumns(set, uint32(rows), uint32((columns+rowsBlock-1)/rowsBlock), unsafe.Pointer(&push))
+}
+
 func (p *QwenPipeline) productK(r *Recorder, set *Set, rows, columns int, push matvecKPush) {
 	for at := 0; at < columns; {
 		w := p.span(set, columns-at, at, narrowChunk)
@@ -2271,9 +2293,10 @@ func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, runs []span, snap
 	columns := widthOf(runs)
 	qkv := moePush{dim: uint32(s.ConvDim), ffn: uint32(s.Dim), used: 1}
 	gate := moePush{dim: uint32(s.Inner), ffn: uint32(s.Dim), used: 1}
-	small := matvecKPush{Dim: uint32(s.Rank), FFN: uint32(s.Dim)}
 	out := matvecKPush{Dim: uint32(s.Dim), FFN: uint32(s.Inner)}
-	p.rotate(r, p.setRotNormed, s.Dim, columns)
+	if p.rotate(r, p.setRotNormed, s.Dim, columns) {
+		p.tl.Stamp(r, "ssm rot")
+	}
 
 	if b.f32 {
 		p.productK(r, b.setQKV, s.ConvDim, columns, matvecKPush{Dim: uint32(s.ConvDim), FFN: uint32(s.Dim)})
@@ -2282,8 +2305,10 @@ func (p *QwenPipeline) recordSSM(r *Recorder, b *qwenSSMBlock, runs []span, snap
 		p.product(r, b.setQKV, s.ConvDim, columns, qkv)
 		p.product(r, b.setGate, s.Inner, columns, gate)
 	}
-	p.productK(r, b.setAlpha, s.Rank, columns, small)
-	p.productK(r, b.setBeta, s.Rank, columns, small)
+	r.Barrier()
+	p.tl.Stamp(r, "ssm qkvgate")
+	p.productRows(r, b.setAlpha, s.Rank, s.Dim, columns)
+	p.productRows(r, b.setBeta, s.Rank, s.Dim, columns)
 	r.Barrier()
 	p.tl.Stamp(r, "ssm in")
 

@@ -1,0 +1,62 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// y = W * x for a matrix of few rows, one workgroup a row.
+//
+// The delta net's alpha and beta projections are forty-eight rows by five
+// thousand one hundred and twenty. shaders/matvec_f32.comp gives a row eight
+// lanes and a workgroup sixteen rows, which is three workgroups on a card of
+// sixty-four compute units, each lane walking six hundred and forty strided
+// loads in a row: on Bonsai 2 the two of them were five milliseconds of a
+// twenty-three millisecond token, more than the scan and the attention
+// together. Here a row is a whole workgroup and a lane owns twenty
+// consecutive-by-stride weights, so the read is one short burst.
+//
+// The second axis of the grid is blocks of COLS columns, which is what keeps a
+// prompt's pass from walking five hundred and twelve columns in one workgroup.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer W { float w[]; };
+layout(std430, binding = 1) readonly  buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint dim;
+    uint ffn;
+    uint col;     // the first column of the pass
+    uint columns; // how many columns the pass carries from there
+} p;
+
+const uint COLS = 4u;
+
+shared float partial[COLS][8];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint c0 = p.col + gl_WorkGroupID.y * COLS;
+    uint end = p.col + p.columns;
+    uint t = gl_LocalInvocationID.x;
+
+    float sum[COLS];
+    [[unroll]] for (uint c = 0u; c < COLS; c++) sum[c] = 0.0;
+    uint rowBase = row * p.ffn;
+    for (uint i = t; i < p.ffn; i += 256u) {
+        float wi = w[rowBase + i];
+        [[unroll]] for (uint c = 0u; c < COLS; c++) {
+            if (c0 + c < end) sum[c] += wi * x[(c0 + c) * p.ffn + i];
+        }
+    }
+    uint sg = gl_SubgroupID, nsg = gl_NumSubgroups;
+    [[unroll]] for (uint c = 0u; c < COLS; c++) {
+        float s = subgroupAdd(sum[c]);
+        if (subgroupElect()) partial[c][sg] = s;
+    }
+    barrier();
+    if (t < COLS && c0 + t < end) {
+        float s = 0.0;
+        for (uint g = 0u; g < nsg; g++) s += partial[t][g];
+        y[(c0 + t) * p.dim + row] = s;
+    }
+}
