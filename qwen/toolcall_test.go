@@ -71,3 +71,39 @@ func TestParseToolCallsRefusesWhatItCannotRead(t *testing.T) {
 		}
 	}
 }
+
+// Qwen3.5's template teaches the model another spelling, parameters as tags.
+func TestParseToolCallsReadsTheTaggedSpelling(t *testing.T) {
+	before, calls, err := ParseToolCalls("Je regarde.\n\n<tool_call>\n<function=weather>\n" +
+		"<parameter=city>\nLyon\n</parameter>\n<parameter=days>\n3\n</parameter>\n" +
+		"<parameter=note>\ntwo\nlines\n</parameter>\n<parameter=opts>\n{\"metric\": true}\n</parameter>\n" +
+		"</function>\n</tool_call>\n<tool_call>\n<function=now>\n</function>\n</tool_call>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != "Je regarde." || len(calls) != 2 {
+		t.Fatalf("%q %+v", before, calls)
+	}
+	a := calls[0].Arguments
+	if calls[0].Name != "weather" || a["city"] != "Lyon" || a["days"] != 3.0 || a["note"] != "two\nlines" {
+		t.Fatalf("call %+v", calls[0])
+	}
+	if opts, ok := a["opts"].(map[string]any); !ok || opts["metric"] != true {
+		t.Fatalf("opts %+v", a["opts"])
+	}
+	if calls[1].Name != "now" || len(calls[1].Arguments) != 0 {
+		t.Fatalf("call %+v", calls[1])
+	}
+}
+
+func TestParseToolCallsRefusesAHalfTaggedCall(t *testing.T) {
+	for _, text := range []string{
+		"<tool_call>\n<function=weather>\n<parameter=city>\nLyon\n</function>\n</tool_call>",
+		"<tool_call>\n<function=weather>\nLyon\n</function>\n</tool_call>",
+		"<tool_call>\n<function=>\n</function>\n</tool_call>",
+	} {
+		if _, _, err := ParseToolCalls(text); err == nil {
+			t.Fatalf("read %q", text)
+		}
+	}
+}
