@@ -387,6 +387,41 @@ because `vk/shaders/matvec_h3g.comp` also carries two rows a lane, which halves
 the activation traffic past one column; `vk/hyb_bench_test.go` separates the two
 and most of the four-column gain is the rows, which T3G could have too.
 
+### H4G: the same at four bits
+
+A fifteen-bit state, eight bits a pair so every window starts on a byte, and
+4096 half2 pairs picked by bits 4..15 of s·(s+1). 128 weights in 67 bytes,
+T4G's size to the byte. The pair code starts further behind at four bits — a
+fourteen-bit state and 2048 pairs read 22.37 dB untrained against T4G's 22.82
+— and the wider state and table are what bring it past: trained, 23.41 dB.
+
+Same binary and salience against T4G, head and table in the pair tier:
+
+| | size | PPL | KL | top-1 | top-5 |
+|---|---|---|---|---|---|
+| Qwen3-0.6B T4G | 298.5 MiB | 30.3765 | 0.0800 | 84.2 % | 99.0 % |
+| Qwen3-0.6B H4G | 298.5 MiB | 30.8123 | **0.0758** | **84.7 %** | **99.1 %** |
+| Qwen3-4B T4G | 1.96 GiB | 19.9443 | 0.0541 | 89.8 % | **99.8 %** |
+| Qwen3-4B H4G | 1.96 GiB | 20.0749 | **0.0495** | **90.2 %** | 99.7 % |
+| Qwen3.8-27B T4G | 13.34 GiB | 9.4634 | 0.0248 | 92.5 % | **100.0 %** |
+| Qwen3.8-27B H4G | 13.34 GiB | **9.4605** | **0.0235** | **92.7 %** | 99.9 % |
+
+On the small models the perplexity goes T4G's way and the divergence H4G's,
+and neither perplexity gap passes the paired test: on 16352 tokens the 4B
+reads 15.8814 against 16.0025, t = 1.07, and the 0.6B 26.6709 against 27.0176,
+t = 1.81. On the 27B both go H4G's way.
+
+On the card the four-bit token is a wash — the weight is a larger share of it
+and the decode a smaller one — and the draft is not:
+
+| Qwen3.8-27B | T4G | H4G | Q4_0 |
+|---|---|---|---|
+| tokens a second | 33.4 | 33.5 | 34.1 |
+| `-draft-n 3`, prose | 46.3 | **56.3** | — |
+| `-draft-n 3`, code | 56.5 | **70.8** | — |
+
+T4G read at its best shape, as T3G above.
+
 ### Tail-biting: built, measured, and not taken
 
 The seven padding bits and the twelve priming bits are what a **tail-biting**
