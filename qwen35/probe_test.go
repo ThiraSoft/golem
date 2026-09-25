@@ -18,7 +18,12 @@ func hasNaN(v []float32) int {
 }
 
 // cpuTrunk runs the first n blocks on the CPU and returns the stream.
+//
+// It writes the cache without going through step, so it marks the cache used
+// itself: Cache.Reset clears nothing otherwise, and the next probe would start
+// from the delta nets' state this one left.
 func (m *Model) cpuTrunk(token int32, pos, blocks int) []float32 {
+	m.cache.used = true
 	m.W.TokenEmbd.Row(int(token), m.x)
 	for i := 0; i < blocks; i++ {
 		Block(m.Cfg, m.Cfg.Blocks[i], &m.W.Blocks[i], &m.cache.Blocks[i], m.rope, Place{Pos: pos, T: pos, H: pos, W: pos}, m.x, m.scratch)
@@ -27,6 +32,7 @@ func (m *Model) cpuTrunk(token int32, pos, blocks int) []float32 {
 }
 
 func (m *Model) cpuMixer(token int32, pos, block int) ([]float32, []float32) {
+	m.cache.used = true
 	m.W.TokenEmbd.Row(int(token), m.x)
 	for i := 0; i < block; i++ {
 		Block(m.Cfg, m.Cfg.Blocks[i], &m.W.Blocks[i], &m.cache.Blocks[i], m.rope, Place{Pos: pos, T: pos, H: pos, W: pos}, m.x, m.scratch)
