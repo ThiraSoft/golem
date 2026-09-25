@@ -9,6 +9,7 @@ package tensors
 import (
 	"encoding/binary"
 	"fmt"
+	"github.com/ThiraSoft/golem/internal/pairbook"
 	"math"
 	"sort"
 	"strings"
@@ -304,6 +305,15 @@ func golemBlockBytes(seq, state, k int) int {
 //   - a `golem.format` this build does not implement;
 //   - a declared geometry that disagrees with what this build codes, or that
 //     names a body tier no tensor in the file uses.
+// A pair tier's file carries its own codebook under golem.<type>.codebook and
+// is refused when it is not the one internal/pairbook holds for this build:
+// the table is trained, a retrained one is a different format under the same
+// type number, and a file decoded through the wrong table loads, reads every
+// tensor at the right size, and answers nonsense.
+
+// GolemCodebookKey is the metadata key a pair tier's codebook is written under.
+func GolemCodebookKey(dtype string) string { return "golem." + strings.ToLower(dtype) + ".codebook" }
+
 func (g *GGUF) checkGolemFile() error {
 	for key := range g.Meta {
 		if strings.HasPrefix(key, "golem.d4.") {
@@ -374,6 +384,37 @@ func (g *GGUF) checkGolemFile() error {
 	}
 	if !bodySeen {
 		return fmt.Errorf("gguf: golem.trellis.bits says the body is %d bits and no tensor in the file is that tier (%s)", bits, strings.Join(names, ", "))
+	}
+	for _, name := range names {
+		if _, pair := golemPairState[name]; !pair {
+			continue
+		}
+		if err := g.checkGolemCodebook(name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkGolemCodebook holds a pair tier's codebook in the file to this build's.
+func (g *GGUF) checkGolemCodebook(dtype string) error {
+	want := pairbook.Of(dtype)
+	if want == nil {
+		return fmt.Errorf("gguf: this build has no codebook for %s", dtype)
+	}
+	key := GolemCodebookKey(dtype)
+	v, ok := g.Meta[key]
+	if !ok {
+		return fmt.Errorf("gguf: %s tensors with no %s; the file has to be rebuilt with golemquant", dtype, key)
+	}
+	got, ok := v.([]any)
+	if !ok || len(got) != len(want) {
+		return fmt.Errorf("gguf: %s is not a table of %d half-precision numbers", key, len(want))
+	}
+	for i, e := range got {
+		if h, ok := e.(uint16); !ok || h != want[i] {
+			return fmt.Errorf("gguf: the file's %s codebook differs from this build's at entry %d; it was written with another table and would decode to nonsense", dtype, i/2)
+		}
 	}
 	return nil
 }

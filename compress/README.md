@@ -339,7 +339,7 @@ for T4G and 32m46 for T3G.
 ### H3G: two weights a state
 
 T3G's product spends nine tenths of its time cutting a twelve-bit window per
-weight and looking it up. H3G (`nn/h3g.go`) is QTIP's HYB code: a
+weight and looking it up. H3G (`nn/pair.go`) is QTIP's HYB code: a
 fourteen-bit state moves six bits a *pair*, s·(s+1) picks one of 2048 half2
 pairs, and one window and one read make two weights. The codebook was trained
 once by Lloyd's algorithm through the trellis on a unit Gaussian

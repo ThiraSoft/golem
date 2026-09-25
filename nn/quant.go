@@ -39,7 +39,7 @@ const (
 	PQ2_0
 	PTQ1_0
 	// H3G is the trellis at three bits a weight that decodes two weights a
-	// state: 128 weights in 51 bytes, 3.1875 each. nn/h3g.go describes it.
+	// state: 128 weights in 51 bytes, 3.1875 each. nn/pair.go describes it.
 	H3G
 	// H4G is the same at four bits a weight: 128 weights in 67 bytes, T4G's
 	// size.

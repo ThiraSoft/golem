@@ -3,6 +3,7 @@ package tensors
 import (
 	"bytes"
 	"encoding/binary"
+	"github.com/ThiraSoft/golem/internal/pairbook"
 	"os"
 	"path/filepath"
 	"strings"
@@ -169,5 +170,44 @@ func TestRetiredTypeNumbersSayToRebuild(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "rebuilt with golemquant") {
 		t.Fatalf("error is %v, which does not say to rebuild the file", err)
+	}
+}
+
+// A pair tier's file carries its codebook, and a file whose table is not this
+// build's is refused rather than decoded through the wrong one.
+func TestGolemPairCodebookGuard(t *testing.T) {
+	book := pairbook.H3G[:]
+	table := func(h ...uint16) []any {
+		out := make([]any, len(h))
+		for i, v := range h {
+			out[i] = v
+		}
+		return out
+	}
+	key := GolemCodebookKey("H3G")
+	for _, c := range []struct {
+		name  string
+		edits map[string]any
+		want  string
+	}{
+		{"the build's table", map[string]any{key: table(book...)}, ""},
+		{"no table", nil, "no " + key},
+		{"another table", map[string]any{key: table(append(append([]uint16{}, book[:2]...), append([]uint16{book[2] ^ 1}, book[3:]...)...)...)}, "differs from this build's at entry 1"},
+		{"a shorter table", map[string]any{key: table(book[:2]...)}, "is not a table"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			g, err := OpenGGUF(golemFixture(t, "H3G", c.edits))
+			if err == nil {
+				g.Close()
+			}
+			switch {
+			case c.want == "" && err != nil:
+				t.Fatalf("a well-formed file was refused: %v", err)
+			case c.want != "" && err == nil:
+				t.Fatalf("opened without complaint; expected an error naming %q", c.want)
+			case c.want != "" && !strings.Contains(err.Error(), c.want):
+				t.Fatalf("error is %v, expected one naming %q", err, c.want)
+			}
+		})
 	}
 }

@@ -1,5 +1,7 @@
 package nn
 
+import "github.com/ThiraSoft/golem/internal/pairbook"
+
 // H3G and H4G: the trellis with two weights a state, at three and four bits a
 // weight. 128 weights in 51 and 67 bytes.
 //
@@ -44,9 +46,12 @@ package nn
 // same for every tensor of every model. It was trained once, by Lloyd's
 // algorithm run through the trellis itself on a unit Gaussian — a path, then
 // every entry becomes the mean of the pairs it coded — and it lives in
-// nn/h3g_codebook.go; cmd/paircodebook is what wrote it. QTIP keeps a table of
+// internal/pairbook; cmd/paircodebook is what wrote it. QTIP keeps a table of
 // 512 pairs and a sign bit; a free table of 2048 measured the same and costs
 // the decoder one instruction less.
+//
+// A file carries the table it was written with, under golem.<tier>.codebook,
+// and tensors refuses one whose table is not this build's.
 
 // PairTier is one tier of the pair trellis: everything a reader, a writer and
 // an encoder need to agree on.
@@ -58,7 +63,11 @@ type PairTier struct {
 	Entries  int // pairs in the codebook
 	Shift    int // the entry is bits Shift.. of s·(s+1)
 	book     []float32
+	half     []uint16
 }
+
+// CodebookHalves is the codebook as the half-precision bits a file carries.
+func (p *PairTier) CodebookHalves() []uint16 { return p.half }
 
 const (
 	// H3GL, H3GK: H3G's state and rate.
@@ -78,7 +87,8 @@ func init() {
 	for _, t := range []struct {
 		tier *PairTier
 		half []uint16
-	}{{h3gTier, h3gCodebookHalf[:]}, {h4gTier, h4gCodebookHalf[:]}} {
+	}{{h3gTier, pairbook.H3G[:]}, {h4gTier, pairbook.H4G[:]}} {
+		t.tier.half = t.half
 		t.tier.book = make([]float32, len(t.half))
 		for i, h := range t.half {
 			t.tier.book[i] = halfToFloat(h)

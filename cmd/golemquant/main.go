@@ -697,6 +697,19 @@ func main() {
 	meta["golem.trellis.seq"] = uint32(nn.T4GSeq)
 	meta["golem.trellis.bits"] = uint32(*bodyBits)
 	meta["golem.trellis.state"] = uint32(nn.T4GL)
+	// Every pair tier the file uses carries the table it was written with.
+	for _, pl := range plans {
+		q, _ := nn.QuantOf(pl.dtype)
+		if p := nn.PairTierOf(q); p != nil {
+			if key := tensors.GolemCodebookKey(pl.dtype); meta[key] == nil {
+				table := make([]any, len(p.CodebookHalves()))
+				for i, h := range p.CodebookHalves() {
+					table[i] = h
+				}
+				meta[key] = table
+			}
+		}
+	}
 
 	must(checkVectors(out, rotatedBy))
 

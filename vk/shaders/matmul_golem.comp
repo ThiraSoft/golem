@@ -212,9 +212,10 @@ layout(push_constant) uniform Push {
 
 const uint SEQ   = 128u; // weights in one path
 const uint BLOCK = 64u;  // weights sharing one step
-// PAIRS is nn/h3g.go's pair trellis: a fourteen-bit state a pair of weights,
-// six bits apart, and a codebook of 2048 pairs read from binding 1 after the
-// step grid. The tile decodes a weight once for BN columns, so the table is
+// PAIRS is nn/pair.go's pair trellis: at KBITS 3 a fourteen-bit state a pair
+// of weights, six bits apart, and 2048 pairs (H3G); at 4 fifteen bits, eight
+// apart, and 4096 (H4G). The codebook is read from binding 1 after the step
+// grid. The tile decodes a weight once for BN columns, so the table is
 // read from memory rather than staged: its eight kibibytes stay in the cache.
 #ifndef PAIRS
 #define PAIRS 0
