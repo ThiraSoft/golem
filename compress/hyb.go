@@ -31,7 +31,7 @@ func (o PairOpts) Entry(s uint16) int { return nn.PairEntry(s, o.Shift, o.Entrie
 // PairOptsFor is the trellis a pair tier is written with.
 func PairOptsFor(q nn.Quant) PairOpts {
 	p := nn.PairTierOf(q)
-	return PairOpts{K: p.K, L: p.L, Seq: nn.T4GSeq, Shift: p.Shift, Entries: p.Entries}
+	return PairOpts{K: p.K, L: p.L, Seq: nn.GolemSeq, Shift: p.Shift, Entries: p.Entries}
 }
 
 type pairWork struct {
@@ -202,14 +202,14 @@ func TrainPairCodebook(src []float32, o PairOpts, book []float32, rounds int) []
 }
 
 // EncodePairs writes one matrix in a pair tier: the same site vector, rotation
-// and per-block normalisation as EncodeT4GAs, then the pair trellis, then each
+// and per-block normalisation as the one-weight trellis had, then the pair trellis, then each
 // block's step fitted by least squares to the path.
 func EncodePairs(w []float32, rows, cols int, q []float32, p GolemParams, kind nn.Quant) []byte {
 	tier := nn.PairTierOf(kind)
-	if cols%nn.T4GSeq != 0 {
+	if cols%nn.GolemSeq != 0 {
 		panic("compress: a pair-trellis row must be a multiple of 128 wide")
 	}
-	if p.ScaleBlock != 0 && p.ScaleBlock != nn.T4GBlock {
+	if p.ScaleBlock != 0 && p.ScaleBlock != nn.GolemBlock {
 		panic("compress: a pair-trellis block is 64 weights and its step is not negotiable")
 	}
 	n := rows * cols
@@ -220,15 +220,15 @@ func EncodePairs(w []float32, rows, cols int, q []float32, p GolemParams, kind n
 	states := make([]uint16, n/2)
 	QuantizePairsPath(norm, PairOptsFor(kind), tier.Codebook(), states)
 
-	nblk := n / nn.T4GBlock
+	nblk := n / nn.GolemBlock
 	steps := golemFitSteps(prep, norm, nblk)
 	Parallel(rows, func(lo, hi int) {
 		for r := lo; r < hi; r++ {
 			plane, codes := tier.Planes(out[r*rowBytes:(r+1)*rowBytes], cols)
-			copy(plane, steps[r*cols/nn.T4GBlock:(r+1)*cols/nn.T4GBlock])
-			for s := 0; s*nn.T4GSeq < cols; s++ {
-				at := (r*cols + s*nn.T4GSeq) / 2
-				tier.PutStates(codes[s*tier.SeqBytes:], states[at:at+nn.T4GSeq/2])
+			copy(plane, steps[r*cols/nn.GolemBlock:(r+1)*cols/nn.GolemBlock])
+			for s := 0; s*nn.GolemSeq < cols; s++ {
+				at := (r*cols + s*nn.GolemSeq) / 2
+				tier.PutStates(codes[s*tier.SeqBytes:], states[at:at+nn.GolemSeq/2])
 			}
 		}
 	})

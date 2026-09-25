@@ -4,13 +4,15 @@
 
 // Y = W * X for a golem matrix against a batch of float activations.
 //
-// shaders/matvec_t4g.comp is the same product one column at a time, and for a
-// token that is the right shape. It is the wrong shape for a prompt, and the
+// shaders/matvec_pair.comp is the same product a few columns at a time, and
+// for a token that is the right shape. It is the wrong shape for a prompt, and the
 // reason is not the one a K-quant kernel has. There, a wide pass amortizes the
 // weight traffic; here the weights are already four tenths of a byte and the
 // traffic was never the wall. What a golem weight costs is the *decode* — a
-// window cut out of a bit stream, a hash, a multiply — about five instructions,
-// and the mat-vec pays them once per column of the pass. At eight columns,
+// window cut out of a bit stream, a hash, a table read — and the mat-vec pays
+// it once per column of the pass. (These measurements are the retired
+// one-weight trellis's, which decoded a window a weight; the pair tiers
+// decode one a pair, and the tile's case only gets stronger.) At eight columns,
 // which is where GolemWidths stops, that is five instructions of decode against
 // eight of product, and the activation is read from memory once per weight per
 // column on top.
@@ -30,14 +32,13 @@
 // costs where a Q4_0 one costs two, and that is the price of a format that has
 // no bytes to stage.
 //
-// **The codebook's table is not here and that is deliberate.** matvec_t4g.comp
-// builds the hash's whole image in shared memory because a narrow pass hashes
-// every weight for every column. Here a weight is hashed once and spent BN
-// times, so the hash is already amortized by the tile and the table would be
-// sixteen kibibytes bought against the occupancy for nothing.
+// **The codebook is read from memory and not staged.** matvec_pair.comp
+// stages it in shared memory because a narrow pass reads it for every weight
+// and every column. Here a pair is read once and spent BN times, and its eight
+// or sixteen kibibytes stay in the cache.
 //
-// The activation is float and one column after another, exactly as
-// matvec_t4g.comp reads it, and it has already been through PrepareGolem: the
+// The activation is float and one column after another, exactly as the
+// mat-vec reads it, and it has already been through PrepareGolem: the
 // per-column vector and the rotation belong to the site and are undone on this
 // side.
 //
@@ -103,7 +104,7 @@
 //
 //   the activation's read from memory            23 %
 //   the window cut                                4 %
-//   the 1MAD hash                                 4 %
+//   the 1MAD hash (retired)                       4 %
 //   the weight tile's shared walk                 3 %
 //   the activation tile's shared walk             2 %
 //   the weight stream's read from memory           —
@@ -138,19 +139,17 @@
 #define COLUMNS 64
 #endif
 
-// The tier: three bits, four, or five. Only the geometry changes with it.
+// The tier: three bits (H3G) or four (H4G).
 #ifndef KBITS
 #define KBITS 4
 #endif
 
 // ABLATE removes one part of the product at a time so that a sweep can say what
-// that part costs, and is zero in every shipped binary. It is the same
-// instrument shaders/matvec_t4g.comp carries, and it exists because every
-// reading of this kernel so far that was reasoned rather than measured has been
-// wrong in one direction or the other.
+// that part costs, and is zero in every shipped binary. It exists because
+// every reading of this kernel so far that was reasoned rather than measured
+// has been wrong in one direction or the other. 1 and 2 cut the retired
+// one-weight decode and are gone with it.
 //
-//   1 the 1MAD hash, replaced by the window's own bits
-//   2 the window cut, replaced by twelve bits of the first word
 //   3 the activation's shared read, pinned to one index
 //   4 the activation's read from memory, replaced by a constant
 //   5 the weight stream's read from memory, replaced by the loop index
@@ -217,25 +216,12 @@ const uint BLOCK = 64u;  // weights sharing one step
 // apart, and 4096 (H4G). The codebook is read from binding 1 after the step
 // grid. The tile decodes a weight once for BN columns, so the table is
 // read from memory rather than staged: its eight kibibytes stay in the cache.
-#ifndef PAIRS
-#define PAIRS 0
-#endif
-
-#if PAIRS && KBITS == 4
+#if KBITS == 4
 const uint SEQB  = 65u;
 const uint HALFB = 32u;
-#elif PAIRS
+#else
 const uint SEQB  = 49u;
 const uint HALFB = 24u;
-#elif KBITS == 5
-const uint SEQB  = 81u;
-const uint HALFB = 40u;
-#elif KBITS == 3
-const uint SEQB  = 50u;
-const uint HALFB = 24u;
-#else
-const uint SEQB  = 65u;
-const uint HALFB = 32u;
 #endif
 
 // WPT is how many of a block's sixty-four weights one thread decodes, and
@@ -252,14 +238,10 @@ const uint HALFB = 32u;
 #define WLOADS  ((WITEMS + THREADS - 1) / THREADS)
 
 // SJ is how many words of realigned stream one thread's WPT weights lie in:
-// the last of them starts at bit (WPT-1)*KBITS and is twelve wide. One more
+// the last pair's window starts at bit (WPT/2-1)·2·KBITS and is PL wide. One more
 // word than that is read, because the realignment pairs word j with word j+1.
-#if PAIRS
 #define PL (KBITS == 4 ? 15 : 14)
 #define SJ (((WPT / 2 - 1) * 2 * KBITS + PL + 31) / 32)
-#else
-#define SJ (((WPT - 1) * KBITS + 12 + 31) / 32)
-#endif
 
 // VEC4 reads the staged tiles sixteen bytes at a time — one ds_read_b128 where
 // there are four scalar reads — which is the one axis that moves the ratio the
@@ -308,42 +290,16 @@ uint bswap(uint v) {
     return (v >> 24u) | ((v >> 8u) & 0xFF00u) | ((v << 8u) & 0xFF0000u) | (v << 24u);
 }
 
-// The 1MAD code of nn/t4g.go, hashed rather than looked up: see the header.
-float t4gHash(uint s) {
-    uint v = (((519u * s) & 0xFFFFu) << 16u) + (25297u * s + 76625530u);
-    uint sum = uint(dotPacked4x8EXT(v, 0x01010101u));
-    return (float(sum) - 510.0) * 0.00676589971;
-}
-
 // seqOf is the byte a block's stream starts at.
 uint seqOf(uint codeBase, uint b) {
     return codeBase + (b >> 1u) * SEQB + (b & 1u) * HALFB;
 }
 
-// The four places an ablation cuts in, spelled by the preprocessor and not by a
+// The places an ablation cuts in, spelled by the preprocessor and not by a
 // condition on a constant: ABLATE zero has to compile to the same binary as a
 // build with no ABLATE at all, and a ternary on a folded constant did not — the
 // SPIR-V came out different, which is enough to make the baseline a different
 // kernel from the one that ships.
-#if ABLATE == 1
-#define HASH(v) float(v)             // the 1MAD hash, gone
-#else
-#define HASH(v) t4gHash(v)
-#endif
-#if ABLATE == 2
-// Masked to twelve bits: the point is to drop the cut, not to index anything
-// out of range. It is confounded — a state that is the same for several weights
-// lets the compiler hash it once — and it bounds the cut from above.
-#define CUTV(v, s, wi, bi) v = (s)[0] & 0xFFFu;
-#else
-#define CUTV(v, s, wi, bi) \
-    if ((bi) <= 20u) { \
-        v = bitfieldExtract((s)[wi], int(20u - (bi)), 12); \
-    } else { \
-        v = (((s)[wi] << (bi)) | ((s)[(wi) + 1u] >> (32u - (bi)))) >> 20u; \
-    }
-#endif
-#if PAIRS
 #define DECODE \
         [[unroll]] for (uint n = 0u; n < uint(WPT) / 2u; n++) { \
             const uint o  = n * 2u * uint(KBITS); \
@@ -359,17 +315,7 @@ uint seqOf(uint codeBase, uint b) {
             WSTORE(r, q * uint(WPT) + 2u * n, steps[256u + 2u * e] * wstep[i]) \
             WSTORE(r, q * uint(WPT) + 2u * n + 1u, steps[257u + 2u * e] * wstep[i]) \
         }
-#else
-#define DECODE \
-        [[unroll]] for (uint n = 0u; n < uint(WPT); n++) { \
-            const uint o  = n * uint(KBITS); \
-            const uint wi = o >> 5u; \
-            const uint bi = o & 31u; \
-            uint v; \
-            CUTV(v, s, wi, bi) \
-            WSTORE(r, q * uint(WPT) + n, HASH(v) * wstep[i]) \
-        }
-#endif
+
 
 #if ABLATE == 3
 #define XK(k) 0u                     // the shared walk across the tile, gone

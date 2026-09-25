@@ -42,8 +42,8 @@ func Fp16round(x float32) float32 {
 
 // StepCodeRound rounds a block's scale onto the eight-bit grid a file stores it
 // on — powers of two a sixteenth apart — so that the bench pays for a scale
-// what the format pays. Which grid depends on the codec: nn/t4g.go's window
-// sits two octaves above nn/golem.go's, because a lattice step is a fraction of
+// what the format pays. Which grid depends on the codec: nn/golem_step.go's
+// window sits two octaves above the lattice's, because a lattice step is a fraction of
 // its block's RMS and a trellis step is the RMS itself.
 //
 // The grid is 4.4 % wide, against fp16's 0.05 %, and half a bit a block cheaper
@@ -58,13 +58,13 @@ func StepCodeRound(x float32, trellis bool) float32 {
 		return 0
 	}
 	if trellis {
-		return nn.T4GStep(nn.T4GStepCode(x))
+		return nn.GolemStep(nn.GolemStepCode(x))
 	}
-	c := nn.GolemStepCode(x)
+	c := nn.LatticeStepCode(x)
 	if c == 0 || c == 255 {
 		atomic.AddInt64(&stepClipped, 1)
 	}
-	return nn.GolemStep(c)
+	return nn.LatticeStep(c)
 }
 
 // stepClipped counts the blocks whose scale landed on an end of the lattice's
@@ -73,7 +73,7 @@ func StepCodeRound(x float32, trellis bool) float32 {
 var stepClipped int64
 
 // StepClipped is that count, and resets it.
-func StepClipped() int64 { return atomic.SwapInt64(&stepClipped, 0) + nn.T4GStepClipped.Swap(0) }
+func StepClipped() int64 { return atomic.SwapInt64(&stepClipped, 0) + nn.GolemStepClipped.Swap(0) }
 
 func Parallel(n int, fn func(lo, hi int)) {
 	// GOMAXPROCS and not NumCPU: they are the same until somebody sets the

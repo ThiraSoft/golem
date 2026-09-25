@@ -27,13 +27,13 @@ func TestGGUFRoundTrip(t *testing.T) {
 		"golem.scale_block":        uint32(64),
 		"golem.trellis.seq":        uint32(128),
 		"golem.trellis.bits":       uint32(4),
-		"golem.trellis.state":      uint32(12),
 		"general.quantization_ver": uint64(2),
 	}
+	meta[GolemCodebookKey("H4G")] = codebookMeta("H4G")
 	tensors := []OutTensor{
 		{Name: "output_norm.weight", Shape: []int{4}, DType: "F32",
 			Data: []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}},
-		{Name: "blk.0.attn_q.weight", Shape: []int{128, 2}, DType: "T4G",
+		{Name: "blk.0.attn_q.weight", Shape: []int{128, 2}, DType: "H4G",
 			Data: make([]byte, 2*67)},
 	}
 	for i := range tensors[1].Data {
@@ -83,8 +83,8 @@ func TestGGUFRoundTrip(t *testing.T) {
 }
 
 // TestGGUFRefusesLatticeEra checks the guard that catches the one tensor type a
-// D4G file and a T3G file cannot be told apart by size or type number alone:
-// both are 26 bytes per 64 weights. A file still carrying a golem.d4.* key must
+// D4G file and the retired T3G could not be told apart by size or type number
+// alone: both were 26 bytes per 64 weights. A file still carrying a golem.d4.* key must
 // fail to open rather than decode through the trellis as nonsense.
 func TestGGUFRefusesLatticeEra(t *testing.T) {
 	meta := map[string]any{
@@ -93,8 +93,8 @@ func TestGGUFRefusesLatticeEra(t *testing.T) {
 		"golem.d4.hadamard_group": uint32(128),
 	}
 	tensors := []OutTensor{
-		{Name: "blk.0.attn_q.weight", Shape: []int{128, 2}, DType: "T3G",
-			Data: make([]byte, 2*52)},
+		{Name: "blk.0.attn_q.weight", Shape: []int{128, 2}, DType: "H3G",
+			Data: make([]byte, 2*51)},
 	}
 	path := filepath.Join(t.TempDir(), "lattice-era.golem")
 	if err := WriteGGUF(path, meta, tensors); err != nil {
@@ -118,8 +118,8 @@ func TestGGUFRefusesLatticeEraEvenWithTrellisBits(t *testing.T) {
 		"golem.trellis.bits":      uint32(4),
 	}
 	tensors := []OutTensor{
-		{Name: "blk.0.attn_q.weight", Shape: []int{128, 2}, DType: "T3G",
-			Data: make([]byte, 2*52)},
+		{Name: "blk.0.attn_q.weight", Shape: []int{128, 2}, DType: "H3G",
+			Data: make([]byte, 2*51)},
 	}
 	path := filepath.Join(t.TempDir(), "transitional.golem")
 	if err := WriteGGUF(path, meta, tensors); err != nil {
@@ -140,11 +140,10 @@ func TestGGUFRefusesTrellisWithoutBits(t *testing.T) {
 		"general.alignment":    uint32(32),
 		"golem.format":         GolemFormat,
 		"golem.trellis.seq":    uint32(128),
-		"golem.trellis.state":  uint32(12),
 	}
 	tensors := []OutTensor{
-		{Name: "blk.0.attn_q.weight", Shape: []int{128, 2}, DType: "T3G",
-			Data: make([]byte, 2*52)},
+		{Name: "blk.0.attn_q.weight", Shape: []int{128, 2}, DType: "H3G",
+			Data: make([]byte, 2*51)},
 	}
 	path := filepath.Join(t.TempDir(), "no-bits.golem")
 	if err := WriteGGUF(path, meta, tensors); err != nil {

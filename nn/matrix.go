@@ -80,8 +80,6 @@ func (m Matrix) RowBytes() int {
 		return m.Cols / SuperBlock * q6_kBlockBytes
 	case Q8_0:
 		return m.Cols / QuantBlock * q8_0BlockBytes
-	case T3G, T4G, T5G:
-		return T4GRowBytesN(m.Cols, m.Quant)
 	case H3G, H4G:
 		return PairTierOf(m.Quant).RowBytes(m.Cols)
 	case PQ2_0:
@@ -202,8 +200,6 @@ func (m Matrix) rows(b *Batch, ys [][]float32, start, end int) {
 		// quantized gets zeros, which is the same contract every other
 		// quantized format here has always had.
 		matVecQ8_0Rows(m.Data, b, m.Cols, ys, start, end)
-	case T3G, T4G, T5G:
-		matVecT4GRows(m.Data, b, m.Cols, m.Quant, ys, start, end)
 	case H3G, H4G:
 		PairTierOf(m.Quant).matVecRows(m.Data, b, m.Cols, ys, start, end)
 	case PQ2_0:
@@ -283,9 +279,6 @@ func (m Matrix) Row(index int, out []float32) {
 		DequantizeQ3_K(row, m.Cols, out)
 	case Q4_K:
 		DequantizeQ4_K(row, m.Cols, out)
-	case T3G, T4G, T5G:
-		DequantizeT4GN(row, m.Cols, m.Quant, out)
-		m.unrotate(out)
 	case H3G, H4G:
 		PairTierOf(m.Quant).Dequantize(row, m.Cols, out)
 		m.unrotate(out)

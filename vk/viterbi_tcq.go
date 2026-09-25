@@ -17,11 +17,9 @@ package vk
 // same cost and not to the same path, so the bytes written have to be the ones
 // the card actually walked.
 //
-// The path comes back wide, one state a weight, and is packed into the file's
-// 520-bit sequences by nn.PutT4GStates — the same division of labour
-// vk/encode_golem.go makes, and for the same reason: a shader that packed
-// twelve-bit fields straddling words would cost more to write than the packing
-// costs to do on the processor.
+// The one-weight trellis this encodes is the research codec now: the file
+// tiers it wrote are retired, and vk/viterbi_hyb.go encodes the pair tiers
+// that replaced them. cmd/vqbuild and cmd/vqeval still reach it.
 
 import (
 	_ "embed"
@@ -201,7 +199,7 @@ func (e *TrellisEncoder) UseK(k int) error {
 }
 
 // QuantizePath is Quantize with the path kept: states holds one state a weight,
-// which is what nn.PutT4GStates writes into a file. The reconstruction is still
+// which is what the retired one-weight file tiers were written from. The reconstruction is still
 // written back over norm, because the converter needs it to fit each block's
 // step by least squares before it packs anything.
 func (e *TrellisEncoder) QuantizePath(norm []float32, gain float32, states []uint16) error {

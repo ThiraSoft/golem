@@ -626,7 +626,7 @@ func (d *Device) Upload(data []byte) (*Buffer, error) { return d.UploadTail(data
 //
 // A kernel that reads its weights a word at a time reads a whole word even for
 // the last byte it wants, and one that slides a window across a misaligned
-// stream reads the word after that as well. matvec_t4g.comp does both, so the
+// stream reads the word after that as well. matvec_pair.comp does both, so the
 // last block of the last row reaches a few bytes past the tensor. Those bytes
 // are multiplied by nothing — the loop that wants them has already stopped —
 // but they have to be inside the allocation, so the caller says how many.
@@ -634,7 +634,7 @@ func (d *Device) UploadTail(data []byte, tail int) (*Buffer, error) {
 	// Rounded up to a word. Every kernel here reads a storage buffer as uint[],
 	// so a tensor whose byte count is not a multiple of four would put its last
 	// bytes in a word past the end of the buffer — which most drivers answer
-	// with zeros and one answers with a fault. A T4G row is 67·n/128 bytes and
+	// with zeros and one answers with a fault. An H3G row is 51·n/128 bytes and
 	// is odd whenever the row is not a multiple of 512 wide, which a vision
 	// tower's 1152 is not.
 	size := ((len(data) + tail) + 3) &^ 3

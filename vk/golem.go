@@ -1,12 +1,12 @@
 package vk
 
-// The golem product on the card: a trellis, decoded without a codebook.
+// The golem product on the card: nn/pair.go's pair trellis.
 //
-// The weights go up once, as the file holds them. The step grid goes up once
-// too, for the whole device — 256 floats, one copy serving every matrix of
-// every model on the card. A code costs a window read, a multiply and a byte
-// sum, and what it saves is a third of the bytes a Q4_K row would have cost to
-// read.
+// The weights go up once, as the file holds them. The step grid and the
+// codebook go up once too, for the whole device and a tier — 256 floats, then
+// the codebook's pairs — one copy serving every matrix of every model on the
+// card. A state costs a window cut, a multiply, a bitfield extract and a
+// shared-memory read, and it makes two weights.
 //
 // The activation arrives already through PrepareGolem: the per-column vector
 // and the rotation belong to the site, not to the block, and both are undone on
@@ -17,62 +17,15 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"os"
-	"strconv"
-	"strings"
-	"sync"
 	"unsafe"
 
 	"github.com/ThiraSoft/golem/nn"
 )
 
-// The four widths of each tier are not four copies of one kernel: golemShapes
-// below says which workgroup and which decoder each of them is built with, and
-// TestGolemSweep is where those came from.
-// The four widths of each tier are not four copies of one kernel: golemShapes
-// below says which workgroup, which decoder and which read each of them is
-// built with, and TestGolemSweep is where those came from.
-// One binary a tier and a width. The workgroup, the decoder and the read-ahead
-// are specialization constants rather than defines, so the shape is chosen when
-// the pipeline is made — see GolemShapes.
-//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t4g.spv
-//go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t4g_2.spv
-//go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t4g_4.spv
-//go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t4g_8.spv
-
-//go:embed shaders/matvec_t4g.spv
-var matvecT4GSPIRV []byte
-
-//go:embed shaders/matvec_t4g_2.spv
-var matvecT4G2SPIRV []byte
-
-//go:embed shaders/matvec_t4g_4.spv
-var matvecT4G4SPIRV []byte
-
-//go:embed shaders/matvec_t4g_8.spv
-var matvecT4G8SPIRV []byte
-
-//go:generate glslc -O -DKBITS=3 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t3g.spv
-//go:generate glslc -O -DKBITS=3 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t3g_2.spv
-//go:generate glslc -O -DKBITS=3 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t3g_4.spv
-//go:generate glslc -O -DKBITS=3 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t3g_8.spv
-
-//go:embed shaders/matvec_t3g.spv
-var matvecT3GSPIRV []byte
-
-//go:embed shaders/matvec_t3g_2.spv
-var matvecT3G2SPIRV []byte
-
-//go:embed shaders/matvec_t3g_4.spv
-var matvecT3G4SPIRV []byte
-
-//go:embed shaders/matvec_t3g_8.spv
-var matvecT3G8SPIRV []byte
-
-//go:generate glslc -O -DCOLUMNS=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h3g_1.spv
-//go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h3g_2.spv
-//go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h3g_4.spv
-//go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h3g_8.spv
+//go:generate glslc -O -DCOLUMNS=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_pair.comp -o shaders/matvec_h3g_1.spv
+//go:generate glslc -O -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_pair.comp -o shaders/matvec_h3g_2.spv
+//go:generate glslc -O -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_pair.comp -o shaders/matvec_h3g_4.spv
+//go:generate glslc -O -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_pair.comp -o shaders/matvec_h3g_8.spv
 
 //go:embed shaders/matvec_h3g_1.spv
 var matvecH3G1SPIRV []byte
@@ -86,10 +39,10 @@ var matvecH3G4SPIRV []byte
 //go:embed shaders/matvec_h3g_8.spv
 var matvecH3G8SPIRV []byte
 
-//go:generate glslc -O -DKBITS=4 -DCOLUMNS=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h4g_1.spv
-//go:generate glslc -O -DKBITS=4 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h4g_2.spv
-//go:generate glslc -O -DKBITS=4 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h4g_4.spv
-//go:generate glslc -O -DKBITS=4 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h4g_8.spv
+//go:generate glslc -O -DKBITS=4 -DCOLUMNS=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_pair.comp -o shaders/matvec_h4g_1.spv
+//go:generate glslc -O -DKBITS=4 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_pair.comp -o shaders/matvec_h4g_2.spv
+//go:generate glslc -O -DKBITS=4 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_pair.comp -o shaders/matvec_h4g_4.spv
+//go:generate glslc -O -DKBITS=4 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_pair.comp -o shaders/matvec_h4g_8.spv
 
 //go:embed shaders/matvec_h4g_1.spv
 var matvecH4G1SPIRV []byte
@@ -103,204 +56,15 @@ var matvecH4G4SPIRV []byte
 //go:embed shaders/matvec_h4g_8.spv
 var matvecH4G8SPIRV []byte
 
-// h3gRowsPerGroup is matvec_h3g.comp's, at both of its tiers: 256 threads, sixteen lanes to a row
-// group and two rows a lane. It is not GolemShapes' business — that kernel has
-// no specialization constants — and it is the same at every width.
-const h3gRowsPerGroup = 32
-
-//go:generate glslc -O -DKBITS=5 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t5g.spv
-//go:generate glslc -O -DKBITS=5 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t5g_2.spv
-//go:generate glslc -O -DKBITS=5 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t5g_4.spv
-//go:generate glslc -O -DKBITS=5 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_t4g.comp -o shaders/matvec_t5g_8.spv
-
-//go:embed shaders/matvec_t5g.spv
-var matvecT5GSPIRV []byte
-
-//go:embed shaders/matvec_t5g_2.spv
-var matvecT5G2SPIRV []byte
-
-//go:embed shaders/matvec_t5g_4.spv
-var matvecT5G4SPIRV []byte
-
-//go:embed shaders/matvec_t5g_8.spv
-var matvecT5G8SPIRV []byte
+// golemRowsPerGroup is matvec_pair.comp's, at both tiers and every width: 256
+// threads, sixteen lanes to a row group and two rows a lane.
+const golemRowsPerGroup = 32
 
 type golemPush struct {
 	dim uint32 // outputs
 	ffn uint32 // inputs
 	col uint32 // the first column this dispatch answers
 }
-
-// GolemShape is how a pass width is built: the workgroup that answers it,
-// whether the codebook's image lives in that workgroup's shared memory or is
-// hashed again for every weight, and whether a block's stream is read one
-// iteration before it is decoded. All three are specialization constants of
-// vk/shaders/matvec_t4g.comp, so a shape costs a pipeline and not a binary.
-type GolemShape struct {
-	Threads  int  // the workgroup, eight lanes to a row
-	Table    bool // the codebook's image in shared memory, or the hash per weight
-	Prefetch bool // read the next block's stream while this one decodes
-	Copies   int  // copies of that image, one per group of lanes, against bank conflicts
-}
-
-// Spec is the three constants in the order the shader numbers them.
-func (s GolemShape) Spec() []uint32 {
-	b := func(v bool) uint32 {
-		if v {
-			return 1
-		}
-		return 0
-	}
-	copies := s.Copies
-	if copies < 1 {
-		copies = 1
-	}
-	return []uint32{uint32(s.Threads), b(s.Table), b(s.Prefetch), uint32(copies)}
-}
-
-func (s GolemShape) String() string {
-	copies := s.Copies
-	if copies < 1 {
-		copies = 1
-	}
-	return fmt.Sprintf("%d,%t,%t,%d", s.Threads, s.Table, s.Prefetch, copies)
-}
-
-// golemDefaultShapes is what cmd/golemtune measured on an RX 9070 XT (RADV,
-// RDNA4): every shape interleaved in one process, the order rotating between
-// rounds, the fastest of twelve, on a 9728x2560 product. Microseconds:
-//
-//	width  hash/128  hash/256  table/128  table/256  table/512  +prefetch 128/256/512
-//	    1      49.6      49.2       46.0      44.4       44.5     44.5 / 42.4 / 44.8
-//	    2      57.9      57.2       56.1      61.2       54.6     55.9 / 60.9 / 55.2
-//	    4      79.5      79.6       80.8      99.3       84.5     83.2 / 96.4 / 95.6
-//	    8     138.7     138.0      137.3     164.8      167.6    139.7 /187.4 /188.6
-//
-// A narrow pass decodes a weight for one activation and wants the table; a pass
-// of eight spends each decoded weight eight times, so the hash is already
-// amortized and all the table has left to offer is sixteen kibibytes against
-// the occupancy. The read-ahead is worth having only at one column, where the
-// wave has nothing else to wait behind.
-//
-// The workgroup is not one number either, and an earlier version of this table
-// said it was. Measured without rotating the order — which is worth three to
-// six per cent by itself, see vk/golem_bar_test.go — the two-column row came
-// out ten per cent wrong; four and eight are ties between 128 and 256 threads
-// that change places between runs, and take 256 for being the others' number.
-var golemDefaultShapes = map[int]GolemShape{
-	1: {Threads: 256, Table: true, Prefetch: true, Copies: 1},
-	2: {Threads: 512, Table: true, Prefetch: false, Copies: 1},
-	4: {Threads: 256, Table: false, Prefetch: false, Copies: 1},
-	8: {Threads: 256, Table: false, Prefetch: false, Copies: 1},
-}
-
-// The shape of the trade above follows from the pass width and would come out
-// the same way on any card. Where the crossing falls, and which workgroup wins,
-// is the card's and the matrix's answer together, so none of it is compiled in:
-// run cmd/golemtune — at the geometry of a matrix the model actually has, with
-// -rows and -cols — and set GOLEM_MATVEC_SHAPE to what it prints. Every shape
-// answers the same numbers whatever is fastest, and TestGolemBuildsAgree holds
-// them to it.
-//
-// And read what it prints as a candidate rather than an answer. golemtune times
-// one matrix in a loop, where a model reads sixty of them with everything else
-// a block does between; the two disagree, and they disagree in both directions.
-// Measured on Qwen3.8-27B in t3g, at its own 17408x5120 geometry, against
-// qwen35's TestVulkanWidthCost which times the same shapes inside a pass:
-//
-//	width  golemtune says   in a pass   what a pass measured
-//	    1  256,true,true    prefetch off      27.7 -> 27.1 ms
-//	    2  512,true,true    256,true,false    31.8 -> 30.2 ms
-//
-// The table above is Qwen3-4B's and the 4B still wants what it says — its t4g
-// draws at 75.6 tokens a second with the read-ahead and 76.9 without, which is
-// inside the noise, and the fastest single pass of either belongs to the
-// read-ahead. So the compiled default stays the 4B's and the 27B is a
-// GOLEM_MATVEC_SHAPE away, which is what the setting is for. What is worth
-// carrying away is that an isolated timing is a hypothesis: it has been wrong
-// about the mat-vec's shape, about the K-quant kernel's, and about this.
-
-// GolemShapes is the shape each pass width is built with. It is
-// golemDefaultShapes unless GOLEM_MATVEC_SHAPE says otherwise, in the form
-// cmd/golemtune prints: "1:256,true,true 2:128,true,true 4:128,true,false
-// 8:256,false,false", widths it does not name keeping their default.
-//
-// A malformed setting is a mistake worth hearing about rather than working
-// around, so it is reported once on the standard error and then ignored.
-func GolemShapes() map[int]GolemShape {
-	golemShapesOnce.Do(func() {
-		golemShapes = map[int]GolemShape{}
-		for w, s := range golemDefaultShapes {
-			golemShapes[w] = s
-		}
-		spec := os.Getenv("GOLEM_MATVEC_SHAPE")
-		if spec == "" {
-			return
-		}
-		for _, field := range strings.Fields(spec) {
-			w, s, err := parseGolemShape(field)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "vk: GOLEM_MATVEC_SHAPE %q: %v\n", field, err)
-				continue
-			}
-			golemShapes[w] = s
-		}
-	})
-	return golemShapes
-}
-
-var (
-	golemShapesOnce sync.Once
-	golemShapes     map[int]GolemShape
-)
-
-// parseGolemShape reads one "width:threads,table,prefetch" field.
-func parseGolemShape(field string) (int, GolemShape, error) {
-	width, rest, ok := strings.Cut(field, ":")
-	if !ok {
-		return 0, GolemShape{}, fmt.Errorf("want width:threads,table,prefetch")
-	}
-	w, err := strconv.Atoi(width)
-	if err != nil {
-		return 0, GolemShape{}, fmt.Errorf("width: %w", err)
-	}
-	if _, ok := golemDefaultShapes[w]; !ok {
-		return 0, GolemShape{}, fmt.Errorf("there is no pass of %d columns", w)
-	}
-	parts := strings.Split(rest, ",")
-	if len(parts) != 3 && len(parts) != 4 {
-		return 0, GolemShape{}, fmt.Errorf("want threads,table,prefetch[,copies]")
-	}
-	var s GolemShape
-	if s.Threads, err = strconv.Atoi(parts[0]); err != nil {
-		return 0, GolemShape{}, fmt.Errorf("threads: %w", err)
-	}
-	// Eight lanes to a row, and a workgroup the card will take.
-	if s.Threads%8 != 0 || s.Threads < 8 || s.Threads > 1024 {
-		return 0, GolemShape{}, fmt.Errorf("threads: %d is not eight lanes a row up to 1024", s.Threads)
-	}
-	if s.Table, err = strconv.ParseBool(parts[1]); err != nil {
-		return 0, GolemShape{}, fmt.Errorf("table: %w", err)
-	}
-	if s.Prefetch, err = strconv.ParseBool(parts[2]); err != nil {
-		return 0, GolemShape{}, fmt.Errorf("prefetch: %w", err)
-	}
-	s.Copies = 1
-	if len(parts) == 4 {
-		if s.Copies, err = strconv.Atoi(parts[3]); err != nil {
-			return 0, GolemShape{}, fmt.Errorf("copies: %w", err)
-		}
-		// Sixteen kibibytes a copy, and a workgroup has sixty-four.
-		if s.Copies < 1 || s.Copies > 4 {
-			return 0, GolemShape{}, fmt.Errorf("copies: %d is not one to four", s.Copies)
-		}
-	}
-	return w, s, nil
-}
-
-// golemRowsPerGroup is the shader's OUTS for a pass of that width: eight lanes
-// to a row, so a workgroup answers an eighth of itself.
-func golemRowsPerGroup(columns int) int { return GolemShapes()[columns].Threads / 8 }
 
 // golemReadTail is how far past a tensor the kernel's last block reaches: it
 // reads a block's stream as words and slides the window across the one after
@@ -342,13 +106,7 @@ func NewGolemKernels(d *Device, q nn.Quant) (*GolemKernels, error) {
 		return nil, err
 	}
 	for _, columns := range GolemWidths {
-		var p *Pipeline
-		var err error
-		if nn.PairTierOf(q) != nil {
-			p, err = d.NewPipeline(spirv[columns], 4, golemPushSize)
-		} else {
-			p, err = d.NewPipelineSpec(spirv[columns], 4, golemPushSize, GolemShapes()[columns].Spec())
-		}
+		p, err := d.NewPipeline(spirv[columns], 4, golemPushSize)
 		if err != nil {
 			k.Close()
 			return nil, err
@@ -375,12 +133,6 @@ func NewGolemKernels(d *Device, q nn.Quant) (*GolemKernels, error) {
 
 func golemSPIRV(q nn.Quant) (map[int][]byte, bool) {
 	switch q {
-	case nn.T3G:
-		return map[int][]byte{1: matvecT3GSPIRV, 2: matvecT3G2SPIRV, 4: matvecT3G4SPIRV, 8: matvecT3G8SPIRV}, true
-	case nn.T4G:
-		return map[int][]byte{1: matvecT4GSPIRV, 2: matvecT4G2SPIRV, 4: matvecT4G4SPIRV, 8: matvecT4G8SPIRV}, true
-	case nn.T5G:
-		return map[int][]byte{1: matvecT5GSPIRV, 2: matvecT5G2SPIRV, 4: matvecT5G4SPIRV, 8: matvecT5G8SPIRV}, true
 	case nn.H3G:
 		return map[int][]byte{1: matvecH3G1SPIRV, 2: matvecH3G2SPIRV, 4: matvecH3G4SPIRV, 8: matvecH3G8SPIRV}, true
 	case nn.H4G:
@@ -402,21 +154,14 @@ func golemTableFor(q nn.Quant) []byte {
 }
 
 // RowsPerGroup is how many rows a workgroup of a pass that wide answers.
-func (k *GolemKernels) RowsPerGroup(columns int) int {
-	if nn.PairTierOf(k.q) != nil {
-		return h3gRowsPerGroup
-	}
-	return golemRowsPerGroup(columns)
-}
+func (k *GolemKernels) RowsPerGroup(columns int) int { return golemRowsPerGroup }
 
-// golemTable is what the second binding holds: the step grid, 256 floats, the
-// only table the card is handed. The codebook is not in it: the trellis decodes
-// by arithmetic, and vk/shaders/matvec_t4g.comp builds the image of that
-// arithmetic in its own shared memory once a workgroup.
+// golemTable is the head of what the second binding holds: the step grid, 256
+// floats. golemTableFor puts the tier's codebook after it.
 func golemTable() []byte {
 	out := make([]byte, 256*4)
 	for c := 0; c < 256; c++ {
-		binary.LittleEndian.PutUint32(out[c*4:], math.Float32bits(nn.T4GStep(byte(c))))
+		binary.LittleEndian.PutUint32(out[c*4:], math.Float32bits(nn.GolemStep(byte(c))))
 	}
 	return out
 }
@@ -464,7 +209,7 @@ type GolemMatrix struct {
 func NewGolemMatrixOn(k *GolemKernels, data []byte, rows, cols int, act, out *Buffer) (*GolemMatrix, error) {
 	// A path is the unit, not a block: a row that held half of one would have a
 	// step with no codes under it.
-	unit := nn.T4GSeq
+	unit := nn.GolemSeq
 	if cols%unit != 0 {
 		return nil, fmt.Errorf("vk: a %s row needs a multiple of %d columns, given %d", k.q, unit, cols)
 	}

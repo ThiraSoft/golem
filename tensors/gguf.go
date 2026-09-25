@@ -213,9 +213,10 @@ func (g *GGUF) readHeader() error {
 // checkGolemFile, which is what actually decides that a file is a golem file.
 const (
 	golemTypeBase uint32 = 0x676C6D00 // "glm\0"
-	golemT3G      uint32 = golemTypeBase | 3
-	golemT4G      uint32 = golemTypeBase | 4
-	golemT5G      uint32 = golemTypeBase | 5
+	// 0x676C6D03 to 05 were T3G, T4G and T5G, the one-weight trellis, retired
+	// on 2026-09-25 for the pair tiers below and never reused.
+	golemRetiredLo uint32 = golemTypeBase | 3
+	golemRetiredHi uint32 = golemTypeBase | 5
 	// golemH3G is the pair trellis at three bits. The low byte keeps the bits a
 	// weight in its low nibble; the high bit of it says two weights a state.
 	golemH3G uint32 = golemTypeBase | 0x80 | 3
@@ -247,9 +248,6 @@ var ggmlTypes = map[uint32]string{
 	14: "Q6_K",
 	30: "BF16",
 	// golem's own, which llama.cpp will not recognise and is not meant to.
-	golemT3G: "T3G",
-	golemT4G: "T4G",
-	golemT5G: "T5G",
 	golemH3G: "H3G",
 	golemH4G: "H4G",
 	142:      "PQ2_0",
@@ -270,17 +268,16 @@ var ggmlTypes = map[uint32]string{
 // TestGolemBlockGeometryMatchesNN is the join that holds the two equal.
 const (
 	golemSeq        = 128 // weights coded as one trellis path
-	golemState      = 12  // bits of state the path carries
 	golemScaleBlock = 64  // weights under one step code, a byte each
 )
 
 // golemTierBits is the bits a weight each private type codes at, which is by
 // construction the low byte of its type number.
-var golemTierBits = map[string]int{"T3G": 3, "T4G": 4, "T5G": 5, "H3G": 3, "H4G": 4}
+var golemTierBits = map[string]int{"H3G": 3, "H4G": 4}
 
-// golemPairState is the state of each pair tier, which is its own and not
-// golem.trellis.state: that key describes the one-weight tiers a file's head
-// is still written in, and a pair tier's state is fixed by its type.
+// golemPairState is the state of each pair tier, fixed by its type. A file
+// written while the one-weight tiers still existed also carries
+// golem.trellis.state, their twelve bits, which is no longer read.
 var golemPairState = map[string]int{"H3G": 14, "H4G": 15}
 
 // golemBlockBytes is what a block of seq weights occupies at k bits each with
@@ -345,14 +342,6 @@ func (g *GGUF) checkGolemFile() error {
 	if int(seq) != golemSeq {
 		return fmt.Errorf("gguf: the file codes %d weights as one path and this build codes %d", seq, golemSeq)
 	}
-	state, err := g.Uint32("golem.trellis.state")
-	if err != nil {
-		return fmt.Errorf("gguf: %s file with no golem.trellis.state: %w", format, err)
-	}
-	if int(state) != golemState {
-		return fmt.Errorf("gguf: the file carries %d bits of trellis state and this build carries %d", state, golemState)
-	}
-
 	bits, err := g.Uint32("golem.trellis.bits")
 	if err != nil {
 		return fmt.Errorf("gguf: %s file with no golem.trellis.bits to say which tier the body is: %w", format, err)
@@ -372,12 +361,10 @@ func (g *GGUF) checkGolemFile() error {
 		// claims. Both sides are already pinned above, so this only fires when
 		// blockGeometry drifts from the arithmetic that produced it — which is
 		// the failure that reads every row at the wrong offset.
-		st, got := int(state), golemBlockBytes(int(seq), int(state), k)
-		if ps, ok := golemPairState[name]; ok {
-			// L + 63·2k is 127·k + (L−k): the pair path is the one-weight
-			// arithmetic with L−k bits standing in for the state.
-			st, got = ps, golemBlockBytes(int(seq), ps-k, k)
-		}
+		// L + 63·2k is 127·k + (L−k): a pair path is the one-weight
+		// arithmetic with L−k bits standing in for the state.
+		st := golemPairState[name]
+		got := golemBlockBytes(int(seq), st-k, k)
 		if want := blockGeometry[name][1]; want != got {
 			return fmt.Errorf("gguf: %s reads %d bytes a block and a %d-weight path of %d bits with %d of state is %d", name, want, seq, k, st, got)
 		}
@@ -386,9 +373,6 @@ func (g *GGUF) checkGolemFile() error {
 		return fmt.Errorf("gguf: golem.trellis.bits says the body is %d bits and no tensor in the file is that tier (%s)", bits, strings.Join(names, ", "))
 	}
 	for _, name := range names {
-		if _, pair := golemPairState[name]; !pair {
-			continue
-		}
 		if err := g.checkGolemCodebook(name); err != nil {
 			return err
 		}
@@ -433,9 +417,6 @@ var blockGeometry = map[string][2]int{
 	"Q4_K":   {256, 144}, // 2 fp16 (d, dmin) + 12 scales + 128 nibbles
 	"Q5_K":   {256, 176}, // 2 fp16 (d, dmin) + 12 scales + 32 high bits + 128 nibbles
 	"Q6_K":   {256, 210}, // 128 low nibbles, 64 high pairs, 16 scales, one fp16
-	"T3G":    {128, 52},  // two step codes, then a 393-bit path in 400
-	"T4G":    {128, 67},  // two step codes, then a 520-bit trellis path
-	"T5G":    {128, 83},  // the same at five bits a weight, 648 of them
 	"H3G":    {128, 51},  // two step codes, then a 392-bit path of 64 pairs
 	"H4G":    {128, 67},  // two step codes, then a 519-bit path of 64 pairs in 520
 	"PQ2_0":  {128, 34},  // one fp16 scale, then 32 packed two-bit quants
@@ -491,6 +472,9 @@ func (g *GGUF) readTensorTable(r *reader, count uint64) error {
 			// reader to look for a missing decoder rather than to rebuild.
 			if kind >= 1000 && kind <= 1004 {
 				return fmt.Errorf("tensor %q: ggml type %d is one of golem's retired numbers; this file predates the move to %#x and has to be rebuilt with golemquant", name, kind, golemTypeBase)
+			}
+			if kind >= golemRetiredLo && kind <= golemRetiredHi {
+				return fmt.Errorf("tensor %q: %#x is T%dG, the one-weight trellis, which is retired; the file has to be rebuilt with golemquant, which writes H3G or H4G", name, kind, kind&0xFF)
 			}
 			if kind>>8 == golemTypeBase>>8 {
 				return fmt.Errorf("tensor %q: %#x is a golem type at %d bits a weight, which this build does not implement", name, kind, kind&0xFF)

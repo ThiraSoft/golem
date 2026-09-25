@@ -1,14 +1,14 @@
 package vk
 
 // SetEmbeddingGolem's shader reads a row a genuinely different way from the
-// matvec kernels t4g_test.go already holds exact: instead of a dot product it
+// matvec kernels pair_kernels_test.go already holds exact: instead of a dot product it
 // runs the rotation forward once (its own inverse) and multiplies by the
 // site's vector, producing one token's embedding rather than one output of a
 // product. Nothing exercised that path before this test — the only assurance
 // it had was that two end-to-end runs produced sane text, which is a
 // measurement, not a test.
 //
-// This follows t4g_test.go's shape: dispatch the shader directly, without
+// This follows pair_kernels_test.go's shape: dispatch the shader directly, without
 // going through a Stack, and compare it exactly against nn.Matrix.Row, which
 // takes the same table through the same rotation and vector on the CPU.
 
@@ -20,7 +20,7 @@ import (
 )
 
 func TestEmbedGolemMatchesCPU(t *testing.T) {
-	for _, kind := range []nn.Quant{nn.T3G, nn.T4G, nn.T5G, nn.H3G, nn.H4G} {
+	for _, kind := range []nn.Quant{nn.H3G, nn.H4G} {
 		t.Run(kind.String(), func(t *testing.T) {
 			testEmbedGolemMatchesCPU(t, kind)
 		})
@@ -32,7 +32,7 @@ func testEmbedGolemMatchesCPU(t *testing.T, kind nn.Quant) {
 	d := open(t)
 	defer d.Close()
 
-	data, q := t4gMatrixAs(t, rows, cols, kind)
+	data, q := golemMatrixAs(t, rows, cols, kind)
 	pre := make([]float32, cols)
 	for j := range pre {
 		pre[j] = 1 / q[j]
@@ -43,12 +43,6 @@ func testEmbedGolemMatchesCPU(t *testing.T, kind nn.Quant) {
 
 	var spirv []byte
 	switch kind {
-	case nn.T3G:
-		spirv = embedT3GSPIRV
-	case nn.T4G:
-		spirv = embedT4GSPIRV
-	case nn.T5G:
-		spirv = embedT5GSPIRV
 	case nn.H3G:
 		spirv = embedH3GSPIRV
 	case nn.H4G:

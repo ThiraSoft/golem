@@ -11,14 +11,15 @@
 // A state is the fourteen bits at 6t; s·(s+1) picks one of 2048 pairs out of
 // the codebook, which sits in shared memory as half2, eight kibibytes. So one
 // window, one multiply, one bitfield extract and one shared read make two
-// weights, where matvec_t4g.comp spends a window and a read on each.
+// weights, where the retired one-weight trellis spent a window and a read on
+// each.
 //
 // And every lane carries ROWS rows. Past one column what a mat-vec spends is
 // not the weights, three eighths of a byte each, but the activations, four
 // bytes each a column and read again for every row the workgroup answers; a
 // lane that loads a block of them once and spends it on two rows halves that.
-// Measured on Qwen3.8-27B's two shapes against T3G's kernel, vk/hyb_bench_test.go,
-// microseconds, each matrix several times over so none of it sits in the
+// Measured on Qwen3.8-27B's two shapes against the retired T3G's kernel,
+// interleaved (the bench went with T3G; git history has it), microseconds, each matrix several times over so none of it sits in the
 // Infinity Cache:
 //
 //	                 17408x5120          5120x17408

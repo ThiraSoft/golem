@@ -38,14 +38,14 @@ func TestPerRowGainIsNotWorthCarrying(t *testing.T) {
 	for i, v := range q {
 		inv[i] = 1 / v
 	}
-	p := GolemParams{ScaleBlock: nn.T4GBlock, HadGroup: 128}
-	data := EncodeT4GAs(w, rows, cols, q, p, nn.T4G)
+	p := GolemParams{ScaleBlock: nn.GolemBlock, HadGroup: 128}
+	data := EncodeGolem(w, rows, cols, q, p, nn.H4G)
 
 	xr := cloneRows(x)
 	for _, r := range xr {
 		nn.PrepareGolem(r, inv, 128)
 	}
-	m := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols}
+	m := nn.Matrix{Data: data, Quant: nn.H4G, Rows: rows, Cols: cols}
 	rec := make([]float32, cols)
 	var plain, gained, den float64
 	var sumG, sumG2 float64

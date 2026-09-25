@@ -17,14 +17,14 @@ import (
 func golemFixture(t *testing.T, dtype string, edits map[string]any) string {
 	t.Helper()
 	meta := map[string]any{
-		"general.architecture": "qwen3",
-		"general.alignment":    uint32(32),
-		"golem.format":         GolemFormat,
-		"golem.hadamard_group": uint32(128),
-		"golem.scale_block":    uint32(64),
-		"golem.trellis.seq":    uint32(golemSeq),
-		"golem.trellis.bits":   uint32(golemTierBits[dtype]),
-		"golem.trellis.state":  uint32(golemState),
+		"general.architecture":  "qwen3",
+		"general.alignment":     uint32(32),
+		"golem.format":          GolemFormat,
+		"golem.hadamard_group":  uint32(128),
+		"golem.scale_block":     uint32(64),
+		"golem.trellis.seq":     uint32(golemSeq),
+		"golem.trellis.bits":    uint32(golemTierBits[dtype]),
+		GolemCodebookKey(dtype): codebookMeta(dtype),
 	}
 	for k, v := range edits {
 		if v == nil {
@@ -54,22 +54,19 @@ func TestGolemFileGuards(t *testing.T) {
 		edits map[string]any
 		want  string // a fragment of the error, so the message stays diagnostic
 	}{
-		{"a valid file", "T3G", nil, ""},
-		{"a valid four-bit file", "T4G", nil, ""},
-		{"a valid five-bit file", "T5G", nil, ""},
-		{"no golem.format at all", "T3G",
+		{"a valid file", "H3G", nil, ""},
+		{"a valid four-bit file", "H4G", nil, ""},
+		{"no golem.format at all", "H3G",
 			map[string]any{"golem.format": nil}, "no golem.format"},
-		{"a golem.format from another codec", "T3G",
+		{"a golem.format from another codec", "H3G",
 			map[string]any{"golem.format": "lattice/1"}, `is "lattice/1"`},
-		{"a golem.format from a later layout", "T3G",
+		{"a golem.format from a later layout", "H3G",
 			map[string]any{"golem.format": "trellis/2"}, `is "trellis/2"`},
-		{"a sequence length this build does not code", "T3G",
+		{"a sequence length this build does not code", "H3G",
 			map[string]any{"golem.trellis.seq": uint32(96)}, "96 weights as one path"},
-		{"a state width this build does not carry", "T3G",
-			map[string]any{"golem.trellis.state": uint32(10)}, "10 bits of trellis state"},
-		{"a body tier no tensor in the file is", "T3G",
-			map[string]any{"golem.trellis.bits": uint32(5)}, "no tensor in the file is that tier"},
-		{"a lattice-era key", "T3G",
+		{"a body tier no tensor in the file is", "H3G",
+			map[string]any{"golem.trellis.bits": uint32(4)}, "no tensor in the file is that tier"},
+		{"a lattice-era key", "H3G",
 			map[string]any{"golem.d4.hadamard_group": uint32(128)}, "lattice-era converter"},
 	}
 	for _, c := range cases {
@@ -146,13 +143,13 @@ func TestGolemTypeNumbersSpellThemselves(t *testing.T) {
 // The reader has to say so: "unsupported ggml type 1000" sends whoever reads
 // it looking for a missing decoder, when the answer is to rebuild the file.
 func TestRetiredTypeNumbersSayToRebuild(t *testing.T) {
-	path := golemFixture(t, "T3G", nil)
+	path := golemFixture(t, "H3G", nil)
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var was, now [4]byte
-	binary.LittleEndian.PutUint32(was[:], golemT3G)
+	binary.LittleEndian.PutUint32(was[:], golemH3G)
 	binary.LittleEndian.PutUint32(now[:], 1000)
 	i := bytes.Index(b, was[:])
 	if i < 0 {
@@ -191,7 +188,7 @@ func TestGolemPairCodebookGuard(t *testing.T) {
 		want  string
 	}{
 		{"the build's table", map[string]any{key: table(book...)}, ""},
-		{"no table", nil, "no " + key},
+		{"no table", map[string]any{key: nil}, "no " + key},
 		{"another table", map[string]any{key: table(append(append([]uint16{}, book[:2]...), append([]uint16{book[2] ^ 1}, book[3:]...)...)...)}, "differs from this build's at entry 1"},
 		{"a shorter table", map[string]any{key: table(book[:2]...)}, "is not a table"},
 	} {
@@ -209,5 +206,45 @@ func TestGolemPairCodebookGuard(t *testing.T) {
 				t.Fatalf("error is %v, expected one naming %q", err, c.want)
 			}
 		})
+	}
+}
+
+// codebookMeta is a pair tier's codebook as golemquant writes it.
+func codebookMeta(dtype string) []any {
+	book := pairbook.Of(dtype)
+	out := make([]any, len(book))
+	for i, h := range book {
+		out[i] = h
+	}
+	return out
+}
+
+// A file of the retired one-weight tiers says to rebuild, not that a decoder
+// is missing.
+func TestRetiredTrellisTiersSayToRebuild(t *testing.T) {
+	path := golemFixture(t, "H3G", nil)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var was, now [4]byte
+	binary.LittleEndian.PutUint32(was[:], golemH3G)
+	binary.LittleEndian.PutUint32(now[:], golemRetiredLo)
+	i := bytes.Index(b, was[:])
+	if i < 0 {
+		t.Fatal("the fixture does not carry the type number it was written with")
+	}
+	copy(b[i:], now[:])
+	retired := filepath.Join(t.TempDir(), "t3g.golem")
+	if err := os.WriteFile(retired, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g, err := OpenGGUF(retired)
+	if err == nil {
+		g.Close()
+		t.Fatal("a T3G file opened without complaint")
+	}
+	if !strings.Contains(err.Error(), "retired") || !strings.Contains(err.Error(), "rebuilt with golemquant") {
+		t.Fatalf("error is %v, which does not say the tier is retired and to rebuild", err)
 	}
 }

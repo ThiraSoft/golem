@@ -184,17 +184,17 @@ golem reads GGUF like everyone else. It also writes `.golem`, which trades speed
 | --- | --- | --- | --- | --- |
 | bf16 | 7.5 GiB | 19.29 | | |
 | Q4_K_M | 2.33 GiB | 20.04 | 0.0715 | 90.1 % |
-| **`.golem` T4G** | **1.96 GiB** | 20.38 | **0.0526** | **90.6 %** |
+| **`.golem` H4G** | **1.96 GiB** | 20.07 | **0.0495** | **90.2 %** |
 | Q3_K_M | 1.93 GiB | 24.03 | 0.2453 | 79.8 % |
-| **`.golem` T3G** | **1.57 GiB** | **21.11** | **0.1771** | **83.1 %** |
+| **`.golem` H3G** | **1.54 GiB** | **21.67** | **0.1715** | **84.6 %** |
 
-T3G is 18 % smaller than Q3_K_M and ahead of it on every column. The codebook is a state machine rather than a table, so a weight is twelve bits of a code stream put through four instructions and there is nothing to look up.
+H3G is 20 % smaller than Q3_K_M and ahead of it on every column. A weight is a path through a trellis found by Viterbi, QTIP's scheme: a window of the code stream is hashed into a small trained table, and each window gives two weights.
 
 ```bash
 golemquant -model Qwen3-4B-BF16.gguf -out Qwen3-4B.golem -bits 3 -calib wiki.txt
 ```
 
-**The cost is generation speed, and it is not small:** 82.5 tokens a second against Q4_0's 130.4 on the same card, because a trellis weight is decoded one at a time where a nibble format decodes eight per instruction. Prompts are unaffected since a tiled product decodes each weight once for a whole tile. The trade is worth taking when memory is what is short and not otherwise. [`compress/README.md`](compress/README.md) has the method, the thirteen things that were tried to close the speed gap, and the eleven that made it worse.
+On Qwen3.8-27B, which is the model the format is for, H3G is 10.46 GiB and closer to bf16 than Q3_K_M (KL 0.0660), and it generates at 39.2 tokens a second against Q4_0's 34.1 on the same card, 59.8 to 66.7 drafting. H4G is 13.34 GiB, KL 0.0235 from bf16, 33.5 tokens a second and 56.3 to 70.8 drafting. [`compress/README.md`](compress/README.md) has the method, the measurements, and the one-weight trellis these two replaced.
 
 ## How it is known to be right
 
@@ -214,7 +214,7 @@ Judge it the way you would judge any dependency you did not write: run the tests
 
 ## Project structure
 
-- `cmd/golem-cli`, `cmd/golem-server`, `cmd/pocket-tts`, `cmd/golemquant`, `cmd/golemtune` are the commands.
+- `cmd/golem-cli`, `cmd/golem-server`, `cmd/pocket-tts`, `cmd/golemquant` are the commands.
 - `engine/` reads the architecture out of a GGUF and opens the engine that implements it.
 - `gemma/`, `qwen/`, `qwen35/`, `pockettts/`, `stt/`, `nomic/` are standalone engines. They do not import one another.
 - `nn/` and `vk/` are the shared kernels: quantized AVX2 and NEON, and Vulkan compute.

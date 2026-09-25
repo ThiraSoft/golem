@@ -16,10 +16,10 @@ func TestPairGeometry(t *testing.T) {
 		bpw      float64
 	}{{H3G, 49, 51, 3.1875}, {H4G, 65, 67, 4.1875}} {
 		p := PairTierOf(c.q)
-		if want := (p.L + (T4GSeq/2-1)*2*p.K + 7) / 8; p.SeqBytes != want || want != c.seq {
+		if want := (p.L + (GolemSeq/2-1)*2*p.K + 7) / 8; p.SeqBytes != want || want != c.seq {
 			t.Fatalf("%s: a sequence is %d bytes of path, want %d", c.q, p.SeqBytes, c.seq)
 		}
-		if got := p.RowBytes(T4GSeq); got != c.blk {
+		if got := p.RowBytes(GolemSeq); got != c.blk {
 			t.Fatalf("%s: 128 weights are %d bytes, not %d", c.q, got, c.blk)
 		}
 		if bpw := float64(p.RowBytes(1024)*8) / 1024; bpw != c.bpw {
@@ -40,7 +40,7 @@ func TestPairRoundTripIsExact(t *testing.T) {
 	for _, q := range []Quant{H3G, H4G} {
 		p := PairTierOf(q)
 		for trial := 0; trial < 100; trial++ {
-			states := make([]uint16, T4GSeq/2)
+			states := make([]uint16, GolemSeq/2)
 			states[0] = uint16(rng.Intn(1 << p.L))
 			for i := 1; i < len(states); i++ {
 				states[i] = (states[i-1]<<(2*p.K) | uint16(rng.Intn(1<<(2*p.K)))) & (1<<p.L - 1)
@@ -94,9 +94,9 @@ func TestPairDequantizeMatchesStates(t *testing.T) {
 		p.Dequantize(row, n, out)
 		steps, codes := p.Planes(row, n)
 		for i := 0; i < n; i += 2 {
-			s := p.StateAt(codes[i/T4GSeq*p.SeqBytes:], i%T4GSeq/2)
+			s := p.StateAt(codes[i/GolemSeq*p.SeqBytes:], i%GolemSeq/2)
 			a, b := p.Value(s)
-			d := T4GStep(steps[i/T4GBlock])
+			d := GolemStep(steps[i/GolemBlock])
 			if out[i] != a*d || out[i+1] != b*d {
 				t.Fatalf("%s weights %d,%d decode to %v,%v, want %v,%v", q, i, i+1, out[i], out[i+1], a*d, b*d)
 			}

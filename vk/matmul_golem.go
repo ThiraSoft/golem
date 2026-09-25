@@ -18,18 +18,11 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 )
 
-//go:generate glslc -O -DKBITS=3 -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_t3g_32.spv
-//go:generate glslc -O -DKBITS=3 -DCOLUMNS=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_t3g_64.spv
-//go:generate glslc -O -DKBITS=4 -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_t4g_32.spv
-//go:generate glslc -O -DKBITS=4 -DCOLUMNS=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_t4g_64.spv
-//go:generate glslc -O -DKBITS=5 -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_t5g_32.spv
-//go:generate glslc -O -DKBITS=5 -DCOLUMNS=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_t5g_64.spv
+//go:generate glslc -O -DKBITS=3 -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_h3g_32.spv
+//go:generate glslc -O -DKBITS=3 -DCOLUMNS=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_h3g_64.spv
 
-//go:generate glslc -O -DKBITS=3 -DPAIRS=1 -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_h3g_32.spv
-//go:generate glslc -O -DKBITS=3 -DPAIRS=1 -DCOLUMNS=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_h3g_64.spv
-
-//go:generate glslc -O -DKBITS=4 -DPAIRS=1 -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_h4g_32.spv
-//go:generate glslc -O -DKBITS=4 -DPAIRS=1 -DCOLUMNS=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_h4g_64.spv
+//go:generate glslc -O -DKBITS=4 -DCOLUMNS=32 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_h4g_32.spv
+//go:generate glslc -O -DKBITS=4 -DCOLUMNS=64 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_golem.comp -o shaders/matmul_h4g_64.spv
 
 //go:embed shaders/matmul_h4g_32.spv
 var matmulH4G32SPIRV []byte
@@ -42,24 +35,6 @@ var matmulH3G32SPIRV []byte
 
 //go:embed shaders/matmul_h3g_64.spv
 var matmulH3G64SPIRV []byte
-
-//go:embed shaders/matmul_t3g_32.spv
-var matmulT3G32SPIRV []byte
-
-//go:embed shaders/matmul_t3g_64.spv
-var matmulT3G64SPIRV []byte
-
-//go:embed shaders/matmul_t4g_32.spv
-var matmulT4G32SPIRV []byte
-
-//go:embed shaders/matmul_t4g_64.spv
-var matmulT4G64SPIRV []byte
-
-//go:embed shaders/matmul_t5g_32.spv
-var matmulT5G32SPIRV []byte
-
-//go:embed shaders/matmul_t5g_64.spv
-var matmulT5G64SPIRV []byte
 
 // GolemTiledWidths are the pass widths the tiled product is built for, and they
 // begin where GolemWidths stops. A pass narrower than the tile has nothing to
@@ -74,7 +49,7 @@ var GolemTiledWidths = []int{32, 64}
 // answering a prompt eight columns at a time as it did before this file
 // existed. It is there so that the two shapes can be read off one binary in
 // one process: a prefill measured in two builds is a measurement of the card's
-// clock, which vk/golemtune.go's header says at length.
+// clock, which moves by a sixth between processes.
 func golemAllWidths() []int {
 	out := make([]int, 0, len(GolemWidths)+len(GolemTiledWidths))
 	out = append(out, GolemWidths...)
@@ -109,27 +84,12 @@ func golemTiledGroups(rows, columns int) uint32 {
 // golemTiledSPIRV is one binary a tier and a width, or nothing where the tier
 // has none.
 //
-// All three tiers are built and TestGolemWidePassesMatchCPU holds all three to
-// the processor, but only two of them are reached by a model. T5G is the head's
-// format, and a head answers one hidden state at a time — a prompt wants the
-// logits of its last position and no other, so vk/golemhead.go dispatches at
-// width one. Its tiled binaries are there for a checkpoint that puts a *layer*
-// in T5G, and until one exists they are covered by the parity test and by
-// nothing else.
-//
-// **The geometry below was swept on T3G alone** and the same tile is used for
-// all three. That is defensible rather than measured: the tier changes only the
-// density of the stream, which is the decode, and the ablation switch in
-// shaders/matmul_golem.comp puts the decode at eight per cent of this kernel.
-// It is worth a sweep per tier the day one of them looks wrong.
+// The tile's geometry was swept on the retired T3G and kept for the pair
+// tiers: the tier changes only the density of the stream, which is the
+// decode, and the decode was eight per cent of this kernel. It is worth a sweep
+// per tier the day one of them looks wrong.
 func golemTiledSPIRV(q nn.Quant) (map[int][]byte, bool) {
 	switch q {
-	case nn.T3G:
-		return map[int][]byte{32: matmulT3G32SPIRV, 64: matmulT3G64SPIRV}, true
-	case nn.T4G:
-		return map[int][]byte{32: matmulT4G32SPIRV, 64: matmulT4G64SPIRV}, true
-	case nn.T5G:
-		return map[int][]byte{32: matmulT5G32SPIRV, 64: matmulT5G64SPIRV}, true
 	case nn.H3G:
 		return map[int][]byte{32: matmulH3G32SPIRV, 64: matmulH3G64SPIRV}, true
 	case nn.H4G:

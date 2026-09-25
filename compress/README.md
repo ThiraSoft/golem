@@ -31,6 +31,16 @@ that codebook by a month and read, wrongly, as the name of a codec this
 repository no longer has. Where `D4G` still appears below it names that retired
 lattice and its files, and is meant to.
 
+**Status, 2026-09-25.** The file tiers are H3G and H4G, the pair trellis
+described under "H3G: two weights a state" and "H4G: the same at four bits".
+T3G, T4G and T5G, the one-weight trellis most of this file measures, are
+retired: the pair tiers matched or beat them on every model measured (the
+perplexity gaps against them are inside the paired test), their type numbers
+0x676C6D03–05 are refused with a message to rebuild, and their code is gone.
+The one-weight trellis survives as the research codec in compress/trellis.go,
+which cmd/vqbuild and cmd/vqeval still use. The history below is kept because
+the pair tiers inherit everything it established.
+
 ## What a block holds: a trellis, with nothing to look up
 
 A sequence of 128 weights costs 67 bytes, 4.1875 bits each, and there is no
@@ -354,7 +364,8 @@ holds its 16384 states in registers, sixteen a thread, where two cost planes in
 shared memory would not fit.
 
 Each pair of rows below comes from the same binary and the same salience file,
-`golemquant -bits 3` against `-bits 3 -code pair`, head and table T4G in both:
+`golemquant -bits 3` against `-bits 3 -code pair` (the flag went with T3G),
+head and table T4G in both:
 
 | | size | PPL | KL | top-1 | top-5 |
 |---|---|---|---|---|---|

@@ -57,27 +57,12 @@ var combineSPIRV []byte
 //go:embed shaders/embed_q6k.spv
 var embedQ6KSPIRV []byte
 
-//go:generate glslc -O -DKBITS=3 --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_t4g.comp -o shaders/embed_t3g.spv
-
-//go:embed shaders/embed_t3g.spv
-var embedT3GSPIRV []byte
-
-//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_t4g.comp -o shaders/embed_t4g.spv
-
-//go:embed shaders/embed_t4g.spv
-var embedT4GSPIRV []byte
-
-//go:generate glslc -O -DKBITS=5 --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_t4g.comp -o shaders/embed_t5g.spv
-
-//go:embed shaders/embed_t5g.spv
-var embedT5GSPIRV []byte
-
-//go:generate glslc -O -DKBITS=3 -DPAIRS=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_t4g.comp -o shaders/embed_h3g.spv
+//go:generate glslc -O -DKBITS=3 --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_golem.comp -o shaders/embed_h3g.spv
 
 //go:embed shaders/embed_h3g.spv
 var embedH3GSPIRV []byte
 
-//go:generate glslc -O -DKBITS=4 -DPAIRS=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_t4g.comp -o shaders/embed_h4g.spv
+//go:generate glslc -O -DKBITS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_golem.comp -o shaders/embed_h4g.spv
 
 //go:embed shaders/embed_h4g.spv
 var embedH4GSPIRV []byte
@@ -334,25 +319,17 @@ func (s *Stack) SetEmbedding(table *Buffer, cols int, scale float32) error {
 // token crosses the bus as an identifier rather than as a row of floats. pre is
 // the head's vector, which this undoes along with the rotation.
 //
-// Every tier is a trellis, so an unknown one is refused rather than given a
-// default. It used to fall back to the lattice's decoder, which was the right
-// shape when there were two codebooks and is a way to read a file as a format
-// it is not now that there is one.
+// An unknown tier is refused rather than given a default: falling back to
+// another decoder is a way to read a file as a format it is not.
 func (s *Stack) SetEmbeddingGolem(table, steps *Buffer, cols int, pre []float32, q nn.Quant) error {
 	var spirv []byte
 	switch q {
-	case nn.T3G:
-		spirv = embedT3GSPIRV
-	case nn.T4G:
-		spirv = embedT4GSPIRV
-	case nn.T5G:
-		spirv = embedT5GSPIRV
 	case nn.H3G:
 		spirv = embedH3GSPIRV
 	case nn.H4G:
 		spirv = embedH4GSPIRV
 	default:
-		return fmt.Errorf("vk: %s is not a trellis tier, so it has no embedding shader", q)
+		return fmt.Errorf("vk: %s is not a pair tier, so it has no embedding shader", q)
 	}
 	if cols != s.dim {
 		return fmt.Errorf("vk: the embedding is %d wide and the stream is %d", cols, s.dim)

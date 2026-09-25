@@ -5,8 +5,10 @@ import "github.com/ThiraSoft/golem/internal/pairbook"
 // H3G and H4G: the trellis with two weights a state, at three and four bits a
 // weight. 128 weights in 51 and 67 bytes.
 //
-// T3G spends most of its product on one thing: every weight cuts its own
-// twelve-bit window out of the stream and looks its value up. This is QTIP's
+// T3G, the one-weight trellis these replaced (retired 2026-09-25; the numbers
+// are in compress/README.md), spent most of its product on one thing: every
+// weight cut its own twelve-bit window out of the stream and looked its value
+// up. This is QTIP's
 // answer to that (Tseng et al., arXiv:2406.11235, the HYB code of
 // lib/codebook/bitshift.py): a state reconstructs a *pair* of weights, so the
 // stream moves six bits a state and a window is cut, hashed and looked up once
@@ -127,11 +129,11 @@ func (p *PairTier) Value(s uint16) (float32, float32) {
 }
 
 // RowBytes is what one row of n weights occupies: the steps, then the codes.
-func (p *PairTier) RowBytes(n int) int { return n/T4GBlock + n/T4GSeq*p.SeqBytes }
+func (p *PairTier) RowBytes(n int) int { return n/GolemBlock + n/GolemSeq*p.SeqBytes }
 
 // Planes splits a row into its steps and its codes.
 func (p *PairTier) Planes(row []byte, n int) (steps, codes []byte) {
-	ns := n / T4GBlock
+	ns := n / GolemBlock
 	return row[:ns], row[ns:p.RowBytes(n)]
 }
 
@@ -140,7 +142,7 @@ func (p *PairTier) Planes(row []byte, n int) (steps, codes []byte) {
 // each is its predecessor shifted up by 2K with 2K new bits at the bottom, and
 // a window read at offset 2K·t is exactly that. Bits past the path are zero.
 func (p *PairTier) PutStates(dst []byte, states []uint16) {
-	if len(states) != T4GSeq/2 || len(dst) < p.SeqBytes {
+	if len(states) != GolemSeq/2 || len(dst) < p.SeqBytes {
 		panic("nn: a pair sequence is 64 states")
 	}
 	for i := range dst[:p.SeqBytes] {
@@ -155,7 +157,7 @@ func (p *PairTier) PutStates(dst []byte, states []uint16) {
 		}
 	}
 	put(0, p.L, uint32(states[0]))
-	for t := 1; t < T4GSeq/2; t++ {
+	for t := 1; t < GolemSeq/2; t++ {
 		put(p.L+(t-1)*2*p.K, 2*p.K, uint32(states[t])&(1<<(2*p.K)-1))
 	}
 }
@@ -173,15 +175,15 @@ func (p *PairTier) StateAt(codes []byte, t int) uint16 {
 
 // Dequantize expands one row of n weights. out must hold n floats.
 func (p *PairTier) Dequantize(w []byte, n int, out []float32) {
-	if n%T4GSeq != 0 {
+	if n%GolemSeq != 0 {
 		panic("nn: trellis rows must be a multiple of 128")
 	}
 	steps, codes := p.Planes(w, n)
-	for s := 0; s*T4GSeq < n; s++ {
+	for s := 0; s*GolemSeq < n; s++ {
 		seq := codes[s*p.SeqBytes : (s+1)*p.SeqBytes]
-		dst := out[s*T4GSeq : (s+1)*T4GSeq]
-		for t := 0; t < T4GSeq/2; t++ {
-			d := t4gSteps[steps[s*t4gStepsPerSeq+2*t/T4GBlock]]
+		dst := out[s*GolemSeq : (s+1)*GolemSeq]
+		for t := 0; t < GolemSeq/2; t++ {
+			d := golemSteps[steps[s*golemStepsPerSeq+2*t/GolemBlock]]
 			a, b := p.Value(p.StateAt(seq, t))
 			dst[2*t] = a * d
 			dst[2*t+1] = b * d

@@ -1,6 +1,6 @@
 package vk
 
-// The trellis kernel against the processor's, on bytes a real encoder wrote.
+// The pair-trellis kernels against the processor's, on bytes a real encoder wrote.
 //
 // The exactness is the point, and it is a stronger contract than the encoders
 // keep with each other. Two Viterbis that find different minimum-cost paths
@@ -20,11 +20,7 @@ import (
 	"github.com/ThiraSoft/golem/nn"
 )
 
-func t4gMatrix(tb testing.TB, rows, cols int) ([]byte, []float32) {
-	return t4gMatrixAs(tb, rows, cols, nn.T4G)
-}
-
-func t4gMatrixAs(tb testing.TB, rows, cols int, kind nn.Quant) ([]byte, []float32) {
+func golemMatrixAs(tb testing.TB, rows, cols int, kind nn.Quant) ([]byte, []float32) {
 	tb.Helper()
 	r := rand.New(rand.NewSource(23))
 	w := make([]float32, rows*cols)
@@ -40,8 +36,8 @@ func t4gMatrixAs(tb testing.TB, rows, cols int, kind nn.Quant) ([]byte, []float3
 			q[j] = -1
 		}
 	}
-	data := compress.EncodeT4GAs(w, rows, cols, q, compress.GolemParams{
-		ScaleBlock: nn.T4GBlock, HadGroup: 128}, kind)
+	data := compress.EncodeGolem(w, rows, cols, q, compress.GolemParams{
+		ScaleBlock: nn.GolemBlock, HadGroup: 128}, kind)
 	return data, q
 }
 
@@ -51,11 +47,11 @@ func t4gMatrixAs(tb testing.TB, rows, cols int, kind nn.Quant) ([]byte, []float3
 // is a multiplication by zero and adding zero to a float is exact, so what the
 // kernel writes is the weight it decoded and nothing else. Sweeping the hot
 // column over a whole row walks all 128 offsets of a path, both halves of both
-// step codes, and both alignments a twelve-bit window can have inside a byte
-// pair — which is the whole of what there is to get wrong.
-func TestT4GDecodeMatchesCPUExactly(t *testing.T) {
-	testGolemDecodeMatchesCPUExactly(t, nn.T4G)
-	testGolemDecodeMatchesCPUExactly(t, nn.T5G)
+// step codes, both halves of every pair and every alignment a window can have
+// inside its bytes — which is the whole of what there is to get wrong.
+func TestGolemDecodeMatchesCPUExactly(t *testing.T) {
+	testGolemDecodeMatchesCPUExactly(t, nn.H3G)
+	testGolemDecodeMatchesCPUExactly(t, nn.H4G)
 }
 
 // testGolemDecodeMatchesCPUExactly is the sweep every trellis tier is held to,
@@ -66,7 +62,7 @@ func testGolemDecodeMatchesCPUExactly(t *testing.T, kind nn.Quant) {
 	d := open(t)
 	defer d.Close()
 
-	data, _ := t4gMatrixAs(t, rows, cols, kind)
+	data, _ := golemMatrixAs(t, rows, cols, kind)
 	m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols}
 	want := make([]float32, cols)
 
@@ -96,13 +92,13 @@ func testGolemDecodeMatchesCPUExactly(t *testing.T, kind nn.Quant) {
 	}
 }
 
-func TestT4GMatVecMatchesCPU(t *testing.T) {
+func TestGolemMatVecMatchesCPU(t *testing.T) {
 	const rows, cols = 512, 1024
 	d := open(t)
 	defer d.Close()
 
-	data, q := t4gMatrix(t, rows, cols)
-	m := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols}
+	data, q := golemMatrixAs(t, rows, cols, nn.H4G)
+	m := nn.Matrix{Data: data, Quant: nn.H4G, Rows: rows, Cols: cols}
 
 	x := make([]float32, cols)
 	for i := range x {
@@ -119,7 +115,7 @@ func TestT4GMatVecMatchesCPU(t *testing.T) {
 	want := make([]float32, rows)
 	m.MatVec(b, want)
 
-	gpu, err := newHostGolemMatrix(d, data, rows, cols, nn.T4G)
+	gpu, err := newHostGolemMatrix(d, data, rows, cols, nn.H4G)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,8 +147,7 @@ func TestT4GMatVecMatchesCPU(t *testing.T) {
 // not a multiple of 512 wide. A vision tower's is 1152, so this is not
 // hypothetical: the upload has to round up to a word or the last bytes of the
 // last row are read out of a word past the end of the buffer.
-func TestT4GUnalignedRowsDecode(t *testing.T) {
-	testUnalignedRowsDecode(t, nn.T4G)
+func TestGolemUnalignedRowsDecode(t *testing.T) {
 	testUnalignedRowsDecode(t, nn.H3G)
 	testUnalignedRowsDecode(t, nn.H4G)
 }
@@ -162,7 +157,7 @@ func testUnalignedRowsDecode(t *testing.T, kind nn.Quant) {
 	d := open(t)
 	defer d.Close()
 
-	data, _ := t4gMatrixAs(t, rows, cols, kind)
+	data, _ := golemMatrixAs(t, rows, cols, kind)
 	m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols}
 	if m.RowBytes()%4 == 0 {
 		t.Fatalf("%d columns give a word-aligned row; this test is not testing anything", cols)
@@ -200,9 +195,6 @@ func testUnalignedRowsDecode(t *testing.T, kind nn.Quant) {
 // would otherwise ship silently: prefill runs through the wide passes, and a
 // bug there reads back as a bad perplexity rather than as a shader bug.
 func TestGolemWidePassesMatchCPU(t *testing.T) {
-	testGolemWidePassesMatchCPU(t, nn.T3G)
-	testGolemWidePassesMatchCPU(t, nn.T4G)
-	testGolemWidePassesMatchCPU(t, nn.T5G)
 	testGolemWidePassesMatchCPU(t, nn.H3G)
 	testGolemWidePassesMatchCPU(t, nn.H4G)
 }
@@ -212,7 +204,7 @@ func testGolemWidePassesMatchCPU(t *testing.T, kind nn.Quant) {
 	d := open(t)
 	defer d.Close()
 
-	data, q := t4gMatrixAs(t, rows, cols, kind)
+	data, q := golemMatrixAs(t, rows, cols, kind)
 	m := nn.Matrix{Data: data, Quant: kind, Rows: rows, Cols: cols}
 
 	pre := make([]float32, cols)

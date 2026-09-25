@@ -11,30 +11,29 @@ package nn
 // site a matrix reads are the same question for all of them, and this file is
 // where that question is answered once.
 //
-// GolemBlock and GolemSubBlock name the block a step covers, and the step grid
-// itself — golemSteps, GolemStep, GolemStepCode — is shared by every tier that
-// has existed: two eight-bit codes a block, one per thirty-two weights, naming
-// powers of two a sixteenth apart. A grid an eighth apart costs a whole point
-// of perplexity against an fp16 step at the same granularity, which is more
-// than the finer granularity wins back; a sixteenth apart is four percent over
-// a range from 7.6e-6 to 0.48, wider than any weight of any model has asked
-// for, and near enough the bottom of the curve to cost a tenth of what a
-// coarser grid did.
+// The step grid the pair tiers use lives in nn/golem_step.go. The one below —
+// latticeSteps, LatticeStep, LatticeStepCode — is the D4 lattice's, which only
+// compress's research bench still reads: two eight-bit codes a block, one per
+// thirty-two weights, powers of two a sixteenth apart over 7.6e-6 to 0.48. A
+// grid an eighth apart cost a whole point of perplexity against an fp16 step at
+// the same granularity, which is why both grids are a sixteenth apart.
 
 import (
 	"math"
 	"strings"
 )
 
-// golemSteps is what the eight bits of a step code name.
-var golemSteps [256]float32
+// latticeSteps is the D4 lattice era's step grid, which only the research
+// bench in compress still reads: a lattice step is a fraction of its block's
+// RMS, so the grid sits two octaves below the trellis's, nn/golem_step.go.
+var latticeSteps [256]float32
 
-// GolemStep expands a step code.
-func GolemStep(code byte) float32 { return golemSteps[code] }
+// LatticeStep expands a step code.
+func LatticeStep(code byte) float32 { return latticeSteps[code] }
 
-// GolemStepCode is the code nearest a step, in the ratio the codes are spaced
+// LatticeStepCode is the code nearest a step, in the ratio the codes are spaced
 // by.
-func GolemStepCode(v float32) byte {
+func LatticeStepCode(v float32) byte {
 	if !(v > 0) {
 		return 0
 	}
@@ -50,7 +49,7 @@ func GolemStepCode(v float32) byte {
 
 func init() {
 	for c := 0; c < 256; c++ {
-		golemSteps[c] = float32(math.Exp2((float64(c) - 272) / 16))
+		latticeSteps[c] = float32(math.Exp2((float64(c) - 272) / 16))
 	}
 }
 

@@ -51,9 +51,9 @@ func TestGolemProductSurvivesTheRoundTrip(t *testing.T) {
 
 	var unrotated float64
 	for _, group := range []int{0, 128} {
-		params := GolemParams{ScaleBlock: nn.T4GBlock, HadGroup: group}
-		data := EncodeT4GAs(w, rows, cols, q, params, nn.T4G)
-		if want := rows * nn.T4GRowBytesN(cols, nn.T4G); len(data) != want {
+		params := GolemParams{ScaleBlock: nn.GolemBlock, HadGroup: group}
+		data := EncodeGolem(w, rows, cols, q, params, nn.H4G)
+		if want := rows * nn.PairTierOf(nn.H4G).RowBytes(cols); len(data) != want {
 			t.Fatalf("group %d: %d bytes, want %d", group, len(data), want)
 		}
 
@@ -62,7 +62,7 @@ func TestGolemProductSurvivesTheRoundTrip(t *testing.T) {
 		copy(xp, x)
 		nn.PrepareGolem(xp, pre, group)
 
-		m := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols}
+		m := nn.Matrix{Data: data, Quant: nn.H4G, Rows: rows, Cols: cols}
 		b := nn.NewBatch(cols, 1)
 		copy(b.F[0], xp)
 		got := make([]float32, rows)
@@ -106,10 +106,10 @@ func TestGolemWithoutRotationOrScaling(t *testing.T) {
 	for i := range w {
 		w[i] = float32(r.NormFloat64()) * 0.05
 	}
-	data := EncodeT4GAs(w, rows, cols, nil, GolemParams{ScaleBlock: nn.T4GBlock}, nn.T4G)
+	data := EncodeGolem(w, rows, cols, nil, GolemParams{ScaleBlock: nn.GolemBlock}, nn.H4G)
 
 	out := make([]float32, cols)
-	m := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols}
+	m := nn.Matrix{Data: data, Quant: nn.H4G, Rows: rows, Cols: cols}
 	var num, den float64
 	for i := 0; i < rows; i++ {
 		m.Row(i, out)
@@ -151,11 +151,11 @@ func TestARowReadsBackAsTheRowThatWentIn(t *testing.T) {
 		q[j] = s
 		pre[j] = 1 / s
 	}
-	p := GolemParams{ScaleBlock: nn.T4GBlock, HadGroup: group}
-	data := EncodeT4GAs(w, rows, cols, q, p, nn.T4G)
+	p := GolemParams{ScaleBlock: nn.GolemBlock, HadGroup: group}
+	data := EncodeGolem(w, rows, cols, q, p, nn.H4G)
 
 	// Bound the way a loader binds it: the vector the file carries beside it.
-	m := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols, Pre: pre, HadGroup: group}
+	m := nn.Matrix{Data: data, Quant: nn.H4G, Rows: rows, Cols: cols, Pre: pre, HadGroup: group}
 	got := make([]float32, cols)
 	var num, den float64
 	for i := 0; i < rows; i++ {
@@ -173,7 +173,7 @@ func TestARowReadsBackAsTheRowThatWentIn(t *testing.T) {
 
 	// And a matrix with no vector hands back what it holds, because that is
 	// what a product wants.
-	plain := nn.Matrix{Data: data, Quant: nn.T4G, Rows: rows, Cols: cols}
+	plain := nn.Matrix{Data: data, Quant: nn.H4G, Rows: rows, Cols: cols}
 	stored := make([]float32, cols)
 	plain.Row(0, stored)
 	m.Row(0, got)

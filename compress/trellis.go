@@ -16,11 +16,7 @@ package compress
 // stored, and every weight decodes independently of its neighbours — which is
 // what a shader needs, and what a conventional trellis cannot give.
 
-import (
-	"math"
-
-	"github.com/ThiraSoft/golem/nn"
-)
+import "math"
 
 // TrellisCode names how a state becomes a number.
 type TrellisCode int
@@ -64,13 +60,8 @@ func trellisValue(c TrellisCode, s uint32) float32 {
 		m2 := math.Float32frombits((x^0x3c00)&0xffff<<16) * float32(i3M)
 		return m1 + m2
 	default:
-		// nn owns this, because the decoder does: a file is read by nn and a
-		// second copy of the hash here would be a second format sharing a
-		// name. At L past sixteen the state no longer fits what nn takes, and
-		// nothing in the format goes there.
-		if l := s >> 16; l == 0 {
-			return nn.T4GValue(uint16(s))
-		}
+		// The research codec, and no file reads it any more: the one-weight
+		// tiers it was the codebook of are retired (compress/README.md).
 		x := uint32(mad1A)*s + uint32(mad1B)
 		sum := (x & 0xff) + ((x >> 8) & 0xff) + ((x >> 16) & 0xff) + ((x >> 24) & 0xff)
 		return (float32(sum) - 510) * mad1Scale

@@ -59,10 +59,8 @@ func (d *Device) NewPipeline(spirv []byte, bindings int, pushBytes uint32) (*Pip
 // any constant past the end of the slice.
 //
 // It is how one shader becomes several kernels without becoming several
-// binaries. vk/golem.go builds a matvec whose workgroup, decoder and read-ahead
-// are all constant ids, so the shape that is fastest on a card is chosen when
-// the pipeline is made rather than when the repository is compiled — see
-// GolemShapes and cmd/golemtune.
+// binaries: the shape that is fastest on a card is chosen when the pipeline is
+// made rather than when the repository is compiled.
 func (d *Device) NewPipelineSpec(spirv []byte, bindings int, pushBytes uint32, spec []uint32) (*Pipeline, error) {
 	return d.newPipeline(spirv, bindings, pushBytes, 0, spec)
 }

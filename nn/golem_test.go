@@ -13,20 +13,20 @@ import (
 // granularity it pays for.
 func TestD4StepCodeRoundTrip(t *testing.T) {
 	for _, v := range []float32{1e-5, 1e-4, 3e-3, 0.0125, 0.1, 0.4} {
-		got := GolemStep(GolemStepCode(v))
+		got := LatticeStep(LatticeStepCode(v))
 		if ratio := float64(got / v); ratio < 0.96 || ratio > 1.045 {
 			t.Errorf("step %g came back as %g", v, got)
 		}
 	}
-	if lo, hi := GolemStep(0), GolemStep(255); lo > 1e-5 || hi < 0.4 {
+	if lo, hi := LatticeStep(0), LatticeStep(255); lo > 1e-5 || hi < 0.4 {
 		t.Errorf("the codes reach %g to %g, which does not cover what weights ask for", lo, hi)
 	}
 	// Past either end the code saturates rather than wrapping, which is the
 	// difference between a block that is a little wrong and one that is noise.
-	if c := GolemStepCode(1e-12); c != 0 {
+	if c := LatticeStepCode(1e-12); c != 0 {
 		t.Errorf("a step under the range named code %d, not 0", c)
 	}
-	if c := GolemStepCode(1e6); c != 255 {
+	if c := LatticeStepCode(1e6); c != 255 {
 		t.Errorf("a step over the range named code %d, not 255", c)
 	}
 }

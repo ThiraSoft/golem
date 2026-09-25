@@ -21,21 +21,13 @@ const (
 	Q5_K
 	Q6_K
 	Q8_0
-	// T4G is the trellis: 128 weights in 67 bytes, 4.1875 bits each, and a
-	// codebook that is computed rather than looked up. nn/t4g.go describes it.
-	T4G
-	// T5G is the same trellis a bit a weight wider — 128 weights in 83 bytes,
-	// 5.1875 bits each. It exists for the logit head, which is not a hidden
-	// layer whose error is absorbed downstream but the thing that makes the
-	// logits, and which llama.cpp's K-quant mixes have always given more bits
-	// than the rest of the model.
-	T5G
-	// T3G is the trellis at three bits a weight: 128 weights in 52 bytes, 3.25
-	// each, which is the D4G lattice's rate to the bit. Same 1MAD, same window,
-	// seven bits of padding at the end of a sequence because 12 + 127·3 is 393
-	// and not a whole number of bytes. It is what retires the lattice: the same
-	// size, two decibels better on a Gaussian, and no table at all.
-	T3G
+	// Three retired tiers held these positions: T4G, T5G and T3G, the
+	// trellis with one weight a state and a hashed codebook. The pair tiers
+	// below replaced them on every axis measured (compress/README.md), and
+	// the numbers stay taken so that no other format is read as one of them.
+	_
+	_
+	_
 	PQ2_0
 	PTQ1_0
 	// H3G is the trellis at three bits a weight that decodes two weights a
@@ -55,7 +47,7 @@ const (
 // format that has no lattice code at all came to need a name for the question.
 func (q Quant) Golem() bool {
 	switch q {
-	case T3G, T4G, T5G, H3G, H4G:
+	case H3G, H4G:
 		return true
 	}
 	return false
@@ -85,12 +77,6 @@ func (q Quant) String() string {
 		return "Q6_K"
 	case Q8_0:
 		return "Q8_0"
-	case T4G:
-		return "T4G"
-	case T5G:
-		return "T5G"
-	case T3G:
-		return "T3G"
 	case PQ2_0:
 		return "PQ2_0"
 	case PTQ1_0:
@@ -128,12 +114,6 @@ func QuantOf(dtype string) (Quant, bool) {
 		return Q6_K, true
 	case "Q8_0":
 		return Q8_0, true
-	case "T4G":
-		return T4G, true
-	case "T5G":
-		return T5G, true
-	case "T3G":
-		return T3G, true
 	case "PQ2_0":
 		return PQ2_0, true
 	case "PTQ1_0":
