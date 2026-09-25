@@ -43,7 +43,7 @@ func main() {
 	hadGroup := flag.Int("hadamard", 128, "rotation group; 0 leaves the weights unrotated")
 	headBits := flag.Int("head", 4, "bits a weight for the logit head, 3, 4 or 5, and never narrower than -bits. Four or five is what llama.cpp's K-quant mixes do in spirit — Qwen3-4B's Q4_K_M spends 6.56 bits there and 4.95 on the rest — and on Qwen3-0.6B it takes about three fifths of what an unquantized head is worth, for six percent of the file rather than seventy-three. Four is the default whatever the body is: on a three-bit body that is a bit more, which is the same mix in spirit")
 	bodyBits := flag.Int("bits", 4, "trellis body rate in bits a weight: 3, 4 or 5")
-	code := flag.String("code", "trellis", "the body's trellis: trellis, one weight a state (T3G, T4G, T5G), or pair, two weights a state (H3G, three bits only). The head and the table stay in the one-weight trellis either way")
+	code := flag.String("code", "trellis", "the body's trellis: trellis, one weight a state (T3G, T4G, T5G), or pair, two weights a state (H3G at three bits, H4G at four). The head and the table stay in the one-weight trellis either way")
 	ntok := flag.Int("tokens", 2048, "calibration tokens; every measurement in compress/README.md used 2048, and more buys nothing at these file sizes")
 	ctx := flag.Int("ctx", 512, "calibration window")
 	calibFile := flag.String("calib", "", "text to calibrate on; a built-in paragraph when empty")
@@ -83,8 +83,8 @@ func main() {
 	if *code != "trellis" && *code != "pair" {
 		must(fmt.Errorf("golemquant: -code is trellis or pair, not %q", *code))
 	}
-	if *code == "pair" && *bodyBits != nn.H3GK {
-		must(fmt.Errorf("golemquant: the pair trellis is built at %d bits a weight, not %d", nn.H3GK, *bodyBits))
+	if *code == "pair" && *bodyBits != nn.H3GK && *bodyBits != nn.H4GK {
+		must(fmt.Errorf("golemquant: the pair trellis is built at %d or %d bits a weight, not %d", nn.H3GK, nn.H4GK, *bodyBits))
 	}
 	if *headBits < *bodyBits {
 		must(fmt.Errorf("golemquant: a %d-bit head under a %d-bit body spends the bits where they are worth least", *headBits, *bodyBits))
@@ -184,24 +184,33 @@ func main() {
 					return true
 				}
 				if *code == "pair" {
-					penc, err := vk.NewPairEncoder(d, 1<<24, nn.H3GCodebook())
-					if err != nil {
-						fmt.Printf("no pair encoder on the device (%v); the processor then\n", err)
-					} else {
-						defer penc.Close()
-						compress.PairAccel = func(norm []float32, o compress.PairOpts, book []float32, states []uint16) bool {
-							if o.K != vk.PairGPUK || o.L != vk.PairGPUL || o.Seq != vk.PairGPUSeq {
-								offCard += int64(len(norm))
-								return false
-							}
-							if err := penc.QuantizePath(norm, states); err != nil {
-								fmt.Printf("  the card refused a matrix (%v); the processor takes it\n", err)
-								offCard += int64(len(norm))
-								return false
-							}
-							onCard += int64(len(norm))
-							return true
+					// An encoder a pair tier, built the first time a matrix
+					// of it arrives: the body and the head may be two tiers,
+					// and each binds its own codebook.
+					encs := map[compress.PairOpts]*vk.PairEncoder{}
+					defer func() {
+						for _, e := range encs {
+							e.Close()
 						}
+					}()
+					compress.PairAccel = func(norm []float32, o compress.PairOpts, book []float32, states []uint16) bool {
+						e, ok := encs[o]
+						if !ok {
+							var err error
+							if e, err = vk.NewPairEncoder(d, 1<<24, book, o.L, o.K, o.Shift); err != nil {
+								fmt.Printf("  no pair encoder for this tier (%v); the processor takes it\n", err)
+								offCard += int64(len(norm))
+								return false
+							}
+							encs[o] = e
+						}
+						if err := e.QuantizePath(norm, states); err != nil {
+							fmt.Printf("  the card refused a matrix (%v); the processor takes it\n", err)
+							offCard += int64(len(norm))
+							return false
+						}
+						onCard += int64(len(norm))
+						return true
 					}
 				}
 				defer func() {
@@ -224,7 +233,7 @@ func main() {
 	params := compress.GolemParams{ScaleBlock: nn.T4GBlock, HadGroup: *hadGroup}
 	dtype := dtypeFor(*bodyBits)
 	if *code == "pair" {
-		dtype = "H3G"
+		dtype = map[int]string{nn.H3GK: "H3G", nn.H4GK: "H4G"}[*bodyBits]
 	}
 	// What a row has to be a multiple of: a trellis sequence.
 	unit := nn.T4GSeq
@@ -522,12 +531,15 @@ func main() {
 		// 0.0662. Five bits takes three fifths of the way there for six
 		// percent of the file.
 		//
-		// Under the pair trellis they stay in the one-weight one whatever the
-		// rate: the table is read a row at a time by a gather that decodes
-		// single weights, and H3G has no such kernel.
-		if (*headBits != *bodyBits || *code == "pair") &&
-			(name == "output.weight" || (name == "token_embd.weight" && *embd != "bf16")) {
+		// Under the pair trellis the head is a pair tier too, at three or four
+		// bits; five stays T5G, which has no pair tier.
+		if name == "output.weight" || (name == "token_embd.weight" && *embd != "bf16") {
 			pl.dtype = dtypeFor(*headBits)
+			if *code == "pair" {
+				if pd, ok := map[int]string{nn.H3GK: "H3G", nn.H4GK: "H4G"}[*headBits]; ok {
+					pl.dtype = pd
+				}
+			}
 		}
 		if len(t.Shape) == 3 {
 			// A stack of experts: ne2 of them, each ne1 rows of ne0. They are

@@ -26,10 +26,13 @@ func TestGolemBlockGeometryMatchesNN(t *testing.T) {
 			t.Fatalf("%s: the container reads %d bytes a block, nn writes %d", name, g[1], want)
 		}
 	}
-	if g := blockGeometry["H3G"]; g[0] != nn.T4GSeq || g[1] != nn.H3GRowBytes(nn.T4GSeq) {
-		t.Fatalf("H3G: the container reads %v, nn writes %d bytes a %d-weight block", g, nn.H3GRowBytes(nn.T4GSeq), nn.T4GSeq)
-	}
-	if golemPairState != nn.H3GL {
-		t.Fatalf("the container says the pair state is %d bits, nn says %d", golemPairState, nn.H3GL)
+	for _, q := range []nn.Quant{nn.H3G, nn.H4G} {
+		p, name := nn.PairTierOf(q), q.String()
+		if g := blockGeometry[name]; g[0] != nn.T4GSeq || g[1] != p.RowBytes(nn.T4GSeq) {
+			t.Fatalf("%s: the container reads %v, nn writes %d bytes a %d-weight block", name, g, p.RowBytes(nn.T4GSeq), nn.T4GSeq)
+		}
+		if golemPairState[name] != p.L {
+			t.Fatalf("%s: the container says the state is %d bits, nn says %d", name, golemPairState[name], p.L)
+		}
 	}
 }

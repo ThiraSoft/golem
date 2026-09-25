@@ -1,6 +1,6 @@
 package vk
 
-// The pair trellis's encoder on the card: nn/h3g.go's format, and
+// The pair trellis's encoder on the card: nn/pair.go's formats, and
 // shaders/viterbi_hyb.comp's arithmetic. Its host side is TrellisEncoder's —
 // stage the weights, one submission a pass, the reconstruction and the path
 // back — with a codebook bound beside them, because an H3G state's value is a
@@ -12,20 +12,36 @@ import (
 	"unsafe"
 )
 
-//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/viterbi_hyb.comp -o shaders/viterbi_hyb.spv
+//go:generate glslc -O -DLBITS=14 -DKV=6 --target-env=vulkan1.1 -fshader-stage=compute shaders/viterbi_hyb.comp -o shaders/viterbi_hyb.spv
+//go:generate glslc -O -DLBITS=15 -DKV=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/viterbi_hyb.comp -o shaders/viterbi_hyb4.spv
 
 //go:embed shaders/viterbi_hyb.spv
 var viterbiHybSPIRV []byte
 
-// What shaders/viterbi_hyb.comp is compiled for.
-const (
-	PairGPUSeq = 128 // weights a sequence, two a state
-	PairGPUK   = 3
-	PairGPUL   = 14
-)
+//go:embed shaders/viterbi_hyb4.spv
+var viterbiHyb4SPIRV []byte
+
+// PairGPUSeq is the sequence shaders/viterbi_hyb.comp is compiled for.
+const PairGPUSeq = 128 // weights a sequence, two a state
+
+// PairGPUHas says whether a kernel was built for a state of l bits at k bits a
+// weight: H3G's fourteen at three, H4G's fifteen at four.
+func PairGPUHas(l, k int) bool { return pairSPIRV(l, k) != nil }
+
+func pairSPIRV(l, k int) []byte {
+	switch {
+	case l == 14 && k == 3:
+		return viterbiHybSPIRV
+	case l == 15 && k == 4:
+		return viterbiHyb4SPIRV
+	}
+	return nil
+}
 
 type pairPush struct {
-	seqs uint32
+	seqs   uint32
+	eshift uint32
+	emask  uint32
 }
 
 // PairEncoder holds the room for one pass of weights.
@@ -41,17 +57,28 @@ type PairEncoder struct {
 	pathBack *Buffer
 	book     *Buffer
 
-	pipe *Pipeline
-	set  *Set
+	pipe   *Pipeline
+	set    *Set
+	eshift uint32
+	emask  uint32
 }
 
-// NewPairEncoder builds the encoder for a codebook of pairs.
-func NewPairEncoder(d *Device, capacity int, book []float32) (*PairEncoder, error) {
+// NewPairEncoder builds the encoder for a trellis of l state bits at k bits a
+// weight, whose states read entry bits shift.. of s·(s+1) out of book, a pair
+// an entry and a power of two of them.
+func NewPairEncoder(d *Device, capacity int, book []float32, l, k, shift int) (*PairEncoder, error) {
+	spirv := pairSPIRV(l, k)
+	if spirv == nil {
+		return nil, fmt.Errorf("vk: there is no pair Viterbi for %d state bits at %d bits a weight", l, k)
+	}
+	if n := len(book) / 2; n&(n-1) != 0 {
+		return nil, fmt.Errorf("vk: a codebook of %d pairs is not a power of two", n)
+	}
 	if capacity%PairGPUSeq != 0 {
 		return nil, fmt.Errorf("vk: a pass of %d weights is not a whole number of %d-weight sequences",
 			capacity, PairGPUSeq)
 	}
-	e := &PairEncoder{d: d, cap: capacity}
+	e := &PairEncoder{d: d, cap: capacity, eshift: uint32(shift), emask: uint32(len(book)/2 - 1)}
 	for _, b := range []struct {
 		at   **Buffer
 		host bool
@@ -82,7 +109,7 @@ func NewPairEncoder(d *Device, capacity int, book []float32) (*PairEncoder, erro
 		return nil, err
 	}
 	bufs := []*Buffer{e.z, e.rec, e.path, e.book}
-	if e.pipe, err = d.NewPipeline(viterbiHybSPIRV, len(bufs), uint32(unsafe.Sizeof(pairPush{}))); err != nil {
+	if e.pipe, err = d.NewPipeline(spirv, len(bufs), uint32(unsafe.Sizeof(pairPush{}))); err != nil {
 		e.Close()
 		return nil, err
 	}
@@ -114,7 +141,7 @@ func (e *PairEncoder) QuantizePath(norm []float32, states []uint16) error {
 		n := min(step, len(norm)-at)
 		spread(n, func(lo, hi int) { copy(xs[lo:hi], norm[at+lo:at+hi]) })
 		seqs := n / PairGPUSeq
-		push := pairPush{seqs: uint32(seqs)}
+		push := pairPush{seqs: uint32(seqs), eshift: e.eshift, emask: e.emask}
 		err := e.d.Submit(func(r *Recorder) {
 			r.CopyFrom(e.z, 0, e.stage, 0, n*4)
 			r.Barrier()

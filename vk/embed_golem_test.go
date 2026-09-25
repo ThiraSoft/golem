@@ -20,7 +20,7 @@ import (
 )
 
 func TestEmbedGolemMatchesCPU(t *testing.T) {
-	for _, kind := range []nn.Quant{nn.T3G, nn.T4G, nn.T5G} {
+	for _, kind := range []nn.Quant{nn.T3G, nn.T4G, nn.T5G, nn.H3G, nn.H4G} {
 		t.Run(kind.String(), func(t *testing.T) {
 			testEmbedGolemMatchesCPU(t, kind)
 		})
@@ -49,6 +49,10 @@ func testEmbedGolemMatchesCPU(t *testing.T, kind nn.Quant) {
 		spirv = embedT4GSPIRV
 	case nn.T5G:
 		spirv = embedT5GSPIRV
+	case nn.H3G:
+		spirv = embedH3GSPIRV
+	case nn.H4G:
+		spirv = embedH4GSPIRV
 	}
 
 	p, err := d.NewPipeline(spirv, 5, uint32(unsafe.Sizeof(embedPush{})))
@@ -62,7 +66,7 @@ func testEmbedGolemMatchesCPU(t *testing.T, kind nn.Quant) {
 		t.Fatal(err)
 	}
 	defer table.Close()
-	steps, err := d.Upload(golemTable())
+	steps, err := d.Upload(golemTableFor(kind))
 	if err != nil {
 		t.Fatal(err)
 	}

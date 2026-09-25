@@ -77,10 +77,11 @@ func EncodeT4G(w []float32, rows, cols int, q []float32, p GolemParams) []byte {
 // a bit, and it is the tensor that makes the logits rather than one whose
 // error the layers after it absorb.
 //
-// H3G is handed to EncodeH3G, which shares everything here but the trellis.
+// The pair tiers are handed to EncodePairs, which shares everything here but
+// the trellis.
 func EncodeT4GAs(w []float32, rows, cols int, q []float32, p GolemParams, kind nn.Quant) []byte {
-	if kind == nn.H3G {
-		return EncodeH3G(w, rows, cols, q, p)
+	if nn.PairTierOf(kind) != nil {
+		return EncodePairs(w, rows, cols, q, p, kind)
 	}
 	if cols%nn.T4GSeq != 0 {
 		panic("compress: a T4G row must be a multiple of 128 wide")

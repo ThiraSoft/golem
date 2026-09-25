@@ -82,8 +82,8 @@ func (m Matrix) RowBytes() int {
 		return m.Cols / QuantBlock * q8_0BlockBytes
 	case T3G, T4G, T5G:
 		return T4GRowBytesN(m.Cols, m.Quant)
-	case H3G:
-		return H3GRowBytes(m.Cols)
+	case H3G, H4G:
+		return PairTierOf(m.Quant).RowBytes(m.Cols)
 	case PQ2_0:
 		return m.Cols / TernaryBlock * pq2_0BlockBytes
 	case PTQ1_0:
@@ -204,8 +204,8 @@ func (m Matrix) rows(b *Batch, ys [][]float32, start, end int) {
 		matVecQ8_0Rows(m.Data, b, m.Cols, ys, start, end)
 	case T3G, T4G, T5G:
 		matVecT4GRows(m.Data, b, m.Cols, m.Quant, ys, start, end)
-	case H3G:
-		matVecH3GRows(m.Data, b, m.Cols, ys, start, end)
+	case H3G, H4G:
+		PairTierOf(m.Quant).matVecRows(m.Data, b, m.Cols, ys, start, end)
 	case PQ2_0:
 		matVecPQ2_0Rows(m.Data, b, m.Cols, ys, start, end)
 	case PTQ1_0:
@@ -286,8 +286,8 @@ func (m Matrix) Row(index int, out []float32) {
 	case T3G, T4G, T5G:
 		DequantizeT4GN(row, m.Cols, m.Quant, out)
 		m.unrotate(out)
-	case H3G:
-		DequantizeH3G(row, m.Cols, out)
+	case H3G, H4G:
+		PairTierOf(m.Quant).Dequantize(row, m.Cols, out)
 		m.unrotate(out)
 	case F32:
 		for i := 0; i < m.Cols; i++ {

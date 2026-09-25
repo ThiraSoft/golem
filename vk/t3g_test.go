@@ -21,4 +21,5 @@ func TestT3GDecodeMatchesCPUExactly(t *testing.T) {
 // contract: every weight, every position of a path, exactly.
 func TestH3GDecodeMatchesCPUExactly(t *testing.T) {
 	testGolemDecodeMatchesCPUExactly(t, nn.H3G)
+	testGolemDecodeMatchesCPUExactly(t, nn.H4G)
 }

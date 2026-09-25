@@ -343,7 +343,7 @@ weight and looking it up. H3G (`nn/h3g.go`) is QTIP's HYB code: a
 fourteen-bit state moves six bits a *pair*, s·(s+1) picks one of 2048 half2
 pairs, and one window and one read make two weights. The codebook was trained
 once by Lloyd's algorithm through the trellis on a unit Gaussian
-(`cmd/h3gcodebook`, 400 rounds of 16 M weights on the card, 36 seconds for 40):
+(`cmd/paircodebook`, 400 rounds of 16 M weights on the card, 36 seconds for 40):
 17.58 dB held out, against 17.25 for T3G's 1MAD at the gain the format uses.
 128 weights in 51 bytes, 3.1875 bits a weight, no padding.
 

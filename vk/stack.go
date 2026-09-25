@@ -72,6 +72,16 @@ var embedT4GSPIRV []byte
 //go:embed shaders/embed_t5g.spv
 var embedT5GSPIRV []byte
 
+//go:generate glslc -O -DKBITS=3 -DPAIRS=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_t4g.comp -o shaders/embed_h3g.spv
+
+//go:embed shaders/embed_h3g.spv
+var embedH3GSPIRV []byte
+
+//go:generate glslc -O -DKBITS=4 -DPAIRS=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/embed_t4g.comp -o shaders/embed_h4g.spv
+
+//go:embed shaders/embed_h4g.spv
+var embedH4GSPIRV []byte
+
 //go:embed shaders/embed_q40.spv
 var embedQ40SPIRV []byte
 
@@ -337,6 +347,10 @@ func (s *Stack) SetEmbeddingGolem(table, steps *Buffer, cols int, pre []float32,
 		spirv = embedT4GSPIRV
 	case nn.T5G:
 		spirv = embedT5GSPIRV
+	case nn.H3G:
+		spirv = embedH3GSPIRV
+	case nn.H4G:
+		spirv = embedH4GSPIRV
 	default:
 		return fmt.Errorf("vk: %s is not a trellis tier, so it has no embedding shader", q)
 	}

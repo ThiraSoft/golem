@@ -86,7 +86,24 @@ var matvecH3G4SPIRV []byte
 //go:embed shaders/matvec_h3g_8.spv
 var matvecH3G8SPIRV []byte
 
-// h3gRowsPerGroup is matvec_h3g.comp's: 256 threads, sixteen lanes to a row
+//go:generate glslc -O -DKBITS=4 -DCOLUMNS=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h4g_1.spv
+//go:generate glslc -O -DKBITS=4 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h4g_2.spv
+//go:generate glslc -O -DKBITS=4 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h4g_4.spv
+//go:generate glslc -O -DKBITS=4 -DCOLUMNS=8 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec_h3g.comp -o shaders/matvec_h4g_8.spv
+
+//go:embed shaders/matvec_h4g_1.spv
+var matvecH4G1SPIRV []byte
+
+//go:embed shaders/matvec_h4g_2.spv
+var matvecH4G2SPIRV []byte
+
+//go:embed shaders/matvec_h4g_4.spv
+var matvecH4G4SPIRV []byte
+
+//go:embed shaders/matvec_h4g_8.spv
+var matvecH4G8SPIRV []byte
+
+// h3gRowsPerGroup is matvec_h3g.comp's, at both of its tiers: 256 threads, sixteen lanes to a row
 // group and two rows a lane. It is not GolemShapes' business — that kernel has
 // no specialization constants — and it is the same at every width.
 const h3gRowsPerGroup = 32
@@ -327,7 +344,7 @@ func NewGolemKernels(d *Device, q nn.Quant) (*GolemKernels, error) {
 	for _, columns := range GolemWidths {
 		var p *Pipeline
 		var err error
-		if q == nn.H3G {
+		if nn.PairTierOf(q) != nil {
 			p, err = d.NewPipeline(spirv[columns], 4, golemPushSize)
 		} else {
 			p, err = d.NewPipelineSpec(spirv[columns], 4, golemPushSize, GolemShapes()[columns].Spec())
@@ -366,16 +383,18 @@ func golemSPIRV(q nn.Quant) (map[int][]byte, bool) {
 		return map[int][]byte{1: matvecT5GSPIRV, 2: matvecT5G2SPIRV, 4: matvecT5G4SPIRV, 8: matvecT5G8SPIRV}, true
 	case nn.H3G:
 		return map[int][]byte{1: matvecH3G1SPIRV, 2: matvecH3G2SPIRV, 4: matvecH3G4SPIRV, 8: matvecH3G8SPIRV}, true
+	case nn.H4G:
+		return map[int][]byte{1: matvecH4G1SPIRV, 2: matvecH4G2SPIRV, 4: matvecH4G4SPIRV, 8: matvecH4G8SPIRV}, true
 	}
 	return nil, false
 }
 
-// golemTableFor is golemTable, and for H3G the codebook after it: 2048 pairs
-// as floats, which the kernels narrow back to the half2 each one is exactly.
+// golemTableFor is golemTable, and for a pair tier its codebook after it, as
+// floats, which the kernels narrow back to the half2 each one is exactly.
 func golemTableFor(q nn.Quant) []byte {
 	out := golemTable()
-	if q == nn.H3G {
-		for _, v := range nn.H3GCodebook() {
+	if p := nn.PairTierOf(q); p != nil {
+		for _, v := range p.Codebook() {
 			out = binary.LittleEndian.AppendUint32(out, math.Float32bits(v))
 		}
 	}
@@ -384,7 +403,7 @@ func golemTableFor(q nn.Quant) []byte {
 
 // RowsPerGroup is how many rows a workgroup of a pass that wide answers.
 func (k *GolemKernels) RowsPerGroup(columns int) int {
-	if k.q == nn.H3G {
+	if nn.PairTierOf(k.q) != nil {
 		return h3gRowsPerGroup
 	}
 	return golemRowsPerGroup(columns)

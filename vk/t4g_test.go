@@ -154,6 +154,7 @@ func TestT4GMatVecMatchesCPU(t *testing.T) {
 func TestT4GUnalignedRowsDecode(t *testing.T) {
 	testUnalignedRowsDecode(t, nn.T4G)
 	testUnalignedRowsDecode(t, nn.H3G)
+	testUnalignedRowsDecode(t, nn.H4G)
 }
 
 func testUnalignedRowsDecode(t *testing.T, kind nn.Quant) {
@@ -203,6 +204,7 @@ func TestGolemWidePassesMatchCPU(t *testing.T) {
 	testGolemWidePassesMatchCPU(t, nn.T4G)
 	testGolemWidePassesMatchCPU(t, nn.T5G)
 	testGolemWidePassesMatchCPU(t, nn.H3G)
+	testGolemWidePassesMatchCPU(t, nn.H4G)
 }
 
 func testGolemWidePassesMatchCPU(t *testing.T, kind nn.Quant) {

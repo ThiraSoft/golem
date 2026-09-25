@@ -15,6 +15,12 @@ import (
 // card to its own path: the states it returns chain as the format says, and
 // decode to the reconstruction it wrote.
 func TestPairViterbiMatchesCPU(t *testing.T) {
+	for _, q := range []nn.Quant{nn.H3G, nn.H4G} {
+		t.Run(q.String(), func(t *testing.T) { pairViterbiAgainstCPU(t, q) })
+	}
+}
+
+func pairViterbiAgainstCPU(t *testing.T, q nn.Quant) {
 	d := open(t)
 	defer d.Close()
 
@@ -26,16 +32,16 @@ func TestPairViterbiMatchesCPU(t *testing.T) {
 	}
 	// Any codebook will do for the contract; a Gaussian one exercises the
 	// same near-ties a trained one has.
-	book := make([]float32, 2*nn.H3GEntries)
+	o := compress.PairOptsFor(q)
+	book := make([]float32, 2*o.Entries)
 	for i := range book {
 		book[i] = float32(rg.NormFloat64())
 	}
-	o := compress.PairOpts{K: PairGPUK, L: PairGPUL, Seq: PairGPUSeq}
 
 	want := append([]float32(nil), src...)
 	compress.QuantizePairsPath(want, o, book, make([]uint16, n/2))
 
-	e, err := NewPairEncoder(d, n, book)
+	e, err := NewPairEncoder(d, n, book, o.L, o.K, o.Shift)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,11 +76,11 @@ func TestPairViterbiMatchesCPU(t *testing.T) {
 
 	for i, s := range states {
 		if i%(PairGPUSeq/2) != 0 {
-			if prev := states[i-1]; s>>(2*PairGPUK) != prev&(1<<(PairGPUL-2*PairGPUK)-1) {
+			if prev := states[i-1]; s>>(2*o.K) != prev&(1<<(o.L-2*o.K)-1) {
 				t.Fatalf("pair %d: state %#x does not follow %#x", i, s, prev)
 			}
 		}
-		e := nn.H3GEntry(s)
+		e := o.Entry(s)
 		if got[2*i] != book[2*e] || got[2*i+1] != book[2*e+1] {
 			t.Fatalf("pair %d: the reconstruction is not what its state decodes to", i)
 		}

@@ -41,6 +41,9 @@ const (
 	// H3G is the trellis at three bits a weight that decodes two weights a
 	// state: 128 weights in 51 bytes, 3.1875 each. nn/h3g.go describes it.
 	H3G
+	// H4G is the same at four bits a weight: 128 weights in 67 bytes, T4G's
+	// size.
+	H4G
 )
 
 // Golem says the format is one of golem's own — a matrix stored as A·(q ⊙ W),
@@ -52,7 +55,7 @@ const (
 // format that has no lattice code at all came to need a name for the question.
 func (q Quant) Golem() bool {
 	switch q {
-	case T3G, T4G, T5G, H3G:
+	case T3G, T4G, T5G, H3G, H4G:
 		return true
 	}
 	return false
@@ -94,6 +97,8 @@ func (q Quant) String() string {
 		return "PTQ1_0"
 	case H3G:
 		return "H3G"
+	case H4G:
+		return "H4G"
 	}
 	return "unknown"
 }
@@ -135,6 +140,8 @@ func QuantOf(dtype string) (Quant, bool) {
 		return PTQ1_0, true
 	case "H3G":
 		return H3G, true
+	case "H4G":
+		return H4G, true
 	}
 	return 0, false
 }

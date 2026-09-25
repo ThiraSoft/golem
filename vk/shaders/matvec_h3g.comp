@@ -2,8 +2,10 @@
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_control_flow_attributes : enable
 
-// y = W * x for an H3G matrix against float activations: nn/h3g.go's pair
-// trellis, two weights a state.
+// y = W * x for an H3G or H4G matrix against float activations: nn/pair.go's
+// pair trellis, two weights a state. KBITS picks the tier: 3 for H3G, whose
+// numbers are the ones described below, 4 for H4G — a fifteen-bit state, eight
+// bits a pair, 4096 pairs picked by bits 4..15 of s·(s+1).
 //
 // A sequence is 128 weights: two step codes and a 392-bit path of 64 states.
 // A state is the fourteen bits at 6t; s·(s+1) picks one of 2048 pairs out of
@@ -46,7 +48,7 @@
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly  buffer W { uint  w[]; };
-// Binding 1: the 256 step floats, then the codebook as 2048 pairs of floats,
+// Binding 1: the 256 step floats, then the codebook as ENTRIES pairs of floats,
 // each a half-precision number exactly.
 layout(std430, binding = 1) readonly  buffer T { float steps[]; };
 layout(std430, binding = 2) readonly  buffer X { vec4 x4[]; };
@@ -58,14 +60,29 @@ layout(push_constant) uniform Push {
     uint col; // the first column of the pass this dispatch answers
 } p;
 
+#ifndef KBITS
+#define KBITS 3
+#endif
+
 const uint SEQ    = 128u;
 const uint BLOCK  = 64u;
 const uint PAIRS  = BLOCK / 2u;
+#if KBITS == 4
+const uint L      = 15u;
+const uint SEQB   = 65u;   // 15 + 63·8 = 519 bits, one unused
+const uint HALFB  = 32u;   // the first 32 states: 256 bits
+const uint ENTRIES = 4096u;
+const int  ESHIFT = 4;
+const int  EBITS  = 12;
+#else
 const uint L      = 14u;
-const uint STRIDE = 6u;    // bits a state adds
 const uint SEQB   = 49u;   // 14 + 63·6 = 392 bits
 const uint HALFB  = 24u;   // the first 32 states: 192 bits
 const uint ENTRIES = 2048u;
+const int  ESHIFT = 5;
+const int  EBITS  = 11;
+#endif
+const uint STRIDE = 2u * uint(KBITS); // bits a state adds
 // Words of stream a block's thirty-two windows reach into.
 const uint SD = ((PAIRS - 1u) * STRIDE + L + 31u) / 32u;
 
@@ -90,10 +107,10 @@ vec2 pairOf(uint s[SD], uint j) {
     } else {
         v = ((s[wi] << bi) | (s[wi + 1u] >> (32u - bi))) >> (32u - L);
     }
-    // s·(s+1) fits thirty-two bits for a fourteen-bit s, and both factors
+    // s·(s+1) fits thirty-two bits for a fifteen-bit s, and both factors
     // fit the twenty-four bits of v_mul_u32_u24.
     uint h = v * (v + 1u);
-    return unpackHalf2x16(book[bitfieldExtract(h, 5, 11)]);
+    return unpackHalf2x16(book[bitfieldExtract(h, ESHIFT, EBITS)]);
 }
 
 void main() {

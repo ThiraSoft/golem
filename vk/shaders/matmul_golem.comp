@@ -220,7 +220,10 @@ const uint BLOCK = 64u;  // weights sharing one step
 #define PAIRS 0
 #endif
 
-#if PAIRS
+#if PAIRS && KBITS == 4
+const uint SEQB  = 65u;
+const uint HALFB = 32u;
+#elif PAIRS
 const uint SEQB  = 49u;
 const uint HALFB = 24u;
 #elif KBITS == 5
@@ -251,7 +254,8 @@ const uint HALFB = 32u;
 // the last of them starts at bit (WPT-1)*KBITS and is twelve wide. One more
 // word than that is read, because the realignment pairs word j with word j+1.
 #if PAIRS
-#define SJ (((WPT / 2 - 1) * 2 * KBITS + 14 + 31) / 32)
+#define PL (KBITS == 4 ? 15 : 14)
+#define SJ (((WPT / 2 - 1) * 2 * KBITS + PL + 31) / 32)
 #else
 #define SJ (((WPT - 1) * KBITS + 12 + 31) / 32)
 #endif
@@ -345,12 +349,12 @@ uint seqOf(uint codeBase, uint b) {
             const uint wi = o >> 5u; \
             const uint bi = o & 31u; \
             uint v; \
-            if (bi <= 18u) { \
-                v = bitfieldExtract(s[wi], int(18u - bi), 14); \
+            if (bi <= uint(32 - PL)) { \
+                v = bitfieldExtract(s[wi], int(uint(32 - PL) - bi), PL); \
             } else { \
-                v = ((s[wi] << bi) | (s[wi + 1u] >> (32u - bi))) >> 18u; \
+                v = ((s[wi] << bi) | (s[wi + 1u] >> (32u - bi))) >> uint(32 - PL); \
             } \
-            uint e = bitfieldExtract(v * (v + 1u), 5, 11); \
+            uint e = bitfieldExtract(v * (v + 1u), KBITS == 4 ? 4 : 5, KBITS == 4 ? 12 : 11); \
             WSTORE(r, q * uint(WPT) + 2u * n, steps[256u + 2u * e] * wstep[i]) \
             WSTORE(r, q * uint(WPT) + 2u * n + 1u, steps[257u + 2u * e] * wstep[i]) \
         }

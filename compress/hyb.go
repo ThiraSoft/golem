@@ -1,6 +1,6 @@
 package compress
 
-// The trellis that codes two weights a state: nn/h3g.go's format.
+// The trellis that codes two weights a state: nn/pair.go's H3G and H4G.
 //
 // The Viterbi is compress/trellis.go's with one change of unit. A step is a
 // pair of weights and not one, the stream moves 2k bits a step, and the
@@ -18,13 +18,21 @@ import (
 
 // PairOpts is a pair trellis.
 type PairOpts struct {
-	K   int // bits a weight; a state adds 2K
-	L   int // state bits
-	Seq int // weights a sequence, two a state
+	K       int // bits a weight; a state adds 2K
+	L       int // state bits
+	Seq     int // weights a sequence, two a state
+	Shift   int // a state's entry is bits Shift.. of s·(s+1)
+	Entries int // pairs in the codebook
 }
 
-// H3GOpts is the trellis nn/h3g.go reads.
-func H3GOpts() PairOpts { return PairOpts{K: nn.H3GK, L: nn.H3GL, Seq: nn.T4GSeq} }
+// Entry is which codebook entry a state reads.
+func (o PairOpts) Entry(s uint16) int { return nn.PairEntry(s, o.Shift, o.Entries) }
+
+// PairOptsFor is the trellis a pair tier is written with.
+func PairOptsFor(q nn.Quant) PairOpts {
+	p := nn.PairTierOf(q)
+	return PairOpts{K: p.K, L: p.L, Seq: nn.T4GSeq, Shift: p.Shift, Entries: p.Entries}
+}
 
 type pairWork struct {
 	prev, cur []float32
@@ -106,7 +114,7 @@ func viterbiPairs(z []float32, val []float32, o PairOpts, w *pairWork, states []
 
 // PairAccel, when set, is given first refusal on a whole pass, as
 // TrellisPathAccel is for the one-weight trellis. book is the codebook, a pair
-// an entry, and a state reads the entry nn.H3GEntry names; states receives one
+// an entry, and a state reads the entry o.Entry names; states receives one
 // state a pair. It returns false for a shape it was not built for.
 var PairAccel func(norm []float32, o PairOpts, book []float32, states []uint16) bool
 
@@ -125,7 +133,7 @@ func pairTable(o PairOpts, book []float32) []float32 {
 	ns := 1 << uint(o.L)
 	val := make([]float32, 2*ns)
 	for s := 0; s < ns; s++ {
-		e := nn.H3GEntry(uint16(s))
+		e := o.Entry(uint16(s))
 		val[2*s], val[2*s+1] = book[2*e], book[2*e+1]
 	}
 	return val
@@ -160,10 +168,10 @@ func QuantizePairsCPU(norm []float32, o PairOpts, val []float32, states []uint16
 // TrainPairCodebook is Lloyd's algorithm run through the trellis: code the
 // source, then move every codebook entry to the mean of the pairs its states
 // coded, and again. book holds the pairs and is updated in place; entry says
-// which entry a state reads through nn.H3GEntry. It returns the mean squared
+// which entry a state reads through o.Entry. It returns the mean squared
 // error of each round, measured before that round's update.
 func TrainPairCodebook(src []float32, o PairOpts, book []float32, rounds int) []float64 {
-	entry := nn.H3GEntry
+	entry := o.Entry
 	var errs []float64
 	for r := 0; r < rounds; r++ {
 		z := append([]float32(nil), src...)
@@ -193,33 +201,34 @@ func TrainPairCodebook(src []float32, o PairOpts, book []float32, rounds int) []
 	return errs
 }
 
-// EncodeH3G writes one matrix in H3G: the same site vector, rotation and
-// per-block normalisation as EncodeT4GAs, then the pair trellis, then each
+// EncodePairs writes one matrix in a pair tier: the same site vector, rotation
+// and per-block normalisation as EncodeT4GAs, then the pair trellis, then each
 // block's step fitted by least squares to the path.
-func EncodeH3G(w []float32, rows, cols int, q []float32, p GolemParams) []byte {
+func EncodePairs(w []float32, rows, cols int, q []float32, p GolemParams, kind nn.Quant) []byte {
+	tier := nn.PairTierOf(kind)
 	if cols%nn.T4GSeq != 0 {
-		panic("compress: an H3G row must be a multiple of 128 wide")
+		panic("compress: a pair-trellis row must be a multiple of 128 wide")
 	}
 	if p.ScaleBlock != 0 && p.ScaleBlock != nn.T4GBlock {
-		panic("compress: an H3G block is 64 weights and its step is not negotiable")
+		panic("compress: a pair-trellis block is 64 weights and its step is not negotiable")
 	}
 	n := rows * cols
-	rowBytes := nn.H3GRowBytes(cols)
+	rowBytes := tier.RowBytes(cols)
 	out := make([]byte, rows*rowBytes)
 	prep, norm := golemNormalise(w, rows, cols, q, p)
 
 	states := make([]uint16, n/2)
-	QuantizePairsPath(norm, H3GOpts(), nn.H3GCodebook(), states)
+	QuantizePairsPath(norm, PairOptsFor(kind), tier.Codebook(), states)
 
 	nblk := n / nn.T4GBlock
 	steps := golemFitSteps(prep, norm, nblk)
 	Parallel(rows, func(lo, hi int) {
 		for r := lo; r < hi; r++ {
-			plane, codes := nn.H3GPlanes(out[r*rowBytes:(r+1)*rowBytes], cols)
+			plane, codes := tier.Planes(out[r*rowBytes:(r+1)*rowBytes], cols)
 			copy(plane, steps[r*cols/nn.T4GBlock:(r+1)*cols/nn.T4GBlock])
 			for s := 0; s*nn.T4GSeq < cols; s++ {
 				at := (r*cols + s*nn.T4GSeq) / 2
-				nn.PutH3GStates(codes[s*nn.H3GSeqBytes:], states[at:at+nn.T4GSeq/2])
+				tier.PutStates(codes[s*tier.SeqBytes:], states[at:at+nn.T4GSeq/2])
 			}
 		}
 	})

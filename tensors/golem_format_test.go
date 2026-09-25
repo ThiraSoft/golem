@@ -129,7 +129,7 @@ func TestGolemTypeNumbersSpellThemselves(t *testing.T) {
 		if int(id&0x0F) != k || id&0x70 != 0 {
 			t.Fatalf("%s is %#x, whose low byte says %d bits a weight and it codes %d", name, id, id&0x0F, k)
 		}
-		if pair := id&0x80 != 0; pair != (name == "H3G") {
+		if pair := id&0x80 != 0; pair != (name == "H3G" || name == "H4G") {
 			t.Fatalf("%s is %#x, and its pair bit says %t", name, id, pair)
 		}
 	}
