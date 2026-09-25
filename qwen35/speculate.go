@@ -23,8 +23,9 @@ import (
 // The 1.056 is a Q4_0 kernel's, and a .golem checkpoint's is not. A trellis
 // weight has to be decoded before it can be spent, so a second column costs
 // what an activation load and a multiply-add cost on top of a decode that the
-// two columns share — cmd/golemtune on Qwen3.8-27B's feed forward reads 89.8
-// microseconds at one column and 112.6 at two, which is **1.25**, not 1.056.
+// two columns share — cmd/golemtune, while it existed, read Qwen3.8-27B's
+// feed forward in T3G at 89.8 microseconds at one column and 112.6 at two,
+// which is **1.25**, not 1.056.
 // The bargain survives that on paper: at 74% acceptance a step returns 1.74
 // tokens for 1.25 passes plus the block plus two extra readings of the logit
 // head, which qwen35/cost_test.go measures at 2.2 microseconds against a

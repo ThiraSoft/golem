@@ -194,7 +194,7 @@ H3G is 20 % smaller than Q3_K_M and ahead of it on every column. A weight is a p
 golemquant -model Qwen3-4B-BF16.gguf -out Qwen3-4B.golem -bits 3 -calib wiki.txt
 ```
 
-On Qwen3.8-27B, which is the model the format is for, H3G is 10.46 GiB and closer to bf16 than Q3_K_M (KL 0.0660), and it generates at 39.2 tokens a second against Q4_0's 34.1 on the same card, 59.8 to 66.7 drafting. H4G is 13.34 GiB, KL 0.0235 from bf16, 33.5 tokens a second and 56.3 to 70.8 drafting. [`compress/README.md`](compress/README.md) has the method, the measurements, and the one-weight trellis these two replaced.
+On Qwen3.8-27B, which is the model the format is for, H3G is 10.45 GiB and closer to bf16 than Q3_K_M (KL 0.0646 against 0.0900), and it generates at 38.8 tokens a second against Q4_0's 34.1 on the same card, about 60 to 67 drafting. H4G is 13.34 GiB, KL 0.0235 from bf16, 33.5 tokens a second and 56.3 to 70.8 drafting. [`compress/README.md`](compress/README.md) has the method, the measurements, and the one-weight trellis these two replaced.
 
 ## How it is known to be right
 
@@ -218,7 +218,7 @@ Judge it the way you would judge any dependency you did not write: run the tests
 - `engine/` reads the architecture out of a GGUF and opens the engine that implements it.
 - `gemma/`, `qwen/`, `qwen35/`, `pockettts/`, `stt/`, `nomic/` are standalone engines. They do not import one another.
 - `nn/` and `vk/` are the shared kernels: quantized AVX2 and NEON, and Vulkan compute.
-- `compress/` is the `.golem` format: calibration, the trellis codec, and the conversion pipeline.
+- `compress/` is the `.golem` format: calibration, the pair-trellis codec, and the conversion pipeline.
 - `grammar/` is GBNF and the JSON Schema converter that feeds it.
 - `internal/kyutai/` is the Mimi codec, shared by both directions of speech.
 - `tensors/`, `token/`, `chat/`, `sample/`, `audio/`, `imageio/` are the rest of the shared layer.

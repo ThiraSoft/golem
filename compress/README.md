@@ -1,28 +1,29 @@
 # compress
 
-A checkpoint in, a `.golem` out. One codebook, and a scheme around it:
+A checkpoint in, a `.golem` out. One codec, a trellis that decodes two weights
+a state, at two rates:
 
 | | block | bits/weight | tensor type |
 |---|---|---|---|
-| `T3G` | 128 weights in 52 bytes | 3.25 | `0x676C6D03` |
-| `T4G` | 128 weights in 67 bytes | 4.19 | `0x676C6D04` |
-| `T5G` | 128 weights in 83 bytes | 5.19 | `0x676C6D05` |
+| `H3G` | 128 weights in 51 bytes | 3.1875 | `0x676C6D83` |
+| `H4G` | 128 weights in 67 bytes | 4.1875 | `0x676C6D84` |
 
-`T3G` is the narrow body of a small model or a tight budget. The head defaults
-to four bits whatever the body is — a logit head narrower than the body would
-spend bits where they are worth least — but `-head` can still be set to match
-the body; `golemquant` only refuses a head *narrower* than the body, not an
-equal one.
+`golemquant -bits` picks the body's tier. `-head` picks the tier of the logit
+head and the embedding table, 3 or 4, and defaults to 4 whatever the body is:
+a logit head narrower than the body would spend bits where they are worth
+least, so `golemquant` refuses a head narrower than the body, though it takes
+an equal one.
 
 The file is a GGUF. Same container, so the vocabulary, the rope base and the
 chat template travel unchanged; what is new is a tensor type llama.cpp does not
-know and one vector per calibration site beside the matrices.
+know, one vector per calibration site beside the matrices, and the codebook the
+file was written with.
 
 Everything below about the scheme — the salience, the bound of 24×, the rotation
 by 128, `nn.GolemVectorNames` and the `A·(q ⊙ W)` convention with its two rules —
 is where most of the format's value is, and it is independent of the codebook:
-a lattice carried it before the trellis did, and lost only the codebook question
-when it was retired.
+a lattice carried it first, then a one-weight trellis, and each lost only the
+codebook question when it was retired.
 
 The scheme is named for the format rather than for any codebook — `nn/golem.go`,
 `vk/golem.go`, `nn.PrepareGolem`, `compress.GolemParams`. It was called `D4G`
@@ -31,17 +32,437 @@ that codebook by a month and read, wrongly, as the name of a codec this
 repository no longer has. Where `D4G` still appears below it names that retired
 lattice and its files, and is meant to.
 
-**Status, 2026-09-25.** The file tiers are H3G and H4G, the pair trellis
-described under "H3G: two weights a state" and "H4G: the same at four bits".
-T3G, T4G and T5G, the one-weight trellis most of this file measures, are
-retired: the pair tiers matched or beat them on every model measured (the
-perplexity gaps against them are inside the paired test), their type numbers
-0x676C6D03–05 are refused with a message to rebuild, and their code is gone.
-The one-weight trellis survives as the research codec in compress/trellis.go,
-which cmd/vqbuild and cmd/vqeval still use. The history below is kept because
-the pair tiers inherit everything it established.
+**History, in one paragraph.** The one-weight trellis T3G, T4G and T5G carried
+the format from 2026-08-30 to 2026-09-25. H3G and H4G matched or beat it on
+every model measured at the same or a smaller size, and run faster on the card,
+so it was retired: its type numbers `0x676C6D03`–`05` are refused with a
+message to rebuild, and its decoders and kernels are gone. It survives as the
+research codec in `compress/trellis.go`, which `cmd/vqbuild` and `cmd/vqeval`
+still use. Most of what this file measures was measured on it, and the pair
+tiers inherit all of it; that record is under "The one-weight trellis" below.
 
-## What a block holds: a trellis, with nothing to look up
+## What a block holds: two weights a state
+
+`nn/pair.go` is the definition, and QTIP's HYB code is the scheme (Tseng et al.,
+arXiv:2406.11235). The state is the last *L* bits of the code stream; each
+state shifts in 2*k* new bits and decodes a *pair* of weights, read out of a
+small trained table:
+
+    s      = the L bits at 2k·t within the sequence
+    h      = s·(s+1)                    (mod 2³²)
+    pair t = step[t/32] · codebook[bits Shift.. of h]
+
+| | L | bits a pair | codebook | entry bits of h |
+|---|---|---|---|---|
+| H3G | 14 | 6 | 2048 half2 pairs, 8 KiB | 5..15 |
+| H4G | 15 | 8 | 4096 half2 pairs, 16 KiB | 4..15 |
+
+Per sequence of 128 weights, 64 pairs:
+
+- **two step codes**, one for each 64 weights, eight bits each on the grid in
+  `nn/golem_step.go`, fitted by least squares after the path.
+- **the path**: *L* bits for the first pair and 2*k* for each of the 63 after
+  it. At three bits that is 14 + 63·6 = 392 bits, exactly 49 bytes. At four it
+  is 15 + 63·8 = 519, 65 bytes with one bit unused, and every window starts on
+  a byte.
+
+      H3G    392/128 + 8/64 = 3.0625 + 0.125 = 3.1875 bits a weight
+      H4G    520/128 + 8/64 = 4.0625 + 0.125 = 4.1875
+
+A row is two planes, steps then codes, because a shader reads words.
+
+**The codebook is trained, and the file carries it.** Each table was trained
+once by Lloyd's algorithm run through the trellis itself on a unit Gaussian (a
+path, then every entry becomes the mean of the pairs it coded) by
+`cmd/paircodebook`, and lives in `internal/pairbook`. A one-weight trellis
+decoded by arithmetic, so a file depended on nothing but its bits; a pair tier
+decodes through a table compiled into the binary, and a retrained table would
+decode every existing file to nonsense without an error. So `golemquant` writes
+the table under `golem.<tier>.codebook`, and a file whose table is not this
+build's is refused.
+
+**Why these states.** A state covering two weights shifts twice as far, so at
+the same *L* a path remembers half as many weights back: at twelve bits the pair
+code loses 0.45 dB to the one-weight trellis on a unit Gaussian. Fourteen is
+level with it untrained (17.40 dB against 17.39) and sixteen is only 0.06 dB
+ahead for a Viterbi four times the size. At four bits the pair code starts
+further behind, and the fifteen-bit state and the table of 4096 are what bring
+it past: 23.41 dB trained against 22.82. QTIP keeps a table of 512 pairs and a
+sign bit; a free table of 2048 measured the same and costs the decoder one
+instruction less.
+
+## Measured against the one-weight trellis
+
+Each pair of rows below comes from the same binary and the same salience
+file, so the codec is the only difference.
+
+### H3G against T3G
+
+T3G's product spent nine tenths of its time cutting a twelve-bit window per
+weight and looking it up; H3G cuts one window for two weights. Its codebook
+(`cmd/paircodebook`, 400 rounds of 16 M weights on the card, 36 seconds for 40)
+reads 17.58 dB held out on a unit Gaussian, against 17.25 for T3G's 1MAD at the
+gain the format uses.
+
+`golemquant -bits 3` against `-bits 3 -code pair` (the flag chose the codec
+then and went with T3G), head and table T4G in both:
+
+| | size | PPL | KL | top-1 | top-5 |
+|---|---|---|---|---|---|
+| Qwen3-0.6B T3G | 249.3 MiB | 34.8554 | 0.2498 | 73.6 % | 96.4 % |
+| Qwen3-0.6B H3G | 246.0 MiB | 34.9618 | 0.2471 | 74.3 % | 96.4 % |
+| Qwen3-4B T3G | 1.57 GiB | 21.1069 | 0.1771 | 83.1 % | 98.3 % |
+| Qwen3-4B H3G | 1.54 GiB | 21.8573 | **0.1720** | **84.4 %** | **98.5 %** |
+| Qwen3.8-27B T3G | 10.63 GiB | 9.9676 | 0.0738 | 87.4 % | 99.3 % |
+| Qwen3.8-27B H3G | **10.46 GiB** | **9.8248** | **0.0660** | **88.0 %** | **99.4 %** |
+
+The 4B's perplexity gap is the paired test's to judge and it does not pass it:
+0.035 nats a window, t = 1.18 over the eight windows, and on 16352 tokens of
+`eval-long.txt` in 32 windows the two read 17.3794 (T3G) and 17.3631 (H3G), H3G
+ahead in 18 of 32, t = −0.06. The divergence is the reliable number and it goes
+H3G's way on all three models.
+
+What it buys on the card, Qwen3.8-27B, `golem-cli -vulkan -temp 0 -n 256`,
+best of three rotated rounds, two prompts:
+
+| | T3G | H3G | Q4_0 |
+|---|---|---|---|
+| tokens a second | 35.4 | **39.2** | 34.1 |
+| `-draft-n 3`, prose | 46.3 | **59.8** | — |
+| `-draft-n 3`, code | 54.7 | **66.7** | — |
+
+T3G was read with `GOLEM_MATVEC_SHAPE="1:256,true,false 2:256,true,false"`, its
+best; the default read 34.7 and 35.0. The Q4_0 file's prediction projection is
+Q8_0 and it does not draft here. The draft's gain is larger than the token's
+because `vk/shaders/matvec_pair.comp` also carries two rows a lane, which halves
+the activation traffic past one column; a bench that went with T3G separated
+the two, and most of the four-column gain is the rows, which T3G could have had
+too.
+
+### H4G against T4G
+
+H4G is T4G's size to the byte. The pair code starts further behind at four
+bits — a fourteen-bit state and 2048 pairs read 22.37 dB untrained against
+T4G's 22.82 — and the wider state and table are what bring it past: trained,
+23.41 dB.
+
+Same binary and salience against T4G, head and table in the pair tier:
+
+| | size | PPL | KL | top-1 | top-5 |
+|---|---|---|---|---|---|
+| Qwen3-0.6B T4G | 298.5 MiB | 30.3765 | 0.0800 | 84.2 % | 99.0 % |
+| Qwen3-0.6B H4G | 298.5 MiB | 30.8123 | **0.0758** | **84.7 %** | **99.1 %** |
+| Qwen3-4B T4G | 1.96 GiB | 19.9443 | 0.0541 | 89.8 % | **99.8 %** |
+| Qwen3-4B H4G | 1.96 GiB | 20.0749 | **0.0495** | **90.2 %** | 99.7 % |
+| Qwen3.8-27B T4G | 13.34 GiB | 9.4634 | 0.0248 | 92.5 % | **100.0 %** |
+| Qwen3.8-27B H4G | 13.34 GiB | **9.4605** | **0.0235** | **92.7 %** | 99.9 % |
+
+On the small models the perplexity goes T4G's way and the divergence H4G's,
+and neither perplexity gap passes the paired test: on 16352 tokens the 4B
+reads 15.8814 against 16.0025, t = 1.07, and the 0.6B 26.6709 against 27.0176,
+t = 1.81. On the 27B both go H4G's way.
+
+On the card the four-bit token is a wash — the weight is a larger share of it
+and the decode a smaller one — and the draft is not:
+
+| Qwen3.8-27B | T4G | H4G | Q4_0 |
+|---|---|---|---|
+| tokens a second | 33.4 | 33.5 | 34.1 |
+| `-draft-n 3`, prose | 46.3 | **56.3** | — |
+| `-draft-n 3`, code | 56.5 | **70.8** | — |
+
+T4G read at its best shape, as T3G above.
+
+### What the files read
+
+The three-bit rows above carry a T4G head. The files `golemquant` writes now
+carry an H4G one, reconverted from the same salience files. Same corpus and
+windows, all read by `cmd/vqdiff`:
+
+| | size | PPL | KL | top-1 | top-5 |
+|---|---|---|---|---|---|
+| Qwen3-0.6B H3G, head H4G | 246.0 MiB | 35.3099 | 0.2451 | 74.5 % | 96.6 % |
+| Qwen3-4B H3G, head H4G | 1.54 GiB | 21.6689 | 0.1715 | 84.6 % | 98.6 % |
+| Qwen3.8-27B H3G, head H4G | 10.45 GiB | 9.8333 | 0.0646 | 88.3 % | — |
+
+The H4G files are the rows of the table above. The 27B H3G generates at 38.8
+tokens a second with its H4G head, against 39.2 with the T4G one; the drafting
+figures were not taken again.
+
+## The file
+
+### What says a file is a golem file
+
+A `.golem` is a GGUF with private tensor types in it, and for one day it was
+identified by nothing else: the number 1000. That is an integer in ggml's enum,
+which ggml owns and grows, and it turned out not even to be safe against this
+repository's own past. Before the trellis, 1000 meant `D4G`: a lattice, 64
+weights in 26 bytes. It then meant `T3G`: a trellis, 128 in 52. **The same 3.25
+bits a weight** — so a lattice-era file passed the type lookup, passed the row
+size, decoded lattice codes through the trellis hash, and read its rotation from
+a key that no longer existed, silently, as none. The file agreed about every
+shape and answered nonsense, which is this format's named failure mode.
+
+Four checks in `tensors.checkGolemFile` now have to agree before a file is read:
+
+1. **`golem.format = "trellis/1"`** — a positive discriminator in golem's own
+   namespace, with a version. *This* is what makes a file a golem file. A file
+   carrying a private tensor type without it is refused, because a missing key
+   cannot be told from agreement: it means "written before this key existed",
+   and that file has to be rebuilt. A `golem.d4.*` key, which only the
+   lattice-era converter wrote, is refused too.
+2. **The tensor type**, which the metadata cannot replace: it is per tensor, and
+   it is what distinguishes an `H3G` body from an `H4G` head inside one file.
+   The top three bytes are ASCII `glm`, so a hex dump names the format to
+   somebody with no tooling. The low byte's low nibble is the bits a weight and
+   its high bit says two weights a state, so H3G is `0x676C6D83` and H4G
+   `0x676C6D84`. `0x676C6D03`–`05` were the one-weight tiers and are refused
+   with a message to rebuild; 1000–1004 are retired. None is ever reused.
+3. **The declared geometry.** `golem.trellis.seq` and `golem.trellis.bits` are
+   checked against what the build implements, the body's tier has to be one
+   the file's tensors use, and the block size each tensor type claims has to
+   follow from its state and rate. A mismatch is an error naming both numbers,
+   not a reinterpretation. A file written while the one-weight tiers existed
+   also carries `golem.trellis.state`, their twelve bits, which is no longer
+   read: a pair tier's state is fixed by its type.
+4. **The codebook.** `golem.h3g.codebook` or `golem.h4g.codebook`, for each
+   tier the file uses, has to equal the table in `internal/pairbook` entry for
+   entry.
+
+Each catches what the others do not. The type number alone collides with its own
+history — that is the D4G case above, and `golem.format` is what refuses it.
+`golem.format` alone cannot say which tier a tensor is, because it is per file.
+Both together would still let a file written by a build with a different
+sequence length decode at the right size and the wrong offsets, which is what
+the geometry check refuses. And all three pass a file written through another
+table, which is what the codebook check is for.
+
+**`general.file_type` is `-1`, `GGML_FTYPE_UNKNOWN`, on purpose.** It used to
+carry the body's tier as a private number. That field is llama.cpp's `ftype`,
+and unlike the tensor types it is read by tools that do not understand this
+file — Hugging Face's GGUF viewer renders it as the quantization's name. Putting
+a private value there is the same mistake as squatting the tensor enum, and
+worse in one respect: the tensor numbers are only read by readers that already
+know what the file is, whereas `ftype` is read by ones that do not, and would
+show a confident wrong answer to somebody with no way to check it. The body's
+tier is `golem.trellis.bits`, in golem's own namespace, where it belongs. Do not
+put it back.
+
+`golem.hadamard_group` and `golem.scale_block` in the metadata say what the
+file was written with — both name the scheme, and are unchanged by which
+codebook a block holds.
+
+### The step, and where its window sits
+
+Eight bits naming powers of two a sixteenth apart. A grid an eighth apart costs
+a whole point of perplexity against an fp16 step at the same granularity, which
+is more than the finer granularity wins back — the step sits at the bottom of a
+curve, and nine percent is far enough up its sides to matter.
+
+The window is 6.1e-5 to 3.83, not the wider range an earlier, lattice-based
+codebook used. A lattice's step is a *fraction* of its block's RMS — the block
+is scaled up into a shell several units across — while a trellis step is the
+block's RMS itself, and the two windows are not interchangeable: a unit-variance
+source clipped at the wider window's ceiling reconstructs at **5.5 dB instead of
+23**, with every shape still agreeing.
+
+An eight-bit step against an fp16 scale is 0.125 bits a weight, three percent of
+the file, and whether it is free is not a question squared error can answer —
+see the trap below. Measured through the offline bench on Qwen3-0.6B at k=4,
+everything else equal:
+
+| | bpw | PPL | KL | top-1 |
+|---|---|---|---|---|
+| fp16 scale | 4.3125 | 29.7845 | 0.0658 | 84.2 % |
+| eight-bit step | **4.1875** | 29.8677 | 0.0702 | 84.0 % |
+
+A twentieth of a point of perplexity and some percent of the divergence, for
+three percent of the file. The format takes the step.
+
+### The step is chosen after the path
+
+A block's RMS is the scale that makes it unit-variance, which is not the scale
+that reconstructs it best. The lattice buys that difference with a grid of seven
+candidate steps per block; a trellis cannot, because one path spans two blocks
+and the search would have to be joint. Least squares takes it exactly and for
+nothing once the path exists, and it is worth about 4 % of the error.
+
+### The head, which is the one tensor worth more bits
+
+`token_embd`, the tied logit head, is not a hidden layer whose error the
+layers after it absorb; it makes the logits, and llama.cpp's K-quant mixes have
+always spent more there: Qwen3-4B's Q4_K_M gives it 6.56 bits and the rest 4.95.
+That is why `-head` defaults to four bits on a three-bit body.
+
+A five-bit head was measured with the one-weight trellis's `T5G`, and it is
+gone with it; `-head` takes 3 or 4. On Qwen3-0.6B, where the head is a quarter
+of the weights, the measurement was:
+
+| head | file | PPL | KL | top-1 |
+|---|---|---|---|---|
+| four bits (T4G, 2048-token calibration) | 298.5 MiB | 30.3744 | 0.0800 | 84.2 % |
+| five bits (T5G) | 317.1 MiB | 30.5240 | 0.0718 | 84.8 % |
+| bf16, the ceiling | 517.6 MiB | 30.3016 | 0.0662 | 85.2 % |
+
+Five bits took about three fifths of the way to an unquantized head for six
+percent of the file. A five-bit pair tier would be `0x676C6D85` and need no
+other decision; nobody has built it.
+
+### The offline bench is not a file, and the difference is one mechanism
+
+`cmd/vqbuild` holds 32 columns per matrix out of the quantizer at 8 bits. **No
+`.golem` can**: the format has nowhere to put them, and neither codec has ever
+stored one. So every number the bench reports is of a scheme with an extra part,
+and the bits it prints do not count it — `Opts.BPW` leaves the held-out columns
+out of its own total.
+
+What that part is worth, on Qwen3-0.6B at the same rate and codec:
+
+| | PPL | KL | top-1 |
+|---|---|---|---|
+| bench, salience unbounded, 32 columns held out | 29.87 | 0.0702 | 84.0 % |
+| bench, salience unbounded, none held out | **39.67** | **0.3105** | 69.4 % |
+| the file: salience bounded to 24×, none held out | 30.37 | 0.0800 | 84.2 % |
+
+Ten points, and the whole of it is the handful of columns whose salience scale
+would otherwise dominate the group it is rotated with. The bench solves that by
+paying 8 bits for them; the converter solves it by bounding the scale, which
+costs no bits at all and recovers all but a point of the difference. They are
+two answers to one problem and the file's is nearly as good — but it is not
+quite, and a point of perplexity is what stands between this format and the
+perplexity column of the table above.
+
+### The two encoders are held to a weaker contract than byte equality
+
+A codebook read by index has one right index for a point, so two encoders that
+disagree write different files for the same weights, and byte equality would be
+the contract to hold them to. A trellis records the path it chose instead, and
+**any minimum-cost path is an equally valid file**: `TestPairViterbiMatchesCPU`
+therefore holds the card's encoder to the processor's on the same *cost*,
+sequence by sequence, and checks that the states it returns chain as the format
+says and decode to the reconstruction it wrote. `TestViterbiMatchesCPU` does the
+same for the one-weight research codec.
+
+**This does not extend to the decoder.** A decoder is a pure function of the bits
+it reads, so Go and the shader must agree exactly, and
+`TestGolemDecodeMatchesCPUExactly` sweeps a one-hot activation over a whole row
+to say so weight by weight, for both tiers. The step grid is uploaded as 256
+floats rather than recomputed with an `exp2` for the same reason: this card's
+`exp2` lands one unit in the last place from Go's, which is 3e-7 of an output
+and is exactly the kind of invisible this format cannot afford. The codebook is
+half-precision numbers for the same reason: a kernel holds it as halves, and
+`TestPairCodebookIsHalfExact` holds the Go side to the same values.
+
+### On the card
+
+`vk/shaders/viterbi_hyb.comp` is the pair tiers' encoder. It holds its 16384 or
+32768 states in registers, sixteen or thirty-two a thread, where two cost planes
+in shared memory would not fit. The Viterbi is the only half of a conversion
+that cares where it runs: the 4B converts in under three minutes at three bits
+and the 27B in fifteen. `vk/shaders/matvec_pair.comp` is the mat-vec,
+`matmul_golem.comp` the tiled product and `embed_golem.comp` the embedding
+gather, each compiled once per tier. `vk/shaders/viterbi_tcq.comp` is the
+one-weight trellis's encoder, which the research bench still reads.
+
+## The scheme, and the one thing to understand about it
+
+A matrix is not stored as its weights. It is stored as **A·(q ⊙ W)**: its
+columns scaled by a per-column vector `q`, then rotated by a Hadamard transform
+in groups of 128 with random signs folded in.
+
+Nothing undoes that on the weight side. The activation meets **A·(x / q)**
+instead — the same function with the reciprocal vector — and since AᵀA = I the
+product is unchanged. `nn.PrepareGolem` is both directions; it runs once per site
+rather than once per matrix, which is why the scheme is cheap at inference.
+
+Two consequences, and both have cost this repository a day:
+
+**A matrix reads the vector of its site, not its own.** The three projections
+of an attention read one stream and so share one vector; a hybrid's four input
+projections share the same one; the feed forward's gate and up share another.
+`nn.GolemVectorNames` is where that convention lives, for the converter and every
+reader alike — a copy of it anywhere else drifts, and a file whose matrices were
+quantized against one vector and are read through another loads, agrees about
+every shape, and answers nonsense.
+
+**A row read on its own is not a product.** The embedding table is read a token
+at a time, and that row has to be the embedding rather than the rotated form a
+product would want. `nn.Matrix.Row` undoes the transform when the matrix carries
+its vector; `MatVec` does not, because the activation already did.
+
+## The salience, which is most of what the format is
+
+`q` is not just signs. It carries an AWQ-style scale: the per-column power of
+the activations that reach a site, raised to α = 0.5 and normalised by its
+geometric mean. Converting without it — signs and rotation alone — costs twenty
+points of perplexity on Qwen3-0.6B, 39.80 against 60.01. The codebook, which
+took the most work, was worth 1.5 of those points when it was the D4 lattice —
+a comparison against the codebook doing nothing, not against the trellis that
+replaced it.
+
+The scale is **bounded to 24×**, and that is not a detail. It is applied before
+a rotation that mixes 128 columns together: a column shrunk by two thousand is
+mixed with one left alone, quantized as if it were the second, and multiplied
+back by two thousand on the activation side. At α = 0.75 the spread reaches
+eighteen thousand and the model reads at a perplexity of 246 rather than 40.
+
+`cmd/golemquant` measures the sites by running the model — on a card when it can,
+which is fifteen seconds for eight thousand tokens of a 27B against an hour and
+a half of eight cores — and refuses to write a file it could not calibrate.
+
+## What is measured and does not work
+
+- **GPTQ compensation**: 0.15 points on a real model, where it halves the
+  output error on synthetic data. The rotation whitens the Hessian and leaves
+  nothing to redistribute. It worked; it just bought nothing here, so the
+  factoring machinery (`Comp`, `NewComp`, the Cholesky routines) was removed
+  from `gptq.go` along with `cmd/golemquant`'s `-gptq` and `-damp` flags —
+  what is left is the windowed-Hessian accumulator, which the salience search
+  still reads.
+- **Non-uniform bit allocation**: per-weight sensitivities span 2.4× and
+  `ffn_down` is indeed the most sensitive, but the arithmetic-to-geometric mean
+  ratio is 0.17 dB. Three code widths and three shader variants for that: no.
+- **Deltas between adjacent layers**: blocks differ by 1.30–1.37 against 1.414
+  for two unrelated matrices. They share nothing.
+- **Low rank**: the spectrum is not flat and the rotation does not touch it, but
+  rank 64 in fp16 costs 46 % of the bits to remove 2.1 dB where 46 % more code
+  gives 9.
+- **A per-row gain**: γ = 1.0000 ± 1.7 %, which removes 0.5 % of the error.
+- **A global gain on the trellis codebook**: g = 1 is optimal and any departure
+  costs. The adaptation that pays is per block, and least squares takes it
+  exactly.
+- **The salience bound, and its exponent**, for the trellis. Six settings on
+  Qwen3-0.6B — bounds of 8, 12, 24, 48 and none at α = 0.5, and α = 0.4 and 0.6
+  at 24 — read 30.68 to 30.82 and KL 0.0800 to 0.0850. The default is as good as
+  any of them, which is the same answer `-search` gets by a different route.
+- **More calibration**, for the trellis. On Qwen3-4B in one pass, 2048 tokens
+  read 19.7285 and KL 0.0510; 8192 read 19.7004 and **0.0550**. More calibration
+  buys average likelihood and sells per-token agreement. Windowing it to match
+  the evaluation's regime is worse on both: 19.7808 / 0.0566. **This does not
+  generalise.** On Qwen3-0.6B, 2048 tokens read 30.3744 and 8192 read 30.8680 —
+  a gap of 0.49 nats the *other* way round: more calibration makes perplexity
+  worse on the smaller model. Whatever the 4B's pair of numbers said about
+  calibration buying average likelihood at the cost of per-token agreement, it
+  is a fact about that model's size, not about calibration in general — the two
+  models disagree on which direction more calibration even moves perplexity, so
+  a reader should not assume either row predicts a third model's.
+- **Choosing the salience per site** (`-search`, left off): six settings give a
+  mean of 39.73 against 39.80 for one bound chosen for the whole model. The
+  spread is the choosing, not the choice.
+
+## The one-weight trellis, 2026-08-30 to 2026-09-25
+
+What follows is the record of T3G, T4G and T5G: one weight a state, twelve bits
+of state, and a codebook computed by QTIP's 1MAD hash rather than read from a
+table. Its numbers stand as measured. Several files it names went with it and
+are in the history before 717d6be: `nn/t4g.go`, `vk/shaders/matvec_t4g.comp`,
+`vk/golem_ablate_test.go`, `vk/golem_bar_test.go`, `vk/hyb_bench_test.go`,
+`vk.TestGolemBuildsAgree`, and `cmd/golemtune` with its `GOLEM_MATVEC_SHAPE`
+setting. What it established about
+measuring on this card, and about bytes read not being what a decoding kernel
+is short of, holds for the pair tiers too.
+
+### What a block held: a trellis, with nothing to look up
 
 A sequence of 128 weights costs 67 bytes, 4.1875 bits each, and there is no
 decode table at all — the whole reason this codebook exists. An earlier
@@ -51,11 +472,6 @@ the four-bit tier its successor needed would have taken a table of 493 KiB,
 which does not fit. The trellis was written to close that gap, and once it did,
 carrying two codebooks bought nothing a measurement could find at any rate
 either format reached — so the lattice was retired rather than kept beside it.
-
-`golem.hadamard_group` and `golem.scale_block` in the metadata say what the
-file was written with — both name the scheme, and are unchanged by which
-codebook a block holds. What says the file is golem's at all is three separate
-things, below.
 
 The state is the last twelve bits of the code stream, so
 weight *t* reads the twelve bits at offset 4·*t* and hashes them:
@@ -96,82 +512,6 @@ half a byte of output.
 and a Viterbi is a chain of comparisons over a codebook with 1021 distinct
 values for 4096 states — near ties are everywhere and one bit moves whole paths.
 It was 7 % of the weights.
-
-### What says a file is a golem file
-
-A `.golem` is a GGUF with private tensor types in it, and for one day it was
-identified by nothing else: the number 1000. That is an integer in ggml's enum,
-which ggml owns and grows, and it turned out not even to be safe against this
-repository's own past. Before the trellis, 1000 meant `D4G`: a lattice, 64
-weights in 26 bytes. It now means `T3G`: a trellis, 128 in 52. **The same 3.25
-bits a weight** — so a lattice-era file passed the type lookup, passed the row
-size, decoded lattice codes through the trellis hash, and read its rotation from
-a key that no longer existed, silently, as none. The file agreed about every
-shape and answered nonsense, which is this format's named failure mode.
-
-Three independent layers now have to agree before a file is read:
-
-1. **`golem.format = "trellis/1"`** — a positive discriminator in golem's own
-   namespace, with a version. *This* is what makes a file a golem file. A file
-   carrying a private tensor type without it is refused, because a missing key
-   cannot be told from agreement: it means "written before this key existed",
-   and that file has to be rebuilt.
-2. **The tensor type**, which the metadata cannot replace: it is per tensor, and
-   it is what distinguishes a `T3G` body from a `T4G` head inside one file. The
-   three are `0x676C6D03`, `04` and `05`. The top three bytes are ASCII `glm`,
-   so a hex dump names the format to somebody with no tooling, and **the low
-   byte is the bits a weight**, so a six-bit tier is `0x676C6D06` and needs no
-   decision. 1000–1004 are retired and never reused.
-3. **The declared geometry.** `golem.trellis.seq`, `golem.trellis.bits` and
-   `golem.trellis.state` are checked against what the build implements and
-   against the block size each tensor type claims. A mismatch is an error naming
-   both numbers, not a reinterpretation.
-
-Each catches what the others do not. The type number alone collides with its own
-history — that is the D4G case above, and `golem.format` is what refuses it.
-`golem.format` alone cannot say which tier a tensor is, because it is per file.
-And both together would still let a file written by a build with a different
-sequence length or state width decode at the right size and the wrong offsets,
-which is what the geometry check refuses. Reading a file as a format it is not
-now needs three coincidences at once.
-
-**`general.file_type` is `-1`, `GGML_FTYPE_UNKNOWN`, on purpose.** It used to
-carry the body's tier as a private number. That field is llama.cpp's `ftype`,
-and unlike the tensor types it is read by tools that do not understand this
-file — Hugging Face's GGUF viewer renders it as the quantization's name. Putting
-a private value there is the same mistake as squatting the tensor enum, and
-worse in one respect: the tensor numbers are only read by readers that already
-know what the file is, whereas `ftype` is read by ones that do not, and would
-show a confident wrong answer to somebody with no way to check it. The body's
-tier is `golem.trellis.bits`, in golem's own namespace, where it belongs. Do not
-put it back.
-
-### The step, and where its window sits
-
-Eight bits naming powers of two a sixteenth apart. A grid an eighth apart costs
-a whole point of perplexity against an fp16 step at the same granularity, which
-is more than the finer granularity wins back — the step sits at the bottom of a
-curve, and nine percent is far enough up its sides to matter.
-
-The window is 6.1e-5 to 3.83, not the wider range an earlier, lattice-based
-codebook used. A lattice's step is a *fraction* of its block's RMS — the block
-is scaled up into a shell several units across — while a trellis step is the
-block's RMS itself, and the two windows are not interchangeable: a unit-variance
-source clipped at the wider window's ceiling reconstructs at **5.5 dB instead of
-23**, with every shape still agreeing.
-
-An eight-bit step against an fp16 scale is 0.125 bits a weight, three percent of
-the file, and whether it is free is not a question squared error can answer —
-see the trap below. Measured through the offline bench on Qwen3-0.6B at k=4,
-everything else equal:
-
-| | bpw | PPL | KL | top-1 |
-|---|---|---|---|---|
-| fp16 scale | 4.3125 | 29.7845 | 0.0658 | 84.2 % |
-| eight-bit step | **4.1875** | 29.8677 | 0.0702 | 84.0 % |
-
-A twentieth of a point of perplexity and some percent of the divergence, for
-three percent of the file. The format takes the step.
 
 ### What it costs the weights
 
@@ -345,93 +685,6 @@ calibration, three minutes and forty-two seconds for 257 sites.
 Both conversions ran on the card end to end — **27318 of 27321 M weights**, the
 remaining three million being the shapes no kernel is compiled for — in 34m25
 for T4G and 32m46 for T3G.
-
-### H3G: two weights a state
-
-T3G's product spends nine tenths of its time cutting a twelve-bit window per
-weight and looking it up. H3G (`nn/pair.go`) is QTIP's HYB code: a
-fourteen-bit state moves six bits a *pair*, s·(s+1) picks one of 2048 half2
-pairs, and one window and one read make two weights. The codebook was trained
-once by Lloyd's algorithm through the trellis on a unit Gaussian
-(`cmd/paircodebook`, 400 rounds of 16 M weights on the card, 36 seconds for 40):
-17.58 dB held out, against 17.25 for T3G's 1MAD at the gain the format uses.
-128 weights in 51 bytes, 3.1875 bits a weight, no padding.
-
-At twelve bits of state a pair code loses 0.45 dB to T3G — a state covering two
-weights remembers half as far back — which is why the state is fourteen: level
-at 17.40 dB untrained, and the card's Viterbi (`vk/shaders/viterbi_hyb.comp`)
-holds its 16384 states in registers, sixteen a thread, where two cost planes in
-shared memory would not fit.
-
-Each pair of rows below comes from the same binary and the same salience file,
-`golemquant -bits 3` against `-bits 3 -code pair` (the flag went with T3G),
-head and table T4G in both:
-
-| | size | PPL | KL | top-1 | top-5 |
-|---|---|---|---|---|---|
-| Qwen3-0.6B T3G | 249.3 MiB | 34.8554 | 0.2498 | 73.6 % | 96.4 % |
-| Qwen3-0.6B H3G | 246.0 MiB | 34.9618 | 0.2471 | 74.3 % | 96.4 % |
-| Qwen3-4B T3G | 1.57 GiB | 21.1069 | 0.1771 | 83.1 % | 98.3 % |
-| Qwen3-4B H3G | 1.54 GiB | 21.8573 | **0.1720** | **84.4 %** | **98.5 %** |
-| Qwen3.8-27B T3G | 10.63 GiB | 9.9676 | 0.0738 | 87.4 % | 99.3 % |
-| Qwen3.8-27B H3G | **10.46 GiB** | **9.8248** | **0.0660** | **88.0 %** | **99.4 %** |
-
-The 4B's perplexity gap is the paired test's to judge and it does not pass it:
-0.035 nats a window, t = 1.18 over the eight windows, and on 16352 tokens of
-`eval-long.txt` in 32 windows the two read 17.3794 (T3G) and 17.3631 (H3G), H3G
-ahead in 18 of 32, t = −0.06. The divergence is the reliable number and it goes
-H3G's way on all three models.
-
-What it buys on the card, Qwen3.8-27B, `golem-cli -vulkan -temp 0 -n 256`,
-best of three rotated rounds, two prompts:
-
-| | T3G | H3G | Q4_0 |
-|---|---|---|---|
-| tokens a second | 35.4 | **39.2** | 34.1 |
-| `-draft-n 3`, prose | 46.3 | **59.8** | — |
-| `-draft-n 3`, code | 54.7 | **66.7** | — |
-
-T3G is read with `GOLEM_MATVEC_SHAPE="1:256,true,false 2:256,true,false"`, its
-best; the default reads 34.7 and 35.0. The Q4_0 file's prediction projection is
-Q8_0 and it does not draft here. The draft's gain is larger than the token's
-because `vk/shaders/matvec_h3g.comp` also carries two rows a lane, which halves
-the activation traffic past one column; `vk/hyb_bench_test.go` separates the two
-and most of the four-column gain is the rows, which T3G could have too.
-
-### H4G: the same at four bits
-
-A fifteen-bit state, eight bits a pair so every window starts on a byte, and
-4096 half2 pairs picked by bits 4..15 of s·(s+1). 128 weights in 67 bytes,
-T4G's size to the byte. The pair code starts further behind at four bits — a
-fourteen-bit state and 2048 pairs read 22.37 dB untrained against T4G's 22.82
-— and the wider state and table are what bring it past: trained, 23.41 dB.
-
-Same binary and salience against T4G, head and table in the pair tier:
-
-| | size | PPL | KL | top-1 | top-5 |
-|---|---|---|---|---|---|
-| Qwen3-0.6B T4G | 298.5 MiB | 30.3765 | 0.0800 | 84.2 % | 99.0 % |
-| Qwen3-0.6B H4G | 298.5 MiB | 30.8123 | **0.0758** | **84.7 %** | **99.1 %** |
-| Qwen3-4B T4G | 1.96 GiB | 19.9443 | 0.0541 | 89.8 % | **99.8 %** |
-| Qwen3-4B H4G | 1.96 GiB | 20.0749 | **0.0495** | **90.2 %** | 99.7 % |
-| Qwen3.8-27B T4G | 13.34 GiB | 9.4634 | 0.0248 | 92.5 % | **100.0 %** |
-| Qwen3.8-27B H4G | 13.34 GiB | **9.4605** | **0.0235** | **92.7 %** | 99.9 % |
-
-On the small models the perplexity goes T4G's way and the divergence H4G's,
-and neither perplexity gap passes the paired test: on 16352 tokens the 4B
-reads 15.8814 against 16.0025, t = 1.07, and the 0.6B 26.6709 against 27.0176,
-t = 1.81. On the 27B both go H4G's way.
-
-On the card the four-bit token is a wash — the weight is a larger share of it
-and the decode a smaller one — and the draft is not:
-
-| Qwen3.8-27B | T4G | H4G | Q4_0 |
-|---|---|---|---|
-| tokens a second | 33.4 | 33.5 | 34.1 |
-| `-draft-n 3`, prose | 46.3 | **56.3** | — |
-| `-draft-n 3`, code | 56.5 | **70.8** | — |
-
-T4G read at its best shape, as T3G above.
 
 ### Tail-biting: built, measured, and not taken
 
@@ -753,72 +1006,6 @@ of whichever sits third — the same binary, both ways round. Two of those three
 readings were confident and wrong. **Below a tenth, nothing measured any other
 way should be believed, including by whoever measured it.**
 
-**And a warning about the tuning.** The first shapes shipped here were measured
-on the 4B's feed forward alone, 9728 by 2560. On the 27B's, 17408 by 5120, the
-workgroup that won for the 4B at two columns costs **28 %** — which was most of
-why drafting looked worse than it is. The defaults are now the consensus of both
-geometries, and `cmd/golemtune` takes `-rows` and `-cols` so that a model with a
-shape unlike either can be measured on its own.
-
-Two things follow for anyone reading this next.
-
-**The standing lesson survives, sharpened.** T4G is still not bandwidth-bound —
-it now moves about 190 GB/s of 640 — so a change argued for on bytes read still
-has to clear that bar. What has changed is that "it is not bandwidth-bound" is
-no longer where the analysis stops.
-
-**And the bar to beat is not the one this file was measuring against.** Q4_0 has
-two mat-vecs here: `matvec_q40.comp`, which reads float activations, and
-`matvec.comp`, which reads them quantized to Q8_0 and spends one
-`dotPacked4x8AccSatEXT` on eight weights. The second is the path most of a
-model's projections actually take, and it is much the faster of the two. On the
-same 9728x2560 shape, one column:
-
-| | microseconds |
-|---|---|
-| T4G, after everything above | 67.9 |
-| Q4_0 against float activations | 52.4 |
-| **Q4_0 against Q8_0, integer dot product** | **44.7** |
-
-End to end on Qwen3-4B, same engine, same card, warm: Q4_0 generates at 103.6
-tokens a second where T4G does 67.5 and T3G 68.4. **1.53 times**, against the
-mat-vec's 1.52 — so the whole of the difference is the product and none of it is
-anywhere else. The transform each site applies to its activation was measured by
-taking it out: four per cent.
-
-**What it would take to close the rest is not a kernel.** The obvious answer is
-to do what Q4_0 does — never leave the integers, one `dotPacked4x8` on eight
-weights against an activation packed four to a word — and 1MAD's byte sum runs 0
-to 1020, eleven bits, so it would have to be split into a high byte and a few
-low bits and summed as two dot products. That was worth measuring before it was
-worth writing, and `vk/golem_bar_test.go` measures it. All five kernels in one
-process, round-robin, fastest of six rounds, 9728 by 2560, one column:
-
-| | microseconds | of the bar |
-|---|---|---|
-| **Q4_0 against Q8_0, integer dot product** | **36.2** | 1.00 |
-| Q4_0 against float activations | 45.0 | 1.24 |
-| **T4G with nothing but the window and the table** | **56.8** | **1.57** |
-| T4G | 61.7 | 1.70 |
-| T3G | 62.7 | 1.73 |
-
-The third row is the answer. It is the kernel with the float multiply, the fused
-add and the activation load all taken out — `ABLATE 6` of
-`vk/shaders/matvec_t4g.comp`, which cuts each weight's window, reads its value
-out of shared memory and adds it to an integer. **Everything an integer
-reformulation could win is the 4.9 microseconds between it and the full kernel,
-eight per cent**, and it would have to pay for packing four values into a word
-to win any of it. What is left below is the window cut and the table read, and
-those are the codebook: a trellis decodes one weight at a time from twelve bits
-of state, and Q4_0 decodes eight from one instruction.
-
-So the trellis costs about 1.7 times a nibble's product on this card, of which
-1.57 is not reachable by any arrangement of the arithmetic that reads the
-weights the same way. That is the price of the bits it saves, and it should be
-argued about as a price rather than as a bug: T3G is 18 % smaller than Q3_K_M
-and ahead of it on every quality column, and it generates at about six tenths of
-Q4_0's rate. Nothing above changes either half of that sentence.
-
 **The third knob is the card's, not ours.** Whether the table is worth its
 sixteen kibibytes depends on the pass width: a pass of one decodes a weight for
 one activation, and a pass of eight spends each decoded weight eight times, so
@@ -837,170 +1024,6 @@ the cases interleaved round-robin, keeping the fastest round of each. A Go
 benchmark, which runs its cases in sequence, is the wrong instrument for this
 and was believed twice before that was noticed.
 
-### The head, which is the one tensor worth more bits
-
-`-head 5` writes `token_embd` — the tied logit head — in the wide tier and
-everything else in the ordinary one. It is not a hidden layer whose error the
-layers after it absorb; it makes the logits, and llama.cpp's K-quant mixes have
-always spent more there: Qwen3-4B's Q4_K_M gives it 6.56 bits and the rest 4.95.
-
-On Qwen3-0.6B, where the head is a quarter of the weights:
-
-| head | file | PPL | KL | top-1 |
-|---|---|---|---|---|
-| four bits (2048-token calibration) | 298.5 MiB | 30.3744 | 0.0800 | 84.2 % |
-| **five bits** | 317.1 MiB | 30.5240 | 0.0718 | 84.8 % |
-| bf16 — the ceiling | 517.6 MiB | 30.3016 | 0.0662 | 85.2 % |
-
-Five bits takes about three fifths of the way to an unquantized head for six
-percent of the file rather than seventy-three. It is off by default because the
-smallest file is the point, and because four bits already reads a quarter closer
-to bf16 than Q4_K_M does at sixteen percent less. On Qwen3-4B the head is a
-tenth of the weights rather than a quarter, so five costs 0.10 GiB.
-
-### The offline bench is not a file, and the difference is one mechanism
-
-`cmd/vqbuild` holds 32 columns per matrix out of the quantizer at 8 bits. **No
-`.golem` can**: the format has nowhere to put them, and neither codec has ever
-stored one. So every number the bench reports is of a scheme with an extra part,
-and the bits it prints do not count it — `Opts.BPW` leaves the held-out columns
-out of its own total.
-
-What that part is worth, on Qwen3-0.6B at the same rate and codec:
-
-| | PPL | KL | top-1 |
-|---|---|---|---|
-| bench, salience unbounded, 32 columns held out | 29.87 | 0.0702 | 84.0 % |
-| bench, salience unbounded, none held out | **39.67** | **0.3105** | 69.4 % |
-| the file: salience bounded to 24×, none held out | 30.37 | 0.0800 | 84.2 % |
-
-Ten points, and the whole of it is the handful of columns whose salience scale
-would otherwise dominate the group it is rotated with. The bench solves that by
-paying 8 bits for them; the converter solves it by bounding the scale, which
-costs no bits at all and recovers all but a point of the difference. They are
-two answers to one problem and the file's is nearly as good — but it is not
-quite, and a point of perplexity is what stands between this format and the
-perplexity column of the table above.
-
-### The step is chosen after the path
-
-A block's RMS is the scale that makes it unit-variance, which is not the scale
-that reconstructs it best. The lattice buys that difference with a grid of seven
-candidate steps per block; a trellis cannot, because one path spans two blocks
-and the search would have to be joint. Least squares takes it exactly and for
-nothing once the path exists, and it is worth about 4 % of the error.
-
-### The two encoders are held to a weaker contract than byte equality
-
-A codebook that is a table has one right index for a point — an index into a
-shared enumeration — so two encoders that disagree write different files for
-the same weights, and byte equality is the contract to hold them to. A trellis
-records the path it chose instead, and **any minimum-cost path is an equally
-valid file**: `TestViterbiMatchesCPU` therefore holds the two encoders to the
-same *cost*, to a part in a hundred thousand, and reports agreement (94.2 %)
-only as a collapse detector.
-
-**This does not extend to the decoder.** A decoder is a pure function of the bits
-it reads, so Go and the shader must agree exactly, and
-`TestT4GDecodeMatchesCPUExactly` sweeps a one-hot activation over a whole row to
-say so weight by weight. The step grid is uploaded as 256 floats rather than
-recomputed with an `exp2` for the same reason: this card's `exp2` lands one unit
-in the last place from Go's, which is 3e-7 of an output and is exactly the kind
-of invisible this format cannot afford.
-
-### On the card
-
-`vk/shaders/viterbi_tcq.comp`. The Viterbi is 2^L operations a weight — four
-thousand at L=12, against the lattice's eight — and it is the only half of a
-conversion that cares where it runs: the 0.6B goes from 25 minutes on twelve
-cores to 1 min 07.
-
-## The scheme, and the one thing to understand about it
-
-A matrix is not stored as its weights. It is stored as **A·(q ⊙ W)**: its
-columns scaled by a per-column vector `q`, then rotated by a Hadamard transform
-in groups of 128 with random signs folded in.
-
-Nothing undoes that on the weight side. The activation meets **A·(x / q)**
-instead — the same function with the reciprocal vector — and since AᵀA = I the
-product is unchanged. `nn.PrepareGolem` is both directions; it runs once per site
-rather than once per matrix, which is why the scheme is cheap at inference.
-
-Two consequences, and both have cost this repository a day:
-
-**A matrix reads the vector of its site, not its own.** The three projections
-of an attention read one stream and so share one vector; a hybrid's four input
-projections share the same one; the feed forward's gate and up share another.
-`nn.GolemVectorNames` is where that convention lives, for the converter and every
-reader alike — a copy of it anywhere else drifts, and a file whose matrices were
-quantized against one vector and are read through another loads, agrees about
-every shape, and answers nonsense.
-
-**A row read on its own is not a product.** The embedding table is read a token
-at a time, and that row has to be the embedding rather than the rotated form a
-product would want. `nn.Matrix.Row` undoes the transform when the matrix carries
-its vector; `MatVec` does not, because the activation already did.
-
-## The salience, which is most of what the format is
-
-`q` is not just signs. It carries an AWQ-style scale: the per-column power of
-the activations that reach a site, raised to α = 0.5 and normalised by its
-geometric mean. Converting without it — signs and rotation alone — costs twenty
-points of perplexity on Qwen3-0.6B, 39.80 against 60.01. The codebook, which
-took the most work, was worth 1.5 of those points when it was the D4 lattice —
-a comparison against the codebook doing nothing, not against the trellis that
-replaced it.
-
-The scale is **bounded to 24×**, and that is not a detail. It is applied before
-a rotation that mixes 128 columns together: a column shrunk by two thousand is
-mixed with one left alone, quantized as if it were the second, and multiplied
-back by two thousand on the activation side. At α = 0.75 the spread reaches
-eighteen thousand and the model reads at a perplexity of 246 rather than 40.
-
-`cmd/golemquant` measures the sites by running the model — on a card when it can,
-which is fifteen seconds for eight thousand tokens of a 27B against an hour and
-a half of eight cores — and refuses to write a file it could not calibrate.
-
-## What is measured and does not work
-
-- **GPTQ compensation**: 0.15 points on a real model, where it halves the
-  output error on synthetic data. The rotation whitens the Hessian and leaves
-  nothing to redistribute. It worked; it just bought nothing here, so the
-  factoring machinery (`Comp`, `NewComp`, the Cholesky routines) was removed
-  from `gptq.go` along with `cmd/golemquant`'s `-gptq` and `-damp` flags —
-  what is left is the windowed-Hessian accumulator, which the salience search
-  still reads.
-- **Non-uniform bit allocation**: per-weight sensitivities span 2.4× and
-  `ffn_down` is indeed the most sensitive, but the arithmetic-to-geometric mean
-  ratio is 0.17 dB. Three code widths and three shader variants for that: no.
-- **Deltas between adjacent layers**: blocks differ by 1.30–1.37 against 1.414
-  for two unrelated matrices. They share nothing.
-- **Low rank**: the spectrum is not flat and the rotation does not touch it, but
-  rank 64 in fp16 costs 46 % of the bits to remove 2.1 dB where 46 % more code
-  gives 9.
-- **A per-row gain**: γ = 1.0000 ± 1.7 %, which removes 0.5 % of the error.
-- **A global gain on the trellis codebook**: g = 1 is optimal and any departure
-  costs. The adaptation that pays is per block, and least squares takes it
-  exactly.
-- **The salience bound, and its exponent**, for the trellis. Six settings on
-  Qwen3-0.6B — bounds of 8, 12, 24, 48 and none at α = 0.5, and α = 0.4 and 0.6
-  at 24 — read 30.68 to 30.82 and KL 0.0800 to 0.0850. The default is as good as
-  any of them, which is the same answer `-search` gets by a different route.
-- **More calibration**, for the trellis. On Qwen3-4B in one pass, 2048 tokens
-  read 19.7285 and KL 0.0510; 8192 read 19.7004 and **0.0550**. More calibration
-  buys average likelihood and sells per-token agreement. Windowing it to match
-  the evaluation's regime is worse on both: 19.7808 / 0.0566. **This does not
-  generalise.** On Qwen3-0.6B, 2048 tokens read 30.3744 and 8192 read 30.8680 —
-  a gap of 0.49 nats the *other* way round: more calibration makes perplexity
-  worse on the smaller model. Whatever the 4B's pair of numbers said about
-  calibration buying average likelihood at the cost of per-token agreement, it
-  is a fact about that model's size, not about calibration in general — the two
-  models disagree on which direction more calibration even moves perplexity, so
-  a reader should not assume either row predicts a third model's.
-- **Choosing the salience per site** (`-search`, left off): six settings give a
-  mean of 39.73 against 39.80 for one bound chosen for the whole model. The
-  spread is the choosing, not the choice.
-
 ## What this is built on
 
 None of this is a new idea; the value is in what got kept, what got measured
@@ -1010,8 +1033,10 @@ what golem took:
 - **QTIP** — Tseng, Sun, Hou, De Sa, *QTIP: Quantization with Trellises and
   Incoherence Processing*, NeurIPS 2024, arXiv:2406.11235. The bitshift trellis
   itself: state as the last *L* bits of the code stream, the 1MAD hash that
-  turns a state into a Gaussian sample, and the fact that a computed codebook
-  needs no table. `nn/t4g.go`, `compress/trellis.go`.
+  turns a state into a Gaussian sample and made the one-weight trellis need no
+  table (`compress/trellis.go`), and the HYB code, a hashed state reading a
+  pair out of a small table, which the shipped tiers are (`nn/pair.go`,
+  `compress/hyb.go`).
 - **Trellis-coded quantization** — Marcellin and Fischer, *Trellis Coded
   Quantization of Memoryless and Gauss-Markov Sources*, IEEE Transactions on
   Communications, vol. 38, no. 1, 1990. The older idea QTIP builds on: code a
@@ -1042,9 +1067,10 @@ what golem took:
   deleted.
 - **Lloyd** — S. P. Lloyd, *Least Squares Quantization in PCM*, IEEE
   Transactions on Information Theory, vol. 28, no. 2, 1982, circulated as a
-  Bell Labs memorandum in 1957. The scalar codebook the `L8G` tier used, and
-  the baseline the table-free comparison measured against; the 25-year gap
-  between writing and publication is not a typo.
+  Bell Labs memorandum in 1957. The scalar codebook the `L8G` tier used, the
+  baseline the table-free comparison measured against, and the algorithm
+  `cmd/paircodebook` runs through the trellis to train the pair tiers' tables;
+  the 25-year gap between writing and publication is not a typo.
 - **AWQ** — Lin, Tang, Tang, Yang, Chen, Wang, Xiao, Dang, Gan, Han,
   *AWQ: Activation-aware Weight Quantization for LLM Compression and
   Acceleration*, MLSys 2024, arXiv:2306.00978. The per-column salience scale, raised to α = 0.5

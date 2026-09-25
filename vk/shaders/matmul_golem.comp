@@ -64,8 +64,9 @@
 // The geometry, and how it was found
 // ------------------------------------------------------------------
 // The tile is preprocessor arithmetic, so a shape is a binary; vk's
-// TestGolemTileSweep compiles a directory of them and times them interleaved
-// with the order rotating, for the reason vk/golemtune.go gives at length.
+// TestGolemTileSweep, which went with the one-weight tiers, compiled a
+// directory of them and timed them interleaved with the order rotating, for
+// the reason compress/README.md's "Interleave, and rotate" gives at length.
 //
 // **The first sweep was run at the wrong size and said the wrong thing.**
 // Timed on a 9728x2560 product — the shape vk/golem_bench_test.go has always

@@ -35,7 +35,7 @@ import "github.com/ThiraSoft/golem/internal/pairbook"
 //
 //	s     = the fourteen bits at 6t within the sequence
 //	h     = s·(s+1) mod 2^32
-//	pair t = step · H3GCodebook[bits 5..15 of h]
+//	pair t = step · codebook[bits 5..15 of h]
 //
 // H4G is the same at four bits: a fifteen-bit state moving eight bits a pair,
 // so every window starts on a byte, and 4096 pairs picked by bits 4..15 of h.
