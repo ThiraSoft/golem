@@ -1,0 +1,206 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+// Laya's attention, in float32, sixty-four queries of one head against
+// sixty-four keys at a time, and the answer written as the output projection
+// reads its operand: split into two fp16 planes.
+//
+// shaders/nomic_flash.comp, which this replaced, gave each thread one query
+// and four keys, so that every multiply-add read a float of shared memory;
+// its sequences were long enough for that not to matter. Laya's are a few
+// dozen to a few hundred positions, thirty-two of them in a pass, and the
+// attention came to a fifth of the pass. Here a thread owns four queries by
+// four keys of the scores, then the same four queries by four dimensions of
+// the answer, so that sixteen multiply-adds share what eight reads of shared
+// memory bring. The sixteen threads of one row of the tile are neighbours in
+// a wave, and a row's maximum and sum are clustered reductions over them.
+//
+// A unit is a stretch of one sequence's queries: where the sequence starts,
+// how long it is, and the first query of the stretch. A window other than
+// zero limits a query to the keys at most that many positions away, which is
+// ModernBERT's local attention; only the tiles that can hold one are walked.
+// Written for a head of sixty-four.
+
+#ifndef BR
+#define BR 32
+#endif
+#ifndef BC
+#define BC 32
+#endif
+// Sixteen threads a row of four queries.
+#define THREADS (BR * 4)
+// How many keys of a tile each thread scores: every sixteenth one.
+#define KT (BC / 16)
+#define HD 64
+#define H4 (HD / 4)
+// Every row one vec4 longer than a head, so that the rows a wave reads land
+// on different banks.
+#define S4 (H4 + 1)
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer QKV   { vec4  qkv[];   };
+layout(std430, binding = 1) readonly  buffer POS   { uint  pos[];   };
+layout(std430, binding = 2) readonly  buffer PAR   { vec4  par[];   };
+layout(std430, binding = 3) writeonly buffer MIXED { f16vec4 mixed[]; };
+layout(std430, binding = 4) readonly  buffer UNITS { uvec4 units[]; };
+
+layout(push_constant) uniform Push {
+    uint dim;
+    uint head;
+    float scale;
+    uint window;
+    uint lo;      // where the low plane of MIXED starts, in vec4
+    uint table;   // where the block's rotation table starts in par, in vec4, or ~0
+} p;
+
+shared vec4 sq[BR * S4];
+// The keys of a tile, and then, once the scores are taken, the probabilities
+// transposed, a key a row: both are BC rows of a head.
+shared vec4 skp[BC * S4];
+shared vec4 sv[BC * S4];
+
+// The answer is the output projection's operand, split as
+// shaders/laya_epi.glsl splits it.
+void split(uint at, vec4 v) {
+    vec4 top = uintBitsToFloat(floatBitsToUint(v) & uvec4(0xffffe000u));
+    mixed[at] = f16vec4(top);
+    mixed[p.lo + at] = f16vec4(v - top);
+}
+
+// stage puts dimensions d and d+32 of a query's or a key's row, four at a
+// time, into shared memory at rowAt, turned by its position's angles on the
+// way: the rotation pairs dimension i with i+32, and the host's table holds a
+// position's thirty-two cosines then its thirty-two sines, the way PyTorch
+// computes them.
+void stage(uint at, uint d, uint position, uint rowAt, bool live, bool isKey) {
+    vec4 a = vec4(0.0), b = vec4(0.0);
+    if (live) {
+        a = qkv[at + d];
+        b = qkv[at + d + uint(H4) / 2u];
+        if (p.table != ~0u) {
+            uint row = p.table + position * uint(H4);
+            vec4 c = par[row + d], s = par[row + uint(H4) / 2u + d];
+            vec4 ra = a * c - b * s;
+            b = a * s + b * c;
+            a = ra;
+        }
+    }
+    if (isKey) {
+        skp[rowAt + d] = a;
+        skp[rowAt + d + uint(H4) / 2u] = b;
+    } else {
+        sq[rowAt + d] = a;
+        sq[rowAt + d + uint(H4) / 2u] = b;
+    }
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint tq = t >> 4, tx = t & 15u;
+    uvec4 u = units[gl_WorkGroupID.x];
+    uint start = u.x, length = u.y, q0 = u.z;
+    uint h = gl_WorkGroupID.y;
+    uint dim4 = p.dim / 4u;
+    uint off4 = h * uint(H4);
+
+    // A thread stages both halves of a row's four dimensions, which is what
+    // the rotation pairs.
+    for (uint e = t; e < uint(BR * H4) / 2u; e += uint(THREADS)) {
+        uint row = e / (uint(H4) / 2u), d = e % (uint(H4) / 2u);
+        uint at = start + q0 + row;
+        bool live = q0 + row < length;
+        stage(at * 3u * dim4 + off4, d, live ? pos[at] : 0u, row * uint(S4), live, false);
+    }
+
+    // This thread's four queries, and their running maximum and sum.
+    float m[4], l[4];
+    vec4 o[4];
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        m[i] = -1.0e30;
+        l[i] = 0.0;
+        o[i] = vec4(0.0);
+    }
+
+    uint first = 0u, end = length;
+    if (p.window > 0u) {
+        first = (q0 > p.window ? q0 - p.window : 0u) / uint(BC) * uint(BC);
+        end = min(length, q0 + uint(BR) + p.window);
+    }
+
+    for (uint c0 = first; c0 < end; c0 += uint(BC)) {
+        barrier();
+        for (uint e = t; e < uint(BC * H4) / 2u; e += uint(THREADS)) {
+            uint row = e / (uint(H4) / 2u), d = e % (uint(H4) / 2u);
+            uint key = start + c0 + row;
+            bool live = c0 + row < length;
+            stage(key * 3u * dim4 + dim4 + off4, d, live ? pos[key] : 0u, row * uint(S4), live, true);
+        }
+        for (uint e = t; e < uint(BC * H4); e += uint(THREADS)) {
+            uint row = e / uint(H4), d = e % uint(H4);
+            bool live = c0 + row < length;
+            uint key = start + c0 + row;
+            sv[row * uint(S4) + d] = live ? qkv[key * 3u * dim4 + 2u * dim4 + off4 + d] : vec4(0.0);
+        }
+        barrier();
+
+        // Four queries against KT keys, the keys tx, tx+16 and so on, so
+        // that the probabilities can go back a key a row.
+        float s[4][KT];
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            [[unroll]] for (uint j = 0u; j < uint(KT); j++) s[i][j] = 0.0;
+        }
+        [[dont_unroll]] for (uint d = 0u; d < uint(H4); d++) {
+            vec4 qv[4], kv[KT];
+            [[unroll]] for (uint i = 0u; i < 4u; i++) qv[i] = sq[(tq * 4u + i) * uint(S4) + d];
+            [[unroll]] for (uint j = 0u; j < uint(KT); j++) kv[j] = skp[(tx + 16u * j) * uint(S4) + d];
+            [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                [[unroll]] for (uint j = 0u; j < uint(KT); j++) s[i][j] += dot(qv[i], kv[j]);
+            }
+        }
+
+        vec4 pr[KT];
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            int qi = int(q0 + tq * 4u + i);
+            float peak = -1.0e30;
+            [[unroll]] for (uint j = 0u; j < uint(KT); j++) {
+                int key = int(c0 + tx + 16u * j);
+                bool seen = uint(key) < length && (p.window == 0u || abs(key - qi) <= int(p.window));
+                s[i][j] = seen ? s[i][j] * p.scale : -1.0e30;
+                peak = max(peak, s[i][j]);
+            }
+            peak = subgroupClusteredMax(peak, 16u);
+            float mine = max(m[i], peak);
+            float bring = exp(m[i] - mine);
+            float sum = 0.0;
+            [[unroll]] for (uint j = 0u; j < uint(KT); j++) {
+                float e = s[i][j] > -1.0e29 ? exp(s[i][j] - mine) : 0.0;
+                pr[j][i] = e;
+                sum += e;
+            }
+            l[i] = l[i] * bring + subgroupClusteredAdd(sum, 16u);
+            m[i] = mine;
+            o[i] *= bring;
+        }
+        barrier();
+        // pr[j] is key tx+16j's probability for the four queries.
+        [[unroll]] for (uint j = 0u; j < uint(KT); j++) skp[(tx + 16u * j) * uint(S4) + tq] = pr[j];
+        barrier();
+
+        // The same four queries by four dimensions of the answer.
+        [[dont_unroll]] for (uint kk = 0u; kk < uint(BC); kk++) {
+            vec4 w = skp[kk * uint(S4) + tq];
+            vec4 v = sv[kk * uint(S4) + tx];
+            [[unroll]] for (uint i = 0u; i < 4u; i++) o[i] += w[i] * v;
+        }
+    }
+
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        uint qr = q0 + tq * 4u + i;
+        if (qr < length) split((start + qr) * dim4 + off4 + tx, o[i] / l[i]);
+    }
+}

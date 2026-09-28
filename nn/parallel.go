@@ -35,6 +35,23 @@ import (
 // a core almost at once.
 const spinRounds = 200000
 
+// yieldEvery is how many turns of a wait go by between two visits to the
+// scheduler.
+//
+// Asynchronous preemption was meant to be what lets the runtime stop a
+// spinning worker, and it almost never can: a turn is eight PAUSE
+// instructions in assembly, which is no place to stop a goroutine, and the
+// few Go instructions around it are a hundredth of the loop. So a signal
+// nearly always lands where it cannot act, and the runtime tries again a
+// tenth of a millisecond later. The garbage collector stops the world at
+// the start and the end of every cycle, and with seven workers spinning that
+// stop took fifty milliseconds, every cycle: laya's short pass ran at a
+// quarter of its speed, all of it waiting for the world to stop. Gosched is a
+// place the runtime can act at once, and when nothing else wants the core
+// it hands it straight back. Sixty-four turns are some fifteen microseconds
+// on an i7-9700K.
+const yieldEvery = 64
+
 type workers struct {
 	count int
 
@@ -93,10 +110,12 @@ func (w *workers) serve(index int) {
 				w.sleeping[index].Store(false)
 				spins = 0
 			}
-			// A bare spin, not a yield: the workers are as many as the cores,
-			// and asynchronous preemption is what keeps the runtime able to
-			// stop them.
+			// A bare spin, not a yield, most of the time: the workers are as
+			// many as the cores. But not only a spin: see yieldEvery.
 			spinPause()
+			if spins%yieldEvery == 0 {
+				runtime.Gosched()
+			}
 		}
 		last = w.sequence.Load()
 
@@ -180,8 +199,8 @@ func (w *workers) run(n, chunks int, work func(start, end int)) {
 
 	w.consume()
 
-	for w.remaining.Load() != 0 {
-		if w.spin.Load() {
+	for spins := 1; w.remaining.Load() != 0; spins++ {
+		if w.spin.Load() && spins%yieldEvery != 0 {
 			spinPause()
 			continue
 		}

@@ -1,0 +1,98 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_GOOGLE_include_directive : enable
+
+// shaders/laya_mm.comp for a card without matrix cores: the same operand
+// planes, the same split along the shared dimension and the same epilogue,
+// in float32 on the vector units. The two planes are added back into the
+// float32 they came from as they are staged, which is exact to the
+// twenty-two bits the planes carry, and the weights widened.
+//
+// A tile is sixty-four outputs by sixty-four columns, each thread four by
+// four, the shared dimension sixteen at a time through shared memory.
+
+#define BM 64
+#define BN 64
+#define BK 16
+#define THREADS 256
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly buffer W   { uint w[];     };
+layout(std430, binding = 1) readonly buffer X   { uint x[];     };
+layout(std430, binding = 2) readonly buffer PAR { float par[];  };
+layout(std430, binding = 3) buffer Y            { float y[];    };
+layout(std430, binding = 4) writeonly buffer HL { float16_t hl[]; };
+
+#include "laya_epi.glsl"
+
+// Staged with the shared dimension outermost, so that a thread's four rows
+// and four columns are neighbours.
+shared float sa[BK][BM + 4];
+shared float sb[BK][BN + 4];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint slices = max(p.slices, 1u);
+    uint rowTiles = (p.outputs + uint(BM) - 1u) / uint(BM);
+    uint per = rowTiles * ((p.cols + uint(BN) - 1u) / uint(BN));
+    uint slice = gl_WorkGroupID.x / per;
+    uint local_ = gl_WorkGroupID.x % per;
+    uint row0 = (local_ % rowTiles) * uint(BM);
+    uint col0 = (local_ / rowTiles) * uint(BN);
+    uint kbeg = (slices > 1u) ? slice * p.kper : 0u;
+    uint kend = (slices > 1u) ? min(p.inputs, kbeg + p.kper) : p.inputs;
+
+    uint tr = (t & 15u) * 4u, tc = (t >> 4) * 4u;
+    float acc[4][4];
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        [[unroll]] for (uint j = 0u; j < 4u; j++) acc[i][j] = 0.0;
+    }
+
+    // Each thread stages two pairs of halves of the weights and two of the
+    // operand a step: sixty-four rows of sixteen, as eight pairs each.
+    for (uint k0 = kbeg; k0 < kend; k0 += uint(BK)) {
+        // As in shaders/laya_mm.comp, nothing is checked against the edges:
+        // rows are whole tiles and the planes whole tiles of columns wide.
+        [[unroll]] for (uint h = 0u; h < 2u; h++) {
+            uint e = t + h * uint(THREADS);
+            uint sr = e >> 3, sk = (e & 7u) * 2u;
+            vec2 a = unpackHalf2x16(w[(p.base + (row0 + sr) * p.inputs + k0 + sk) >> 1]);
+            uint at = (col0 + sr) * p.inputs + k0 + sk;
+            vec2 b = unpackHalf2x16(x[at >> 1]) + unpackHalf2x16(x[(p.lo + at) >> 1]);
+            sa[sk][sr] = a.x;
+            sa[sk + 1u][sr] = a.y;
+            sb[sk][sr] = b.x;
+            sb[sk + 1u][sr] = b.y;
+        }
+        barrier();
+        [[unroll]] for (uint k = 0u; k < uint(BK); k++) {
+            vec4 av = vec4(sa[k][tr], sa[k][tr + 1u], sa[k][tr + 2u], sa[k][tr + 3u]);
+            vec4 bv = vec4(sb[k][tc], sb[k][tc + 1u], sb[k][tc + 2u], sb[k][tc + 3u]);
+            [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                [[unroll]] for (uint j = 0u; j < 4u; j++) acc[i][j] = fma(av[i], bv[j], acc[i][j]);
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint j = 0u; j < 4u; j++) {
+        uint col = col0 + tc + j;
+        if (col >= p.cols) continue;
+        [[unroll]] for (uint i = 0u; i < 4u; i += 2u) {
+            uint row = row0 + tr + i;
+            if (row >= p.outputs) continue;
+            if (slices > 1u) {
+                y[slice * p.stride + col * p.outputs + row] = acc[i][j];
+                y[slice * p.stride + col * p.outputs + row + 1u] = acc[i + 1u][j];
+            } else if (p.mode == EPI_GEGLU) {
+                epiPair(row, col, acc[i][j], acc[i + 1u][j]);
+            } else {
+                epiOne(row, col, acc[i][j]);
+                epiOne(row + 1u, col, acc[i + 1u][j]);
+            }
+        }
+    }
+}

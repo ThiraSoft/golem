@@ -43,6 +43,10 @@ type Vocab struct {
 
 	bos, eos, unk int32
 	addBOS        bool
+
+	// metaspace is the cut LoadTokenizerJSON's files ask for: before every
+	// U+2581, rather than on newlines.
+	metaspace bool
 }
 
 // Load reads the tokenizer from an already-open GGUF.

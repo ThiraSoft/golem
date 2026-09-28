@@ -1,0 +1,239 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_GOOGLE_include_directive : enable
+
+// Laya's product on the matrix cores, Y = X * W' + bias, with the operand
+// already split into two fp16 planes, its high part and what is left of it,
+// both of which meet the fp16 weights: the product is the float32 operand's
+// to about twenty-two bits for twice the work on the cores.
+//
+// The kernel that writes an operand (the norm, the attention, the gated GELU)
+// writes it split, once, rather than every tile splitting it again as it is
+// staged; and a tile's next stretch of the shared dimension is read into
+// registers while the cores work on the one in shared memory.
+//
+// A tile is BM outputs by BN columns, split between the waves two by
+// WAVES/2. The answer leaves through the shared memory the weights were
+// staged in, a sixteen-square at a time, and what a tile does with it is the
+// epilogue's business, shaders/laya_epi.glsl: store it, add it into the
+// residual stream, or gate it into the next product's split operand.
+//
+// CHUNK, when set, sums the shared dimension in chunks, each in accumulators
+// of its own, then into the running total in order. It costs registers and a
+// fifth of the speed, and it is not optional: the matrix cores' own float32
+// accumulation lost enough over a thousand steps that the long fixture's
+// worst waypoint went from 5e-4 to 1.6e-3 against the reference without it.
+//
+// With p.slices above one the shared dimension is cut into slices of p.kper,
+// one workgroup a slice and tile, and each writes its partial sums to its own
+// stretch of Y for shaders/laya_reduce.comp, which adds them in slice order
+// and runs the epilogue: a pass of a few dozen positions makes too few tiles
+// to fill the card otherwise.
+
+#ifndef BM
+#define BM 128
+#endif
+#ifndef BN
+#define BN 128
+#endif
+#define BK 32
+#define THREADS 256
+#ifndef LANES
+#define LANES 64
+#endif
+#define WAVES (THREADS / LANES)
+#define WM (BM / 2)
+#define WN (BN / (WAVES / 2))
+#define FM (WM / 16)
+#define FN (WN / 16)
+// A row of a staged tile is BK halves, four uvec4, and one more so that the
+// rows of a wave's load land on different banks: without it the kernel ran
+// at two thirds of the speed.
+#define S4 (BK / 8 + 1)
+#define AV (BM * BK / 8 / THREADS)
+#define BV (BN * BK / 8 / THREADS)
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly buffer W   { uvec4 w[];    };
+layout(std430, binding = 1) readonly buffer X   { uvec4 x[];    };
+layout(std430, binding = 2) readonly buffer PAR { float par[];  };
+layout(std430, binding = 3) buffer Y            { float y[];    };
+layout(std430, binding = 4) writeonly buffer HL { float16_t hl[]; };
+
+#include "laya_epi.glsl"
+
+shared uvec4 sa[BM * S4];
+shared uvec4 sh[BN * S4];
+shared uvec4 sl[BN * S4];
+
+// A wave's stage for the epilogue: eighty uvec4 of sa, or of sh for the
+// fifth wave on when there are eight.
+float at(uint wave, uint mine, uint r, uint c) {
+    uvec4 v = (wave < 4u) ? sa[mine + r * 5u + (c >> 2)] : sh[mine + r * 5u + (c >> 2)];
+    return uintBitsToFloat(v[c & 3u]);
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint slices = max(p.slices, 1u);
+    uint rowTiles = (p.outputs + uint(BM) - 1u) / uint(BM);
+    uint per = rowTiles * ((p.cols + uint(BN) - 1u) / uint(BN));
+    uint slice = gl_WorkGroupID.x / per;
+    uint local_ = gl_WorkGroupID.x % per;
+    uint row0 = (local_ % rowTiles) * uint(BM);
+    uint col0 = (local_ / rowTiles) * uint(BN);
+    uint kbeg = (slices > 1u) ? slice * p.kper : 0u;
+    uint kend = (slices > 1u) ? min(p.inputs, kbeg + p.kper) : p.inputs;
+
+    uint wave = gl_SubgroupID;
+    uint wr = (wave & 1u) * uint(WM), wc = (wave >> 1) * uint(WN);
+    uint in8 = p.inputs / 8u;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[FM][FN];
+    [[unroll]] for (uint i = 0u; i < uint(FM); i++) {
+        [[unroll]] for (uint j = 0u; j < uint(FN); j++) {
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    // Where each thread's loads come from: fixed rows and columns, a moving
+    // stretch of the shared dimension.
+    //
+    // Nothing is checked against the edges. Every matrix has a whole number
+    // of BM rows, which vk/laya.go makes sure of, and the operand's planes
+    // are allocated a whole number of BN columns wide: the columns past the
+    // pass hold whatever an earlier pass left there, and an output's column
+    // reads its own column of the operand and nothing else, so they meet
+    // only outputs that are never written.
+    uvec4 ra[AV], rh[BV], rl[BV];
+    uint aw[AV], bx[BV];
+    [[unroll]] for (uint i = 0u; i < uint(AV); i++) {
+        uint e = t + i * uint(THREADS);
+        aw[i] = p.base / 8u + (row0 + (e >> 2)) * in8 + (e & 3u);
+    }
+    [[unroll]] for (uint i = 0u; i < uint(BV); i++) {
+        uint e = t + i * uint(THREADS);
+        bx[i] = (col0 + (e >> 2)) * in8 + (e & 3u);
+    }
+    uint lo8 = p.lo / 8u;
+
+    uint k8 = kbeg / 8u;
+    [[unroll]] for (uint i = 0u; i < uint(AV); i++) ra[i] = w[aw[i] + k8];
+    [[unroll]] for (uint i = 0u; i < uint(BV); i++) {
+        rh[i] = x[bx[i] + k8];
+        rl[i] = x[lo8 + bx[i] + k8];
+    }
+
+#ifdef CHUNK
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sum[FM][FN];
+    [[unroll]] for (uint i = 0u; i < uint(FM); i++) {
+        [[unroll]] for (uint j = 0u; j < uint(FN); j++) sum[i][j] = acc[i][j];
+    }
+#endif
+    for (uint k0 = kbeg; k0 < kend; k0 += uint(BK)) {
+#ifdef CHUNK
+        if (k0 != kbeg && (k0 % uint(CHUNK)) == 0u) {
+            [[unroll]] for (uint i = 0u; i < uint(FM); i++) {
+                [[unroll]] for (uint j = 0u; j < uint(FN); j++) {
+                    sum[i][j] = sum[i][j] + acc[i][j];
+                    acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+                }
+            }
+        }
+#endif
+        [[unroll]] for (uint i = 0u; i < uint(AV); i++) {
+            uint e = t + i * uint(THREADS);
+            sa[(e >> 2) * uint(S4) + (e & 3u)] = ra[i];
+        }
+        [[unroll]] for (uint i = 0u; i < uint(BV); i++) {
+            uint e = t + i * uint(THREADS);
+            sh[(e >> 2) * uint(S4) + (e & 3u)] = rh[i];
+            sl[(e >> 2) * uint(S4) + (e & 3u)] = rl[i];
+        }
+        barrier();
+
+        // The next stretch, on its way while this one is multiplied.
+        if (k0 + uint(BK) < kend) {
+            uint n8 = (k0 + uint(BK)) / 8u;
+            [[unroll]] for (uint i = 0u; i < uint(AV); i++) ra[i] = w[aw[i] + n8];
+            [[unroll]] for (uint i = 0u; i < uint(BV); i++) {
+                rh[i] = x[bx[i] + n8];
+                rl[i] = x[lo8 + bx[i] + n8];
+            }
+        }
+
+        [[unroll]] for (uint kk = 0u; kk < uint(BK) / 8u; kk += 2u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a[FM];
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b[FN];
+            [[unroll]] for (uint i = 0u; i < uint(FM); i++) {
+                coopMatLoad(a[i], sa, (wr + i * 16u) * uint(S4) + kk, uint(S4), gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0u; j < uint(FN); j++) {
+                coopMatLoad(b[j], sh, (wc + j * 16u) * uint(S4) + kk, uint(S4), gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint i = 0u; i < uint(FM); i++) {
+                [[unroll]] for (uint j = 0u; j < uint(FN); j++) acc[i][j] = coopMatMulAdd(a[i], b[j], acc[i][j]);
+            }
+            [[unroll]] for (uint j = 0u; j < uint(FN); j++) {
+                coopMatLoad(b[j], sl, (wc + j * 16u) * uint(S4) + kk, uint(S4), gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint i = 0u; i < uint(FM); i++) {
+                [[unroll]] for (uint j = 0u; j < uint(FN); j++) acc[i][j] = coopMatMulAdd(a[i], b[j], acc[i][j]);
+            }
+        }
+        barrier();
+    }
+
+#ifdef CHUNK
+    [[unroll]] for (uint i = 0u; i < uint(FM); i++) {
+        [[unroll]] for (uint j = 0u; j < uint(FN); j++) acc[i][j] = sum[i][j] + acc[i][j];
+    }
+#endif
+    // Out a sixteen-square at a time through each wave's own stage, in the
+    // shared memory the weights were staged in: sixteen rows of sixteen
+    // floats, four uvec4 and one more a row.
+    uint lane = gl_SubgroupInvocationID;
+    uint mine = (wave & 3u) * 16u * 5u;
+    [[unroll]] for (uint i = 0u; i < uint(FM); i++) {
+        [[unroll]] for (uint j = 0u; j < uint(FN); j++) {
+            if (wave < 4u) {
+                coopMatStore(acc[i][j], sa, mine, 5u, gl_CooperativeMatrixLayoutRowMajor);
+            } else {
+                coopMatStore(acc[i][j], sh, mine, 5u, gl_CooperativeMatrixLayoutRowMajor);
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            uint rbase = row0 + wr + i * 16u, cbase = col0 + wc + j * 16u;
+            if (slices > 1u) {
+                [[unroll]] for (uint u = 0u; u < 256u / uint(LANES); u++) {
+                    uint r = lane & 15u, c = (lane >> 4) + u * (uint(LANES) / 16u);
+                    if (rbase + r < p.outputs && cbase + c < p.cols) {
+                        y[slice * p.stride + (cbase + c) * p.outputs + rbase + r] = at(wave, mine, r, c);
+                    }
+                }
+            } else if (p.mode == EPI_GEGLU) {
+                // Rows come in pairs, the input then its gate.
+                [[unroll]] for (uint u = 0u; u < 128u / uint(LANES); u++) {
+                    uint r = (lane & 7u) * 2u, c = (lane >> 3) + u * (uint(LANES) / 8u);
+                    if (rbase + r < p.outputs && cbase + c < p.cols) {
+                        epiPair(rbase + r, cbase + c, at(wave, mine, r, c), at(wave, mine, r + 1u, c));
+                    }
+                }
+            } else {
+                [[unroll]] for (uint u = 0u; u < 256u / uint(LANES); u++) {
+                    uint r = lane & 15u, c = (lane >> 4) + u * (uint(LANES) / 16u);
+                    if (rbase + r < p.outputs && cbase + c < p.cols) {
+                        epiOne(rbase + r, cbase + c, at(wave, mine, r, c));
+                    }
+                }
+            }
+            subgroupBarrier();
+        }
+    }
+}

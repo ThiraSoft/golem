@@ -69,7 +69,11 @@ func (v *Vocab) encodeRaw(text string, out []int32) []int32 {
 	// One symbol per rune, so the byte length is an upper bound and a generous
 	// one. Sized once here, reused by every run below.
 	symbols := make([]string, 0, len(escaped))
-	for _, run := range splitNewlines(escaped) {
+	runs := splitNewlines
+	if v.metaspace {
+		runs = splitMetaspace
+	}
+	for _, run := range runs(escaped) {
 		out, symbols = v.encodeRun(&m, symbols, run, out)
 	}
 	return out
@@ -87,7 +91,7 @@ func (v *Vocab) encodeRun(m *merge.Merger, symbols []string, run string, out []i
 	// whole. Splitting it would leave the merges to rebuild it, and they do
 	// not always reach the same answer.
 	whole := false
-	if strings.Trim(run, "\n") == "" {
+	if !v.metaspace && strings.Trim(run, "\n") == "" {
 		if _, ok := v.ID(run); ok {
 			symbols = append(symbols, run)
 			whole = true

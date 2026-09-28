@@ -1,0 +1,40 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_GOOGLE_include_directive : enable
+
+// The second half of a product shaders/laya_mm.comp split along its shared
+// dimension: each slice wrote its partial sums to its own stretch of PARTIAL,
+// and this adds them in slice order, so that the answer does not depend on
+// which slice finished first, then does what the product's epilogue would
+// have done with them.
+
+#define THREADS 256
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly buffer PARTIAL { float partial[]; };
+layout(std430, binding = 1) readonly buffer PAR     { float par[];     };
+layout(std430, binding = 2) buffer Y                { float y[];       };
+layout(std430, binding = 3) writeonly buffer HL     { float16_t hl[];  };
+
+#include "laya_epi.glsl"
+
+float total(uint at) {
+    float v = 0.0;
+    for (uint s = 0u; s < p.slices; s++) v += partial[s * p.stride + at];
+    return v;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (p.mode == EPI_GEGLU) {
+        uint half_ = p.outputs / 2u;
+        if (i >= p.cols * half_) return;
+        uint col = i / half_, row = (i % half_) * 2u;
+        uint at = col * p.outputs + row;
+        epiPair(row, col, total(at), total(at + 1u));
+    } else {
+        if (i >= p.cols * p.outputs) return;
+        epiOne(i % p.outputs, i / p.outputs, total(i));
+    }
+}

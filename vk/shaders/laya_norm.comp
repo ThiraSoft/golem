@@ -1,0 +1,60 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// shaders/vision_norm.comp for Laya's products: the same layer norm over one
+// position, written as the next product reads its operand, the high fp16 part
+// in one plane and what is left of it in another, lo halves further on.
+
+#define THREADS 256
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly  buffer SRC { float src[]; };
+layout(std430, binding = 1) readonly  buffer PAR { float par[]; };
+layout(std430, binding = 2) writeonly buffer DST { float16_t dst[]; };
+
+layout(push_constant) uniform Push {
+    uint dim;
+    uint gain;   // where the gain starts in par
+    uint bias;   // where the bias starts
+    float eps;
+    uint lo;     // where the low plane starts in DST
+} p;
+
+shared float red[THREADS];
+
+float total(uint t, float mine) {
+    red[t] = mine;
+    barrier();
+    for (uint s = THREADS / 2u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    float all = red[0];
+    barrier();
+    return all;
+}
+
+void main() {
+    uint t    = gl_LocalInvocationID.x;
+    uint base = gl_WorkGroupID.x * p.dim;
+
+    float sum = 0.0;
+    for (uint i = t; i < p.dim; i += THREADS) sum += src[base + i];
+    float mean = total(t, sum) / float(p.dim);
+
+    float sum2 = 0.0;
+    for (uint i = t; i < p.dim; i += THREADS) {
+        float d = src[base + i] - mean;
+        sum2 += d * d;
+    }
+    float scale = inversesqrt(total(t, sum2) / float(p.dim) + p.eps);
+
+    for (uint i = t; i < p.dim; i += THREADS) {
+        float v = (src[base + i] - mean) * scale * par[p.gain + i] + par[p.bias + i];
+        // shaders/laya_epi.glsl says why the high part is cut by a mask.
+        float top = uintBitsToFloat(floatBitsToUint(v) & 0xffffe000u);
+        dst[base + i] = float16_t(top);
+        dst[p.lo + base + i] = float16_t(v - top);
+    }
+}

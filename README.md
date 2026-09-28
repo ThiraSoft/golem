@@ -57,6 +57,7 @@ The bet is that it is worth it only if the result is actually fast. See [the num
 | **Audio in** | Gemma 4 hears WAV, MP3 and FLAC. Kyutai STT transcribes English and French |
 | **Audio out** | Kyutai Pocket TTS, 12 shipped models across 6 languages, plus voice cloning |
 | **Images** | Krea 2 from ComfyUI's fp8 files, with its LoRA, the same picture as ComfyUI for the same seed, and on a colour to key out |
+| **Decisions** | Laya, the open Jev: a state and typed questions in, calibrated probabilities out, in one encoder pass |
 | **Serving** | OpenAI-compatible HTTP API, tool calls, continuous batching, JSON schemas and GBNF grammars |
 | **Weights** | GGUF, every K-quant llama.cpp writes, Prism's ternary PQ2_0 and PTQ1_0, and golem's own `.golem` format |
 
@@ -214,9 +215,9 @@ Judge it the way you would judge any dependency you did not write: run the tests
 
 ## Project structure
 
-- `cmd/golem-cli`, `cmd/golem-server`, `cmd/pocket-tts`, `cmd/golemquant` are the commands.
+- `cmd/golem-cli`, `cmd/golem-server`, `cmd/pocket-tts`, `cmd/laya`, `cmd/golemquant` are the commands.
 - `engine/` reads the architecture out of a GGUF and opens the engine that implements it.
-- `gemma/`, `qwen/`, `qwen35/`, `pockettts/`, `stt/`, `nomic/` are standalone engines. They do not import one another.
+- `gemma/`, `qwen/`, `qwen35/`, `pockettts/`, `stt/`, `nomic/`, `laya/` are standalone engines. They do not import one another.
 - `nn/` and `vk/` are the shared kernels: quantized AVX2 and NEON, and Vulkan compute.
 - `compress/` is the `.golem` format: calibration, the pair-trellis codec, and the conversion pipeline.
 - `grammar/` is GBNF and the JSON Schema converter that feeds it.

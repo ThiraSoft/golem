@@ -19,3 +19,9 @@ func matF16Tile(w []uint16, wStride int, x []float32, xStride, n int, out *[12]f
 func matF32Tile(w []float32, wStride int, x []float32, xStride, n int, out *[12]float32) {
 	matF32x4x3AVX2(&w[0], wStride, &x[0], xStride, n, &out[0])
 }
+
+//go:noescape
+func gemmF16x16x6AVX2(w *uint16, x *float32, xStride, k int, c *float32, cStride int)
+
+//go:noescape
+func gemmF32x16x6AVX2(a *float32, aStride int, x *float32, xStride, k int, c *float32, cStride int)

@@ -47,6 +47,10 @@ type Vocab struct {
 	eos    int32
 	addBOS bool
 	bos    int32
+
+	// split is the pre-tokenizer. Nil is qwen2's, which every GGUF this
+	// package reads declares; a tokenizer.json can name GPT-2's instead.
+	split func(string) []string
 }
 
 // Load reads the tokenizer from an already-open GGUF.

@@ -32,12 +32,16 @@ func (v *Vocab) Encode(text string, addBOS, parseSpecial bool) []int32 {
 	var m merge.Merger
 	symbols := make([]string, 0, len(text))
 
+	split := v.split
+	if split == nil {
+		split = splitQwen2
+	}
 	for _, f := range special.Partition(text, v.specials, parseSpecial) {
 		if f.ID >= 0 {
 			out = append(out, f.ID)
 			continue
 		}
-		for _, word := range splitQwen2(f.Text) {
+		for _, word := range split(f.Text) {
 			out, symbols = v.encodeWord(&m, symbols, word, out)
 		}
 	}

@@ -112,6 +112,10 @@ build/ref/dump_layers "$GOLEM_MODEL_NOMIC"    testdata/nomic/layers    ref/nomic
 build/ref/dump_layers "$GOLEM_MODEL_NOMIC_Q8" testdata/nomic/layers_q8 ref/nomic/short.run
 build/ref/dump_tokens "$GOLEM_MODEL_NOMIC"    testdata/nomic/tokenizer ref/nomic/corpus.tsv
 
+# Laya, with GOLEM_MODEL_LAYA naming the checkpoint directory as Hugging Face
+# ships it. PyTorch runs the checkpoint's own rl_common.py; see laya/README.md.
+python ref/laya/dump.py "$GOLEM_MODEL_LAYA" testdata/laya
+
 python3 ref/gemma/dump_chats.py "$GOLEM_MODEL"      testdata/gemma/chat/cases.json
 python3 ref/gemma/dump_chats.py "$GOLEM_MODEL_12B"  testdata/gemma/chat12/cases.json
 python3 ref/qwen/dump_chats.py  "$GOLEM_MODEL_QWEN" testdata/qwen/chat/cases.json
