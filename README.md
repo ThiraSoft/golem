@@ -9,7 +9,7 @@ _LLMs, vision, speech, images and decisions. No Python, no cgo. CPU, or GPU with
 [![Go Reference](https://pkg.go.dev/badge/github.com/ThiraSoft/golem.svg)](https://pkg.go.dev/github.com/ThiraSoft/golem)
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[Quickstart](#quickstart) · [Speed](#speed) · [What only golem does](#what-only-golem-does) · [How it is checked](#how-it-is-known-to-be-right)
+[Quickstart](#quickstart) · [Speed](#speed) · [What golem does differently](#what-golem-does-differently) · [How it is checked](#how-it-is-known-to-be-right)
 
 <img src="assets/demo.gif" alt="golem-cli running Gemma 4 26B on the GPU at 129 tokens a second, then Laya answering three questions about an email in 17 ms" width="820">
 
@@ -55,7 +55,7 @@ On one RX 9070 XT, every figure a benchmark in this repository:
 | **Images** | Krea 2 from ComfyUI's fp8 files, LoRA included, the same picture as ComfyUI for the same seed |
 | **Decisions** | Laya, the open Jev: a state and typed questions in, calibrated probabilities out, in one encoder pass |
 | **Embeddings** | nomic-embed-text-v2-moe, behind OpenAI's and ollama's endpoints |
-| **Serving** | OpenAI-compatible HTTP API, tool calls, continuous batching, JSON schemas and GBNF grammars |
+| **Serving** | OpenAI-compatible HTTP API, Jev's decision endpoint, tool calls, continuous batching, JSON schemas and GBNF grammars |
 | **Weights** | GGUF with every K-quant llama.cpp writes, Prism's ternary PQ2_0 and PTQ1_0, and golem's own `.golem` format |
 
 ## Quickstart
@@ -73,7 +73,7 @@ golem-cli -model Qwen3-4B-Q4_0.gguf -p "Explain a mutex in one sentence." -stats
 golem-server -model Qwen3-4B-Q4_0.gguf -addr 127.0.0.1:8080 -parallel 4
 ```
 
-`-parallel N` cuts the context into N slots and holds N conversations at once. Whatever is waiting when a pass is built rides in that pass, so four clients wanting a token are one read of the weights instead of four. The same server answers transcriptions (`-stt`), embeddings (`-embed`) and image generation (`-krea2`). Details in [`cmd/golem-server/README.md`](cmd/golem-server/README.md).
+`-parallel N` cuts the context into N slots and holds N conversations at once. Whatever is waiting when a pass is built rides in that pass, so four clients wanting a token are one read of the weights instead of four. The same server answers transcriptions (`-stt`), embeddings (`-embed`), image generation (`-krea2`) and Jev's decision endpoint (`-laya`). Details in [`cmd/golem-server/README.md`](cmd/golem-server/README.md).
 
 </details>
 
@@ -134,7 +134,7 @@ laya -model convaiinnovations/laya -vulkan request.json
 }
 ```
 
-Every option comes back with a calibrated probability, in Jev's shape. The English, typed-decisions and multilingual checkpoints open as Hugging Face ships them. See [`laya/README.md`](laya/README.md).
+Every option comes back with a calibrated probability, in Jev's shape. `golem-server -laya` serves the same on `POST /v1/systemone`, Jev's own endpoint, so a Jev client needs only its base URL changed. The English, typed-decisions and multilingual checkpoints open as Hugging Face ships them. See [`laya/README.md`](laya/README.md).
 
 </details>
 
@@ -167,7 +167,9 @@ m.Forward.Logits(hidden[len(hidden)-1], logits)
 
 </details>
 
-## What only golem does
+## What golem does differently
+
+Three ideas from this repository that go past running a model as it was shipped.
 
 ### A mixture's experts need not be on the card
 

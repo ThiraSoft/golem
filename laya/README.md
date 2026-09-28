@@ -150,7 +150,8 @@ laya -model path/to/laya [-vulkan] [-stats] request.json
 ```
 
 where the request is `{"state": …, "questions": {…}}`. A state that is a JSON
-string is read as the text it holds.
+string is read as the text it holds. `golem-server -laya DIR` answers the same
+request on `POST /v1/systemone`, Jev's endpoint and laya-serve's.
 
 The tests want `GOLEM_MODEL_LAYA` naming the checkpoint directory and the
 fixtures `ref/laya/dump.py` writes into `testdata/laya`.

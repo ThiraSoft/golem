@@ -23,6 +23,7 @@ The endpoints:
 | `POST /v1/audio/transcriptions` | audio transcription (WAV, MP3, FLAC), streamed or not, using Kyutai STT (requires `-stt`) |
 | `POST /v1/embeddings` | OpenAI's embeddings, float or base64 (requires `-embed`) |
 | `POST /api/embed`, `POST /api/embeddings` | ollama's two embedding endpoints, so a client pointed at ollama needs only the port changed (requires `-embed`) |
+| `POST /v1/systemone` | typed questions about a state, answered by Laya in Jev's shape, so a Jev or laya-serve client needs only its base URL changed (requires `-laya`) |
 | `GET /v1/models` | the loaded models, for clients that probe at startup |
 
 ## Tools
@@ -444,15 +445,39 @@ prompt) and `seed` (drawn when absent or -1). The answer is one picture as
 without it each picture reads it again, which is most of its time when the
 file is not in the page cache.
 
+## Decisions
+
+With `-laya <dir>` (or `GOLEM_LAYA`), a Laya checkpoint directory as Hugging
+Face ships it, it answers `POST /v1/systemone`, the endpoint TypeSafe Jev and
+Laya's own `laya-serve` answer on, with the same request and the same answer.
+`laya/README.md` says what the model is and how close to PyTorch.
+
+```bash
+./golem-server -laya convaiinnovations/laya -vulkan -addr 127.0.0.1:8000
+
+curl -s localhost:8000/v1/systemone -d '{
+  "state": {"document": "I was charged twice. Please fix this ASAP."},
+  "questions": {"billing": {"type": "noul", "instructions": "Is this ticket about billing?"}}
+}'
+```
+
+Refusals are written as laya-serve writes them, `{"detail": "…"}`: 400 for a
+body that is not the request, 413 past a mebibyte or sixty-four questions, 422
+for a question Laya cannot read. Unknown fields are ignored, `model` among
+them: the server carries one checkpoint. Requests take turns on the model,
+and on an RX 9070 XT a request of three questions and 225 positions is
+answered in 14 ms over HTTP once the first has been.
+
 ## Flags
 
 | | |
 |---|---|
-| `-model` | the GGUF, or `GOLEM_MODEL`; not required when `-stt` or `-embed` is given |
+| `-model` | the GGUF, or `GOLEM_MODEL`; not required when `-stt`, `-embed`, `-krea2` or `-laya` is given |
 | `-stt` | directory holding the Kyutai STT model, or `GOLEM_STT`; a server may carry it alone, and then answers `/v1/models` and `/v1/audio/transcriptions` and nothing else |
 | `-embed` | a nomic-embed-text-v2-moe GGUF, or `GOLEM_EMBED`, for the embedding endpoints; a server may carry it alone |
+| `-laya` | a Laya checkpoint directory, or `GOLEM_LAYA`, for `/v1/systemone`; a server may carry it alone |
 | `-mmproj` | the projector GGUF, which is what lets a model see and hear, or `GOLEM_MMPROJ` |
-| `-vulkan` | put the blocks and the logit head on a Vulkan device, and the embedder's blocks with `-embed`; it fails rather than falling back |
+| `-vulkan` | put the blocks and the logit head on a Vulkan device, the embedder's blocks with `-embed`, and Laya with `-laya`; it fails rather than falling back |
 | `-addr` | what to listen on; `127.0.0.1:8080` by default |
 | `-context` | positions to keep; 4096 by default, cut between the slots |
 | `-parallel` | conversations at once; 1 by default |

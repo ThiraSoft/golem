@@ -28,6 +28,7 @@ import (
 	"github.com/ThiraSoft/golem/engine"
 	"github.com/ThiraSoft/golem/internal/version"
 	"github.com/ThiraSoft/golem/krea2"
+	"github.com/ThiraSoft/golem/laya"
 	"github.com/ThiraSoft/golem/nomic"
 	"github.com/ThiraSoft/golem/sample"
 	"github.com/ThiraSoft/golem/stt"
@@ -50,6 +51,7 @@ func main() {
 	sttStreams := flag.Int("stt-parallel", 1, "transcriptions to carry at once; they are stepped together, so the trunk's weights are read once for all of them")
 	builtinTemplate := flag.Bool("builtin-template", false, "write conversations with golem's own template rather than the one the file carries")
 	krea2Dir := flag.String("krea2", os.Getenv("GOLEM_KREA2"), "a ComfyUI directory holding Krea 2's three files, to answer /v1/images/generations with (or GOLEM_KREA2)")
+	layaDir := flag.String("laya", os.Getenv("GOLEM_LAYA"), "a Laya checkpoint directory as Hugging Face ships it, to answer Jev's /v1/systemone with (or GOLEM_LAYA)")
 	krea2Keep := flag.Bool("krea2-keep", false, "keep Krea 2's twelve-gigabyte DiT on the card between pictures")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Usage = func() {
@@ -63,15 +65,15 @@ func main() {
 		return
 	}
 
-	if *model == "" && *sttDir == "" && *embedPath == "" && *krea2Dir == "" {
-		fail(fmt.Errorf("no model: pass -model, -stt, -embed or -krea2, or set GOLEM_MODEL, GOLEM_STT, GOLEM_EMBED or GOLEM_KREA2"))
+	if *model == "" && *sttDir == "" && *embedPath == "" && *krea2Dir == "" && *layaDir == "" {
+		fail(fmt.Errorf("no model: pass -model, -stt, -embed, -krea2 or -laya, or set GOLEM_MODEL, GOLEM_STT, GOLEM_EMBED, GOLEM_KREA2 or GOLEM_LAYA"))
 	}
 	// A transcriber or an embedder alone is a whole server. It holds no
 	// conversation, so nothing below this — the runner, the slots, the
 	// generators — has anything to own, and building them around a model that
 	// was never opened would only be a longer way of writing nil.
 	if *model == "" {
-		serveWithoutConversation(*sttDir, *embedPath, *krea2Dir, *krea2Keep, *addr, *sttStreams, *vulkan)
+		serveWithoutConversation(*sttDir, *embedPath, *krea2Dir, *krea2Keep, *layaDir, *addr, *sttStreams, *vulkan)
 		return
 	}
 	start := time.Now()
@@ -183,6 +185,11 @@ func main() {
 		defer p.Close()
 		server.SetImager(p)
 	}
+	if *layaDir != "" {
+		d := openLaya(*layaDir, *vulkan)
+		defer d.Close()
+		server.SetDecider(d)
+	}
 
 	head := vulkanLine(m.Vulkan())
 	draft := ""
@@ -252,7 +259,7 @@ func sttOnVulkan(m *stt.Model, vulkan bool, streams int) {
 // both, and no conversation. Server.Handler registers the conversation route
 // only when there is a pool, so what this listens on is /v1/models and the
 // routes of what it carries.
-func serveWithoutConversation(dir, embedPath, krea2Dir string, krea2Keep bool, addr string, streams int, vulkan bool) {
+func serveWithoutConversation(dir, embedPath, krea2Dir string, krea2Keep bool, layaDir, addr string, streams int, vulkan bool) {
 	start := time.Now()
 	var name string
 	var carries []string
@@ -300,6 +307,15 @@ func serveWithoutConversation(dir, embedPath, krea2Dir string, krea2Keep bool, a
 		}
 		carries = append(carries, "pictures")
 	}
+	if layaDir != "" {
+		d := openLaya(layaDir, vulkan)
+		defer d.Close()
+		server.SetDecider(d)
+		if name == "" {
+			name = "laya"
+		}
+		carries = append(carries, "decisions")
+	}
 	server.name = name
 
 	listener, err := net.Listen("tcp", addr)
@@ -311,6 +327,25 @@ func serveWithoutConversation(dir, embedPath, krea2Dir string, krea2Keep bool, a
 	if err := http.Serve(listener, logging(os.Stderr, server.Handler())); err != nil {
 		fail(err)
 	}
+}
+
+// openLaya opens a Laya checkpoint, on the card when -vulkan says so, and
+// says where it ended up.
+func openLaya(dir string, vulkan bool) *laya.Model {
+	start := time.Now()
+	m, err := laya.Open(dir)
+	if err != nil {
+		fail(fmt.Errorf("laya: %w", err))
+	}
+	where := "on cpu"
+	if vulkan {
+		if err := m.UseVulkan(); err != nil {
+			fail(fmt.Errorf("laya on vulkan: %w", err))
+		}
+		where = "on vulkan"
+	}
+	fmt.Fprintf(os.Stderr, "laya from %s, %s, loaded in %s\n", dir, where, time.Since(start).Round(time.Millisecond))
+	return m
 }
 
 // openKrea2 readies Krea 2 from a ComfyUI directory. Its DiT is read at the

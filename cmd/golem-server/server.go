@@ -40,6 +40,7 @@ type Server struct {
 	sttGroup *stt.Group
 	embed    Embedder
 	imager   Imager
+	decider  Decider
 	// tokens is what a grammar reads the vocabulary through. It is built on
 	// the first request that asks for one and shared by every request after:
 	// a quarter of a million pieces is not something to decode twice, nor to
@@ -138,6 +139,9 @@ func (s *Server) Handler() http.Handler {
 	}
 	if s.imager != nil {
 		mux.HandleFunc("POST /v1/images/generations", s.generations)
+	}
+	if s.decider != nil {
+		mux.HandleFunc("POST /v1/systemone", s.systemone)
 	}
 	return mux
 }

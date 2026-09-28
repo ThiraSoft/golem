@@ -77,7 +77,7 @@ type Result struct {
 func (m *Model) Decide(ctx context.Context, state json.RawMessage, questions []Named) (*Result, error) {
 	text, err := StateText(state)
 	if err != nil {
-		return nil, fmt.Errorf("laya: state: %w", err)
+		return nil, &RequestError{fmt.Errorf("laya: state: %w", err)}
 	}
 	prepared := make([]*question, len(questions))
 	seqs := make([]seq, len(questions))
@@ -85,7 +85,7 @@ func (m *Model) Decide(ctx context.Context, state json.RawMessage, questions []N
 	for i, q := range questions {
 		p, err := prepare(q.Question)
 		if err != nil {
-			return nil, fmt.Errorf("laya: question %q: %w", q.ID, err)
+			return nil, &RequestError{fmt.Errorf("laya: question %q: %w", q.ID, err)}
 		}
 		prepared[i] = p
 	}
@@ -103,7 +103,7 @@ func (m *Model) Decide(ctx context.Context, state json.RawMessage, questions []N
 	})
 	for i, q := range questions {
 		if len(seqs[i].markers) != len(prepared[i].options) {
-			return nil, fmt.Errorf("laya: question %q: its options do not fit in %d tokens", q.ID, m.Cfg.HeadMaxLen)
+			return nil, &RequestError{fmt.Errorf("laya: question %q: its options do not fit in %d tokens", q.ID, m.Cfg.HeadMaxLen)}
 		}
 		res.InputTokens += len(seqs[i].ids)
 	}
@@ -123,6 +123,14 @@ func (m *Model) Decide(ctx context.Context, state json.RawMessage, questions []N
 	}
 	return res, nil
 }
+
+// RequestError is a request Decide will not answer as it was written: a state
+// that is not JSON, a question it cannot read, options that do not fit. A
+// server tells its client so; any other error is the server's own.
+type RequestError struct{ Err error }
+
+func (e *RequestError) Error() string { return e.Err.Error() }
+func (e *RequestError) Unwrap() error { return e.Err }
 
 func (m *Model) acquire(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
