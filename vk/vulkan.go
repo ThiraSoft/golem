@@ -116,6 +116,13 @@ const (
 	accessTransferWrite = 0x1000
 )
 
+// Buffer usages for Host, Readback and Local, for callers outside vk.
+const (
+	UsageStorage     = bufferUsageStorage
+	UsageTransferSrc = bufferUsageTransferSrc
+	UsageTransferDst = bufferUsageTransferDst
+)
+
 // vkApplicationInfo is skipped everywhere: it is optional and an instance
 // without it is a 1.0 instance, which is all a compute dispatch asks for.
 

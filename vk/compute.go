@@ -466,6 +466,15 @@ func (d *Device) Submit(record func(*Recorder)) error {
 	return d.run(func(cb commandBuffer) { record(&Recorder{cb: cb}) })
 }
 
+// Start is Submit without the wait: the work runs while the caller goes on,
+// and Wait collects it. It is for a caller with something else to do in the
+// meantime, a simulation stepping one half of its worlds while the card
+// thinks for the other. Until Wait, nothing else may record on the device:
+// Submit, Upload, CopyInto and Set.Dispatch all reuse the same command buffer.
+func (d *Device) Start(record func(*Recorder)) error {
+	return d.start(func(cb commandBuffer) { record(&Recorder{cb: cb}) })
+}
+
 // Dispatch is one set, once, in a submission of its own.
 func (s *Set) Dispatch(groups uint32, push unsafe.Pointer) error {
 	return s.p.d.Submit(func(r *Recorder) { r.Dispatch(s, groups, push) })

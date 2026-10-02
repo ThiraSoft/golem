@@ -792,6 +792,16 @@ func (d *Device) copyBuffer(src, dst *Buffer, at, n uint64) error {
 // run records one command buffer, submits it, and waits. Everything here is
 // synchronous: the caller wants the answer, not a pipeline.
 func (d *Device) run(record func(commandBuffer)) error {
+	if err := d.start(record); err != nil {
+		return err
+	}
+	return d.Wait()
+}
+
+// start records the device's command buffer and submits it, without waiting.
+// run and Start are its two callers: one waits at once, the other leaves the
+// wait to the caller.
+func (d *Device) start(record func(commandBuffer)) error {
 	if err := check("vkResetCommandBuffer", vkResetCommandBuffer(d.cmd, 0)); err != nil {
 		return err
 	}
@@ -808,9 +818,12 @@ func (d *Device) run(record func(commandBuffer)) error {
 		commandBufferCount: 1,
 		pCommandBuffers:    uintptr(unsafe.Pointer(&d.cmd)),
 	}
-	if err := check("vkQueueSubmit", vkQueueSubmit(d.queue, 1, &si, 0)); err != nil {
-		return err
-	}
+	return check("vkQueueSubmit", vkQueueSubmit(d.queue, 1, &si, 0))
+}
+
+// Wait blocks until everything submitted to the device has run. It is the
+// second half of Start, and harmless when nothing is pending.
+func (d *Device) Wait() error {
 	return check("vkQueueWaitIdle", vkQueueWaitIdle(d.queue))
 }
 
