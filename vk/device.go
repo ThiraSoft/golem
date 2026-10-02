@@ -5,6 +5,7 @@ package vk
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"unsafe"
 
@@ -40,10 +41,33 @@ type Device struct {
 	// See that function for what it is for and why it is asked rather than
 	// computed.
 	budget bool
+
+	// The compute-only queues OpenWith asked for, which streams take in
+	// turn, and the pool their command buffers come from. Empty when the
+	// device was opened with Open: streams then share the main queue.
+	asyncFamily uint32
+	asyncQueues []queue
+	asyncPool   uint64
+	nextAsync   int
+}
+
+// Options are what OpenWith may ask for beyond what Open takes.
+type Options struct {
+	// ComputeQueues asks for up to this many queues of a compute-only family,
+	// for streams. Dispatches on different queues run side by side on the
+	// card; on one queue they take turns, whatever the fences say. A device
+	// without such a family, or with fewer queues, gives what it has.
+	//
+	// Every buffer is then shared between the two families, so that a stream
+	// on a compute queue reads what Upload wrote on the main one.
+	ComputeQueues int
 }
 
 // Open finds the first device with a compute queue and takes it.
-func Open() (*Device, error) {
+func Open() (*Device, error) { return OpenWith(Options{}) }
+
+// OpenWith is Open with options.
+func OpenWith(o Options) (*Device, error) {
 	if err := load(); err != nil {
 		return nil, err
 	}
@@ -79,13 +103,14 @@ func Open() (*Device, error) {
 	}
 
 	found := false
+	var families []queueFamilyProperties
 	for _, p := range devices {
 		var n uint32
 		vkGetPhysicalDeviceQueueFamilyProps(p, &n, nil)
 		if n == 0 {
 			continue
 		}
-		families := make([]queueFamilyProperties, n)
+		families = make([]queueFamilyProperties, n)
 		vkGetPhysicalDeviceQueueFamilyProps(p, &n, &families[0])
 		for i, f := range families {
 			if f.queueFlags&queueCompute != 0 {
@@ -104,11 +129,28 @@ func Open() (*Device, error) {
 	vkGetPhysicalDeviceMemoryProperties(d.phys, &d.memory)
 
 	priority := float32(1)
-	qci := deviceQueueCreateInfo{
+	qcis := []deviceQueueCreateInfo{{
 		sType:            structDeviceQueueCreateInfo,
 		queueFamilyIndex: d.family,
 		queueCount:       1,
 		pQueuePriorities: uintptr(unsafe.Pointer(&priority)),
+	}}
+	priorities := make([]float32, max(o.ComputeQueues, 0))
+	for i := range priorities {
+		priorities[i] = 1
+	}
+	asyncCount := uint32(0)
+	for i, f := range families {
+		if o.ComputeQueues > 0 && uint32(i) != d.family && f.queueFlags&queueCompute != 0 && f.queueFlags&queueGraphics == 0 {
+			d.asyncFamily, asyncCount = uint32(i), min(f.queueCount, uint32(o.ComputeQueues))
+			qcis = append(qcis, deviceQueueCreateInfo{
+				sType:            structDeviceQueueCreateInfo,
+				queueFamilyIndex: d.asyncFamily,
+				queueCount:       asyncCount,
+				pQueuePriorities: uintptr(unsafe.Pointer(&priorities[0])),
+			})
+			break
+		}
 	}
 	have, err := d.extensions()
 	if err != nil {
@@ -172,8 +214,8 @@ func Open() (*Device, error) {
 	dci := deviceCreateInfo{
 		sType:                   structDeviceCreateInfo,
 		pNext:                   chain,
-		queueCreateInfoCount:    1,
-		pQueueCreateInfos:       uintptr(unsafe.Pointer(&qci)),
+		queueCreateInfoCount:    uint32(len(qcis)),
+		pQueueCreateInfos:       uintptr(unsafe.Pointer(&qcis[0])),
 		enabledExtensionCount:   uint32(len(pointers)),
 		ppEnabledExtensionNames: uintptr(unsafe.Pointer(&pointers[0])),
 	}
@@ -182,6 +224,11 @@ func Open() (*Device, error) {
 		return nil, err
 	}
 	vkGetDeviceQueue(d.dev, d.family, 0, &d.queue)
+	for i := range asyncCount {
+		var q queue
+		vkGetDeviceQueue(d.dev, d.asyncFamily, i, &q)
+		d.asyncQueues = append(d.asyncQueues, q)
+	}
 
 	if have[hostImportExtension] {
 		d.findHostImport()
@@ -205,6 +252,13 @@ func Open() (*Device, error) {
 	if err := check("vkAllocateCommandBuffers", vkAllocateCommandBuffers(d.dev, &cbai, &d.cmd)); err != nil {
 		d.Close()
 		return nil, err
+	}
+	if len(d.asyncQueues) > 0 {
+		cpci.queueFamilyIndex = d.asyncFamily
+		if err := check("vkCreateCommandPool", vkCreateCommandPool(d.dev, &cpci, 0, &d.asyncPool)); err != nil {
+			d.Close()
+			return nil, err
+		}
 	}
 	return d, nil
 }
@@ -302,6 +356,10 @@ func (d *Device) Close() {
 	if d.cmdPool != 0 {
 		vkDestroyCommandPool(d.dev, d.cmdPool, 0)
 		d.cmdPool = 0
+	}
+	if d.asyncPool != 0 {
+		vkDestroyCommandPool(d.dev, d.asyncPool, 0)
+		d.asyncPool = 0
 	}
 	if d.dev != 0 {
 		vkDestroyDevice(d.dev, 0)
@@ -407,6 +465,8 @@ func (d *Device) Import(p unsafe.Pointer, size int, usage uint32) (*Buffer, erro
 		size:  uint64(size),
 		usage: usage,
 	}
+	families := d.share(&bci)
+	defer runtime.KeepAlive(families)
 	if err := check("vkCreateBuffer", vkCreateBuffer(d.dev, &bci, 0, &b.handle)); err != nil {
 		return nil, err
 	}
@@ -461,10 +521,26 @@ type Buffer struct {
 	mapped unsafe.Pointer
 }
 
+// share makes a buffer concurrent between the main family and the compute
+// queues' when the device has them, so that no ownership has to move between
+// the two. The returned array backs bci's pointer and must outlive the call.
+func (d *Device) share(bci *bufferCreateInfo) *[2]uint32 {
+	if len(d.asyncQueues) == 0 {
+		return nil
+	}
+	families := &[2]uint32{d.family, d.asyncFamily}
+	bci.sharingMode = sharingConcurrent
+	bci.queueFamilyIndexCount = 2
+	bci.pQueueFamilyIndices = uintptr(unsafe.Pointer(&families[0]))
+	return families
+}
+
 // newBuffer allocates size bytes with the given usage and memory properties.
 func (d *Device) newBuffer(size uint64, usage uint32, props uint32) (*Buffer, error) {
 	b := &Buffer{d: d, size: size}
 	bci := bufferCreateInfo{sType: structBufferCreateInfo, size: size, usage: usage}
+	families := d.share(&bci)
+	defer runtime.KeepAlive(families)
 	if err := check("vkCreateBuffer", vkCreateBuffer(d.dev, &bci, 0, &b.handle)); err != nil {
 		return nil, err
 	}

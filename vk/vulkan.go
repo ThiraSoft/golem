@@ -90,7 +90,10 @@ const (
 
 	queryTypeTimestamp = 2
 
-	queueCompute = 0x2
+	queueGraphics = 0x1
+	queueCompute  = 0x2
+
+	sharingConcurrent = 1
 
 	bufferUsageTransferSrc = 0x1
 	bufferUsageTransferDst = 0x2
@@ -558,6 +561,15 @@ type submitInfo struct {
 	pSignalSemaphores    uintptr
 }
 
+// fenceCreateInfo: sType 0, pNext 8, flags 16.
+type fenceCreateInfo struct {
+	sType uint32
+	_     uint32
+	pNext uintptr
+	flags uint32
+	_     uint32
+}
+
 // memoryBarrier: sType 0, pNext 8, srcAccessMask 16, dstAccessMask 20.
 type memoryBarrier struct {
 	sType         uint32
@@ -686,6 +698,11 @@ var (
 	vkGetQueryPoolResults                func(device, uint64, uint32, uint32, uint64, unsafe.Pointer, uint64, uint32) int32
 	vkQueueSubmit                        func(queue, uint32, *submitInfo, uint64) int32
 	vkQueueWaitIdle                      func(queue) int32
+	vkCreateFence                        func(device, *fenceCreateInfo, uintptr, *uint64) int32
+	vkDestroyFence                       func(device, uint64, uintptr)
+	vkResetFences                        func(device, uint32, *uint64) int32
+	vkWaitForFences                      func(device, uint32, *uint64, uint32, uint64) int32
+	vkGetFenceStatus                     func(device, uint64) int32
 	vkGetPhysicalDeviceProperties2       func(physicalDevice, unsafe.Pointer)
 	vkGetDeviceProcAddr                  func(device, uintptr) uintptr
 	vkGetPhysicalDeviceMemoryProps2      func(physicalDevice, unsafe.Pointer)
@@ -761,6 +778,11 @@ func load() error {
 	bind(&vkGetQueryPoolResults, "vkGetQueryPoolResults")
 	bind(&vkQueueSubmit, "vkQueueSubmit")
 	bind(&vkQueueWaitIdle, "vkQueueWaitIdle")
+	bind(&vkCreateFence, "vkCreateFence")
+	bind(&vkDestroyFence, "vkDestroyFence")
+	bind(&vkResetFences, "vkResetFences")
+	bind(&vkWaitForFences, "vkWaitForFences")
+	bind(&vkGetFenceStatus, "vkGetFenceStatus")
 	bind(&vkGetPhysicalDeviceProperties2, "vkGetPhysicalDeviceProperties2")
 	bind(&vkGetDeviceProcAddr, "vkGetDeviceProcAddr")
 	bind(&vkGetPhysicalDeviceMemoryProps2, "vkGetPhysicalDeviceMemoryProperties2")
