@@ -98,7 +98,7 @@ func (g *Generator) GeneratePrompt(ctx context.Context, prompt engine.Prompt, p 
 	// The state the prompt ended on, which is the prediction block's second
 	// input. A conversation that cannot draft never reads it.
 	var state []float32
-	fed, err := g.ctx.PrefillPromptState(prompt, g.logits, &state)
+	fed, err := g.ctx.PrefillPromptState(ctx, prompt, g.logits, &state)
 	if err != nil {
 		return Answer{}, err
 	}
@@ -200,6 +200,11 @@ func (g *Generator) GeneratePrompt(ctx context.Context, prompt engine.Prompt, p 
 	}
 	if answer.Generated >= g.maxTokens {
 		answer.Reason = "length"
+	} else if !stopped && g.ctx.Full() {
+		// The answer is cut where the cache ran out, and the client has no
+		// way to tell it from a finished one: a thinking model cut there has
+		// said nothing at all. And the next turn, longer still, would not fit.
+		return answer, fmt.Errorf("serve: the context is full: the conversation reached %d positions, %d of them this answer: start the server with a larger -context, or send less", g.ctx.Pos(), answer.Generated)
 	}
 	if err := sorted.read(drawn.String(), true); err != nil {
 		return answer, err

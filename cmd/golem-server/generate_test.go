@@ -416,3 +416,21 @@ func TestGenerateSaysACallWasCutByTheLimit(t *testing.T) {
 		t.Fatalf("err %v", err)
 	}
 }
+
+// An answer the context cut short is an error, not an answer that stopped: a
+// client reading "stop" takes the half of it for the whole.
+func TestGenerateSaysTheContextRanOut(t *testing.T) {
+	script := []string{"on", "on", "on", "on", "on", "on", "on", "on"}
+	v := newWordVocab()
+	for _, word := range script {
+		v.id(word)
+	}
+	v.id("<turn|>")
+	e := &scriptedEngine{vocab: v, script: script}
+	ctx := NewContext(running(t, e), 0, 4, time.Now, 0)
+	g := NewGenerator(ctx, v, wordTemplate{}, 4, 32)
+	_, err := g.Generate(context.Background(), v.Encode("a", false, true), greedy(), nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "context is full") {
+		t.Fatalf("err %v, want the context to be full", err)
+	}
+}

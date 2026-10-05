@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/ThiraSoft/golem/engine"
 )
 
 // An engine that records what it was fed and at which position, and whose
@@ -469,5 +473,46 @@ func TestARecurrentCacheResumesFromWhereItLastParted(t *testing.T) {
 	// on: going back to the village's prompt starts over too.
 	if fed, _ := c.Prefill(prompt(9), scores()); fed != len(sheet)+3 || len(e.restored) != 0 {
 		t.Fatalf("after the sheet was written over, fed %d with %d restores", fed, len(e.restored))
+	}
+}
+
+// An engine that hangs the client up once it has carried a number of passes.
+type hangingUpEngine struct {
+	recordingEngine
+	after  int
+	cancel context.CancelFunc
+}
+
+func (e *hangingUpEngine) ForwardSlots(tokens []int32, slots, positions []int) [][]float32 {
+	out := e.recordingEngine.ForwardSlots(tokens, slots, positions)
+	if len(e.widths) == e.after {
+		e.cancel()
+	}
+	return out
+}
+
+// A client that hangs up stops the reading at the next pass, and what was read
+// is kept: the same prompt asked again goes on from there.
+func TestPrefillStopsWhenTheClientHangsUp(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	e := &hangingUpEngine{after: 2, cancel: cancel}
+	c := NewContext(running(t, e), 0, 4096, time.Now, 0)
+	ids := make([]int32, 10*promptBatch)
+	for i := range ids {
+		ids[i] = int32(i + 1)
+	}
+	fed, err := c.PrefillPromptState(ctx, engine.TextPrompt(ids), scores(), nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err %v, want the cancellation", err)
+	}
+	if want := 2 * promptBatch; fed != want || c.Pos() != want || len(e.fed) != want {
+		t.Fatalf("fed %d, held %d, engine read %d; want %d each", fed, c.Pos(), len(e.fed), want)
+	}
+	fed, err = c.Prefill(ids, scores())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := len(ids) - 2*promptBatch; fed != want {
+		t.Fatalf("asked again, fed %d, want %d", fed, want)
 	}
 }

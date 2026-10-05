@@ -57,7 +57,11 @@ func (s *Server) stream(ctx context.Context, w http.ResponseWriter, gen *Generat
 	})
 	if err != nil {
 		if ctx.Err() != nil {
-			return // the client left; there is no stream to write to
+			// The client left; there is no stream to write to, only the log.
+			if rec, ok := w.(*recorder); ok {
+				rec.reason = "the client left before the answer was done"
+			}
+			return
 		}
 		// The status line is already out, so the error goes down the stream,
 		// which is the only place left for it. It goes as its own event, the

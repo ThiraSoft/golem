@@ -25,6 +25,7 @@ package main
 // keys of the previous character, and answered as someone else.
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"sort"
@@ -193,13 +194,17 @@ func (c *Context) Prefill(ids []int32, logits []float32) (int, error) {
 // PrefillPrompt is the same for a prompt that may hold pictures: the rows go
 // in where the soft tokens are, and a batch is never cut inside one.
 func (c *Context) PrefillPrompt(p engine.Prompt, logits []float32) (int, error) {
-	return c.PrefillPromptState(p, logits, nil)
+	return c.PrefillPromptState(context.Background(), p, logits, nil)
 }
 
 // PrefillPromptState is PrefillPrompt that also keeps the hidden state of the
 // last position. A conversation that is about to draft needs it: the prediction
 // block reads the state of the token before the one it drafts from.
-func (c *Context) PrefillPromptState(p engine.Prompt, logits []float32, state *[]float32) (int, error) {
+//
+// A client that hangs up stops the reading between two passes. A long prompt
+// is minutes on a card, and the next request waits behind every one of them.
+// What was read stays held: a client that asks again goes on from there.
+func (c *Context) PrefillPromptState(ctx context.Context, p engine.Prompt, logits []float32, state *[]float32) (int, error) {
 	ids := p.Tokens()
 	if len(ids) == 0 {
 		return 0, fmt.Errorf("serve: an empty prompt")
@@ -241,6 +246,14 @@ func (c *Context) PrefillPromptState(p engine.Prompt, logits []float32, state *[
 	saves := c.savesFor(ids, embeds, from, shared)
 
 	for at := from; at < len(ids); {
+		if err := ctx.Err(); err != nil {
+			// Every pass so far was whole, and a pass never ends inside a
+			// picture, so the cache holds exactly the positions before at.
+			c.held = append(c.held[:0], ids[:at]...)
+			c.media = embeds[:min(at, len(embeds))]
+			c.last = c.now()
+			return at - from, err
+		}
 		// A batch may not be cut inside a picture: every key of a span has to
 		// be in the cache before any of its queries is scored, which holds
 		// within one pass and not across two.

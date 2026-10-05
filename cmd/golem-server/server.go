@@ -258,6 +258,9 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 		// A client that hung up gets no answer, and no error either: there is
 		// nobody left to read one.
 		if r.Context().Err() != nil {
+			if rec, ok := w.(*recorder); ok {
+				rec.reason = "the client left before the answer was done"
+			}
 			return
 		}
 		refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
