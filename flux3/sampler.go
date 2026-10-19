@@ -6,17 +6,6 @@ import (
 	"github.com/ThiraSoft/golem/krea2"
 )
 
-// Defaults ruled from ref/flux3/workflows/flux3_klein_bf16_t2i.json.
-const (
-	DefaultSteps     = 16
-	DefaultCFG       = 1.0
-	DefaultSampler   = "euler"
-	DefaultScheduler = "simple"
-	DefaultShift     = Shift // ln(16), ModelSamplingFlux alpha 16.0
-	DefaultWidth     = 1024
-	DefaultHeight    = 1024
-)
-
 // Defaults holds the generation parameters from ref/flux3/workflows/flux3_klein_bf16_t2i.json.
 var Defaults = struct {
 	Steps     int
@@ -27,26 +16,28 @@ var Defaults = struct {
 	Width     int
 	Height    int
 }{
-	Steps:     DefaultSteps,
-	CFG:       DefaultCFG,
-	Sampler:   DefaultSampler,
-	Scheduler: DefaultScheduler,
-	Shift:     DefaultShift,
-	Width:     DefaultWidth,
-	Height:    DefaultHeight,
+	Steps:     16,
+	CFG:       1.0,
+	Sampler:   "euler",
+	Scheduler: "simple",
+	Shift:     Shift, // ln(16), ModelSamplingFlux alpha 16.0
+	Width:     1024,
+	Height:    1024,
 }
 
 // StartingNoise returns the initial latent noise for a given seed and latent patch
-// dimensions (h, w), 128 channels. It matches ComfyUI's CPU torch.randn bit for bit.
+// dimensions (h, w), 128 channels. MT19937 draws and layout match torch to the bit;
+// the Box-Muller in float64 lands within a few ULP of torch's AVX2 float32 (76.65% exact,
+// max diff 4.77e-7).
 func StartingNoise(seed uint64, h, w int) []float32 {
 	return krea2.TorchCPURandn(seed, 128*h*w)
 }
 
 // Sample runs the Euler ODE solver over sigmas, updating the latent in place.
-// Euler adds no noise, so seed is preserved for interface compatibility.
+// Euler adds no noise, so seed is accepted for interface compatibility with
+// stochastic samplers (e.g. ER-SDE) and left unused.
 // d is the denoiser returning the clean estimate for latent x at step and sigma.
 func Sample(d krea2.Denoiser, x []float32, sigmas []float32, seed uint64, progress krea2.Progress) ([]float32, error) {
-	_ = seed
 	if len(sigmas) < 2 {
 		return nil, fmt.Errorf("flux3: %d sigmas is no schedule", len(sigmas))
 	}
@@ -74,14 +65,19 @@ func Sample(d krea2.Denoiser, x []float32, sigmas []float32, seed uint64, progre
 	return x, nil
 }
 
-// ApplyCFG combines conditional and unconditional denoised estimates.
-func ApplyCFG(cond, uncond []float32, cfg float32) []float32 {
-	if cfg == 1.0 || len(uncond) == 0 {
-		return cond
+// ApplyCFG combines conditional and unconditional denoised estimates:
+// uncond + (cond - uncond) * cfg.
+// Returns an error if cond and uncond have different lengths.
+func ApplyCFG(cond, uncond []float32, cfg float32) ([]float32, error) {
+	if len(cond) != len(uncond) {
+		return nil, fmt.Errorf("flux3: cond len %d != uncond len %d", len(cond), len(uncond))
+	}
+	if cfg == 1.0 {
+		return cond, nil
 	}
 	out := make([]float32, len(cond))
 	for i := range out {
 		out[i] = uncond[i] + (cond[i]-uncond[i])*cfg
 	}
-	return out
+	return out, nil
 }

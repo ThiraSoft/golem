@@ -4,8 +4,9 @@ package krea2
 // latent with torch's CPU generator and the noise ER-SDE adds at every step
 // with a generator on the card; on the machine the mobile front runs on the
 // card is ROCm, so that one is rocrand's Philox4x32-10, spread over threads the
-// way torch launches its kernel. Both are reproduced here to the bit before the
-// floating point, which is what makes a seed give ComfyUI's picture.
+// way torch launches its kernel. MT19937 draws and layout match torch to the bit;
+// the Box-Muller in float64 lands within a few ULP of torch's AVX2 float32, which
+// is what makes a seed give ComfyUI's picture.
 
 import "math"
 

@@ -181,23 +181,41 @@ func TestUncondKeepsItsLength(t *testing.T) {
 		t.Errorf("sample_cfg/uncond shape %v, want [80, %d]", uncondShape, CondWidth)
 	}
 
-	// 3. Verify ApplyCFG formula: uncond + (cond - uncond) * cfg
-	condD := f.read(t, "sample/denoised_0")
-	uncondD := f.read(t, "sample_cfg/denoised_0")
-	cfgResult := ApplyCFG(condD, uncondD, 2.0)
-	if len(cfgResult) != len(condD) {
-		t.Fatalf("ApplyCFG output length %d != %d", len(cfgResult), len(condD))
+	// 3. Test ApplyCFG on synthetic vectors over full length (32768 floats = 256x256 latent).
+	// The real two-slot CFG check moves to Task 6.
+	const n = 32768
+	synthCond := make([]float32, n)
+	synthUncond := make([]float32, n)
+	for i := range synthCond {
+		synthCond[i] = float32(i)*0.125 - 50.0
+		synthUncond[i] = float32(i)*0.0625 + 25.0
 	}
-	for i := 0; i < min(len(cfgResult), 10); i++ {
-		expected := uncondD[i] + (condD[i]-uncondD[i])*2.0
-		if math.Abs(float64(cfgResult[i]-expected)) > 1e-6 {
-			t.Fatalf("ApplyCFG[%d] = %g, want %g", i, cfgResult[i], expected)
+
+	cfgResult, err := ApplyCFG(synthCond, synthUncond, 2.0)
+	if err != nil {
+		t.Fatalf("ApplyCFG failed: %v", err)
+	}
+	if len(cfgResult) != n {
+		t.Fatalf("ApplyCFG output length %d != %d", len(cfgResult), n)
+	}
+	for i := range cfgResult {
+		wantVal := synthUncond[i] + 2.0*(synthCond[i]-synthUncond[i])
+		if cfgResult[i] != wantVal {
+			t.Fatalf("ApplyCFG[%d] = %g, want %g exactly", i, cfgResult[i], wantVal)
 		}
 	}
 
-	// ApplyCFG with cfg=1.0 returns cond slice unchanged
-	cfg1Result := ApplyCFG(condD, uncondD, 1.0)
-	if len(cfg1Result) != len(condD) || &cfg1Result[0] != &condD[0] {
+	// ApplyCFG with cfg=1.0 returns cond directly without error
+	cfg1Result, err := ApplyCFG(synthCond, synthUncond, 1.0)
+	if err != nil {
+		t.Fatalf("ApplyCFG(1.0) failed: %v", err)
+	}
+	if len(cfg1Result) != n || &cfg1Result[0] != &synthCond[0] {
 		t.Errorf("ApplyCFG(cfg=1.0) did not return cond directly")
+	}
+
+	// ApplyCFG returns an error on length mismatch
+	if _, err := ApplyCFG(synthCond, synthUncond[:n-1], 2.0); err == nil {
+		t.Error("ApplyCFG with mismatched lengths succeeded, want error")
 	}
 }
