@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/engine"
+	"github.com/ThiraSoft/golem/flux3"
 	"github.com/ThiraSoft/golem/internal/version"
 	"github.com/ThiraSoft/golem/krea2"
 	"github.com/ThiraSoft/golem/laya"
@@ -51,8 +52,10 @@ func main() {
 	sttStreams := flag.Int("stt-parallel", 1, "transcriptions to carry at once; they are stepped together, so the trunk's weights are read once for all of them")
 	builtinTemplate := flag.Bool("builtin-template", false, "write conversations with golem's own template rather than the one the file carries")
 	krea2Dir := flag.String("krea2", os.Getenv("GOLEM_KREA2"), "a ComfyUI directory holding Krea 2's three files, to answer /v1/images/generations with (or GOLEM_KREA2)")
+	flux3Dir := flag.String("flux3", os.Getenv("GOLEM_FLUX3"), "a ComfyUI directory holding FLUX 3's three files, to answer /v1/images/generations with (or GOLEM_FLUX3)")
 	layaDir := flag.String("laya", os.Getenv("GOLEM_LAYA"), "a Laya checkpoint directory as Hugging Face ships it, to answer Jev's /v1/systemone with (or GOLEM_LAYA)")
 	krea2Keep := flag.Bool("krea2-keep", false, "keep Krea 2's twelve-gigabyte DiT on the card between pictures")
+	flux3Keep := flag.Bool("flux3-keep", false, "keep FLUX 3's DiT on the card between pictures")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [options]\n", filepath.Base(os.Args[0]))
@@ -65,15 +68,15 @@ func main() {
 		return
 	}
 
-	if *model == "" && *sttDir == "" && *embedPath == "" && *krea2Dir == "" && *layaDir == "" {
-		fail(fmt.Errorf("no model: pass -model, -stt, -embed, -krea2 or -laya, or set GOLEM_MODEL, GOLEM_STT, GOLEM_EMBED, GOLEM_KREA2 or GOLEM_LAYA"))
+	if *model == "" && *sttDir == "" && *embedPath == "" && *krea2Dir == "" && *flux3Dir == "" && *layaDir == "" {
+		fail(fmt.Errorf("no model: pass -model, -stt, -embed, -krea2, -flux3 or -laya, or set GOLEM_MODEL, GOLEM_STT, GOLEM_EMBED, GOLEM_KREA2, GOLEM_FLUX3 or GOLEM_LAYA"))
 	}
 	// A transcriber or an embedder alone is a whole server. It holds no
 	// conversation, so nothing below this — the runner, the slots, the
 	// generators — has anything to own, and building them around a model that
 	// was never opened would only be a longer way of writing nil.
 	if *model == "" {
-		serveWithoutConversation(*sttDir, *embedPath, *krea2Dir, *krea2Keep, *layaDir, *addr, *sttStreams, *vulkan)
+		serveWithoutConversation(*sttDir, *embedPath, *krea2Dir, *krea2Keep, *flux3Dir, *flux3Keep, *layaDir, *addr, *sttStreams, *vulkan)
 		return
 	}
 	start := time.Now()
@@ -183,7 +186,12 @@ func main() {
 	if *krea2Dir != "" {
 		p := openKrea2(*krea2Dir, *krea2Keep)
 		defer p.Close()
-		server.SetImager(p)
+		server.SetKrea2(p)
+	}
+	if *flux3Dir != "" {
+		p := openFlux3(*flux3Dir, *flux3Keep)
+		defer p.Close()
+		server.SetFlux3(p)
 	}
 	if *layaDir != "" {
 		d := openLaya(*layaDir, *vulkan)
@@ -259,7 +267,7 @@ func sttOnVulkan(m *stt.Model, vulkan bool, streams int) {
 // both, and no conversation. Server.Handler registers the conversation route
 // only when there is a pool, so what this listens on is /v1/models and the
 // routes of what it carries.
-func serveWithoutConversation(dir, embedPath, krea2Dir string, krea2Keep bool, layaDir, addr string, streams int, vulkan bool) {
+func serveWithoutConversation(dir, embedPath, krea2Dir string, krea2Keep bool, flux3Dir string, flux3Keep bool, layaDir, addr string, streams int, vulkan bool) {
 	start := time.Now()
 	var name string
 	var carries []string
@@ -301,9 +309,18 @@ func serveWithoutConversation(dir, embedPath, krea2Dir string, krea2Keep bool, l
 	if krea2Dir != "" {
 		p := openKrea2(krea2Dir, krea2Keep)
 		defer p.Close()
-		server.SetImager(p)
+		server.SetKrea2(p)
 		if name == "" {
 			name = "krea2"
+		}
+		carries = append(carries, "pictures")
+	}
+	if flux3Dir != "" {
+		p := openFlux3(flux3Dir, flux3Keep)
+		defer p.Close()
+		server.SetFlux3(p)
+		if name == "" {
+			name = "flux3"
 		}
 		carries = append(carries, "pictures")
 	}
@@ -362,6 +379,23 @@ func openKrea2(dir string, keep bool) *krea2.Pipeline {
 		how = "kept on the card after the first picture"
 	}
 	fmt.Fprintf(os.Stderr, "krea2 from %s, the DiT %s\n", dir, how)
+	return p
+}
+
+// openFlux3 readies FLUX 3 from a ComfyUI directory. Its DiT is read at the
+// first picture, and kept on the card after it when keep says so.
+func openFlux3(dir string, keep bool) *flux3.Pipeline {
+	o := flux3.ComfyUI(dir)
+	o.Keep = keep
+	p, err := flux3.Open(o)
+	if err != nil {
+		fail(fmt.Errorf("flux3: %w", err))
+	}
+	how := "read for each picture"
+	if keep {
+		how = "kept on the card after the first picture"
+	}
+	fmt.Fprintf(os.Stderr, "flux3 from %s, the DiT %s\n", dir, how)
 	return p
 }
 

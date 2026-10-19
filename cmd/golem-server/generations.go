@@ -1,13 +1,13 @@
 package main
 
-// POST /v1/images/generations: a picture from a sentence, with Krea 2.
+// POST /v1/images/generations: a picture from a sentence, with Krea 2 or FLUX 3.
 //
 // It is OpenAI's endpoint with what the ComfyUI mobile front sends beside it:
-// the negative prompt, the steps, the guidance and the seed. The answer is the
-// picture as a base64 PNG, and the seed that drew it, so that a client that
-// asked for a random one can ask for the same picture again. The PNG carries
-// the request too, and the golem that drew it. A LoRA is named as the front
-// names it, lora and lora_strength. hide_prompt keeps the prompt out of the
+// the negative prompt, the steps, the guidance, the seed and reference images.
+// The answer is the picture as a base64 PNG, and the seed that drew it, so that
+// a client that asked for a random one can ask for the same picture again. The
+// PNG carries the request too, and the golem that drew it. A LoRA is named as the
+// front names it, lora and lora_strength. hide_prompt keeps the prompt out of the
 // PNG. With stream, the answer is server-sent events, one a step.
 
 import (
@@ -16,6 +16,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"math/rand/v2"
 	"net/http"
@@ -25,13 +27,104 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ThiraSoft/golem/flux3"
 	"github.com/ThiraSoft/golem/krea2"
 )
 
-// Imager draws pictures. krea2.Pipeline is one; the tests have another.
+// PictureRequest carries what any pipeline needs to draw one picture.
+type PictureRequest struct {
+	Prompt         string
+	Negative       string
+	Width          int
+	Height         int
+	Steps          int
+	CFG            float32
+	Seed           uint64
+	Lora           string
+	LoraStrength   float32
+	Chroma         string
+	ChromaStrength float32
+	ChromaSpread   float32
+	HidePrompt     bool
+	Images         []image.Image
+}
+
+// Imager draws pictures. krea2Imager and flux3Imager are two; the tests have another.
 type Imager interface {
-	Generate(r krea2.Request, progress krea2.Progress) (*image.NRGBA, krea2.Timings, error)
-	WritePNG(w io.Writer, img image.Image, r krea2.Request) error
+	Generate(r PictureRequest, progress krea2.Progress) (*image.NRGBA, krea2.Timings, error)
+	WritePNG(w io.Writer, img image.Image, r PictureRequest) error
+}
+
+type krea2Imager struct {
+	p *krea2.Pipeline
+}
+
+func (ki *krea2Imager) Generate(r PictureRequest, progress krea2.Progress) (*image.NRGBA, krea2.Timings, error) {
+	return ki.p.Generate(krea2.Request{
+		Prompt:         r.Prompt,
+		Negative:       r.Negative,
+		Width:          r.Width,
+		Height:         r.Height,
+		Steps:          r.Steps,
+		CFG:            r.CFG,
+		Seed:           r.Seed,
+		Lora:           r.Lora,
+		LoraStrength:   r.LoraStrength,
+		Chroma:         r.Chroma,
+		ChromaStrength: r.ChromaStrength,
+		ChromaSpread:   r.ChromaSpread,
+		HidePrompt:     r.HidePrompt,
+	}, progress)
+}
+
+func (ki *krea2Imager) WritePNG(w io.Writer, img image.Image, r PictureRequest) error {
+	return ki.p.WritePNG(w, img, krea2.Request{
+		Prompt:         r.Prompt,
+		Negative:       r.Negative,
+		Width:          r.Width,
+		Height:         r.Height,
+		Steps:          r.Steps,
+		CFG:            r.CFG,
+		Seed:           r.Seed,
+		Lora:           r.Lora,
+		LoraStrength:   r.LoraStrength,
+		Chroma:         r.Chroma,
+		ChromaStrength: r.ChromaStrength,
+		ChromaSpread:   r.ChromaSpread,
+		HidePrompt:     r.HidePrompt,
+	})
+}
+
+type flux3Imager struct {
+	p *flux3.Pipeline
+}
+
+func (fi *flux3Imager) Generate(r PictureRequest, progress krea2.Progress) (*image.NRGBA, krea2.Timings, error) {
+	return fi.p.Generate(flux3.Request{
+		Prompt:     r.Prompt,
+		Negative:   r.Negative,
+		Width:      r.Width,
+		Height:     r.Height,
+		Steps:      r.Steps,
+		CFG:        r.CFG,
+		Seed:       r.Seed,
+		Images:     r.Images,
+		HidePrompt: r.HidePrompt,
+	}, progress)
+}
+
+func (fi *flux3Imager) WritePNG(w io.Writer, img image.Image, r PictureRequest) error {
+	return fi.p.WritePNG(w, img, flux3.Request{
+		Prompt:     r.Prompt,
+		Negative:   r.Negative,
+		Width:      r.Width,
+		Height:     r.Height,
+		Steps:      r.Steps,
+		CFG:        r.CFG,
+		Seed:       r.Seed,
+		Images:     r.Images,
+		HidePrompt: r.HidePrompt,
+	})
 }
 
 // lockedImager lets one picture be drawn at a time: the card holds one.
@@ -40,11 +133,11 @@ type lockedImager struct {
 	im Imager
 }
 
-func (l *lockedImager) WritePNG(w io.Writer, img image.Image, r krea2.Request) error {
+func (l *lockedImager) WritePNG(w io.Writer, img image.Image, r PictureRequest) error {
 	return l.im.WritePNG(w, img, r)
 }
 
-func (l *lockedImager) Generate(r krea2.Request, p krea2.Progress) (*image.NRGBA, krea2.Timings, error) {
+func (l *lockedImager) Generate(r PictureRequest, p krea2.Progress) (*image.NRGBA, krea2.Timings, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.im.Generate(r, p)
@@ -52,6 +145,12 @@ func (l *lockedImager) Generate(r krea2.Request, p krea2.Progress) (*image.NRGBA
 
 // SetImager lets this server draw pictures.
 func (s *Server) SetImager(im Imager) { s.imager = &lockedImager{im: im} }
+
+// SetKrea2 wires Krea 2 to answer picture generation requests.
+func (s *Server) SetKrea2(p *krea2.Pipeline) { s.SetImager(&krea2Imager{p: p}) }
+
+// SetFlux3 wires FLUX 3 to answer picture generation requests.
+func (s *Server) SetFlux3(p *flux3.Pipeline) { s.SetImager(&flux3Imager{p: p}) }
 
 type generationRequest struct {
 	Prompt         string   `json:"prompt"`
@@ -62,6 +161,7 @@ type generationRequest struct {
 	Steps          int      `json:"steps"`
 	CFG            *float32 `json:"cfg"`
 	Seed           *int64   `json:"seed"`
+	Images         []string `json:"images"`
 	// A LoRA by its file name in ComfyUI's models/loras, as the front's
 	// lora_name, and its strength, 1 when not given.
 	Lora         string   `json:"lora"`
@@ -84,7 +184,7 @@ func (s *Server) generations(w http.ResponseWriter, r *http.Request) {
 		refuse(w, http.StatusBadRequest, "invalid_request_error", "the request body is not the JSON this endpoint reads: "+err.Error())
 		return
 	}
-	k, err := req.krea2()
+	k, err := req.pictureRequest(s.name)
 	if err != nil {
 		refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -110,7 +210,7 @@ func (s *Server) generations(w http.ResponseWriter, r *http.Request) {
 
 // draw draws the picture and returns it as a PNG, noting its cost for the
 // log line.
-func (s *Server) draw(w http.ResponseWriter, k krea2.Request, progress krea2.Progress) ([]byte, error) {
+func (s *Server) draw(w http.ResponseWriter, k PictureRequest, progress krea2.Progress) ([]byte, error) {
 	img, tm, err := s.imager.Generate(k, progress)
 	if err != nil {
 		return nil, err
@@ -129,7 +229,7 @@ func (s *Server) draw(w http.ResponseWriter, k krea2.Request, progress krea2.Pro
 // those of a streamed picture: image_generation.progress after each step
 // (step, steps), then image_generation.completed with the picture, or error.
 // A client waiting behind another picture hears nothing until its own starts.
-func (s *Server) streamGeneration(w http.ResponseWriter, req generationRequest, k krea2.Request) {
+func (s *Server) streamGeneration(w http.ResponseWriter, req generationRequest, k PictureRequest) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		refuse(w, http.StatusInternalServerError, "server_error", "this connection cannot be streamed to")
@@ -159,54 +259,92 @@ func (s *Server) streamGeneration(w http.ResponseWriter, req generationRequest, 
 	})
 }
 
-// krea2 reads the request as Krea 2 wants it, refusing what it cannot do.
-func (req generationRequest) krea2() (krea2.Request, error) {
-	var k krea2.Request
+func decodeImageBase64(s string) (image.Image, error) {
+	if idx := strings.Index(s, ","); idx != -1 && strings.HasPrefix(s, "data:") {
+		s = s[idx+1:]
+	}
+	s = strings.TrimSpace(s)
+	data, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("invalid base64 image: %w", err)
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("decode image: %w", err)
+	}
+	return img, nil
+}
+
+// pictureRequest reads the request, refusing what it cannot do.
+func (req generationRequest) pictureRequest(model string) (PictureRequest, error) {
+	var p PictureRequest
 	if strings.TrimSpace(req.Prompt) == "" {
-		return k, fmt.Errorf("prompt is required")
+		return p, fmt.Errorf("prompt is required")
 	}
 	if req.N > 1 {
-		return k, fmt.Errorf("n is %d; this server draws one picture a request", req.N)
+		return p, fmt.Errorf("n is %d; this server draws one picture a request", req.N)
 	}
 	if req.ResponseFormat != "" && req.ResponseFormat != "b64_json" {
-		return k, fmt.Errorf("response_format %q: only b64_json, there is nowhere to host a url", req.ResponseFormat)
+		return p, fmt.Errorf("response_format %q: only b64_json, there is nowhere to host a url", req.ResponseFormat)
 	}
 	size := req.Size
 	if size == "" {
-		size = defaultSize
+		if strings.Contains(model, "flux3") {
+			size = "1024x1024"
+		} else {
+			size = defaultSize
+		}
 	}
 	ws, hs, ok := strings.Cut(size, "x")
 	width, err1 := strconv.Atoi(ws)
 	height, err2 := strconv.Atoi(hs)
 	if !ok || err1 != nil || err2 != nil {
-		return k, fmt.Errorf("size %q is not WIDTHxHEIGHT", req.Size)
+		return p, fmt.Errorf("size %q is not WIDTHxHEIGHT", req.Size)
 	}
-	k = krea2.Request{Prompt: req.Prompt, Negative: req.NegativePrompt, Width: width, Height: height, Steps: req.Steps, CFG: 1,
-		HidePrompt: req.HidePrompt}
-	if k.Steps == 0 {
-		k.Steps = defaultSteps
+	p = PictureRequest{
+		Prompt:     req.Prompt,
+		Negative:   req.NegativePrompt,
+		Width:      width,
+		Height:     height,
+		Steps:      req.Steps,
+		CFG:        1,
+		HidePrompt: req.HidePrompt,
+	}
+	if p.Steps == 0 {
+		if strings.Contains(model, "flux3") {
+			p.Steps = 16
+		} else {
+			p.Steps = defaultSteps
+		}
 	}
 	if req.CFG != nil {
-		k.CFG = *req.CFG
+		p.CFG = *req.CFG
 	}
 	if req.Lora != "" {
 		if req.Lora != filepath.Base(req.Lora) || strings.HasPrefix(req.Lora, ".") {
-			return k, fmt.Errorf("lora %q: a file name in the LoRA directory", req.Lora)
+			return p, fmt.Errorf("lora %q: a file name in the LoRA directory", req.Lora)
 		}
-		k.Lora, k.LoraStrength = req.Lora, 1
+		p.Lora, p.LoraStrength = req.Lora, 1
 		if req.LoraStrength != nil {
-			k.LoraStrength = *req.LoraStrength
+			p.LoraStrength = *req.LoraStrength
 		}
-		if k.LoraStrength < 0 || k.LoraStrength > krea2.MaxLoRAStrength {
-			return k, fmt.Errorf("lora_strength %g: from 0 to %d", k.LoraStrength, krea2.MaxLoRAStrength)
+		if p.LoraStrength < 0 || p.LoraStrength > krea2.MaxLoRAStrength {
+			return p, fmt.Errorf("lora_strength %g: from 0 to %d", p.LoraStrength, krea2.MaxLoRAStrength)
 		}
 	}
+	for i, raw := range req.Images {
+		img, err := decodeImageBase64(raw)
+		if err != nil {
+			return p, fmt.Errorf("images[%d]: %w", i, err)
+		}
+		p.Images = append(p.Images, img)
+	}
 	if req.Seed != nil && *req.Seed >= 0 {
-		k.Seed = uint64(*req.Seed)
+		p.Seed = uint64(*req.Seed)
 	} else {
 		// ComfyUI's seeds are under 2^50 from the front; so are these, so
 		// that a client storing one as a JavaScript number keeps it whole.
-		k.Seed = rand.Uint64N(1 << 50)
+		p.Seed = rand.Uint64N(1 << 50)
 	}
-	return k, nil
+	return p, nil
 }

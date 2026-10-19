@@ -16,13 +16,16 @@ import (
 	"github.com/ThiraSoft/golem/sample"
 )
 
-type fakeImager struct{ got krea2.Request }
+type fakeImager struct{ got PictureRequest }
 
-func (f *fakeImager) WritePNG(w io.Writer, img image.Image, r krea2.Request) error {
-	return krea2.WritePNG(w, img, r, "fake")
+func (f *fakeImager) WritePNG(w io.Writer, img image.Image, r PictureRequest) error {
+	return krea2.WritePNG(w, img, krea2.Request{
+		Prompt: r.Prompt, Negative: r.Negative, Width: r.Width, Height: r.Height,
+		Steps: r.Steps, CFG: r.CFG, Seed: r.Seed, HidePrompt: r.HidePrompt,
+	}, "fake")
 }
 
-func (f *fakeImager) Generate(r krea2.Request, progress krea2.Progress) (*image.NRGBA, krea2.Timings, error) {
+func (f *fakeImager) Generate(r PictureRequest, progress krea2.Progress) (*image.NRGBA, krea2.Timings, error) {
 	f.got = r
 	if progress != nil {
 		for i := 1; i <= r.Steps; i++ {
@@ -47,8 +50,8 @@ func TestGenerationsReadsTheFrontsFields(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
-	want := krea2.Request{Prompt: "a cat", Negative: "ugly", Width: 512, Height: 768, Steps: 6, CFG: 2.5, Seed: 42}
-	if f.got != want {
+	want := PictureRequest{Prompt: "a cat", Negative: "ugly", Width: 512, Height: 768, Steps: 6, CFG: 2.5, Seed: 42}
+	if f.got.Prompt != want.Prompt || f.got.Negative != want.Negative || f.got.Width != want.Width || f.got.Height != want.Height || f.got.Steps != want.Steps || f.got.CFG != want.CFG || f.got.Seed != want.Seed {
 		t.Fatalf("drew %+v, want %+v", f.got, want)
 	}
 	var out struct {
@@ -160,5 +163,35 @@ func TestGenerationsStreamsTheSteps(t *testing.T) {
 	raw, err := base64.StdEncoding.DecodeString(last["b64_json"].(string))
 	if err != nil || !bytes.Contains(raw, []byte("Seed: 9")) || last["seed"].(float64) != 9 {
 		t.Fatalf("the last event's picture: %v", err)
+	}
+}
+
+func TestGenerationsDecodesBase64Images(t *testing.T) {
+	// Create a tiny 2x2 test image encoded as PNG
+	tiny := image.NewNRGBA(image.Rect(0, 0, 2, 2))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, tiny); err != nil {
+		t.Fatal(err)
+	}
+	b64Raw := base64.StdEncoding.EncodeToString(buf.Bytes())
+	b64DataURI := "data:image/png;base64," + b64Raw
+
+	body := fmt.Sprintf(`{"prompt":"a cat","images":["%s","%s"]}`, b64Raw, b64DataURI)
+	f, rec := generate(t, body)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if len(f.got.Images) != 2 {
+		t.Fatalf("got %d images, want 2", len(f.got.Images))
+	}
+	for i, img := range f.got.Images {
+		if img.Bounds().Dx() != 2 || img.Bounds().Dy() != 2 {
+			t.Errorf("image %d bounds %v, want 2x2", i, img.Bounds())
+		}
+	}
+
+	// Bad base64 image rejected with 400
+	if _, rec := generate(t, `{"prompt":"a cat","images":["not_valid_base64!!!"]}`); rec.Code != 400 {
+		t.Errorf("status %d, want 400", rec.Code)
 	}
 }
