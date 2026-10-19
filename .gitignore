@@ -75,3 +75,4 @@ __pycache__/
 
 # Krea 2, recorded from ComfyUI by ref/krea2/dump.py.
 /testdata/krea2
+/testdata/flux3
