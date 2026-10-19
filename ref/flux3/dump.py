@@ -29,8 +29,9 @@ import sys
 import numpy as np
 from PIL import Image
 
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 COMFY = sys.argv[1] if len(sys.argv) > 1 else "/mnt/data/dev/ComfyUI-flux3"
-OUT = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else os.path.abspath("testdata/flux3")
+OUT = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else os.path.join(ROOT, "testdata/flux3")
 STAGES = sys.argv[3:] or ["tokens", "sample", "sample_cfg", "vae", "i2i", "mi2i", "accept"]
 
 sys.path.insert(0, COMFY)
@@ -52,6 +53,7 @@ import node_helpers  # noqa: E402
 import nodes  # noqa: E402
 import comfy.sample  # noqa: E402
 import comfy.samplers  # noqa: E402
+from comfy_extras.nodes_edit_model import ReferenceMultiLatent  # noqa: E402
 from comfy_extras.nodes_flux import EmptyFlux2LatentImage  # noqa: E402
 from comfy_extras.nodes_model_advanced import ModelSamplingFlux  # noqa: E402
 
@@ -101,16 +103,12 @@ PROMPT_ACCEPT = (
 )
 
 PROMPT_I2I = "spread strawberry jam on the toast and add a few fresh blueberries on the plate"
-PROMPT_MI2I = "the woman from the first image standing on a lookout in front of the autumn forest from the second image"
+PROMPT_MI2I = "a breakfast table with toast in front of the great wave"
 
-REF_TOAST = "/home/ricardo/dev/golem-flux3/ref/flux3/workflows/klein_ref_toast.jpg"
-REF_GREAT_WAVE = "/home/ricardo/dev/golem-flux3/ref/flux3/workflows/klein_ref_great_wave.jpg"
+REF_TOAST = os.path.join(ROOT, "ref/flux3/workflows/klein_ref_toast.jpg")
+REF_GREAT_WAVE = os.path.join(ROOT, "ref/flux3/workflows/klein_ref_great_wave.jpg")
 
 meta = {}
-meta_path = os.path.join(OUT, "meta.json")
-if os.path.exists(meta_path):
-    with open(meta_path) as f:
-        meta = json.load(f)
 
 
 def save(rel, t):
@@ -132,15 +130,81 @@ def save_i32(rel, a):
     meta[rel] = list(arr.shape)
 
 
+def cleanup_stale_files(out_dir):
+    stale_patterns = [
+        "sample/init", "sample/image", "sample/image.png",
+        "sample_cfg/init", "sample_cfg/image", "sample_cfg/image.png",
+        "i2i/init", "i2i/image", "i2i/image.png",
+        "mi2i/init", "mi2i/image", "mi2i/image.png",
+        "accept/init", "accept/image", "accept/image.png",
+        "vae/z",
+        "mi2i/ref_latent0", "mi2i/ref_latent1",
+        "dit32/in.x", "dit32/in.t", "dit32/in.ctx", "dit32/in.next", "dit32/pe",
+    ]
+    for rel in stale_patterns:
+        p = os.path.join(out_dir, rel)
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+                print(f"Removed stale file: {rel}")
+            except OSError:
+                pass
+
+    import re
+    re_stale = [
+        re.compile(r"^(sample|sample_cfg)/x\d+$"),
+        re.compile(r"^(sample|sample_cfg)/denoised\d+$"),
+        re.compile(r"^vae/up\d+$"),
+    ]
+    for root, _, files in os.walk(out_dir):
+        for f in files:
+            rel = os.path.relpath(os.path.join(root, f), out_dir)
+            if any(rx.match(rel) for rx in re_stale):
+                try:
+                    os.remove(os.path.join(out_dir, rel))
+                    print(f"Removed stale file: {rel}")
+                except OSError:
+                    pass
+
+
 def write_meta():
     path = os.path.join(OUT, "meta.json")
     old = {}
     if os.path.exists(path):
         with open(path) as f:
             old = json.load(f)
+
+    import re
+    stale_keys = {
+        "sample/init", "sample/image",
+        "sample_cfg/init", "sample_cfg/image",
+        "i2i/init", "i2i/image",
+        "mi2i/init", "mi2i/image",
+        "accept/init", "accept/image",
+        "vae/z",
+        "mi2i/ref_latent0", "mi2i/ref_latent1",
+        "dit32/in.x", "dit32/in.t", "dit32/in.ctx", "dit32/in.next", "dit32/pe",
+    }
+    re_stale_key = re.compile(r"^(sample|sample_cfg)/(x|denoised)\d+$|^vae/up\d+$")
+    old = {k: v for k, v in old.items() if k not in stale_keys and not re_stale_key.match(k)}
+
+    stage_prefixes = {
+        "tokens": ["tokens/", "encoder/"],
+        "sample": ["sample/", "dit/"],
+        "sample_cfg": ["sample_cfg/"],
+        "vae": ["vae/"],
+        "i2i": ["i2i/"],
+        "mi2i": ["mi2i/"],
+        "accept": ["accept/"],
+    }
+    for stg in STAGES:
+        prefixes = stage_prefixes.get(stg, [f"{stg}/"])
+        old = {k: v for k, v in old.items() if not any(k.startswith(pfx) for pfx in prefixes)}
+
     old.update(meta)
     with open(path, "w") as f:
         json.dump(old, f, indent=1, sort_keys=True)
+    cleanup_stale_files(OUT)
 
 
 def load_models():
@@ -193,14 +257,16 @@ def stage_tokens(clip):
 
 
 def run_sampling(unet, clip, vae, prompt, width, height, steps, cfg, seed, tag,
-                 record_dit=False, extra_conds_fn=None, negative=""):
+                 record_dit=False, extra_conds_fn=None, negative="",
+                 pos=None, neg=None):
     print(f"=== Sampling: {tag} ({width}x{height}, seed={seed}, cfg={cfg}, steps={steps}) ===")
     rec = {"steps": []}
     drec = {}
-    vrecs = {}
 
-    pos = nodes.CLIPTextEncode().encode(clip, prompt)[0]
-    neg = nodes.CLIPTextEncode().encode(clip, negative)[0]
+    if pos is None:
+        pos = nodes.CLIPTextEncode().encode(clip, prompt)[0]
+    if neg is None:
+        neg = nodes.CLIPTextEncode().encode(clip, negative)[0]
     if extra_conds_fn is not None:
         pos, neg = extra_conds_fn(pos, neg)
 
@@ -278,23 +344,18 @@ def run_sampling(unet, clip, vae, prompt, width, height, steps, cfg, seed, tag,
     save(f"{tag}/sigmas", sigmas)
     if "noise0" in rec:
         save(f"{tag}/noise0", rec["noise0"])
-        save(f"{tag}/init", rec["noise0"])
 
     for step_idx, x_val, x0_val in rec["steps"]:
         save(f"{tag}/x_{step_idx}", x_val)
-        save(f"{tag}/x{step_idx}", x_val)
         save(f"{tag}/denoised_{step_idx}", x0_val)
-        save(f"{tag}/denoised{step_idx}", x0_val)
 
     save(f"{tag}/latent", samples["samples"])
     save(f"{tag}/rgb", decoded[0])
-    save(f"{tag}/image", decoded[0])
 
     arr = 255.0 * decoded[0].cpu().numpy()
     img_pil = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
     os.makedirs(os.path.join(OUT, tag), exist_ok=True)
     img_pil.save(os.path.join(OUT, tag, f"{tag}.png"))
-    img_pil.save(os.path.join(OUT, tag, "image.png"))
 
     if record_dit and "in.x" in drec:
         for k, v in drec.items():
@@ -348,9 +409,8 @@ def stage_vae(vae):
     if not os.path.exists(sample_latent_path):
         raise RuntimeError("sample/latent must exist before running stage_vae")
 
-    shape = meta.get("sample/latent", [1, 128, 16, 16])
+    shape = [1, 128, 16, 16]
     z = torch.from_numpy(np.fromfile(sample_latent_path, dtype=np.float32).reshape(shape))
-    save("vae/z", z)
 
     # Decode of sample/latent with waypoints per up block
     vrecs = {}
@@ -362,14 +422,12 @@ def stage_vae(vae):
             def h(m, a, o):
                 val = (o[0] if isinstance(o, list) else o).clone()
                 vrecs[f"up_{idx}"] = val
-                vrecs[f"up{idx}"] = val
             return h
         hooks.append(dec.up[i].upsample.register_forward_hook(make_h(i)))
 
     def h0(m, a, o):
         val = (o[0] if isinstance(o, list) else o).clone()
         vrecs["up_0"] = val
-        vrecs["up0"] = val
     hooks.append(dec.up[0].block[-1].register_forward_hook(h0))
 
     try:
@@ -381,33 +439,66 @@ def stage_vae(vae):
     for k, v in vrecs.items():
         save(f"vae/{k}", v)
 
-    # Encode of klein_ref_toast.jpg at 256x256
-    # Follow BFL reference image preprocessing: resize to 256x256 with Lanczos filter
-    img_pil = Image.open(REF_TOAST).convert("RGB").resize((256, 256), Image.Resampling.LANCZOS)
-    arr = np.array(img_pil).astype(np.float32) / 255.0
-    t_img = torch.from_numpy(arr).unsqueeze(0)  # [1, 256, 256, 3]
+    # Encode of klein_ref_toast.jpg via ReferenceMultiLatent (megapixels=0.0625)
+    t_toast = torch.from_numpy(np.array(Image.open(REF_TOAST).convert("RGB")).astype(np.float32) / 255.0).unsqueeze(0)
+    saved_imgs = []
+    orig_encode = vae.encode
 
-    enc_latent = vae.encode(t_img)  # [1, 128, 16, 16]
+    def hooked_encode(img):
+        saved_imgs.append(img)
+        return orig_encode(img)
 
-    save("vae/enc.in", arr)  # [256, 256, 3]
+    vae.encode = hooked_encode
+    try:
+        res = {"resolution": "resize", "megapixels": 0.0625}
+        out = ReferenceMultiLatent.execute(
+            positive=[[torch.zeros(1), {}]],
+            resolution=res,
+            negative=[[torch.zeros(1), {}]],
+            vae=vae,
+            images={"image1": t_toast}
+        )
+    finally:
+        vae.encode = orig_encode
+
+    enc_in = saved_imgs[0][0]
+    enc_latent = out[0][0][1]["reference_latents"][0]
+
+    save("vae/enc.in", enc_in)
     save("vae/enc.latent", enc_latent)
-    print(f"vae encode toast 256x256: in={arr.shape} latent={tuple(enc_latent.shape)}")
+    print(f"vae encode toast: in={tuple(enc_in.shape)} latent={tuple(enc_latent.shape)}")
 
 
 def stage_i2i(unet, clip, vae):
     print("=== Stage: i2i ===")
-    # Resize reference toast to 256x256 using Lanczos
-    img_pil = Image.open(REF_TOAST).convert("RGB").resize((256, 256), Image.Resampling.LANCZOS)
-    arr = np.array(img_pil).astype(np.float32) / 255.0
-    t_img = torch.from_numpy(arr).unsqueeze(0)
+    t_toast = torch.from_numpy(np.array(Image.open(REF_TOAST).convert("RGB")).astype(np.float32) / 255.0).unsqueeze(0)
+    saved_imgs = []
+    orig_encode = vae.encode
 
-    ref_latent = vae.encode(t_img)  # [1, 128, 16, 16]
+    def hooked_encode(img):
+        saved_imgs.append(img)
+        return orig_encode(img)
+
+    vae.encode = hooked_encode
+    try:
+        res = {"resolution": "resize", "megapixels": 0.0625}
+        pos = nodes.CLIPTextEncode().encode(clip, PROMPT_I2I)[0]
+        neg = nodes.CLIPTextEncode().encode(clip, "")[0]
+        out = ReferenceMultiLatent.execute(
+            positive=pos,
+            resolution=res,
+            negative=neg,
+            vae=vae,
+            images={"image1": t_toast}
+        )
+        pos, neg, _ = out[0], out[1], out[2]
+    finally:
+        vae.encode = orig_encode
+
+    ref_rgb = saved_imgs[0][0]
+    ref_latent = pos[0][1]["reference_latents"][0]
+    save("i2i/ref_rgb", ref_rgb)
     save("i2i/ref_latent", ref_latent)
-
-    def attach_ref(pos, neg):
-        pos = node_helpers.conditioning_set_values(pos, {"reference_latents": [ref_latent]}, append=True)
-        neg = node_helpers.conditioning_set_values(neg, {"reference_latents": [ref_latent]}, append=True)
-        return pos, neg
 
     dm = unet.model.diffusion_model
     i2i_rec = {}
@@ -425,7 +516,7 @@ def stage_i2i(unet, clip, vae):
     try:
         run_sampling(
             unet, clip, vae, PROMPT_I2I, 256, 256, STEPS, CFG, 7, "i2i",
-            record_dit=False, extra_conds_fn=attach_ref
+            record_dit=False, pos=pos, neg=neg
         )
     finally:
         for h in hooks:
@@ -439,35 +530,48 @@ def stage_i2i(unet, clip, vae):
 
 def stage_mi2i(unet, clip, vae):
     print("=== Stage: mi2i ===")
-    # Two references: toast 256x256, great_wave 256x384
-    img_toast = Image.open(REF_TOAST).convert("RGB").resize((256, 256), Image.Resampling.LANCZOS)
-    arr_toast = np.array(img_toast).astype(np.float32) / 255.0
-    t_toast = torch.from_numpy(arr_toast).unsqueeze(0)
-    lat_toast = vae.encode(t_toast)  # [1, 128, 16, 16]
+    t_toast = torch.from_numpy(np.array(Image.open(REF_TOAST).convert("RGB")).astype(np.float32) / 255.0).unsqueeze(0)
+    t_wave = torch.from_numpy(np.array(Image.open(REF_GREAT_WAVE).convert("RGB")).astype(np.float32) / 255.0).unsqueeze(0)
+    saved_imgs = []
+    orig_encode = vae.encode
 
-    img_wave = Image.open(REF_GREAT_WAVE).convert("RGB").resize((384, 256), Image.Resampling.LANCZOS)
-    arr_wave = np.array(img_wave).astype(np.float32) / 255.0
-    t_wave = torch.from_numpy(arr_wave).unsqueeze(0)
-    lat_wave = vae.encode(t_wave)  # [1, 128, 16, 24]
+    def hooked_encode(img):
+        saved_imgs.append(img)
+        return orig_encode(img)
 
-    ref_latents_cat = torch.cat([lat_toast.flatten(2).transpose(1, 2), lat_wave.flatten(2).transpose(1, 2)], dim=1)
+    vae.encode = hooked_encode
+    try:
+        res = {"resolution": "resize", "megapixels": 0.0625}
+        pos = nodes.CLIPTextEncode().encode(clip, PROMPT_MI2I)[0]
+        neg = nodes.CLIPTextEncode().encode(clip, "")[0]
+        out = ReferenceMultiLatent.execute(
+            positive=pos,
+            resolution=res,
+            negative=neg,
+            vae=vae,
+            images={"image1": t_toast, "image2": t_wave}
+        )
+        pos, neg, _ = out[0], out[1], out[2]
+    finally:
+        vae.encode = orig_encode
+
+    ref_rgb0 = saved_imgs[0][0]
+    ref_rgb1 = saved_imgs[1][0]
+    save("mi2i/ref_rgb0", ref_rgb0)
+    save("mi2i/ref_rgb1", ref_rgb1)
+
+    ref_lats = pos[0][1]["reference_latents"]
+    ref_latents_cat = torch.cat([lat.flatten(2).transpose(1, 2) for lat in ref_lats], dim=1)
     save("mi2i/ref_latents", ref_latents_cat)
-    save("mi2i/ref_latent0", lat_toast)
-    save("mi2i/ref_latent1", lat_wave)
 
     dm = unet.model.diffusion_model
-    ref_shapes = [(16, 16), (16, 24)]
-    ref_ids = dm.ref_ids(ref_shapes, "cpu")  # [640, 4]
+    ref_shapes = [tuple(lat.shape[-2:]) for lat in ref_lats]
+    ref_ids = dm.ref_ids(ref_shapes, "cpu")
     save("mi2i/ref_ids", ref_ids)
-
-    def attach_multi_ref(pos, neg):
-        pos = node_helpers.conditioning_set_values(pos, {"reference_latents": [lat_toast, lat_wave]}, append=True)
-        neg = node_helpers.conditioning_set_values(neg, {"reference_latents": [lat_toast, lat_wave]}, append=True)
-        return pos, neg
 
     run_sampling(
         unet, clip, vae, PROMPT_MI2I, 256, 256, STEPS, CFG, 7, "mi2i",
-        record_dit=False, extra_conds_fn=attach_multi_ref
+        record_dit=False, pos=pos, neg=neg
     )
 
 

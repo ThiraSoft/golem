@@ -75,19 +75,29 @@ Stages:
   (flow map target sigma), `pe` (4-axis RoPE tensor), `wp.emb_img`, `wp.txt_early`,
   `wp.img_early`, `wp.single_{0,13,27}`, and `out`.
 - `vae/`: decode of `sample/latent` with waypoints per up block (`up_0`..`up_3`);
-  encode of `ref/flux3/workflows/klein_ref_toast.jpg` at 256 x 256 (`enc.in`, `enc.latent`).
+  encode of `ref/flux3/workflows/klein_ref_toast.jpg` via `ReferenceMultiLatent` (`enc.in`, `enc.latent`).
 - `i2i/`: i2i workflow at 256 x 256, seed 7, with `klein_ref_toast.jpg`: records
-  `ref_latent`, `ref_states` (early blocks output), `dit.out0`, and `rgb`.
-- `mi2i/`: multi-reference with `klein_ref_toast.jpg` (256 x 256) and `klein_ref_great_wave.jpg`
-  (384 x 256): records `ref_latents`, `ref_ids` (ids at l = -1, -2), and `rgb`.
+  `ref_rgb` (resized reference), `ref_latent`, `ref_states` (early blocks output), `dit.out0`, and `rgb`.
+- `mi2i/`: multi-reference with `klein_ref_toast.jpg` and `klein_ref_great_wave.jpg`, prompt
+  "a breakfast table with toast in front of the great wave": records `ref_rgb0`, `ref_rgb1`,
+  `ref_latents` (shape `[1, 494, 128]`), `ref_ids` (ids at l = -1, -2, shape `[494, 4]`), and `rgb`.
 - `accept/`: t2i at 1024 x 1024, seed 42, 16 steps: `latent`, `rgb`, and PNG.
 
 ### Reference image preprocessing
 
-Following the BFL i2i and mi2i workflows (`ReferenceMultiLatent` / `ImageScale` nodes),
-reference images are resized with `lanczos` interpolation (`disabled` crop) before VAE encoding:
-- `toast`: resized to 256 x 256 (latent shape `[1, 128, 16, 16]`)
-- `great_wave`: resized to 384 x 256 (latent shape `[1, 128, 16, 24]`)
+Following the upstream i2i and mi2i workflows, reference images are preprocessed through
+ComfyUI's own `ReferenceMultiLatent` node (`comfy_extras/nodes_edit_model.py:65-74`), not a PIL resize.
+The node is called with:
+- `resolution`: `{"resolution": "resize", "megapixels": 0.0625}` (1/16 MP)
+- Aspect ratio is preserved: `scale = math.sqrt(megapixels * 1024 * 1024 / (w * h))`
+- Scaled width `round(w * scale)`, height `round(h * scale)`
+- Resized via `comfy.utils.common_upscale(..., "lanczos", "disabled")` before VAE encoding
+
+For the test fixtures:
+- `toast` (1776 x 1184): scale = 0.1765, resized to 314 x 209 (preserving 3:2 aspect ratio),
+  encoded latent shape `[1, 128, 13, 19]`. Saved as `vae/enc.in` and `i2i/ref_rgb` (`mi2i/ref_rgb0`).
+- `great_wave` (1760 x 1184): scale = 0.1773, resized to 312 x 210,
+  encoded latent shape `[1, 128, 13, 19]`. Saved as `mi2i/ref_rgb1`.
 
 ### Float32 reference DiT (`dump_f32.py`)
 

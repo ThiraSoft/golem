@@ -19,16 +19,18 @@ import sys
 
 import numpy as np
 
-COMFY = sys.argv[1] if len(sys.argv) > 1 else "/mnt/data/dev/ComfyUI"
-OUT = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else os.path.abspath("testdata/flux3")
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+COMFY = sys.argv[1] if len(sys.argv) > 1 else "/mnt/data/dev/ComfyUI-flux3"
+OUT = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else os.path.join(ROOT, "testdata/flux3")
 
-sys.path.insert(0, "/mnt/data/dev/ComfyUI-flux3")
-os.chdir("/mnt/data/dev/ComfyUI-flux3")
+sys.path.insert(0, COMFY)
+os.chdir(COMFY)
 sys.argv = [sys.argv[0], "--cpu"]
 
 import torch  # noqa: E402
 from safetensors import safe_open  # noqa: E402
 
+import folder_paths  # noqa: E402
 import comfy.model_management  # noqa: E402
 import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
@@ -40,7 +42,11 @@ torch.set_grad_enabled(False)
 comfy.model_management.in_training = True  # use pure-torch apply_rope1 on CPU
 ops = comfy.ops.disable_weight_init
 F32 = torch.float32
-UNET = os.path.join(COMFY, "models/diffusion_models/flux3-image-klein-bf16.safetensors")
+
+unet_path = folder_paths.get_full_path("diffusion_models", "flux3-image-klein-bf16.safetensors")
+if not unet_path:
+    unet_path = os.path.join(COMFY, "models/diffusion_models/flux3-image-klein-bf16.safetensors")
+UNET = unet_path
 
 with open(os.path.join(OUT, "meta.json")) as f:
     meta = json.load(f)
@@ -103,11 +109,14 @@ def main():
     t_next = read("dit/in.next").to(F32)
     pe = read("dit/pe").to(F32)
 
-    save("dit32/in.x", x)
-    save("dit32/in.t", t)
-    save("dit32/in.ctx", context)
-    save("dit32/in.next", t_next)
-    save("dit32/pe", pe)
+    for stale in ["dit32/in.x", "dit32/in.t", "dit32/in.ctx", "dit32/in.next", "dit32/pe"]:
+        meta.pop(stale, None)
+        p = os.path.join(OUT, stale)
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
     # 1. Image embedding
     emb_img = ops.Linear(128, 3072, bias=False, dtype=F32)

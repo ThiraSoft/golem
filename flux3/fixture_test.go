@@ -22,7 +22,7 @@ func loadFixtures(t testing.TB) *fixtures {
 	dir := filepath.Join("..", "testdata", "flux3")
 	raw, err := os.ReadFile(filepath.Join(dir, "meta.json"))
 	if err != nil {
-		t.Fatalf("no recording (%v): see ref/flux3/README.md", err)
+		t.Skipf("no recording (%v): see ref/flux3/README.md", err)
 	}
 	f := &fixtures{dir: dir}
 	if err := json.Unmarshal(raw, &f.shapes); err != nil {
@@ -37,7 +37,7 @@ func (f *fixtures) shape(t testing.TB, name string) []int {
 	t.Helper()
 	s, ok := f.shapes[name]
 	if !ok {
-		t.Fatalf("%s not recorded: see ref/flux3/README.md", name)
+		t.Skipf("%s not recorded: see ref/flux3/README.md", name)
 	}
 	return s
 }
@@ -86,22 +86,33 @@ func TestFixturesPresent(t *testing.T) {
 		"encoder/p0.hidden_l4", "encoder/p1.hidden_l4", "encoder/p2.hidden_l4",
 		"encoder/p0.cond", "encoder/p1.cond", "encoder/p2.cond",
 		"sample/sigmas", "sample/noise0", "sample/latent", "sample/rgb",
+		"sample/x_0", "sample/x_15", "sample/denoised_0", "sample/denoised_15",
 		"sample_cfg/cond", "sample_cfg/uncond",
 		"dit/in.x", "dit/in.t", "dit/in.ctx", "dit/in.next", "dit/pe",
 		"dit/wp.emb_img", "dit/wp.txt_early", "dit/wp.img_early",
 		"dit/wp.single_0", "dit/wp.single_13", "dit/wp.single_27", "dit/out",
-		"dit32/in.x", "dit32/in.t", "dit32/in.ctx", "dit32/in.next", "dit32/pe",
 		"dit32/wp.emb_img", "dit32/wp.txt_early", "dit32/wp.img_early",
 		"dit32/wp.single_0", "dit32/wp.single_13", "dit32/wp.single_27", "dit32/out",
 		"vae/up_0", "vae/up_1", "vae/up_2", "vae/up_3",
 		"vae/enc.in", "vae/enc.latent",
-		"i2i/ref_latent", "i2i/ref_states", "i2i/dit.out0", "i2i/rgb",
-		"mi2i/ref_latents", "mi2i/ref_ids", "mi2i/rgb",
+		"i2i/ref_rgb", "i2i/ref_latent", "i2i/ref_states", "i2i/dit.out0", "i2i/rgb",
+		"mi2i/ref_rgb0", "mi2i/ref_rgb1", "mi2i/ref_latents", "mi2i/ref_ids", "mi2i/rgb",
 		"accept/latent", "accept/rgb",
 	}
 	for _, req := range required {
 		if !f.has(req) {
 			t.Errorf("missing fixture: %s", req)
+		}
+	}
+	forbidden := []string{
+		"sample/init", "sample/image", "sample/x0", "sample/denoised0",
+		"vae/z", "vae/up0", "vae/up1", "vae/up2", "vae/up3",
+		"mi2i/ref_latent0", "mi2i/ref_latent1",
+		"dit32/in.x", "dit32/in.t", "dit32/in.ctx", "dit32/in.next",
+	}
+	for _, fbd := range forbidden {
+		if f.has(fbd) {
+			t.Errorf("stale/duplicate fixture present: %s", fbd)
 		}
 	}
 }
