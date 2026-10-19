@@ -9,7 +9,7 @@ package vk
 // vectors) in one float32 parameter buffer. The weights of the products are
 // one buffer per tensor, fp8 or fp16, which is what keeps a 12 GB network
 // under the four gigabytes one storage buffer addresses. Every kernel binds
-// the same three things — a weight buffer, the arena, the parameters — and a
+// the same three things: a weight buffer, the arena, the parameters; and a
 // kernel that reads no weight binds the parameters in its place. The products
 // bind a fourth, the DiT's LoRA (SetLoRA), or the parameters when there is
 // none.
@@ -616,12 +616,18 @@ func (k *K2) Flux3Gate(r *Recorder, g K2Flux3Gate) {
 }
 
 func (k *K2) Flux3GStats(r *Recorder, s K2Flux3GStats) {
+	if s.Slices > 65535 {
+		panic(fmt.Sprintf("vk: Flux3 GroupNorm stats of %d slices is past the 65535 limit", s.Slices))
+	}
 	r.DispatchColumns(k.set(k2Flux3GStats, -1), s.Slices, 32, unsafe.Pointer(&s))
 	r.Barrier()
 }
 
 func (k *K2) Flux3GNorm(r *Recorder, n K2Flux3GNorm) {
 	groups := (n.GroupElems + 255) / 256
+	if groups > 65535 {
+		panic(fmt.Sprintf("vk: Flux3 GroupNorm of %d workgroups is past the 65535 limit", groups))
+	}
 	r.DispatchColumns(k.set(k2Flux3GNorm, -1), groups, 32, unsafe.Pointer(&n))
 	r.Barrier()
 }

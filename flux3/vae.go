@@ -39,6 +39,12 @@ import (
 	"github.com/ThiraSoft/golem/vk"
 )
 
+const (
+	convNormal     = 0
+	convUpsample   = 1
+	convDownsample = 2
+)
+
 type vaeConv struct {
 	name                 string
 	w                    int
@@ -60,7 +66,7 @@ type vaeRes struct {
 
 type vaeAttn struct {
 	norm     vaeNorm
-	q, k, v  vaeConv
+	qkv      vaeConv
 	proj     vaeConv
 	channels uint32
 }
@@ -120,28 +126,51 @@ type VAE struct {
 	dec vaeDecoder
 	enc vaeEncoder
 
-	maxLatentPix int
-	stageFloats  int
-	bufs         [3]uint32
-	statsBuf     uint32
-	wpBufs       [4]uint32 // up_0, up_1, up_2, up_3 copy buffers
+	maxLatentPix    int
+	recordWaypoints bool
+	stageFloats     int
+	bufs            [3]uint32
+	statsBuf        uint32
+	wpBufs          [4]uint32 // up_0, up_1, up_2, up_3 copy buffers (only when recordWaypoints is true)
 
 	decodeProgs map[[2]int]vaeDecodeProgram
 	encodeProgs map[[2]int]vaeEncodeProgram
 }
 
 // OpenVAE opens the VAE from a safetensors file for latents up to maxLatentPix.
+// Waypoint buffers are not allocated on this production path.
 func OpenVAE(d *vk.Device, path string, maxLatentPix int) (*VAE, error) {
+	return openVAE(d, path, maxLatentPix, false)
+}
+
+// openVAEForTest opens the VAE with waypoint buffers allocated for testing.
+func openVAEForTest(d *vk.Device, path string, maxLatentPix int) (*VAE, error) {
+	return openVAE(d, path, maxLatentPix, true)
+}
+
+func openVAE(d *vk.Device, path string, maxLatentPix int, waypoints bool) (*VAE, error) {
+	maxAllowedPix := int((1<<32/4 - 1024) / 163840)
+	if maxLatentPix <= 0 || maxLatentPix > maxAllowedPix {
+		return nil, fmt.Errorf("flux3: maxLatentPix %d past arena limit of %d (max resolution %dx%d)", maxLatentPix, maxAllowedPix, int(math.Sqrt(float64(maxAllowedPix)))*16, int(math.Sqrt(float64(maxAllowedPix)))*16)
+	}
+	if waypoints {
+		maxWaypointsPix := int((1<<32/4 - 1024) / (163840 + 139264))
+		if maxLatentPix > maxWaypointsPix {
+			return nil, fmt.Errorf("flux3: maxLatentPix %d past arena limit with waypoints of %d", maxLatentPix, maxWaypointsPix)
+		}
+	}
+
 	tm, err := tensors.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("flux3: %s: %w", path, err)
 	}
 
 	v := &VAE{
-		tm:           tm,
-		maxLatentPix: maxLatentPix,
-		decodeProgs:  make(map[[2]int]vaeDecodeProgram),
-		encodeProgs:  make(map[[2]int]vaeEncodeProgram),
+		tm:              tm,
+		maxLatentPix:    maxLatentPix,
+		recordWaypoints: waypoints,
+		decodeProgs:     make(map[[2]int]vaeDecodeProgram),
+		encodeProgs:     make(map[[2]int]vaeEncodeProgram),
 	}
 	fail := func(err error) (*VAE, error) {
 		v.Close()
@@ -257,14 +286,42 @@ func OpenVAE(d *vk.Device, path string, maxLatentPix int) (*VAE, error) {
 		if a.norm, err = loadNorm(pre+".norm", c); err != nil {
 			return a, err
 		}
-		if a.q, err = loadConv(pre+".q", c, c, 1); err != nil {
+		// Fuse q, k, v (each c->c 1x1 conv) into one (3c)->c 1x1 conv.
+		qB, err := v.tm.Get(pre + ".q.bias")
+		if err != nil {
 			return a, err
 		}
-		if a.k, err = loadConv(pre+".k", c, c, 1); err != nil {
+		qBias, err := qB.F32()
+		if err != nil {
 			return a, err
 		}
-		if a.v, err = loadConv(pre+".v", c, c, 1); err != nil {
+		kB, err := v.tm.Get(pre + ".k.bias")
+		if err != nil {
 			return a, err
+		}
+		kBias, err := kB.F32()
+		if err != nil {
+			return a, err
+		}
+		vB, err := v.tm.Get(pre + ".v.bias")
+		if err != nil {
+			return a, err
+		}
+		vBias, err := vB.F32()
+		if err != nil {
+			return a, err
+		}
+		qkvBias := make([]float32, 3*c)
+		copy(qkvBias[0:c], qBias)
+		copy(qkvBias[c:2*c], kBias)
+		copy(qkvBias[2*c:3*c], vBias)
+		a.qkv = vaeConv{
+			name: pre + ".qkv",
+			outs: uint32(3 * c),
+			ins:  uint32(c),
+			taps: 1,
+			row:  uint32(c),
+			bias: par.add(qkvBias),
 		}
 		if a.proj, err = loadConv(pre+".proj_out", c, c, 1); err != nil {
 			return a, err
@@ -386,8 +443,8 @@ func OpenVAE(d *vk.Device, path string, maxLatentPix int) (*VAE, error) {
 	v.bufs[0] = a.take(65536 * maxLatentPix)
 	v.bufs[1] = a.take(65536 * maxLatentPix)
 	v.bufs[2] = a.take(32768 * maxLatentPix)
-	if maxLatentPix <= 1024 {
-		// Waypoint copy buffers (for testing decoder waypoints on 16x16 / 32x32)
+	if waypoints {
+		// Waypoint copy buffers allocated ONLY when test opts in via openVAEForTest.
 		v.wpBufs[3] = a.take(512 * 16 * maxLatentPix)  // up_3: 512 channels at 4x latent
 		v.wpBufs[2] = a.take(512 * 64 * maxLatentPix)  // up_2: 512 channels at 8x latent
 		v.wpBufs[1] = a.take(256 * 256 * maxLatentPix) // up_1: 256 channels at 16x latent
@@ -444,20 +501,52 @@ func (v *VAE) upload() error {
 		return nil
 	}
 
-	uploadAttn := func(a *vaeAttn) error {
-		if err := up(&a.q); err != nil {
+	uploadAttn := func(a *vaeAttn, pre string) error {
+		qT, err := v.tm.Get(pre + ".q.weight")
+		if err != nil {
 			return err
 		}
-		if err := up(&a.k); err != nil {
+		qF, err := qT.F32()
+		if err != nil {
 			return err
 		}
-		if err := up(&a.v); err != nil {
+		kT, err := v.tm.Get(pre + ".k.weight")
+		if err != nil {
 			return err
 		}
-		if err := up(&a.proj); err != nil {
+		kF, err := kT.F32()
+		if err != nil {
 			return err
 		}
-		return nil
+		vT, err := v.tm.Get(pre + ".v.weight")
+		if err != nil {
+			return err
+		}
+		vF, err := vT.F32()
+		if err != nil {
+			return err
+		}
+		c := int(a.channels)
+		outs := 3 * c
+		row := c
+		half := make([]byte, 2*outs*row)
+		writeWeights := func(floats []float32, outOffset int) {
+			for o := 0; o < c; o++ {
+				for i := 0; i < c; i++ {
+					w := floats[o*c+i]
+					idx := 2 * ((outOffset+o)*row + i)
+					binary.LittleEndian.PutUint16(half[idx:idx+2], floatToHalf(w))
+				}
+			}
+		}
+		writeWeights(qF, 0)
+		writeWeights(kF, c)
+		writeWeights(vF, 2*c)
+		a.qkv.w, err = v.k.AddWeights(half)
+		if err != nil {
+			return err
+		}
+		return up(&a.proj)
 	}
 
 	// Upload decoder
@@ -469,7 +558,7 @@ func (v *VAE) upload() error {
 	if err := uploadRes(&v.dec.mid0); err != nil {
 		return err
 	}
-	if err := uploadAttn(&v.dec.midAttn); err != nil {
+	if err := uploadAttn(&v.dec.midAttn, "decoder.mid.attn_1"); err != nil {
 		return err
 	}
 	if err := uploadRes(&v.dec.mid1); err != nil {
@@ -509,7 +598,7 @@ func (v *VAE) upload() error {
 	if err := uploadRes(&v.enc.mid0); err != nil {
 		return err
 	}
-	if err := uploadAttn(&v.enc.midAttn); err != nil {
+	if err := uploadAttn(&v.enc.midAttn, "encoder.mid.attn_1"); err != nil {
 		return err
 	}
 	if err := uploadRes(&v.enc.mid1); err != nil {
@@ -519,11 +608,12 @@ func (v *VAE) upload() error {
 	return nil
 }
 
-func (v *VAE) conv(r *vk.Recorder, c vaeConv, h, w, x, y, residual uint32, mode uint32) {
+func (v *VAE) conv(r *vk.Recorder, c vaeConv, h, w, x, y, residual uint32, mode int) {
 	up, down := uint32(0), uint32(0)
-	if mode == 1 {
+	switch mode {
+	case convUpsample:
 		up = 1
-	} else if mode == 2 {
+	case convDownsample:
 		down = 1
 	}
 	v.k.Conv(r, c.w, vk.K2Conv{
@@ -578,14 +668,14 @@ func (v *VAE) norm(r *vk.Recorder, src, dst, c, h, w uint32, n vaeNorm, silu boo
 func (v *VAE) residual(r *vk.Recorder, b [3]uint32, rb vaeRes, h, w uint32) [3]uint32 {
 	x, t, u := b[0], b[1], b[2]
 	v.norm(r, x, t, rb.ins, h, w, rb.norm1, true)
-	v.conv(r, rb.conv1, h, w, t, u, vk.K2None, 0)
+	v.conv(r, rb.conv1, h, w, t, u, vk.K2None, convNormal)
 	v.norm(r, u, u, rb.outs, h, w, rb.norm2, true)
 	if rb.shortcut == nil {
-		v.conv(r, rb.conv2, h, w, u, x, x, 0)
+		v.conv(r, rb.conv2, h, w, u, x, x, convNormal)
 		return b
 	}
-	v.conv(r, *rb.shortcut, h, w, x, t, vk.K2None, 0)
-	v.conv(r, rb.conv2, h, w, u, t, t, 0)
+	v.conv(r, *rb.shortcut, h, w, x, t, vk.K2None, convNormal)
+	v.conv(r, rb.conv2, h, w, u, t, t, convNormal)
 	return [3]uint32{t, x, u}
 }
 
@@ -593,16 +683,15 @@ func (v *VAE) attention(r *vk.Recorder, b [3]uint32, a vaeAttn, h, w uint32) [3]
 	x, t, u := b[0], b[1], b[2]
 	P := h * w
 	v.norm(r, x, t, a.channels, h, w, a.norm, false)
-	v.conv(r, a.q, h, w, t, u, vk.K2None, 0)
-	v.conv(r, a.k, h, w, t, u+512*P, vk.K2None, 0)
-	v.conv(r, a.v, h, w, t, u+2*512*P, vk.K2None, 0)
+	// Single fused 1x1 convolution computing Q, K, V at once.
+	v.conv(r, a.qkv, h, w, t, u, vk.K2None, convNormal)
 
 	qToken := t
 	kToken := t + 512*P
 	vToken := t + 2*512*P
 	oToken := t + 3*512*P
 	for i, dst := range []uint32{qToken, kToken, vToken} {
-		v.k.Pix(r, vk.K2Pix{Src: u + uint32(i)*512*P, Dst: dst, C: 512, H: h, W: w, Op: vk.K2ToTokens})
+		v.k.Pix(r, vk.K2Pix{Src: u + uint32(i)*512*P, Dst: dst, C: 512, H: h, W: w, Op: vk.K2ToTokens, Residual: vk.K2None})
 	}
 	v.k.Attn(r, vk.K2Attn{
 		Q:       qToken,
@@ -622,12 +711,12 @@ func (v *VAE) attention(r *vk.Recorder, b [3]uint32, a vaeAttn, h, w uint32) [3]
 		HeadDim: 512,
 	})
 	v.k.Pix(r, vk.K2Pix{Src: oToken, Dst: u, C: 512, H: h, W: w, Op: vk.K2ToPlanes, Residual: vk.K2None})
-	v.conv(r, a.proj, h, w, u, x, x, 0)
+	v.conv(r, a.proj, h, w, u, x, x, convNormal)
 	return b
 }
 
 func (v *VAE) copyPlane(r *vk.Recorder, src, dst, count uint32) {
-	v.k.Pix(r, vk.K2Pix{Src: src, Dst: dst, C: count, H: 1, W: 1, Op: vk.K2ToTokens})
+	v.k.Pix(r, vk.K2Pix{Src: src, Dst: dst, C: count, H: 1, W: 1, Op: vk.K2ToTokens, Residual: vk.K2None})
 }
 
 func (v *VAE) decodeProgram(h, w int, recordWPs bool) (vaeDecodeProgram, error) {
@@ -656,11 +745,11 @@ func (v *VAE) decodeProgram(h, w int, recordWPs bool) (vaeDecodeProgram, error) 
 		H, W = 2*H, 2*W
 
 		// 2. post_quant_conv
-		v.conv(r, v.dec.postQuantConv, H, W, b[0], b[1], vk.K2None, 0)
+		v.conv(r, v.dec.postQuantConv, H, W, b[0], b[1], vk.K2None, convNormal)
 		b = [3]uint32{b[1], b[0], b[2]}
 
 		// 3. conv_in (32 -> 512)
-		v.conv(r, v.dec.convIn, H, W, b[0], b[1], vk.K2None, 0)
+		v.conv(r, v.dec.convIn, H, W, b[0], b[1], vk.K2None, convNormal)
 		b = [3]uint32{b[1], b[0], b[2]}
 
 		// 4. Middle
@@ -676,7 +765,7 @@ func (v *VAE) decodeProgram(h, w int, recordWPs bool) (vaeDecodeProgram, error) 
 			}
 			if up.upsample != nil {
 				H, W = 2*H, 2*W
-				v.conv(r, *up.upsample, H, W, b[0], b[1], vk.K2None, 1)
+				v.conv(r, *up.upsample, H, W, b[0], b[1], vk.K2None, convUpsample)
 				b = [3]uint32{b[1], b[0], b[2]}
 			}
 			if recordWPs {
@@ -699,7 +788,7 @@ func (v *VAE) decodeProgram(h, w int, recordWPs bool) (vaeDecodeProgram, error) 
 
 		// 6. Head
 		v.norm(r, b[0], b[1], 128, H, W, v.dec.normOut, true)
-		v.conv(r, v.dec.convOut, H, W, b[1], b[2], vk.K2None, 0)
+		v.conv(r, v.dec.convOut, H, W, b[1], b[2], vk.K2None, convNormal)
 		prog.out = b[2]
 	})
 	if err != nil {
@@ -724,7 +813,7 @@ func (v *VAE) encodeProgram(h, w int) (vaeEncodeProgram, error) {
 		H, W := uint32(h), uint32(w) // image dimensions (16*h_lat, 16*w_lat)
 
 		// 1. conv_in: 3 -> 128
-		v.conv(r, v.enc.convIn, H, W, b[0], b[1], vk.K2None, 0)
+		v.conv(r, v.enc.convIn, H, W, b[0], b[1], vk.K2None, convNormal)
 		b = [3]uint32{b[1], b[0], b[2]}
 
 		// 2. Down blocks: 0, 1, 2, 3
@@ -735,7 +824,7 @@ func (v *VAE) encodeProgram(h, w int) (vaeEncodeProgram, error) {
 			}
 			if down.downsample != nil {
 				H, W = H/2, W/2
-				v.conv(r, *down.downsample, H, W, b[0], b[1], vk.K2None, 2)
+				v.conv(r, *down.downsample, H, W, b[0], b[1], vk.K2None, convDownsample)
 				b = [3]uint32{b[1], b[0], b[2]}
 			}
 		}
@@ -747,12 +836,12 @@ func (v *VAE) encodeProgram(h, w int) (vaeEncodeProgram, error) {
 
 		// 4. End
 		v.norm(r, b[0], b[1], 512, H, W, v.enc.normOut, true)
-		v.conv(r, v.enc.convOut, H, W, b[1], b[2], vk.K2None, 0)
+		v.conv(r, v.enc.convOut, H, W, b[1], b[2], vk.K2None, convNormal)
 
 		// quant_conv: 64 -> 32
-		v.conv(r, v.enc.quantConv, H, W, b[2], b[1], vk.K2None, 0)
+		v.conv(r, v.enc.quantConv, H, W, b[2], b[1], vk.K2None, convNormal)
 
-		// 5. Patch 2×2 + BN: from 32-ch at 2H_lat, 2W_lat to 128-ch at H_lat, W_lat
+		// 5. Patch 2x2 + BN: from 32-ch at 2H_lat, 2W_lat to 128-ch at H_lat, W_lat
 		hLat, wLat := H/2, W/2
 		v.k.Flux3VAEPatch(r, vk.K2Flux3VAEPatch{
 			Src:  b[1],
@@ -772,30 +861,7 @@ func (v *VAE) encodeProgram(h, w int) (vaeEncodeProgram, error) {
 	return prog, nil
 }
 
-// Decode turns a 128-ch x16 latent into an RGB image [0, 1] as float32,
-// row by row, three floats per pixel.
-func (v *VAE) Decode(latent []float32, h, w int) ([]float32, error) {
-	if len(latent) != 128*h*w {
-		return nil, fmt.Errorf("flux3: a latent of %d floats for 128 x %d x %d", len(latent), h, w)
-	}
-	if h*w > v.maxLatentPix {
-		return nil, fmt.Errorf("flux3: a latent of %d x %d is past the %d pixels the VAE was opened for", h, w, v.maxLatentPix)
-	}
-	p, err := v.decodeProgram(h, w, false)
-	if err != nil {
-		return nil, err
-	}
-	if err := v.k.Write(int(v.bufs[0]), latent); err != nil {
-		return nil, err
-	}
-	if err := p.p.Run(); err != nil {
-		return nil, err
-	}
-	px := 256 * h * w
-	planes, err := v.k.Read(int(p.out), 3*px)
-	if err != nil {
-		return nil, err
-	}
+func toRGB(planes []float32, px int) []float32 {
 	out := make([]float32, 3*px)
 	for i := 0; i < px; i++ {
 		for c := 0; c < 3; c++ {
@@ -803,19 +869,26 @@ func (v *VAE) Decode(latent []float32, h, w int) ([]float32, error) {
 			out[3*i+c] = min(max(x, 0.0), 1.0)
 		}
 	}
-	return out, nil
+	return out
 }
 
-// decodeWithWaypoints turns a 128-ch x16 latent into RGB and returns per-block waypoints.
-func (v *VAE) decodeWithWaypoints(latent []float32, h, w int) ([]float32, map[string][]float32, error) {
+func (v *VAE) decodeCore(latent []float32, h, w int, recordWPs bool) ([]float32, map[string][]float32, error) {
+	if recordWPs && !v.recordWaypoints {
+		return nil, nil, fmt.Errorf("flux3: decodeWithWaypoints called on VAE opened without waypoint buffers (use openVAEForTest)")
+	}
 	if len(latent) != 128*h*w {
 		return nil, nil, fmt.Errorf("flux3: a latent of %d floats for 128 x %d x %d", len(latent), h, w)
 	}
-	p, err := v.decodeProgram(h, w, true)
+	if h*w > v.maxLatentPix {
+		return nil, nil, fmt.Errorf("flux3: a latent of %d x %d is past the %d pixels the VAE was opened for", h, w, v.maxLatentPix)
+	}
+	p, err := v.decodeProgram(h, w, recordWPs)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer p.p.Close()
+	if recordWPs {
+		defer p.p.Close()
+	}
 
 	if err := v.k.Write(int(v.bufs[0]), latent); err != nil {
 		return nil, nil, err
@@ -824,53 +897,69 @@ func (v *VAE) decodeWithWaypoints(latent []float32, h, w int) ([]float32, map[st
 		return nil, nil, err
 	}
 
-	wps := make(map[string][]float32)
-
-	// up_3: 512 channels, 4h x 4w
-	n3 := 512 * (4 * h) * (4 * w)
-	d3, err := v.k.Read(int(p.up3), n3)
-	if err != nil {
-		return nil, nil, err
-	}
-	wps["vae/up_3"] = d3
-
-	// up_2: 512 channels, 8h x 8w
-	n2 := 512 * (8 * h) * (8 * w)
-	d2, err := v.k.Read(int(p.up2), n2)
-	if err != nil {
-		return nil, nil, err
-	}
-	wps["vae/up_2"] = d2
-
-	// up_1: 256 channels, 16h x 16w
-	n1 := 256 * (16 * h) * (16 * w)
-	d1, err := v.k.Read(int(p.up1), n1)
-	if err != nil {
-		return nil, nil, err
-	}
-	wps["vae/up_1"] = d1
-
-	// up_0: 128 channels, 16h x 16w
-	n0 := 128 * (16 * h) * (16 * w)
-	d0, err := v.k.Read(int(p.up0), n0)
-	if err != nil {
-		return nil, nil, err
-	}
-	wps["vae/up_0"] = d0
-
 	px := 256 * h * w
 	planes, err := v.k.Read(int(p.out), 3*px)
 	if err != nil {
 		return nil, nil, err
 	}
-	out := make([]float32, 3*px)
-	for i := 0; i < px; i++ {
-		for c := 0; c < 3; c++ {
-			x := (planes[c*px+i] + 1.0) / 2.0
-			out[3*i+c] = min(max(x, 0.0), 1.0)
+
+	var wps map[string][]float32
+	if recordWPs {
+		wps = make(map[string][]float32)
+		// up_3: 512 channels, 4h x 4w
+		n3 := 512 * (4 * h) * (4 * w)
+		d3, err := v.k.Read(int(p.up3), n3)
+		if err != nil {
+			return nil, nil, err
 		}
+		wps["vae/up_3"] = d3
+
+		// up_2: 512 channels, 8h x 8w
+		n2 := 512 * (8 * h) * (8 * w)
+		d2, err := v.k.Read(int(p.up2), n2)
+		if err != nil {
+			return nil, nil, err
+		}
+		wps["vae/up_2"] = d2
+
+		// up_1: 256 channels, 16h x 16w
+		n1 := 256 * (16 * h) * (16 * w)
+		d1, err := v.k.Read(int(p.up1), n1)
+		if err != nil {
+			return nil, nil, err
+		}
+		wps["vae/up_1"] = d1
+
+		// up_0: 128 channels, 16h x 16w
+		n0 := 128 * (16 * h) * (16 * w)
+		d0, err := v.k.Read(int(p.up0), n0)
+		if err != nil {
+			return nil, nil, err
+		}
+		wps["vae/up_0"] = d0
 	}
-	return out, wps, nil
+
+	return planes, wps, nil
+}
+
+// Decode turns a 128-ch x16 latent into an RGB image [0, 1] as float32,
+// row by row, three floats per pixel.
+func (v *VAE) Decode(latent []float32, h, w int) ([]float32, error) {
+	planes, _, err := v.decodeCore(latent, h, w, false)
+	if err != nil {
+		return nil, err
+	}
+	return toRGB(planes, 256*h*w), nil
+}
+
+// decodeWithWaypoints turns a 128-ch x16 latent into RGB and returns per-block waypoints.
+// Requires VAE opened via openVAEForTest.
+func (v *VAE) decodeWithWaypoints(latent []float32, h, w int) ([]float32, map[string][]float32, error) {
+	planes, wps, err := v.decodeCore(latent, h, w, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	return toRGB(planes, 256*h*w), wps, nil
 }
 
 // Encode turns an RGB image in [0, 1] into a 128-ch latent.

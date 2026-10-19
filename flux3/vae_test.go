@@ -46,7 +46,7 @@ func TestVAEDecodeMatchesComfyUI(t *testing.T) {
 	wantUp3 := f.read(t, "vae/up_3")
 
 	d := device(t)
-	v, err := OpenVAE(d, vaePath(), 16*16)
+	v, err := openVAEForTest(d, vaePath(), 16*16)
 	if err != nil {
 		t.Fatalf("OpenVAE: %v", err)
 	}
@@ -154,4 +154,41 @@ func TestVAEDecode1024MatchesComfyUI(t *testing.T) {
 	}
 	dur = time.Since(start)
 	t.Logf("Encode 1 MP reference steady-state: %v", dur)
+}
+
+func TestVAEBoundsAndErrors(t *testing.T) {
+	if _, err := os.Stat(vaePath()); err != nil {
+		t.Skipf("VAE file not found at %s: %v", vaePath(), err)
+	}
+	d := device(t)
+
+	// maxLatentPix <= 0 rejected
+	if _, err := OpenVAE(d, vaePath(), 0); err == nil {
+		t.Errorf("expected error opening VAE with maxLatentPix=0")
+	}
+	if _, err := OpenVAE(d, vaePath(), -1); err == nil {
+		t.Errorf("expected error opening VAE with maxLatentPix=-1")
+	}
+
+	// maxLatentPix beyond arena capacity rejected
+	if _, err := OpenVAE(d, vaePath(), 7000); err == nil {
+		t.Errorf("expected error opening VAE with maxLatentPix=7000 (> 6553)")
+	}
+
+	// Product OpenVAE does not allocate waypoint buffers; decodeWithWaypoints must fail
+	prodVAE, err := OpenVAE(d, vaePath(), 16*16)
+	if err != nil {
+		t.Fatalf("OpenVAE: %v", err)
+	}
+	defer prodVAE.Close()
+
+	dummyLatent := make([]float32, 128*16*16)
+	if _, _, err := prodVAE.decodeWithWaypoints(dummyLatent, 16, 16); err == nil {
+		t.Errorf("expected error calling decodeWithWaypoints on product VAE")
+	}
+
+	// Decode with h*w > maxLatentPix fails
+	if _, err := prodVAE.Decode(make([]float32, 128*17*16), 17, 16); err == nil {
+		t.Errorf("expected error calling Decode with 17*16 > 16*16")
+	}
 }
