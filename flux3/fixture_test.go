@@ -106,8 +106,11 @@ func TestFixturesPresent(t *testing.T) {
 	}
 	forbidden := []string{
 		"sample/init", "sample/image", "sample/x0", "sample/denoised0",
-		"vae/z", "vae/up0", "vae/up1", "vae/up2", "vae/up3",
+		"i2i/init", "i2i/image", "i2i/x0", "i2i/denoised0",
+		"mi2i/init", "mi2i/image", "mi2i/x0", "mi2i/denoised0",
 		"mi2i/ref_latent0", "mi2i/ref_latent1",
+		"accept/init", "accept/image", "accept/x0", "accept/denoised0",
+		"vae/z", "vae/up0", "vae/up1", "vae/up2", "vae/up3",
 		"dit32/in.x", "dit32/in.t", "dit32/in.ctx", "dit32/in.next",
 	}
 	for _, fbd := range forbidden {

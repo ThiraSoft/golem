@@ -152,8 +152,7 @@ def cleanup_stale_files(out_dir):
 
     import re
     re_stale = [
-        re.compile(r"^(sample|sample_cfg)/x\d+$"),
-        re.compile(r"^(sample|sample_cfg)/denoised\d+$"),
+        re.compile(r"^[^/]+/(x|denoised)\d+$"),
         re.compile(r"^vae/up\d+$"),
     ]
     for root, _, files in os.walk(out_dir):
@@ -168,6 +167,7 @@ def cleanup_stale_files(out_dir):
 
 
 def write_meta():
+    cleanup_stale_files(OUT)
     path = os.path.join(OUT, "meta.json")
     old = {}
     if os.path.exists(path):
@@ -185,7 +185,7 @@ def write_meta():
         "mi2i/ref_latent0", "mi2i/ref_latent1",
         "dit32/in.x", "dit32/in.t", "dit32/in.ctx", "dit32/in.next", "dit32/pe",
     }
-    re_stale_key = re.compile(r"^(sample|sample_cfg)/(x|denoised)\d+$|^vae/up\d+$")
+    re_stale_key = re.compile(r"^[^/]+/(x|denoised)\d+$|^vae/up\d+$")
     old = {k: v for k, v in old.items() if k not in stale_keys and not re_stale_key.match(k)}
 
     stage_prefixes = {
@@ -202,9 +202,10 @@ def write_meta():
         old = {k: v for k, v in old.items() if not any(k.startswith(pfx) for pfx in prefixes)}
 
     old.update(meta)
+    # Only keep entries that actually exist as files on disk
+    final_meta = {k: v for k, v in old.items() if os.path.isfile(os.path.join(OUT, k))}
     with open(path, "w") as f:
-        json.dump(old, f, indent=1, sort_keys=True)
-    cleanup_stale_files(OUT)
+        json.dump(final_meta, f, indent=1, sort_keys=True)
 
 
 def load_models():
