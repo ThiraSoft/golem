@@ -56,6 +56,20 @@ func (f *fixtures) read(t testing.TB, name string) []float32 {
 	return out
 }
 
+func (f *fixtures) readInt32(t testing.TB, name string) []int32 {
+	t.Helper()
+	f.shape(t, name)
+	b, err := os.ReadFile(filepath.Join(f.dir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make([]int32, len(b)/4)
+	for i := range out {
+		out[i] = int32(binary.LittleEndian.Uint32(b[i*4:]))
+	}
+	return out
+}
+
 func rmsError(got, want []float32) float64 {
 	var d, n float64
 	for i := range want {
