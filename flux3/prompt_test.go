@@ -51,6 +51,9 @@ func TestTokenizeMatchesComfyUI(t *testing.T) {
 			t.Errorf("%s: real tokens %d, want %d", name, gotReal, want.UnpaddedLen)
 		}
 
+		if len(gotIDs) != len(want.IDs) {
+			t.Fatalf("%s: ids length %d != want.ids %d", name, len(gotIDs), len(want.IDs))
+		}
 		fixtureIDs := f.readInt32(t, "tokens/"+name+".ids")
 		if len(gotIDs) != len(fixtureIDs) {
 			t.Fatalf("%s: ids length %d != fixture %d", name, len(gotIDs), len(fixtureIDs))

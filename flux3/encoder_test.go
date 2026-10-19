@@ -63,6 +63,26 @@ func TestEncoderMatchesComfyUI(t *testing.T) {
 		}
 		compareRMS(t, name+" cond", cond, want, 0.01)
 
+		T := len(ids)
+		if T > 2 {
+			compareRMS(t, name+" rows 2..T", cond[2*CondWidth:], want[2*CondWidth:], 0.01)
+		}
+
+		if real < T {
+			compareRMS(t, name+" pad rows", cond[real*CondWidth:], want[real*CondWidth:], 0.01)
+		}
+
+		var worstRow int
+		var worstRMS float64
+		for r := 0; r < T; r++ {
+			rRMS := rmsError(cond[r*CondWidth:(r+1)*CondWidth], want[r*CondWidth:(r+1)*CondWidth])
+			if rRMS > worstRMS {
+				worstRMS = rRMS
+				worstRow = r
+			}
+		}
+		t.Logf("%s: worst row %d rms error %.4f%%", name, worstRow, worstRMS*100)
+
 		if f.has("encoder/" + name + ".hidden_l4") {
 			hiddenL4 := f.read(t, "encoder/"+name+".hidden_l4")
 			T := len(ids)

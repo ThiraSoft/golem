@@ -75,6 +75,17 @@ func OpenEncoder(d *vk.Device, path string, host bool) (*Encoder, error) {
 // OpenEncoderTaps uploads the text model up to the last tap in taps to the
 // card (or system memory with host set) with taps recorded.
 func OpenEncoderTaps(d *vk.Device, path string, host bool, taps []int) (*Encoder, error) {
+	if len(taps) == 0 {
+		return nil, fmt.Errorf("krea2: taps must not be empty")
+	}
+	for i := 1; i < len(taps); i++ {
+		if taps[i] <= taps[i-1] {
+			return nil, fmt.Errorf("krea2: taps must be strictly increasing, got %d <= %d", taps[i], taps[i-1])
+		}
+	}
+	if taps[0] < 0 {
+		return nil, fmt.Errorf("krea2: taps must be non-negative, got %d", taps[0])
+	}
 	ck, err := openCheckpoint(path)
 	if err != nil {
 		return nil, err
@@ -222,47 +233,17 @@ func (e *Encoder) program(tokens, real int) (*vk.Program, error) {
 // for each token from p.Start on, the twelve taps side by side.
 func (e *Encoder) Encode(p Prompt) ([]float32, int, error) {
 	T := len(p.IDs)
-	if T > MaxPromptTokens {
-		return nil, 0, fmt.Errorf("krea2: a prompt of %d tokens is past the %d the encoder holds", T, MaxPromptTokens)
-	}
 	if p.Start < 0 || p.Start >= T {
 		return nil, 0, fmt.Errorf("krea2: the prompt's text starts at %d of %d tokens", p.Start, T)
 	}
-	x := make([]float32, T*encWidth)
-	for i, id := range p.IDs {
-		if id < 0 || int(id) >= encVocab {
-			return nil, 0, fmt.Errorf("krea2: token %d is outside the vocabulary", id)
-		}
-		row := e.embed.Raw[int(id)*encWidth*2:]
-		for j := 0; j < encWidth; j++ {
-			x[i*encWidth+j] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(row[2*j:])) << 16)
-		}
-	}
-	if err := e.k.Write(int(e.x), x); err != nil {
-		return nil, 0, err
-	}
-	if err := e.k.Write(int(e.table), encoderRope(T)); err != nil {
-		return nil, 0, err
-	}
-	prog, err := e.program(T, T)
+	all, err := e.EncodeMasked(p.IDs, T)
 	if err != nil {
 		return nil, 0, err
 	}
-	if err := prog.Run(); err != nil {
-		return nil, 0, err
-	}
-	taps, err := e.k.Read(int(e.taps), len(e.tapLayers)*T*encWidth)
-	if err != nil {
-		return nil, 0, err
-	}
-	seq := T - p.Start
 	condWidth := len(e.tapLayers) * encWidth
+	seq := T - p.Start
 	cond := make([]float32, seq*condWidth)
-	for t := 0; t < seq; t++ {
-		for j := range e.tapLayers {
-			copy(cond[t*condWidth+j*encWidth:], taps[(j*T+p.Start+t)*encWidth:(j*T+p.Start+t+1)*encWidth])
-		}
-	}
+	copy(cond, all[p.Start*condWidth:])
 	return cond, seq, nil
 }
 

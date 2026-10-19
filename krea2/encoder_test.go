@@ -67,3 +67,24 @@ func TestEncoderMatchesComfyUI(t *testing.T) {
 }
 
 func itoa(i int) string { return string(rune('0'+i/10)) + string(rune('0'+i%10)) }
+
+func TestOpenEncoderTapsValidation(t *testing.T) {
+	needFile(t, EncoderPath())
+	d := device(t)
+	cases := []struct {
+		name string
+		taps []int
+	}{
+		{"nil taps", nil},
+		{"empty taps", []int{}},
+		{"non-increasing taps", []int{4, 4}},
+		{"decreasing taps", []int{8, 4}},
+		{"negative taps", []int{-1, 4}},
+	}
+	for _, tc := range cases {
+		_, err := OpenEncoderTaps(d, EncoderPath(), false, tc.taps)
+		if err == nil {
+			t.Errorf("%s: expected error, got nil", tc.name)
+		}
+	}
+}
