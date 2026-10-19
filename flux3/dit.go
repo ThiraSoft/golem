@@ -158,7 +158,6 @@ type stepKey struct {
 	h, w      int
 	refTokens int
 	txtTokens int
-	refShapes string
 }
 
 type earlyTKey struct {
@@ -180,6 +179,11 @@ type ropeKey struct {
 	refShapes string
 }
 
+type countedProgram struct {
+	p               *vk.Program
+	earlyDispatches int
+}
+
 // DiT is FLUX 3's transformer on the Vulkan device.
 type DiT struct {
 	k  *vk.K2
@@ -192,7 +196,9 @@ type DiT struct {
 	flowMap           bool
 	depth             int
 	depthSingleBlocks int
+	arenaBytes        int
 
+	recordDispatch  func()
 	earlyDispatches int
 
 	embImg       linearWeight
@@ -246,9 +252,9 @@ type DiT struct {
 	ropeKey   ropeKey
 	ropeTable []float32
 
-	stepProgs   map[stepKey][]*vk.Program
-	earlyTProgs map[earlyTKey]*vk.Program
-	earlyRProgs map[earlyRKey]*vk.Program
+	stepProgs   map[stepKey][]countedProgram
+	earlyTProgs map[earlyTKey]countedProgram
+	earlyRProgs map[earlyRKey]countedProgram
 }
 
 type arena struct {
@@ -288,13 +294,17 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 	if len(prec) > 0 {
 		precision = prec[0]
 	}
+	if precision != PrecisionFP8 && precision != PrecisionFP16 {
+		tm.Close()
+		return nil, fmt.Errorf("flux3: unsupported precision %v", precision)
+	}
 
 	m := &DiT{
 		tm:          tm,
 		precision:   precision,
-		stepProgs:   make(map[stepKey][]*vk.Program),
-		earlyTProgs: make(map[earlyTKey]*vk.Program),
-		earlyRProgs: make(map[earlyRKey]*vk.Program),
+		stepProgs:   make(map[stepKey][]countedProgram),
+		earlyTProgs: make(map[earlyTKey]countedProgram),
+		earlyRProgs: make(map[earlyRKey]countedProgram),
 	}
 	fail := func(err error) (*DiT, error) {
 		m.Close()
@@ -336,6 +346,9 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 	m.depth = countBlocks("txt_mode_blocks.")
 	m.depthSingleBlocks = countBlocks("single_blocks.")
 
+	if m.depth <= 0 {
+		return fail(fmt.Errorf("flux3: invalid depth %d", m.depth))
+	}
 	if m.depthSingleBlocks <= 0 {
 		return fail(fmt.Errorf("flux3: invalid depth_single_blocks %d", m.depthSingleBlocks))
 	}
@@ -441,6 +454,7 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 		}
 	}
 
+	m.arenaBytes = a.n * 4
 	if m.k, err = vk.NewK2(d, a.n, par.data); err != nil {
 		return fail(err)
 	}
@@ -465,12 +479,19 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 			} else {
 				f16Buf = f16Buf[:2*n]
 			}
+			var overflows int
 			for i := 0; i < n; i++ {
 				u := binary.LittleEndian.Uint16(raw[i*2:])
 				h := bf16ToHalfLUT[u]
+				if (h & 0x7c00) == 0x7c00 {
+					overflows++
+				}
 				binary.LittleEndian.PutUint16(f16Buf[i*2:], h)
 			}
 			madviseDontNeed(raw)
+			if overflows > 0 {
+				return linearWeight{}, fmt.Errorf("flux3: %s had %d bf16 values overflow to inf/nan in fp16", name, overflows)
+			}
 			h, err := m.k.AddWeights(f16Buf)
 			if err != nil {
 				return linearWeight{}, err
@@ -614,31 +635,79 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 	return m, nil
 }
 
+// ArenaBytes returns the size in bytes of the Vulkan arena allocated by K2.
+func (m *DiT) ArenaBytes() int {
+	return m.arenaBytes
+}
+
+func (m *DiT) dispatch() {
+	if m.recordDispatch != nil {
+		m.recordDispatch()
+	}
+}
+
 func (m *DiT) mm(r *vk.Recorder, w int, mm vk.K2MM) {
+	m.dispatch()
 	m.k.MM(r, w, m.precision == PrecisionFP8, mm)
+}
+
+func (m *DiT) norm(r *vk.Recorder, n vk.K2Norm) {
+	m.dispatch()
+	m.k.Norm(r, n)
+}
+
+func (m *DiT) flux3Norm(r *vk.Recorder, n vk.K2Flux3Norm) {
+	m.dispatch()
+	m.k.Flux3Norm(r, n)
+}
+
+func (m *DiT) flux3Gate(r *vk.Recorder, g vk.K2Flux3Gate) {
+	m.dispatch()
+	m.k.Flux3Gate(r, g)
+}
+
+func (m *DiT) rope(r *vk.Recorder, p vk.K2Rope) {
+	m.dispatch()
+	m.k.Rope(r, p)
+}
+
+func (m *DiT) act(r *vk.Recorder, a vk.K2Act) {
+	m.dispatch()
+	m.k.Act(r, a)
+}
+
+func (m *DiT) attn(r *vk.Recorder, a vk.K2Attn) {
+	m.dispatch()
+	m.k.Attn(r, a)
 }
 
 func (m *DiT) forget() {
 	for _, progs := range m.stepProgs {
 		for _, p := range progs {
-			if p != nil {
-				p.Close()
+			if p.p != nil {
+				p.p.Close()
 			}
 		}
 	}
+	clear(m.stepProgs)
 	for _, p := range m.earlyTProgs {
-		if p != nil {
-			p.Close()
+		if p.p != nil {
+			p.p.Close()
 		}
 	}
+	clear(m.earlyTProgs)
 	for _, p := range m.earlyRProgs {
-		if p != nil {
-			p.Close()
+		if p.p != nil {
+			p.p.Close()
 		}
 	}
-	m.stepProgs = make(map[stepKey][]*vk.Program)
-	m.earlyTProgs = make(map[earlyTKey]*vk.Program)
-	m.earlyRProgs = make(map[earlyRKey]*vk.Program)
+	clear(m.earlyRProgs)
+	m.ctxTokens = [2]int{}
+	m.refTokens = [2]int{}
+	m.refShapes = [2][][2]int{}
+	m.refIDs = [2][]float32{}
+	m.ropeKey = ropeKey{}
+	m.ropeTable = nil
 }
 
 func (m *DiT) Close() {
@@ -655,12 +724,6 @@ func (m *DiT) Close() {
 
 func (m *DiT) Trim() {
 	m.forget()
-	m.ctxTokens = [2]int{}
-	m.refTokens = [2]int{}
-	m.refShapes = [2][][2]int{}
-	m.refIDs = [2][]float32{}
-	m.ropeKey = ropeKey{}
-	m.ropeTable = nil
 	if m.k != nil {
 		m.k.FreeArena()
 	}
@@ -722,15 +785,15 @@ func (m *DiT) SetText(slot int, cond []float32, tokens int) error {
 	if len(cond) != tokens*ditTxtIn {
 		return fmt.Errorf("flux3: cond len %d != %d", len(cond), tokens*ditTxtIn)
 	}
-	m.ctxTokens[slot] = tokens
 	if err := m.k.Write(int(m.ctx[slot]), cond); err != nil {
 		return err
 	}
 	if !m.flowMap {
-		if err := m.runEarlyText(slot); err != nil {
+		if err := m.runEarlyText(slot, tokens); err != nil {
 			return err
 		}
 	}
+	m.ctxTokens[slot] = tokens
 	return nil
 }
 
@@ -786,7 +849,7 @@ func (m *DiT) recordBlock(r *vk.Recorder, b *ditBlock, tokens int, xOffset uint3
 		dst := 2*m.nh + uint32(sp.start*ditWidth)
 		scale := sp.modOffset + uint32(ditWidth)
 		shift := sp.modOffset
-		m.k.Flux3Norm(r, vk.K2Flux3Norm{
+		m.flux3Norm(r, vk.K2Flux3Norm{
 			Src: src, SrcStride: uint32(ditWidth),
 			Dst: dst, DstStride: uint32(ditWidth),
 			N: uint32(ditWidth), Rows: rows,
@@ -824,14 +887,14 @@ func (m *DiT) recordBlock(r *vk.Recorder, b *ditBlock, tokens int, xOffset uint3
 	})
 
 	// 3. QKNorm.
-	m.k.Norm(r, vk.K2Norm{
+	m.norm(r, vk.K2Norm{
 		Src: m.q, SrcStride: uint32(ditHeadDim),
 		Dst: m.q, DstStride: uint32(ditHeadDim),
 		N: uint32(ditHeadDim), Rows: toks * uint32(ditHeads),
 		Weight: b.qNorm, OnePlus: 0, Eps: ditEps,
 		ScaleA: vk.K2None,
 	})
-	m.k.Norm(r, vk.K2Norm{
+	m.norm(r, vk.K2Norm{
 		Src: m.kBuf, SrcStride: uint32(ditHeadDim),
 		Dst: m.kBuf, DstStride: uint32(ditHeadDim),
 		N: uint32(ditHeadDim), Rows: toks * uint32(ditHeads),
@@ -840,19 +903,19 @@ func (m *DiT) recordBlock(r *vk.Recorder, b *ditBlock, tokens int, xOffset uint3
 	})
 
 	// 4. Rope.
-	m.k.Rope(r, vk.K2Rope{
+	m.rope(r, vk.K2Rope{
 		X: m.q, Stride: uint32(ditWidth),
 		Heads: uint32(ditHeads), Dim: uint32(ditHeadDim),
 		Tokens: toks, Table: ropeOffset,
 	})
-	m.k.Rope(r, vk.K2Rope{
+	m.rope(r, vk.K2Rope{
 		X: m.kBuf, Stride: uint32(ditWidth),
 		Heads: uint32(ditHeads), Dim: uint32(ditHeadDim),
 		Tokens: toks, Table: ropeOffset,
 	})
 
 	// 5. Attention.
-	m.k.Attn(r, vk.K2Attn{
+	m.attn(r, vk.K2Attn{
 		Q: m.q, QStride: uint32(ditWidth),
 		K: m.kBuf, KStride: uint32(ditWidth),
 		V: m.vBuf, VStride: uint32(ditWidth),
@@ -871,7 +934,7 @@ func (m *DiT) recordBlock(r *vk.Recorder, b *ditBlock, tokens int, xOffset uint3
 	})
 
 	// 7. SwiGLU activation into half (fp16).
-	m.k.Act(r, vk.K2Act{
+	m.act(r, vk.K2Act{
 		X: m.mlp, XStride: uint32(2 * ditFFN),
 		Y: m.mlp + uint32(ditFFN), YStride: uint32(2 * ditFFN),
 		N: uint32(ditFFN), Rows: toks,
@@ -893,7 +956,7 @@ func (m *DiT) recordBlock(r *vk.Recorder, b *ditBlock, tokens int, xOffset uint3
 		xDst := xOffset + uint32(sp.start*ditWidth)
 		outSrc := m.out + uint32(sp.start*ditWidth)
 		gate := sp.modOffset + uint32(2*ditWidth)
-		m.k.Flux3Gate(r, vk.K2Flux3Gate{
+		m.flux3Gate(r, vk.K2Flux3Gate{
 			X: xDst, XStride: uint32(ditWidth),
 			Out: outSrc, OutStride: uint32(ditWidth),
 			Gate: gate,
@@ -902,13 +965,14 @@ func (m *DiT) recordBlock(r *vk.Recorder, b *ditBlock, tokens int, xOffset uint3
 	}
 }
 
-func (m *DiT) runEarlyText(slot int) error {
-	tokens := m.ctxTokens[slot]
+func (m *DiT) runEarlyText(slot, tokens int) error {
 	key := earlyTKey{slot: slot, tokens: tokens}
 	p, ok := m.earlyTProgs[key]
 	if !ok {
-		var err error
-		p, err = m.k.Compile(func(r *vk.Recorder) {
+		var count int
+		rawP, err := m.k.Compile(func(r *vk.Recorder) {
+			m.recordDispatch = func() { count++ }
+			defer func() { m.recordDispatch = nil }()
 			T := uint32(tokens)
 			// 1. time_in(0) -> tVecZero
 			m.mm(r, m.timeInIn.w, vk.K2MM{
@@ -917,7 +981,7 @@ func (m *DiT) runEarlyText(slot int) error {
 				Y: m.tA, YStride: uint32(ditWidth),
 				Bias: vk.K2None, Scale: m.timeInIn.scale, Mode: vk.K2Store,
 			})
-			m.k.Act(r, vk.K2Act{X: m.tA, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
+			m.act(r, vk.K2Act{X: m.tA, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
 			m.mm(r, m.timeInOut.w, vk.K2MM{
 				Outputs: uint32(ditWidth), Inputs: uint32(ditWidth), Cols: 1,
 				X: m.tA, XStride: uint32(ditWidth),
@@ -926,7 +990,7 @@ func (m *DiT) runEarlyText(slot int) error {
 			})
 
 			// 2. Modulations for text
-			m.k.Act(r, vk.K2Act{X: m.tVecZero, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
+			m.act(r, vk.K2Act{X: m.tVecZero, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
 			m.mm(r, m.earlyModTxt.w, vk.K2MM{
 				Outputs: uint32(3 * ditWidth), Inputs: uint32(ditWidth), Cols: 1,
 				X: m.tVecZero, XStride: uint32(ditWidth),
@@ -952,31 +1016,38 @@ func (m *DiT) runEarlyText(slot int) error {
 		if err != nil {
 			return err
 		}
+		p = countedProgram{p: rawP, earlyDispatches: count}
 		m.earlyTProgs[key] = p
-		m.earlyDispatches += 6 + m.depth*15
 	}
 
 	// Prepare tembZero and rope table for text
 	if err := m.k.Write(int(m.tembZero), timestepEmbedding(0.0)); err != nil {
 		return err
 	}
-	txtIDs := TextIDs(m.ctxTokens[slot])
+	txtIDs := TextIDs(tokens)
 	txtRope := RopeTable(txtIDs)
 	if err := m.k.Write(int(m.table), txtRope); err != nil {
 		return err
 	}
 
-	return p.Run()
+	if err := p.p.Run(); err != nil {
+		return err
+	}
+	m.earlyDispatches += p.earlyDispatches
+	return nil
 }
 
 func (m *DiT) runEarlyRefs(slot int) error {
 	shapesStr := fmt.Sprint(m.refShapes[slot])
-	key := earlyRKey{slot: slot, tokens: m.refTokens[slot], shapes: shapesStr}
+	tokens := m.refTokens[slot]
+	key := earlyRKey{slot: slot, tokens: tokens, shapes: shapesStr}
 	p, ok := m.earlyRProgs[key]
 	if !ok {
-		var err error
-		p, err = m.k.Compile(func(r *vk.Recorder) {
-			R := uint32(m.refTokens[slot])
+		var count int
+		rawP, err := m.k.Compile(func(r *vk.Recorder) {
+			m.recordDispatch = func() { count++ }
+			defer func() { m.recordDispatch = nil }()
+			R := uint32(tokens)
 			// 1. time_in(0) -> tVecZero
 			m.mm(r, m.timeInIn.w, vk.K2MM{
 				Outputs: uint32(ditWidth), Inputs: uint32(ditTDim), Cols: 1,
@@ -984,7 +1055,7 @@ func (m *DiT) runEarlyRefs(slot int) error {
 				Y: m.tA, YStride: uint32(ditWidth),
 				Bias: vk.K2None, Scale: m.timeInIn.scale, Mode: vk.K2Store,
 			})
-			m.k.Act(r, vk.K2Act{X: m.tA, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
+			m.act(r, vk.K2Act{X: m.tA, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
 			m.mm(r, m.timeInOut.w, vk.K2MM{
 				Outputs: uint32(ditWidth), Inputs: uint32(ditWidth), Cols: 1,
 				X: m.tA, XStride: uint32(ditWidth),
@@ -993,7 +1064,7 @@ func (m *DiT) runEarlyRefs(slot int) error {
 			})
 
 			// 2. Modulations for ref
-			m.k.Act(r, vk.K2Act{X: m.tVecZero, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
+			m.act(r, vk.K2Act{X: m.tVecZero, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
 			m.mm(r, m.earlyModRef.w, vk.K2MM{
 				Outputs: uint32(3 * ditWidth), Inputs: uint32(ditWidth), Cols: 1,
 				X: m.tVecZero, XStride: uint32(ditWidth),
@@ -1018,8 +1089,8 @@ func (m *DiT) runEarlyRefs(slot int) error {
 		if err != nil {
 			return err
 		}
+		p = countedProgram{p: rawP, earlyDispatches: count}
 		m.earlyRProgs[key] = p
-		m.earlyDispatches += 6 + m.depth*15
 	}
 
 	if err := m.k.Write(int(m.tembZero), timestepEmbedding(0.0)); err != nil {
@@ -1030,7 +1101,11 @@ func (m *DiT) runEarlyRefs(slot int) error {
 		return err
 	}
 
-	return p.Run()
+	if err := p.p.Run(); err != nil {
+		return err
+	}
+	m.earlyDispatches += p.earlyDispatches
+	return nil
 }
 
 func singleBlockChunks(depth int) [][2]int {
@@ -1045,8 +1120,8 @@ func singleBlockChunks(depth int) [][2]int {
 	return chunks
 }
 
-func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]*vk.Program, error) {
-	key := stepKey{slot: slot, h: h, w: w, refTokens: refToks, txtTokens: txtToks, refShapes: fmt.Sprint(m.refShapes[slot])}
+func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]countedProgram, error) {
+	key := stepKey{slot: slot, h: h, w: w, refTokens: refToks, txtTokens: txtToks}
 	if progs, ok := m.stepProgs[key]; ok {
 		return progs, nil
 	}
@@ -1064,9 +1139,10 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]*vk.Program, err
 	}
 	spansJoint = append(spansJoint, span{start: I + R, end: totalTokens, modOffset: m.modSingleTxt})
 
-	var progs []*vk.Program
+	var progs []countedProgram
 
 	// Submission 0: Head + early blocks + sequence assembly
+	var p0EarlyCount int
 	p0, err := m.k.Compile(func(r *vk.Recorder) {
 		// 1. Timestep embeddings
 		// time_in(temb) -> tVec
@@ -1076,7 +1152,7 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]*vk.Program, err
 			Y: m.tA, YStride: uint32(ditWidth),
 			Bias: vk.K2None, Scale: m.timeInIn.scale, Mode: vk.K2Store,
 		})
-		m.k.Act(r, vk.K2Act{X: m.tA, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
+		m.act(r, vk.K2Act{X: m.tA, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
 		m.mm(r, m.timeInOut.w, vk.K2MM{
 			Outputs: uint32(ditWidth), Inputs: uint32(ditWidth), Cols: 1,
 			X: m.tA, XStride: uint32(ditWidth),
@@ -1092,14 +1168,14 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]*vk.Program, err
 				Y: m.tA, YStride: uint32(ditWidth),
 				Bias: vk.K2None, Scale: m.refTimeInIn.scale, Mode: vk.K2Store,
 			})
-			m.k.Act(r, vk.K2Act{X: m.tA, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
+			m.act(r, vk.K2Act{X: m.tA, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
 			m.mm(r, m.refTimeInOut.w, vk.K2MM{
 				Outputs: uint32(ditWidth), Inputs: uint32(ditWidth), Cols: 1,
 				X: m.tA, XStride: uint32(ditWidth),
 				Y: m.tTarget, YStride: uint32(ditWidth),
 				Bias: vk.K2None, Scale: m.refTimeInOut.scale, Mode: vk.K2Store,
 			})
-			m.k.Act(r, vk.K2Act{X: m.tVec, XStride: uint32(ditWidth), Y: m.tTarget, YStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2Sum})
+			m.act(r, vk.K2Act{X: m.tVec, XStride: uint32(ditWidth), Y: m.tTarget, YStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2Sum})
 		}
 
 		// time_in(tembZero) -> tVecZero
@@ -1109,7 +1185,7 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]*vk.Program, err
 			Y: m.tA, YStride: uint32(ditWidth),
 			Bias: vk.K2None, Scale: m.timeInIn.scale, Mode: vk.K2Store,
 		})
-		m.k.Act(r, vk.K2Act{X: m.tA, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
+		m.act(r, vk.K2Act{X: m.tA, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
 		m.mm(r, m.timeInOut.w, vk.K2MM{
 			Outputs: uint32(ditWidth), Inputs: uint32(ditWidth), Cols: 1,
 			X: m.tA, XStride: uint32(ditWidth),
@@ -1117,12 +1193,12 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]*vk.Program, err
 			Bias: vk.K2None, Scale: m.timeInOut.scale, Mode: vk.K2Store,
 		})
 		if m.flowMap {
-			m.k.Act(r, vk.K2Act{X: m.tVecZero, XStride: uint32(ditWidth), Y: m.tTarget, YStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2Sum})
+			m.act(r, vk.K2Act{X: m.tVecZero, XStride: uint32(ditWidth), Y: m.tTarget, YStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2Sum})
 		}
 
 		// 2. Modulations
 		// Image modulations from silu(tVec)
-		m.k.Act(r, vk.K2Act{X: m.tVec, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
+		m.act(r, vk.K2Act{X: m.tVec, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
 		m.mm(r, m.earlyModImg.w, vk.K2MM{
 			Outputs: uint32(3 * ditWidth), Inputs: uint32(ditWidth), Cols: 1,
 			X: m.tVec, XStride: uint32(ditWidth),
@@ -1143,7 +1219,7 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]*vk.Program, err
 		})
 
 		// Zero-time modulations (text and ref) from silu(tVecZero)
-		m.k.Act(r, vk.K2Act{X: m.tVecZero, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
+		m.act(r, vk.K2Act{X: m.tVecZero, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
 		m.mm(r, m.earlyModTxt.w, vk.K2MM{
 			Outputs: uint32(3 * ditWidth), Inputs: uint32(ditWidth), Cols: 1,
 			X: m.tVecZero, XStride: uint32(ditWidth),
@@ -1173,6 +1249,7 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]*vk.Program, err
 
 		// 3. Early text & ref streams (when flow_map)
 		if m.flowMap {
+			m.recordDispatch = func() { p0EarlyCount++ }
 			// Early text: txt_in + 5 blocks
 			m.mm(r, m.txtIn.w, vk.K2MM{
 				Outputs: uint32(ditWidth), Inputs: uint32(ditTxtIn), Cols: uint32(T),
@@ -1200,6 +1277,7 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]*vk.Program, err
 					m.recordBlock(r, &m.refEarlyBlocks[i], R, m.refStates[slot], refRopeOffset, spansRef)
 				}
 			}
+			m.recordDispatch = nil
 		}
 
 		// 4. Early image stream: emb_in["image"] + 5 blocks
@@ -1209,7 +1287,7 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]*vk.Program, err
 			Y: m.embImgBuf, YStride: uint32(ditWidth),
 			Bias: vk.K2None, Scale: m.embImg.scale, Mode: vk.K2Store,
 		})
-		m.k.Act(r, vk.K2Act{
+		m.act(r, vk.K2Act{
 			X: m.x, XStride: uint32(ditWidth),
 			Y: m.embImgBuf, YStride: uint32(ditWidth),
 			N: uint32(ditWidth), Rows: uint32(I),
@@ -1223,14 +1301,14 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]*vk.Program, err
 		// 5. Concatenate joint sequence [img, refs, txt] into m.x
 		// Image is already at m.x[0..I*ditWidth]
 		if R > 0 {
-			m.k.Act(r, vk.K2Act{
+			m.act(r, vk.K2Act{
 				X: m.x + uint32(I*ditWidth), XStride: uint32(ditWidth),
 				Y: m.refStates[slot], YStride: uint32(ditWidth),
 				N: uint32(ditWidth), Rows: uint32(R),
 				Op: vk.K2Copy,
 			})
 		}
-		m.k.Act(r, vk.K2Act{
+		m.act(r, vk.K2Act{
 			X: m.x + uint32((I+R)*ditWidth), XStride: uint32(ditWidth),
 			Y: m.txtStates[slot], YStride: uint32(ditWidth),
 			N: uint32(ditWidth), Rows: uint32(T),
@@ -1240,14 +1318,7 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]*vk.Program, err
 	if err != nil {
 		return nil, err
 	}
-	progs = append(progs, p0)
-
-	if m.flowMap {
-		m.earlyDispatches += 1 + m.depth*15
-		if R > 0 {
-			m.earlyDispatches += 1 + m.depth*15
-		}
-	}
+	progs = append(progs, countedProgram{p: p0, earlyDispatches: p0EarlyCount})
 
 	chunks := singleBlockChunks(m.depthSingleBlocks)
 	for _, ch := range chunks {
@@ -1259,16 +1330,16 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]*vk.Program, err
 		})
 		if err != nil {
 			for _, pr := range progs {
-				pr.Close()
+				pr.p.Close()
 			}
 			return nil, err
 		}
-		progs = append(progs, p)
+		progs = append(progs, countedProgram{p: p, earlyDispatches: 0})
 	}
 
 	// Tail submission: Final layer on image tokens
 	pTail, err := m.k.Compile(func(r *vk.Recorder) {
-		m.k.Flux3Norm(r, vk.K2Flux3Norm{
+		m.flux3Norm(r, vk.K2Flux3Norm{
 			Src: m.x, SrcStride: uint32(ditWidth),
 			Dst: 2 * m.nh, DstStride: uint32(ditWidth),
 			N: uint32(ditWidth), Rows: uint32(I),
@@ -1284,11 +1355,11 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]*vk.Program, err
 	})
 	if err != nil {
 		for _, pr := range progs {
-			pr.Close()
+			pr.p.Close()
 		}
 		return nil, err
 	}
-	progs = append(progs, pTail)
+	progs = append(progs, countedProgram{p: pTail, earlyDispatches: 0})
 
 	m.stepProgs[key] = progs
 	return progs, nil
@@ -1367,9 +1438,11 @@ func (m *DiT) stepWithWaypoints(slot int, latent []float32, h, w int, sigma, nex
 
 	// Execution:
 	// prog 0: Head + early blocks
-	if err := progs[0].Run(); err != nil {
+	if err := progs[0].p.Run(); err != nil {
 		return nil, nil, err
 	}
+	m.earlyDispatches += progs[0].earlyDispatches
+
 	if recordWps {
 		if emb, err := m.k.Read(int(m.embImgBuf), I*ditWidth); err == nil {
 			wps["wp.emb_img"] = emb
@@ -1389,9 +1462,10 @@ func (m *DiT) stepWithWaypoints(slot int, latent []float32, h, w int, sigma, nex
 
 	chunks := singleBlockChunks(m.depthSingleBlocks)
 	for i, ch := range chunks {
-		if err := progs[1+i].Run(); err != nil {
+		if err := progs[1+i].p.Run(); err != nil {
 			return nil, nil, err
 		}
+		m.earlyDispatches += progs[1+i].earlyDispatches
 		if recordWps {
 			if ch[1] == 1 {
 				if s0, err := m.k.Read(int(m.x), total*ditWidth); err == nil {
@@ -1412,9 +1486,10 @@ func (m *DiT) stepWithWaypoints(slot int, latent []float32, h, w int, sigma, nex
 	}
 
 	pTail := progs[len(progs)-1]
-	if err := pTail.Run(); err != nil {
+	if err := pTail.p.Run(); err != nil {
 		return nil, nil, err
 	}
+	m.earlyDispatches += pTail.earlyDispatches
 
 	rawOut, err := m.k.Read(int(m.imgOut), I*ditInChannels)
 	if err != nil {
