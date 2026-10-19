@@ -1,0 +1,63 @@
+#version 450
+
+// Second pass of GroupNorm with 32 groups: combines the slices' statistics,
+// then applies (x - mean) / sqrt(var + 1e-6) * weight + bias, and optional SiLU.
+// Grid: x = ceil(groupElems / 256), y = 32 (group index).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint src, dst;
+    uint plane;
+    uint cpg;
+    uint groupElems;
+    uint slices;
+    uint stats;
+    uint weight;
+    uint bias;
+    uint silu;
+} p;
+
+shared float s_mean;
+shared float s_scale;
+
+void main() {
+    uint g = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+
+    if (t == 0u) {
+        uint o = p.stats + g * p.slices * 3u;
+        float n = a[o], mean = a[o + 1u], m2 = a[o + 2u];
+        for (uint s = 1u; s < p.slices; s++) {
+            float nb = a[o + s * 3u], mb = a[o + s * 3u + 1u], m2b = a[o + s * 3u + 2u];
+            if (nb > 0.0) {
+                float nt = n + nb;
+                float d = mb - mean;
+                mean += d * nb / nt;
+                m2 += m2b + d * d * n * nb / nt;
+                n = nt;
+            }
+        }
+        s_mean = mean;
+        s_scale = 1.0 / sqrt(m2 / n + 1e-6);
+    }
+    barrier();
+
+    uint idx = gl_WorkGroupID.x * 256u + t;
+    if (idx < p.groupElems) {
+        uint lc = idx / p.plane;
+        uint c = g * p.cpg + lc;
+        uint base_src = p.src + g * p.cpg * p.plane;
+        uint base_dst = p.dst + g * p.cpg * p.plane;
+        float v = a[base_src + idx];
+        v = (v - s_mean) * s_scale * par[p.weight + c] + par[p.bias + c];
+        if (p.silu != 0u) {
+            v = v / (1.0 + exp(-v));
+        }
+        a[base_dst + idx] = v;
+    }
+}

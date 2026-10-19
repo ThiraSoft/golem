@@ -1,0 +1,72 @@
+#version 450
+
+// First pass of GroupNorm with 32 groups: computes count n, mean, and
+// sum of squared deviations m2 for slices of each group.
+// 256 threads per workgroup, each workgroup handles one slice of one group.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint src;
+    uint plane;
+    uint cpg;
+    uint groupElems;
+    uint sliceLen;
+    uint slices;
+    uint stats;
+} p;
+
+shared float part[256];
+
+void main() {
+    uint s = gl_WorkGroupID.x, g = gl_WorkGroupID.y, t = gl_LocalInvocationID.x;
+    uint begin = s * p.sliceLen;
+    uint end = min(p.groupElems, begin + p.sliceLen);
+    uint base = p.src + g * p.cpg * p.plane;
+
+    if (begin >= end) {
+        if (t == 0u) {
+            uint o = p.stats + (g * p.slices + s) * 3u;
+            a[o] = 0.0;
+            a[o + 1u] = 0.0;
+            a[o + 2u] = 0.0;
+        }
+        return;
+    }
+
+    float sum = 0.0;
+    for (uint i = begin + t; i < end; i += 256u) {
+        sum += a[base + i];
+    }
+    part[t] = sum;
+    barrier();
+    for (uint span = 128u; span > 0u; span >>= 1) {
+        if (t < span) part[t] += part[t + span];
+        barrier();
+    }
+    float n = float(end - begin);
+    float mean = part[0] / n;
+    barrier();
+
+    float m2 = 0.0;
+    for (uint i = begin + t; i < end; i += 256u) {
+        float d = a[base + i] - mean;
+        m2 += d * d;
+    }
+    part[t] = m2;
+    barrier();
+    for (uint span = 128u; span > 0u; span >>= 1) {
+        if (t < span) part[t] += part[t + span];
+        barrier();
+    }
+    if (t == 0u) {
+        uint o = p.stats + (g * p.slices + s) * 3u;
+        a[o] = n;
+        a[o + 1u] = mean;
+        a[o + 2u] = part[0];
+    }
+}

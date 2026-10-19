@@ -1,0 +1,46 @@
+#version 450
+
+// VAE un-batch-norm and unpatch:
+// 1. z = latent * sqrt(running_var + 1e-4) + running_mean (for 128 channels)
+// 2. unpatch: [128, H, W] -> [32, 2H, 2W]
+//    (c*4 + pi*2 + pj, y, x) -> (c, 2*y + pi, 2*x + pj)
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint src, dst;
+    uint h, w;
+    uint mean, var;
+} p;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint plane_in = p.h * p.w;
+    if (idx >= 128u * plane_in) return;
+
+    uint ch_128 = idx / plane_in;
+    uint px = idx % plane_in;
+    uint y = px / p.w;
+    uint x = px % p.w;
+
+    float v = a[p.src + idx];
+    float m = par[p.mean + ch_128];
+    float s = sqrt(par[p.var + ch_128] + 1e-4);
+    v = v * s + m;
+
+    uint c = ch_128 >> 2;
+    uint pi = (ch_128 >> 1) & 1u;
+    uint pj = ch_128 & 1u;
+
+    uint y_out = (y << 1u) + pi;
+    uint x_out = (x << 1u) + pj;
+    uint w_out = p.w << 1u;
+    uint h_out = p.h << 1u;
+    uint plane_out = h_out * w_out;
+
+    a[p.dst + c * plane_out + y_out * w_out + x_out] = v;
+}

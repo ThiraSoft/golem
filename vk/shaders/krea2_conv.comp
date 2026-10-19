@@ -42,6 +42,7 @@ layout(push_constant) uniform Push {
     uint bias;
     uint residual;
     uint up;
+    uint down;
 } p;
 
 shared float16_t sa[BM * SA];
@@ -92,13 +93,22 @@ void main() {
             if (pix < pixels && k < K) {
                 uint ci = k / p.taps, tap = k % p.taps;
                 int yy = int(pix / p.w), xx = int(pix % p.w);
-                if (p.taps == 9u) {
-                    yy += int(tap / 3u) - 1;
-                    xx += int(tap % 3u) - 1;
-                }
-                if (yy >= 0 && yy < int(p.h) && xx >= 0 && xx < int(p.w)) {
-                    uint iw = p.w >> p.up, ih = p.h >> p.up;
-                    v = a[p.x + ci * ih * iw + (uint(yy) >> p.up) * iw + (uint(xx) >> p.up)];
+                if (p.down != 0u) {
+                    uint iw = p.w << 1u, ih = p.h << 1u;
+                    uint in_y = (uint(yy) << 1u) + (tap / 3u);
+                    uint in_x = (uint(xx) << 1u) + (tap % 3u);
+                    if (in_y < ih && in_x < iw) {
+                        v = a[p.x + ci * ih * iw + in_y * iw + in_x];
+                    }
+                } else {
+                    if (p.taps == 9u) {
+                        yy += int(tap / 3u) - 1;
+                        xx += int(tap % 3u) - 1;
+                    }
+                    if (yy >= 0 && yy < int(p.h) && xx >= 0 && xx < int(p.w)) {
+                        uint iw = p.w >> p.up, ih = p.h >> p.up;
+                        v = a[p.x + ci * ih * iw + (uint(yy) >> p.up) * iw + (uint(xx) >> p.up)];
+                    }
                 }
             }
             sb[c * uint(SA) + kk] = float16_t(clamp(v, -65504.0, 65504.0));

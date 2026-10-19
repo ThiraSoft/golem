@@ -30,10 +30,15 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_act.comp -o shaders/krea2_act.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_attn.comp -o shaders/krea2_attn128.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DHD=384 -DBC=16 shaders/krea2_attn.comp -o shaders/krea2_attn384.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DHD=512 -DBC=16 shaders/krea2_attn.comp -o shaders/krea2_attn512.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_conv.comp -o shaders/krea2_conv.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_pix.comp -o shaders/krea2_pix.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_norm.comp -o shaders/flux3_norm.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_gate.comp -o shaders/flux3_gate.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_gstats.comp -o shaders/flux3_gstats.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_gnorm.comp -o shaders/flux3_gnorm.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_vae_unpatch.comp -o shaders/flux3_vae_unpatch.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_vae_patch.comp -o shaders/flux3_vae_patch.spv
 
 //go:embed shaders/krea2_mm8.spv
 var krea2MM8SPIRV []byte
@@ -65,6 +70,9 @@ var krea2Attn128SPIRV []byte
 //go:embed shaders/krea2_attn384.spv
 var krea2Attn384SPIRV []byte
 
+//go:embed shaders/krea2_attn512.spv
+var krea2Attn512SPIRV []byte
+
 //go:embed shaders/krea2_conv.spv
 var krea2ConvSPIRV []byte
 
@@ -76,6 +84,18 @@ var flux3NormSPIRV []byte
 
 //go:embed shaders/flux3_gate.spv
 var flux3GateSPIRV []byte
+
+//go:embed shaders/flux3_gstats.spv
+var flux3GStatsSPIRV []byte
+
+//go:embed shaders/flux3_gnorm.spv
+var flux3GNormSPIRV []byte
+
+//go:embed shaders/flux3_vae_unpatch.spv
+var flux3VAEUnpatchSPIRV []byte
+
+//go:embed shaders/flux3_vae_patch.spv
+var flux3VAEPatchSPIRV []byte
 
 type k2Kernel int
 
@@ -90,10 +110,15 @@ const (
 	k2Act
 	k2Attn128
 	k2Attn384
+	k2Attn512
 	k2Conv
 	k2Pix
 	k2Flux3Norm
 	k2Flux3Gate
+	k2Flux3GStats
+	k2Flux3GNorm
+	k2Flux3VAEUnpatch
+	k2Flux3VAEPatch
 	k2Kernels
 )
 
@@ -209,6 +234,7 @@ type K2Conv struct {
 	Bias            uint32
 	Residual        uint32 // added to the answer; K2None for none
 	Up              uint32 // 1: the input is half the size, read upsampled
+	Down            uint32 // 1: the input is twice the size, read downsampled
 }
 
 // The pixel steps of shaders/krea2_pix.comp.
@@ -246,6 +272,27 @@ type K2Flux3Gate struct {
 	N, Rows        uint32
 }
 
+// K2Flux3GStats is pass 1 of GroupNorm with 32 groups.
+type K2Flux3GStats struct {
+	Src, Plane, CPG, GroupElems uint32
+	SliceLen, Slices, Stats     uint32
+}
+
+// K2Flux3GNorm is pass 2 of GroupNorm with 32 groups.
+type K2Flux3GNorm struct {
+	Src, Dst                    uint32
+	Plane, CPG, GroupElems      uint32
+	Slices, Stats, Weight, Bias uint32
+	SiLU                        uint32
+}
+
+// K2Flux3VAEPatch is VAE patch and unpatch.
+type K2Flux3VAEPatch struct {
+	Src, Dst  uint32
+	H, W      uint32
+	Mean, Var uint32
+}
+
 // K2 is a device set up for Krea 2's kernels, with one arena and one
 // parameter buffer.
 type K2 struct {
@@ -269,20 +316,25 @@ var k2Specs = [k2Kernels]struct {
 	spirv *[]byte
 	push  uintptr
 }{
-	k2MM8:       {&krea2MM8SPIRV, unsafe.Sizeof(K2MM{})},
-	k2MM16:      {&krea2MM16SPIRV, unsafe.Sizeof(K2MM{})},
-	k2MM8H:      {&krea2MM8HSPIRV, unsafe.Sizeof(K2MM{})},
-	k2MM16H:     {&krea2MM16HSPIRV, unsafe.Sizeof(K2MM{})},
-	k2MM8HB:     {&krea2MM8HBSPIRV, unsafe.Sizeof(K2MM{})},
-	k2Norm:      {&krea2NormSPIRV, unsafe.Sizeof(K2Norm{})},
-	k2Rope:      {&krea2RopeSPIRV, unsafe.Sizeof(K2Rope{})},
-	k2Act:       {&krea2ActSPIRV, unsafe.Sizeof(K2Act{})},
-	k2Attn128:   {&krea2Attn128SPIRV, 18 * 4},
-	k2Attn384:   {&krea2Attn384SPIRV, 18 * 4},
-	k2Conv:      {&krea2ConvSPIRV, unsafe.Sizeof(K2Conv{})},
-	k2Pix:       {&krea2PixSPIRV, unsafe.Sizeof(K2Pix{})},
-	k2Flux3Norm: {&flux3NormSPIRV, unsafe.Sizeof(K2Flux3Norm{})},
-	k2Flux3Gate: {&flux3GateSPIRV, unsafe.Sizeof(K2Flux3Gate{})},
+	k2MM8:             {&krea2MM8SPIRV, unsafe.Sizeof(K2MM{})},
+	k2MM16:            {&krea2MM16SPIRV, unsafe.Sizeof(K2MM{})},
+	k2MM8H:            {&krea2MM8HSPIRV, unsafe.Sizeof(K2MM{})},
+	k2MM16H:           {&krea2MM16HSPIRV, unsafe.Sizeof(K2MM{})},
+	k2MM8HB:           {&krea2MM8HBSPIRV, unsafe.Sizeof(K2MM{})},
+	k2Norm:            {&krea2NormSPIRV, unsafe.Sizeof(K2Norm{})},
+	k2Rope:            {&krea2RopeSPIRV, unsafe.Sizeof(K2Rope{})},
+	k2Act:             {&krea2ActSPIRV, unsafe.Sizeof(K2Act{})},
+	k2Attn128:         {&krea2Attn128SPIRV, 18 * 4},
+	k2Attn384:         {&krea2Attn384SPIRV, 18 * 4},
+	k2Attn512:         {&krea2Attn512SPIRV, 18 * 4},
+	k2Conv:            {&krea2ConvSPIRV, unsafe.Sizeof(K2Conv{})},
+	k2Pix:             {&krea2PixSPIRV, unsafe.Sizeof(K2Pix{})},
+	k2Flux3Norm:       {&flux3NormSPIRV, unsafe.Sizeof(K2Flux3Norm{})},
+	k2Flux3Gate:       {&flux3GateSPIRV, unsafe.Sizeof(K2Flux3Gate{})},
+	k2Flux3GStats:     {&flux3GStatsSPIRV, unsafe.Sizeof(K2Flux3GStats{})},
+	k2Flux3GNorm:      {&flux3GNormSPIRV, unsafe.Sizeof(K2Flux3GNorm{})},
+	k2Flux3VAEUnpatch: {&flux3VAEUnpatchSPIRV, unsafe.Sizeof(K2Flux3VAEPatch{})},
+	k2Flux3VAEPatch:   {&flux3VAEPatchSPIRV, unsafe.Sizeof(K2Flux3VAEPatch{})},
 }
 
 // NewK2 makes the pipelines, an arena of arenaFloats and a parameter buffer
@@ -519,11 +571,13 @@ func (k *K2) Act(r *Recorder, a K2Act) {
 	k.dispatch(r, k2Act, -1, groups256(n), unsafe.Pointer(&a))
 }
 
-// Attn records attention; HeadDim is 128 or 384.
+// Attn records attention; HeadDim is 128, 384 or 512.
 func (k *K2) Attn(r *Recorder, a K2Attn) {
 	kern := k2Attn128
 	if a.HeadDim == 384 {
 		kern = k2Attn384
+	} else if a.HeadDim == 512 {
+		kern = k2Attn512
 	} else if a.HeadDim != 128 {
 		panic(fmt.Sprintf("vk: Krea 2 attention has no kernel for heads of %d", a.HeadDim))
 	}
@@ -559,6 +613,27 @@ func (k *K2) Flux3Norm(r *Recorder, n K2Flux3Norm) {
 
 func (k *K2) Flux3Gate(r *Recorder, g K2Flux3Gate) {
 	k.dispatch(r, k2Flux3Gate, -1, groups256(int(g.N*g.Rows)), unsafe.Pointer(&g))
+}
+
+func (k *K2) Flux3GStats(r *Recorder, s K2Flux3GStats) {
+	r.DispatchColumns(k.set(k2Flux3GStats, -1), s.Slices, 32, unsafe.Pointer(&s))
+	r.Barrier()
+}
+
+func (k *K2) Flux3GNorm(r *Recorder, n K2Flux3GNorm) {
+	groups := (n.GroupElems + 255) / 256
+	r.DispatchColumns(k.set(k2Flux3GNorm, -1), groups, 32, unsafe.Pointer(&n))
+	r.Barrier()
+}
+
+func (k *K2) Flux3VAEUnpatch(r *Recorder, u K2Flux3VAEPatch) {
+	n := 128 * int(u.H*u.W)
+	k.dispatch(r, k2Flux3VAEUnpatch, -1, groups256(n), unsafe.Pointer(&u))
+}
+
+func (k *K2) Flux3VAEPatch(r *Recorder, p K2Flux3VAEPatch) {
+	n := 128 * int(p.H*p.W)
+	k.dispatch(r, k2Flux3VAEPatch, -1, groups256(n), unsafe.Pointer(&p))
 }
 
 // Compile records a program over this machine's buffers.
