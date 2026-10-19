@@ -1,0 +1,503 @@
+"""Records what ComfyUI does with FLUX 3 Image Klein, for flux3/'s tests.
+
+Drives ComfyUI's own nodes on its own three files:
+- diffusion_models/flux3-image-klein-bf16.safetensors
+- text_encoders/qwen3vl_4b_fp8_scaled.safetensors
+- vae/flux2-vae.safetensors
+
+and writes what goes in and out of every stage as raw little-endian float32
+(or int32 for token ids), with meta.json giving each file's shape.
+
+    /mnt/data/dev/ComfyUI/.venv/bin/python ref/flux3/dump.py \
+        /mnt/data/dev/ComfyUI testdata/flux3 [stage ...]
+
+Stages:
+- tokens: three prompts (short, exactly 80 tokens, 130 tokens)
+- sample: 256x256 t2i, seed 7, steps 16, euler/simple, alpha 16.0 (also records dit/)
+- sample_cfg: 256x256 cfg 2 run with empty negative, seed 7
+- vae: decode of sample/latent with up-block waypoints; encode of toast at 256x256
+- i2i: i2i at 256x256 seed 7 with toast reference (ref_latent, ref_states, dit.out0, rgb)
+- mi2i: two references (toast 256x256, great_wave 256x384) (ref_latents, ref_ids, rgb)
+- accept: 1024x1024 t2i, seed 42, steps 16, the PNG
+"""
+
+import json
+import math
+import os
+import sys
+
+import numpy as np
+from PIL import Image
+
+COMFY = sys.argv[1] if len(sys.argv) > 1 else "/mnt/data/dev/ComfyUI-flux3"
+OUT = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else os.path.abspath("testdata/flux3")
+STAGES = sys.argv[3:] or ["tokens", "sample", "sample_cfg", "vae", "i2i", "mi2i", "accept"]
+
+sys.path.insert(0, COMFY)
+os.chdir(COMFY)
+sys.argv = [
+    sys.argv[0],
+    "--use-split-cross-attention",
+    "--fp16-text-enc",
+    "--fp16-vae",
+    "--disable-mmap",
+    "--reserve-vram", "1.5",
+    "--deterministic",
+]
+
+import torch  # noqa: E402
+import comfy.options  # noqa: E402
+comfy.options.enable_args_parsing()
+import node_helpers  # noqa: E402
+import nodes  # noqa: E402
+import comfy.sample  # noqa: E402
+import comfy.samplers  # noqa: E402
+from comfy_extras.nodes_flux import EmptyFlux2LatentImage  # noqa: E402
+from comfy_extras.nodes_model_advanced import ModelSamplingFlux  # noqa: E402
+
+UNET = "flux3-image-klein-bf16.safetensors"
+CLIP = "qwen3vl_4b_fp8_scaled.safetensors"
+VAE = "flux2-vae.safetensors"
+
+# Upstream workflow defaults from ref/flux3/workflows/flux3_klein_bf16_t2i.json
+STEPS = 16
+CFG = 1.0
+SAMPLER = "euler"
+SCHEDULER = "simple"
+ALPHA = 16.0
+SHIFT = math.log(ALPHA)  # 2.77259
+
+PROMPTS = {
+    # p0: short prompt (< 80 unpadded tokens, pads to 80)
+    "p0": "a cat",
+    # p1: exactly 80 tokens unpadded (8 template + 72 text tokens = 80 tokens, 0 pads)
+    "p1": (
+        "a beautiful oil painting of a peaceful mountain landscape with a calm blue lake reflection "
+        "tall green pine trees snow capped peaks soft morning mist golden sunlight breaking through the clouds "
+        "flying birds in the distant sky small wooden cabin on the shore blooming wildflowers rough gray rocks "
+        "detailed nature scene artstation concept art highly detailed sharp focus studio lighting vivid colors "
+        "8k resolution cinematic atmospheric composition"
+    ),
+    # p2: 130 tokens unpadded (8 template + 122 text tokens = 130 tokens, pads to 160)
+    "p2": (
+        "a beautiful oil painting of a peaceful mountain landscape with a calm blue lake reflection "
+        "tall green pine trees snow capped peaks soft morning mist golden sunlight breaking through the clouds "
+        "flying birds in the distant sky small wooden cabin on the shore blooming wildflowers rough gray rocks "
+        "detailed nature scene artstation concept art highly detailed sharp focus studio lighting vivid colors "
+        "8k resolution cinematic atmospheric composition, ultra realistic digital illustration of an ancient "
+        "mossy stone bridge spanning over a crystal clear rushing river with smooth rounded pebbles and autumn leaves, "
+        "dramatic shadows casting across the lush valley during sunset with vibrant orange and purple gradient skies, "
+        "epic fantasy masterpiece artwork"
+    ),
+}
+
+PROMPT_ACCEPT = (
+    "close up profile of a young male athlete with closed eyes pressing his "
+    "sweaty forehead against a soccer ball, right hand gripping the ball, "
+    "stark white background, athletic jacket, white ball with jagged red graphic "
+    "patterns, high contrast studio lighting, highly detailed skin texture, "
+    "sharp focus Absolutely no text, no typography, no letters, no words, "
+    "no numbers, no logos, no watermark, no captions, pure imagery only."
+)
+
+PROMPT_I2I = "spread strawberry jam on the toast and add a few fresh blueberries on the plate"
+PROMPT_MI2I = "the woman from the first image standing on a lookout in front of the autumn forest from the second image"
+
+REF_TOAST = "/home/ricardo/dev/golem-flux3/ref/flux3/workflows/klein_ref_toast.jpg"
+REF_GREAT_WAVE = "/home/ricardo/dev/golem-flux3/ref/flux3/workflows/klein_ref_great_wave.jpg"
+
+meta = {}
+meta_path = os.path.join(OUT, "meta.json")
+if os.path.exists(meta_path):
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+
+def save(rel, t):
+    path = os.path.join(OUT, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if isinstance(t, np.ndarray):
+        a = np.ascontiguousarray(t)
+    else:
+        a = t.detach().float().cpu().contiguous().numpy()
+    a.tofile(path)
+    meta[rel] = list(a.shape)
+
+
+def save_i32(rel, a):
+    path = os.path.join(OUT, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    arr = np.array(a, dtype=np.int32)
+    arr.tofile(path)
+    meta[rel] = list(arr.shape)
+
+
+def write_meta():
+    path = os.path.join(OUT, "meta.json")
+    old = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            old = json.load(f)
+    old.update(meta)
+    with open(path, "w") as f:
+        json.dump(old, f, indent=1, sort_keys=True)
+
+
+def load_models():
+    print(f"Loading UNET: {UNET}")
+    unet = nodes.UNETLoader().load_unet(UNET, "default")[0]
+    print(f"Loading CLIP: {CLIP}")
+    clip = nodes.CLIPLoader().load_clip(CLIP, "flux3", "default")[0]
+    print(f"Loading VAE: {VAE}")
+    vae = nodes.VAELoader().load_vae(VAE)[0]
+    return unet, clip, vae
+
+
+def stage_tokens(clip):
+    print("=== Stage: tokens ===")
+    tm = clip.cond_stage_model.qwen3vl_4b.transformer.model
+    for key in ("p0", "p1", "p2"):
+        text = PROMPTS[key]
+        toks = clip.tokenize(text)["qwen3vl_4b"][0]
+        ids = [int(t[0]) for t in toks]
+        unpadded = [t for t in toks if t[0] != 151643]
+
+        rec = {}
+
+        def pre_hook(m, args, kwargs):
+            x = args[0] if len(args) > 0 else kwargs.get("x")
+            rec["hidden_l4"] = x.clone()
+
+        h = tm.layers[4].register_forward_pre_hook(pre_hook, with_kwargs=True)
+        cond = clip.encode_from_tokens_scheduled(clip.tokenize(text))
+        h.remove()
+
+        cond_tensor = cond[0][0][0]  # shape [T, 20480]
+        hidden_l4 = rec["hidden_l4"][0]  # shape [T, 2560]
+
+        save_i32(f"tokens/{key}.ids", ids)
+        save(f"encoder/{key}.hidden_l4", hidden_l4)
+        save(f"encoder/{key}.cond", cond_tensor)
+
+        os.makedirs(os.path.join(OUT, "tokens"), exist_ok=True)
+        with open(os.path.join(OUT, "tokens", f"{key}.json"), "w") as f:
+            json.dump({
+                "name": key,
+                "text": text,
+                "unpadded_len": len(unpadded),
+                "total_len": len(ids),
+                "ids": ids,
+            }, f, indent=2)
+
+        print(f"tokens {key}: unpadded={len(unpadded)} total={len(ids)} cond={tuple(cond_tensor.shape)}")
+
+
+def run_sampling(unet, clip, vae, prompt, width, height, steps, cfg, seed, tag,
+                 record_dit=False, extra_conds_fn=None, negative=""):
+    print(f"=== Sampling: {tag} ({width}x{height}, seed={seed}, cfg={cfg}, steps={steps}) ===")
+    rec = {"steps": []}
+    drec = {}
+    vrecs = {}
+
+    pos = nodes.CLIPTextEncode().encode(clip, prompt)[0]
+    neg = nodes.CLIPTextEncode().encode(clip, negative)[0]
+    if extra_conds_fn is not None:
+        pos, neg = extra_conds_fn(pos, neg)
+
+    patched_unet = ModelSamplingFlux().patch(unet, SHIFT, SHIFT, width, height)[0]
+    latent = EmptyFlux2LatentImage.execute(width, height, 1)[0]
+
+    real_prepare = comfy.sample.prepare_noise
+
+    def prepare(latent_image, s, noise_inds=None):
+        n = real_prepare(latent_image, s, noise_inds)
+        rec["noise0"] = n.clone()
+        return n
+
+    comfy.sample.prepare_noise = prepare
+
+    def cb(step, x0, x, total):
+        rec["steps"].append((step, x.clone(), x0.clone()))
+
+    hooks = []
+    dm = unet.model.diffusion_model
+
+    if record_dit:
+        def pre_dm(m, args, kwargs):
+            if "in.x" not in drec:
+                x_in = args[0] if len(args) > 0 else kwargs.get("x")
+                t_in = args[1] if len(args) > 1 else kwargs.get("timestep")
+                ctx_in = args[2] if len(args) > 2 else kwargs.get("context")
+                opts = args[4] if len(args) > 4 else kwargs.get("transformer_options", {})
+                drec["in.x"] = x_in.clone()
+                drec["in.t"] = t_in.clone()
+                drec["in.ctx"] = ctx_in.clone()
+                sample_sigmas = opts.get("sample_sigmas", None)
+                if sample_sigmas is not None:
+                    i_sig = int((sample_sigmas - t_in[0]).abs().argmin())
+                    target_sig = sample_sigmas[min(i_sig + 1, sample_sigmas.shape[0] - 1)]
+                    drec["in.next"] = target_sig.reshape(1).clone()
+
+        hooks.append(dm.register_forward_pre_hook(pre_dm, with_kwargs=True))
+
+        def grab(name):
+            def h(m, i, o):
+                if name not in drec:
+                    drec[name] = (o[0] if isinstance(o, tuple) else o).clone()
+            return h
+
+        hooks.append(dm.emb_in["image"].register_forward_hook(grab("wp.emb_img")))
+        hooks.append(dm.txt_mode_blocks[-1].register_forward_hook(grab("wp.txt_early")))
+        hooks.append(dm.content_mode_blocks["image"][-1].register_forward_hook(grab("wp.img_early")))
+        hooks.append(dm.single_blocks[0].register_forward_hook(grab("wp.single_0")))
+        hooks.append(dm.single_blocks[13].register_forward_hook(grab("wp.single_13")))
+        hooks.append(dm.single_blocks[27].register_forward_hook(grab("wp.single_27")))
+        hooks.append(dm.register_forward_hook(grab("out")))
+
+    try:
+        import latent_preview
+        real_cb = latent_preview.prepare_callback
+
+        def prep_cb(model, steps_cnt, x0_output_dict=None):
+            return lambda step, x0, x, total: cb(step, x0, x, total)
+
+        latent_preview.prepare_callback = prep_cb
+        samples = nodes.common_ksampler(
+            patched_unet, seed, steps, cfg, SAMPLER, SCHEDULER, pos, neg, latent, denoise=1.0
+        )[0]
+        latent_preview.prepare_callback = real_cb
+        decoded = nodes.VAEDecode().decode(vae, samples)[0]
+    finally:
+        comfy.sample.prepare_noise = real_prepare
+        for h in hooks:
+            h.remove()
+
+    ms = patched_unet.get_model_object("model_sampling")
+    sigmas = comfy.samplers.calculate_sigmas(ms, SCHEDULER, steps)
+
+    save(f"{tag}/sigmas", sigmas)
+    if "noise0" in rec:
+        save(f"{tag}/noise0", rec["noise0"])
+        save(f"{tag}/init", rec["noise0"])
+
+    for step_idx, x_val, x0_val in rec["steps"]:
+        save(f"{tag}/x_{step_idx}", x_val)
+        save(f"{tag}/x{step_idx}", x_val)
+        save(f"{tag}/denoised_{step_idx}", x0_val)
+        save(f"{tag}/denoised{step_idx}", x0_val)
+
+    save(f"{tag}/latent", samples["samples"])
+    save(f"{tag}/rgb", decoded[0])
+    save(f"{tag}/image", decoded[0])
+
+    arr = 255.0 * decoded[0].cpu().numpy()
+    img_pil = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+    os.makedirs(os.path.join(OUT, tag), exist_ok=True)
+    img_pil.save(os.path.join(OUT, tag, f"{tag}.png"))
+    img_pil.save(os.path.join(OUT, tag, "image.png"))
+
+    if record_dit and "in.x" in drec:
+        for k, v in drec.items():
+            save(f"dit/{k}", v)
+        # Compute pe for dit/
+        dev = dm.emb_in["image"].weight.device
+        h_lat, w_lat = drec["in.x"].shape[-2:]
+        txt_len = drec["in.ctx"].shape[1]
+        ids = torch.cat([dm.image_ids(h_lat, w_lat, 0, dev), dm.text_ids(txt_len, dev)])
+        pe = dm.rope(ids)
+        save("dit/pe", pe)
+
+    with open(os.path.join(OUT, tag, "request.json"), "w") as f:
+        json.dump({
+            "prompt": prompt,
+            "negative": negative,
+            "width": width,
+            "height": height,
+            "steps": steps,
+            "cfg": cfg,
+            "seed": seed,
+            "sampler": SAMPLER,
+            "scheduler": SCHEDULER,
+            "alpha": ALPHA,
+            "shift": SHIFT,
+        }, f, indent=2)
+
+    print(f"{tag} done: shape={tuple(samples['samples'].shape)}, steps={len(rec['steps'])}")
+    return samples, decoded, pos, neg
+
+
+def stage_sample(unet, clip, vae):
+    run_sampling(
+        unet, clip, vae, PROMPTS["p0"], 256, 256, STEPS, CFG, 7, "sample", record_dit=True
+    )
+
+
+def stage_sample_cfg(unet, clip, vae):
+    # cfg 2 run with empty negative at 256x256, seed 7, prompt p2 (> 80 tokens)
+    samples, decoded, pos, neg = run_sampling(
+        unet, clip, vae, PROMPTS["p2"], 256, 256, STEPS, 2.0, 7, "sample_cfg",
+        record_dit=False, negative=""
+    )
+    save("sample_cfg/cond", pos[0][0][0])
+    save("sample_cfg/uncond", neg[0][0][0])
+
+
+def stage_vae(vae):
+    print("=== Stage: vae ===")
+    sample_latent_path = os.path.join(OUT, "sample", "latent")
+    if not os.path.exists(sample_latent_path):
+        raise RuntimeError("sample/latent must exist before running stage_vae")
+
+    shape = meta.get("sample/latent", [1, 128, 16, 16])
+    z = torch.from_numpy(np.fromfile(sample_latent_path, dtype=np.float32).reshape(shape))
+    save("vae/z", z)
+
+    # Decode of sample/latent with waypoints per up block
+    vrecs = {}
+    fm = vae.first_stage_model
+    dec = fm.decoder
+    hooks = []
+    for i in (3, 2, 1):
+        def make_h(idx):
+            def h(m, a, o):
+                val = (o[0] if isinstance(o, list) else o).clone()
+                vrecs[f"up_{idx}"] = val
+                vrecs[f"up{idx}"] = val
+            return h
+        hooks.append(dec.up[i].upsample.register_forward_hook(make_h(i)))
+
+    def h0(m, a, o):
+        val = (o[0] if isinstance(o, list) else o).clone()
+        vrecs["up_0"] = val
+        vrecs["up0"] = val
+    hooks.append(dec.up[0].block[-1].register_forward_hook(h0))
+
+    try:
+        decoded = nodes.VAEDecode().decode(vae, {"samples": z})[0]
+    finally:
+        for hk in hooks:
+            hk.remove()
+
+    for k, v in vrecs.items():
+        save(f"vae/{k}", v)
+
+    # Encode of klein_ref_toast.jpg at 256x256
+    # Follow BFL reference image preprocessing: resize to 256x256 with Lanczos filter
+    img_pil = Image.open(REF_TOAST).convert("RGB").resize((256, 256), Image.Resampling.LANCZOS)
+    arr = np.array(img_pil).astype(np.float32) / 255.0
+    t_img = torch.from_numpy(arr).unsqueeze(0)  # [1, 256, 256, 3]
+
+    enc_latent = vae.encode(t_img)  # [1, 128, 16, 16]
+
+    save("vae/enc.in", arr)  # [256, 256, 3]
+    save("vae/enc.latent", enc_latent)
+    print(f"vae encode toast 256x256: in={arr.shape} latent={tuple(enc_latent.shape)}")
+
+
+def stage_i2i(unet, clip, vae):
+    print("=== Stage: i2i ===")
+    # Resize reference toast to 256x256 using Lanczos
+    img_pil = Image.open(REF_TOAST).convert("RGB").resize((256, 256), Image.Resampling.LANCZOS)
+    arr = np.array(img_pil).astype(np.float32) / 255.0
+    t_img = torch.from_numpy(arr).unsqueeze(0)
+
+    ref_latent = vae.encode(t_img)  # [1, 128, 16, 16]
+    save("i2i/ref_latent", ref_latent)
+
+    def attach_ref(pos, neg):
+        pos = node_helpers.conditioning_set_values(pos, {"reference_latents": [ref_latent]}, append=True)
+        neg = node_helpers.conditioning_set_values(neg, {"reference_latents": [ref_latent]}, append=True)
+        return pos, neg
+
+    dm = unet.model.diffusion_model
+    i2i_rec = {}
+    hooks = []
+
+    # Hook early blocks for reference states
+    hooks.append(dm.content_mode_blocks["image_cond"][-1].register_forward_hook(
+        lambda m, i, o: i2i_rec.setdefault("ref_states", (o[0] if isinstance(o, tuple) else o).clone())
+    ))
+    # Hook first step DiT output
+    hooks.append(dm.register_forward_hook(
+        lambda m, i, o: i2i_rec.setdefault("dit.out0", (o[0] if isinstance(o, tuple) else o).clone())
+    ))
+
+    try:
+        run_sampling(
+            unet, clip, vae, PROMPT_I2I, 256, 256, STEPS, CFG, 7, "i2i",
+            record_dit=False, extra_conds_fn=attach_ref
+        )
+    finally:
+        for h in hooks:
+            h.remove()
+
+    if "ref_states" in i2i_rec:
+        save("i2i/ref_states", i2i_rec["ref_states"])
+    if "dit.out0" in i2i_rec:
+        save("i2i/dit.out0", i2i_rec["dit.out0"])
+
+
+def stage_mi2i(unet, clip, vae):
+    print("=== Stage: mi2i ===")
+    # Two references: toast 256x256, great_wave 256x384
+    img_toast = Image.open(REF_TOAST).convert("RGB").resize((256, 256), Image.Resampling.LANCZOS)
+    arr_toast = np.array(img_toast).astype(np.float32) / 255.0
+    t_toast = torch.from_numpy(arr_toast).unsqueeze(0)
+    lat_toast = vae.encode(t_toast)  # [1, 128, 16, 16]
+
+    img_wave = Image.open(REF_GREAT_WAVE).convert("RGB").resize((384, 256), Image.Resampling.LANCZOS)
+    arr_wave = np.array(img_wave).astype(np.float32) / 255.0
+    t_wave = torch.from_numpy(arr_wave).unsqueeze(0)
+    lat_wave = vae.encode(t_wave)  # [1, 128, 16, 24]
+
+    ref_latents_cat = torch.cat([lat_toast.flatten(2).transpose(1, 2), lat_wave.flatten(2).transpose(1, 2)], dim=1)
+    save("mi2i/ref_latents", ref_latents_cat)
+    save("mi2i/ref_latent0", lat_toast)
+    save("mi2i/ref_latent1", lat_wave)
+
+    dm = unet.model.diffusion_model
+    ref_shapes = [(16, 16), (16, 24)]
+    ref_ids = dm.ref_ids(ref_shapes, "cpu")  # [640, 4]
+    save("mi2i/ref_ids", ref_ids)
+
+    def attach_multi_ref(pos, neg):
+        pos = node_helpers.conditioning_set_values(pos, {"reference_latents": [lat_toast, lat_wave]}, append=True)
+        neg = node_helpers.conditioning_set_values(neg, {"reference_latents": [lat_toast, lat_wave]}, append=True)
+        return pos, neg
+
+    run_sampling(
+        unet, clip, vae, PROMPT_MI2I, 256, 256, STEPS, CFG, 7, "mi2i",
+        record_dit=False, extra_conds_fn=attach_multi_ref
+    )
+
+
+def stage_accept(unet, clip, vae):
+    print("=== Stage: accept ===")
+    run_sampling(
+        unet, clip, vae, PROMPT_ACCEPT, 1024, 1024, STEPS, CFG, 42, "accept", record_dit=False
+    )
+
+
+def main():
+    torch.set_grad_enabled(False)
+    unet, clip, vae = load_models()
+    if "tokens" in STAGES:
+        stage_tokens(clip)
+    if "sample" in STAGES:
+        stage_sample(unet, clip, vae)
+    if "sample_cfg" in STAGES:
+        stage_sample_cfg(unet, clip, vae)
+    if "vae" in STAGES:
+        stage_vae(vae)
+    if "i2i" in STAGES:
+        stage_i2i(unet, clip, vae)
+    if "mi2i" in STAGES:
+        stage_mi2i(unet, clip, vae)
+    if "accept" in STAGES:
+        stage_accept(unet, clip, vae)
+    write_meta()
+    print("dump.py complete. meta.json written.")
+
+
+if __name__ == "__main__":
+    main()

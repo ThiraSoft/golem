@@ -50,3 +50,51 @@ The script runs ComfyUI with:
 Card exclusivity: nothing else may hold the GPU while the script runs. Check
 `rocm-smi --showmemuse` and `pgrep -af 'main.py|golem-server|krea2'` first.
 Outputs are saved to `testdata/flux3/smoke.png`.
+
+## Fixture recording (`dump.py` and `dump_f32.py`)
+
+To record reference activations and test fixtures:
+
+```sh
+ulimit -c 0; export HSA_ENABLE_COREDUMP=0
+/mnt/data/dev/ComfyUI/.venv/bin/python ref/flux3/dump.py \
+    /mnt/data/dev/ComfyUI-flux3 testdata/flux3 [stage ...]
+```
+
+Stages:
+- `tokens/`: three prompts: `p0` (short prompt, 10 unpadded tokens, pads to 80),
+  `p1` (exactly 80 unpadded tokens, 0 pads), `p2` (130 unpadded tokens, pads to 160).
+  Records `tokens/p{0,1,2}.ids` (int32), `encoder/p{i}.hidden_l4` (the state entering
+  layer 4 of Qwen3-VL, shape T x 2560), and `encoder/p{i}.cond` (shape T x 20480).
+- `sample/`: 256 x 256 t2i, seed 7, steps 16, euler/simple, alpha 16.0: records
+  `sigmas`, `noise0`, `x_{step}`, `denoised_{step}`, `latent`, and `rgb`.
+- `sample_cfg/`: 256 x 256 run with CFG 2.0 and empty negative: records conditionings
+  `cond` (length 160) and `uncond` (length 80), showing that uncond retains its own length.
+- `dit/`: first DiT step of `sample/`: records `in.x`, `in.t`, `in.ctx`, `in.next`
+  (flow map target sigma), `pe` (4-axis RoPE tensor), `wp.emb_img`, `wp.txt_early`,
+  `wp.img_early`, `wp.single_{0,13,27}`, and `out`.
+- `vae/`: decode of `sample/latent` with waypoints per up block (`up_0`..`up_3`);
+  encode of `ref/flux3/workflows/klein_ref_toast.jpg` at 256 x 256 (`enc.in`, `enc.latent`).
+- `i2i/`: i2i workflow at 256 x 256, seed 7, with `klein_ref_toast.jpg`: records
+  `ref_latent`, `ref_states` (early blocks output), `dit.out0`, and `rgb`.
+- `mi2i/`: multi-reference with `klein_ref_toast.jpg` (256 x 256) and `klein_ref_great_wave.jpg`
+  (384 x 256): records `ref_latents`, `ref_ids` (ids at l = -1, -2), and `rgb`.
+- `accept/`: t2i at 1024 x 1024, seed 42, 16 steps: `latent`, `rgb`, and PNG.
+
+### Reference image preprocessing
+
+Following the BFL i2i and mi2i workflows (`ReferenceMultiLatent` / `ImageScale` nodes),
+reference images are resized with `lanczos` interpolation (`disabled` crop) before VAE encoding:
+- `toast`: resized to 256 x 256 (latent shape `[1, 128, 16, 16]`)
+- `great_wave`: resized to 384 x 256 (latent shape `[1, 128, 16, 24]`)
+
+### Float32 reference DiT (`dump_f32.py`)
+
+To record the same DiT call in float32 arithmetic on CPU and measure the gap to bf16:
+
+```sh
+/mnt/data/dev/ComfyUI/.venv/bin/python ref/flux3/dump_f32.py \
+    /mnt/data/dev/ComfyUI testdata/flux3 [dit]
+```
+
+Writes waypoints under `dit32/` and logs relative RMS difference against `dit/`.
