@@ -505,14 +505,18 @@ def stage_i2i(unet, clip, vae):
     i2i_rec = {}
     hooks = []
 
-    # Hook early blocks for reference states
-    hooks.append(dm.content_mode_blocks["image_cond"][-1].register_forward_hook(
-        lambda m, i, o: i2i_rec.setdefault("ref_states", (o[0] if isinstance(o, tuple) else o).clone())
-    ))
-    # Hook first step DiT output
-    hooks.append(dm.register_forward_hook(
-        lambda m, i, o: i2i_rec.setdefault("dit.out0", (o[0] if isinstance(o, tuple) else o).clone())
-    ))
+    # A forward hook that returns a value replaces the module's output: these
+    # return None, so ComfyUI's trajectory is left alone.
+    def hook_ref(m, i, o):
+        if "ref_states" not in i2i_rec:
+            i2i_rec["ref_states"] = (o[0] if isinstance(o, tuple) else o).clone()
+
+    def hook_dit(m, i, o):
+        if "dit.out0" not in i2i_rec:
+            i2i_rec["dit.out0"] = (o[0] if isinstance(o, tuple) else o).clone()
+
+    hooks.append(dm.content_mode_blocks["image_cond"][-1].register_forward_hook(hook_ref))
+    hooks.append(dm.register_forward_hook(hook_dit))
 
     try:
         run_sampling(
