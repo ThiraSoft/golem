@@ -154,10 +154,12 @@ type span struct {
 }
 
 type stepKey struct {
-	slot      int
-	h, w      int
-	refTokens int
-	txtTokens int
+	slot        int
+	h, w        int
+	refTokens   int
+	txtTokens   int
+	inStepEarly bool
+	zeroTarget  bool
 }
 
 type earlyTKey struct {
@@ -168,7 +170,6 @@ type earlyTKey struct {
 type earlyRKey struct {
 	slot   int
 	tokens int
-	shapes string
 }
 
 type ropeKey struct {
@@ -197,6 +198,9 @@ type DiT struct {
 	depth             int
 	depthSingleBlocks int
 	arenaBytes        int
+
+	inStepEarly bool
+	zeroTarget  bool
 
 	recordDispatch  func()
 	earlyDispatches int
@@ -780,16 +784,20 @@ func (m *DiT) SetText(slot int, cond []float32, tokens int) error {
 		return fmt.Errorf("flux3: slot %d out of range", slot)
 	}
 	if tokens <= 0 || tokens > MaxTextTokens {
+		m.ctxTokens[slot] = 0
 		return fmt.Errorf("flux3: %d text tokens out of range [1, %d]", tokens, MaxTextTokens)
 	}
 	if len(cond) != tokens*ditTxtIn {
+		m.ctxTokens[slot] = 0
 		return fmt.Errorf("flux3: cond len %d != %d", len(cond), tokens*ditTxtIn)
 	}
 	if err := m.k.Write(int(m.ctx[slot]), cond); err != nil {
+		m.ctxTokens[slot] = 0
 		return err
 	}
-	if !m.flowMap {
+	if !m.flowMap && !m.inStepEarly {
 		if err := m.runEarlyText(slot, tokens); err != nil {
+			m.ctxTokens[slot] = 0
 			return err
 		}
 	}
@@ -802,6 +810,9 @@ func (m *DiT) SetRefs(slot int, latents [][]float32, shapes [][2]int) error {
 		return fmt.Errorf("flux3: slot %d out of range", slot)
 	}
 	if len(latents) != len(shapes) {
+		m.refTokens[slot] = 0
+		m.refShapes[slot] = nil
+		m.refIDs[slot] = nil
 		return fmt.Errorf("flux3: len(latents)=%d != len(shapes)=%d", len(latents), len(shapes))
 	}
 	if len(latents) == 0 {
@@ -817,6 +828,9 @@ func (m *DiT) SetRefs(slot int, latents [][]float32, shapes [][2]int) error {
 		sh := shapes[i]
 		expectedLen := sh[0] * sh[1] * ditInChannels
 		if len(lat) != expectedLen {
+			m.refTokens[slot] = 0
+			m.refShapes[slot] = nil
+			m.refIDs[slot] = nil
 			return fmt.Errorf("flux3: ref %d shape %v len %d != %d", i, sh, len(lat), expectedLen)
 		}
 		p := packLatent(lat, sh[0], sh[1])
@@ -824,20 +838,31 @@ func (m *DiT) SetRefs(slot int, latents [][]float32, shapes [][2]int) error {
 		totalRefTokens += sh[0] * sh[1]
 	}
 	if totalRefTokens > MaxRefTokens {
+		m.refTokens[slot] = 0
+		m.refShapes[slot] = nil
+		m.refIDs[slot] = nil
 		return fmt.Errorf("flux3: %d ref tokens exceeds max %d", totalRefTokens, MaxRefTokens)
 	}
-	m.refTokens[slot] = totalRefTokens
-	m.refShapes[slot] = shapes
-	m.refIDs[slot] = RefIDs(shapes)
+
+	refIDs := RefIDs(shapes)
 
 	if err := m.k.Write(int(m.refLatent[slot]), packed); err != nil {
+		m.refTokens[slot] = 0
+		m.refShapes[slot] = nil
+		m.refIDs[slot] = nil
 		return err
 	}
-	if !m.flowMap {
-		if err := m.runEarlyRefs(slot); err != nil {
+	if !m.flowMap && !m.inStepEarly {
+		if err := m.runEarlyRefs(slot, totalRefTokens, refIDs); err != nil {
+			m.refTokens[slot] = 0
+			m.refShapes[slot] = nil
+			m.refIDs[slot] = nil
 			return err
 		}
 	}
+	m.refTokens[slot] = totalRefTokens
+	m.refShapes[slot] = shapes
+	m.refIDs[slot] = refIDs
 	return nil
 }
 
@@ -1037,10 +1062,8 @@ func (m *DiT) runEarlyText(slot, tokens int) error {
 	return nil
 }
 
-func (m *DiT) runEarlyRefs(slot int) error {
-	shapesStr := fmt.Sprint(m.refShapes[slot])
-	tokens := m.refTokens[slot]
-	key := earlyRKey{slot: slot, tokens: tokens, shapes: shapesStr}
+func (m *DiT) runEarlyRefs(slot, tokens int, refIDs []float32) error {
+	key := earlyRKey{slot: slot, tokens: tokens}
 	p, ok := m.earlyRProgs[key]
 	if !ok {
 		var count int
@@ -1096,7 +1119,7 @@ func (m *DiT) runEarlyRefs(slot int) error {
 	if err := m.k.Write(int(m.tembZero), timestepEmbedding(0.0)); err != nil {
 		return err
 	}
-	refRope := RopeTable(m.refIDs[slot])
+	refRope := RopeTable(refIDs)
 	if err := m.k.Write(int(m.table), refRope); err != nil {
 		return err
 	}
@@ -1121,7 +1144,15 @@ func singleBlockChunks(depth int) [][2]int {
 }
 
 func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]countedProgram, error) {
-	key := stepKey{slot: slot, h: h, w: w, refTokens: refToks, txtTokens: txtToks}
+	key := stepKey{
+		slot:        slot,
+		h:           h,
+		w:           w,
+		refTokens:   refToks,
+		txtTokens:   txtToks,
+		inStepEarly: m.inStepEarly,
+		zeroTarget:  m.zeroTarget,
+	}
 	if progs, ok := m.stepProgs[key]; ok {
 		return progs, nil
 	}
@@ -1161,7 +1192,7 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]countedProgram, 
 		})
 
 		// If flow_map: ref_time_in(tembNext) -> tTarget, add to tVec
-		if m.flowMap {
+		if m.flowMap && !m.zeroTarget {
 			m.mm(r, m.refTimeInIn.w, vk.K2MM{
 				Outputs: uint32(ditWidth), Inputs: uint32(ditTDim), Cols: 1,
 				X: m.tembNext, XStride: uint32(ditTDim),
@@ -1192,7 +1223,7 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]countedProgram, 
 			Y: m.tVecZero, YStride: uint32(ditWidth),
 			Bias: vk.K2None, Scale: m.timeInOut.scale, Mode: vk.K2Store,
 		})
-		if m.flowMap {
+		if m.flowMap && !m.zeroTarget {
 			m.act(r, vk.K2Act{X: m.tVecZero, XStride: uint32(ditWidth), Y: m.tTarget, YStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2Sum})
 		}
 
@@ -1247,8 +1278,8 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]countedProgram, 
 			})
 		}
 
-		// 3. Early text & ref streams (when flow_map)
-		if m.flowMap {
+		// 3. Early text & ref streams (when flow_map or inStepEarly)
+		if m.flowMap || m.inStepEarly {
 			m.recordDispatch = func() { p0EarlyCount++ }
 			// Early text: txt_in + 5 blocks
 			m.mm(r, m.txtIn.w, vk.K2MM{
@@ -1401,7 +1432,7 @@ func (m *DiT) stepWithWaypoints(slot int, latent []float32, h, w int, sigma, nex
 	if err := m.k.Write(int(m.temb), timestepEmbedding(sigma)); err != nil {
 		return nil, nil, err
 	}
-	if m.flowMap {
+	if m.flowMap && !m.zeroTarget {
 		if err := m.k.Write(int(m.tembNext), timestepEmbedding(next)); err != nil {
 			return nil, nil, err
 		}

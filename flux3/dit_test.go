@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/krea2"
-	"github.com/ThiraSoft/golem/vk"
 )
 
 func readPeakRSS() int64 {
@@ -132,13 +131,10 @@ func TestDiTMatchesComfyUI(t *testing.T) {
 
 	// 1. FP16 product path: bf16 -> fp16 weights, K2 MM fp16 path
 	t.Log("=== Testing FP16 DiT ===")
-	rssBefore16 := readPeakRSS()
 	m16, err := OpenDiT(d, path, PrecisionFP16)
 	if err != nil {
 		t.Fatalf("OpenDiT FP16: %v", err)
 	}
-	rssAfter16 := readPeakRSS()
-	t.Logf("FP16 OpenDiT VmHWM: %d MB (delta %d MB)", rssAfter16/(1024*1024), (rssAfter16-rssBefore16)/(1024*1024))
 	t.Logf("FP16 DiT weights on GPU: %d MB", m16.WeightBytes()/(1024*1024))
 
 	if err := m16.SetText(0, inCtx, tokens); err != nil {
@@ -182,14 +178,11 @@ func TestDiTMatchesComfyUI(t *testing.T) {
 
 	// 2. FP8 product path: bf16 -> fp8 e4m3 weights, K2 MM fp8 path
 	t.Log("=== Testing FP8 DiT ===")
-	rssBefore8 := readPeakRSS()
 	m8, err := OpenDiT(d, path, PrecisionFP8)
 	if err != nil {
 		t.Fatalf("OpenDiT FP8: %v", err)
 	}
 	defer m8.Close()
-	rssAfter8 := readPeakRSS()
-	t.Logf("FP8 OpenDiT VmHWM: %d MB (delta %d MB)", rssAfter8/(1024*1024), (rssAfter8-rssBefore8)/(1024*1024))
 	t.Logf("FP8 DiT weights on GPU: %d MB", m8.WeightBytes()/(1024*1024))
 
 	if err := m8.SetText(0, inCtx, tokens); err != nil {
@@ -238,11 +231,15 @@ func TestEarlyBlocksCached(t *testing.T) {
 	}
 	defer m.Close()
 
-	// 1. With flowMap = false: early blocks run during SetText/SetRefs and are cached.
+	// 1. Path (a): Cached path (flowMap=false: SetText runs early blocks once, Step reads txtStates)
 	m.flowMap = false
+	m.inStepEarly = false
+	m.zeroTarget = false
 
 	inCtx := f.read(t, "dit/in.ctx")
 	tokens := len(inCtx) / CondWidth
+	inX := f.read(t, "dit/in.x")
+	inT := f.read(t, "dit/in.t")[0]
 
 	dispatchesBefore := m.earlyDispatches
 	if err := m.SetText(0, inCtx, tokens); err != nil {
@@ -254,80 +251,11 @@ func TestEarlyBlocksCached(t *testing.T) {
 	}
 	recordedEarlyTxt := dispatchesAfterSet - dispatchesBefore
 
-	// Read early text states computed during SetText
-	gotStates, err := m.k.Read(int(m.txtStates[0]), tokens*ditWidth)
-	if err != nil {
-		t.Fatalf("Read txtStates: %v", err)
-	}
-
-	// Verify states after SetText equal an in-Step execution of the early text blocks.
-	// The in-Step path computes tembZero -> tVecZero -> modEarlyTxt, then txt_in and early blocks.
-	if err := m.k.Write(int(m.tembZero), timestepEmbedding(0.0)); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.k.Write(int(m.ctx[1]), inCtx); err != nil {
-		t.Fatal(err)
-	}
-	inlineProg, err := m.k.Compile(func(r *vk.Recorder) {
-		T := uint32(tokens)
-		// 1. time_in(tembZero) -> tVecZero
-		m.mm(r, m.timeInIn.w, vk.K2MM{
-			Outputs: uint32(ditWidth), Inputs: uint32(ditTDim), Cols: 1,
-			X: m.tembZero, XStride: uint32(ditTDim),
-			Y: m.tA, YStride: uint32(ditWidth),
-			Bias: vk.K2None, Scale: m.timeInIn.scale, Mode: vk.K2Store,
-		})
-		m.k.Act(r, vk.K2Act{X: m.tA, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
-		m.mm(r, m.timeInOut.w, vk.K2MM{
-			Outputs: uint32(ditWidth), Inputs: uint32(ditWidth), Cols: 1,
-			X: m.tA, XStride: uint32(ditWidth),
-			Y: m.tVecZero, YStride: uint32(ditWidth),
-			Bias: vk.K2None, Scale: m.timeInOut.scale, Mode: vk.K2Store,
-		})
-
-		// 2. Modulations for text from silu(tVecZero)
-		m.k.Act(r, vk.K2Act{X: m.tVecZero, XStride: uint32(ditWidth), N: uint32(ditWidth), Rows: 1, Op: vk.K2SiLU})
-		m.mm(r, m.earlyModTxt.w, vk.K2MM{
-			Outputs: uint32(3 * ditWidth), Inputs: uint32(ditWidth), Cols: 1,
-			X: m.tVecZero, XStride: uint32(ditWidth),
-			Y: m.modEarlyTxt, YStride: uint32(3 * ditWidth),
-			Bias: vk.K2None, Scale: m.earlyModTxt.scale, Mode: vk.K2Store,
-		})
-
-		// 3. txt_in -> txtStates[1]
-		m.mm(r, m.txtIn.w, vk.K2MM{
-			Outputs: uint32(ditWidth), Inputs: uint32(ditTxtIn), Cols: T,
-			X: m.ctx[1], XStride: uint32(ditTxtIn),
-			Y: m.txtStates[1], YStride: uint32(ditWidth),
-			Bias: vk.K2None, Scale: m.txtIn.scale, Mode: vk.K2Store,
-		})
-
-		// 4. txtEarlyBlocks with in-step modEarlyTxt
-		spans := []span{{start: 0, end: int(T), modOffset: m.modEarlyTxt}}
-		for i := 0; i < m.depth; i++ {
-			m.recordBlock(r, &m.txtEarlyBlocks[i], int(T), m.txtStates[1], m.table, spans)
-		}
-	})
-	if err != nil {
-		t.Fatalf("compile inline early text: %v", err)
-	}
-	defer inlineProg.Close()
-	if err := inlineProg.Run(); err != nil {
-		t.Fatalf("run inline early text: %v", err)
-	}
-	inlineStates, err := m.k.Read(int(m.txtStates[1]), tokens*ditWidth)
-	if err != nil {
-		t.Fatalf("Read inline txtStates: %v", err)
-	}
-	compareRMS(t, "states after SetText vs in-Step computed text path", gotStates, inlineStates, 1e-5)
-
-	inX := f.read(t, "dit/in.x")
-	inT := f.read(t, "dit/in.t")[0]
-
 	// Step 1: should run 0 early block dispatches (cached states are reused)
 	dispatchesBeforeStep1 := m.earlyDispatches
-	if _, err := m.Step(0, inX, 16, 16, inT, inT); err != nil {
-		t.Fatalf("Step 1: %v", err)
+	outCached, err := m.Step(0, inX, 16, 16, inT, inT)
+	if err != nil {
+		t.Fatalf("Step 1 (cached): %v", err)
 	}
 	if m.earlyDispatches != dispatchesBeforeStep1 {
 		t.Errorf("Step 1 unexpectedly ran early block dispatches: %d != %d", m.earlyDispatches, dispatchesBeforeStep1)
@@ -336,15 +264,35 @@ func TestEarlyBlocksCached(t *testing.T) {
 	// Step 2: cached step program, 0 early block dispatches
 	dispatchesBeforeStep2 := m.earlyDispatches
 	if _, err := m.Step(0, inX, 16, 16, inT, inT); err != nil {
-		t.Fatalf("Step 2: %v", err)
+		t.Fatalf("Step 2 (cached): %v", err)
 	}
 	if m.earlyDispatches != dispatchesBeforeStep2 {
 		t.Errorf("Step 2 unexpectedly ran early block dispatches: %d != %d", m.earlyDispatches, dispatchesBeforeStep2)
 	}
 
-	// 2. With flowMap = true: each of two Steps runs the early text blocks once (2x the per-run count).
+	// 2. Path (b): in-Step path p0 forced to run with zero vec_target
+	m.Trim()
+	m.flowMap = false
+	m.inStepEarly = true
+	m.zeroTarget = true
+
+	if err := m.SetText(0, inCtx, tokens); err != nil {
+		t.Fatalf("SetText (inStepEarly): %v", err)
+	}
+	outInStep, err := m.Step(0, inX, 16, 16, inT, inT)
+	if err != nil {
+		t.Fatalf("Step (inStepEarly): %v", err)
+	}
+
+	// Both DiT outputs must agree to floating-point rounding
+	compareRMS(t, "cached path vs in-Step path DiT output", outCached, outInStep, 1e-3)
+
+	// 3. With flowMap = true: each of two Steps runs the early text blocks once (2x the per-run count).
 	m.Trim()
 	m.flowMap = true
+	m.inStepEarly = false
+	m.zeroTarget = false
+
 	dispatchesBeforeFlowSet := m.earlyDispatches
 	if err := m.SetText(0, inCtx, tokens); err != nil {
 		t.Fatalf("SetText with flow_map: %v", err)
@@ -360,8 +308,10 @@ func TestEarlyBlocksCached(t *testing.T) {
 		t.Fatalf("Step 1 with flow_map: %v", err)
 	}
 	perRun := m.earlyDispatches - dispatchesBeforeFlowStep1
-	if perRun == 0 {
-		t.Fatalf("Step 1 with flow_map ran 0 early block dispatches, want > 0")
+	key := stepKey{slot: 0, h: 16, w: 16, refTokens: 0, txtTokens: tokens, inStepEarly: false, zeroTarget: false}
+	p0EarlyCount := m.stepProgs[key][0].earlyDispatches
+	if perRun != p0EarlyCount {
+		t.Fatalf("Step 1 with flow_map ran %d early dispatches, want p0 early count %d", perRun, p0EarlyCount)
 	}
 
 	// Step 2 with flow_map runs early text blocks once again
@@ -370,12 +320,12 @@ func TestEarlyBlocksCached(t *testing.T) {
 		t.Fatalf("Step 2 with flow_map: %v", err)
 	}
 	step2Run := m.earlyDispatches - dispatchesBeforeFlowStep2
-	if step2Run != perRun {
-		t.Errorf("Step 2 with flow_map ran %d early block dispatches, want per-run count %d", step2Run, perRun)
+	if step2Run != p0EarlyCount {
+		t.Errorf("Step 2 with flow_map ran %d early block dispatches, want per-run count %d", step2Run, p0EarlyCount)
 	}
 	totalFlowSteps := m.earlyDispatches - dispatchesBeforeFlowStep1
-	if totalFlowSteps != 2*perRun {
-		t.Errorf("Two Steps with flow_map ran %d early block dispatches, want 2x per-run count (%d)", totalFlowSteps, 2*perRun)
+	if totalFlowSteps != 2*p0EarlyCount {
+		t.Errorf("Two Steps with flow_map ran %d early block dispatches, want 2x per-run count (%d)", totalFlowSteps, 2*p0EarlyCount)
 	}
 	t.Logf("Early dispatches run: non-flow_map SetText=%d (Steps=0), flow_map per-Step=%d (2 Steps=%d)", recordedEarlyTxt, perRun, totalFlowSteps)
 }
@@ -528,7 +478,9 @@ func TestOpenDiTPeakRSS(t *testing.T) {
 	d := device(t)
 
 	resetPeakRSS := func() {
-		_ = os.WriteFile("/proc/self/clear_refs", []byte("5\n"), 0644)
+		if err := os.WriteFile("/proc/self/clear_refs", []byte("5\n"), 0644); err != nil {
+			t.Fatalf("clear_refs: %v", err)
+		}
 	}
 
 	measure := func(prec Precision, name string) {
