@@ -13,7 +13,7 @@ own nodes in-process on the three files the t2i/i2i workflows load:
 The text encoder file named by the upstream workflows is `qwen3vl_4b_bf16.safetensors`.
 ComfyUI's `CLIPLoader` with `clip_type="flux3"` accepts the fp8-scaled checkpoint
 `qwen3vl_4b_fp8_scaled.safetensors` without modification, tapping the 8 layers
-[4, 8, 12, 16, 20, 24, 28, 32] for conditioning (hidden size 20480).
+[4, 8, 12, 16, 20, 24, 28, 32] for conditioning (conditioning width (8 taps x 2560)).
 
 The reference workflows and sample input images are copied under `ref/flux3/workflows/`:
 - `flux3_klein_bf16_t2i.json`
@@ -22,13 +22,14 @@ The reference workflows and sample input images are copied under `ref/flux3/work
 
 ## Workflow defaults
 
-Read from `ref/flux3/workflows/flux3_klein_bf16_t2i.json` (node 128 / subgraph):
+Read from `ref/flux3/workflows/flux3_klein_bf16_t2i.json`:
 - Sampler: `euler`
 - Scheduler: `simple`
 - Steps: 16
 - CFG: 1.0
-- Size: 1024 x 1024
+- Size: 2048 x 2048 (the workflow default; node 128 width and height are wired from node 19 `ResolutionSelector` set to `["1:1 (Square)", 4.0, 16]`, computing 4.0 MP -> 2048 x 2048 via `comfy_extras/nodes_resolution.py`; `flux3_klein_bf16_i2i.json` and `_mi2i.json` node 145 also select 4.0 MP). golem defaults to 1024 x 1024 for the 16 GB card budget.
 - Alpha (timestep shift): 16.0 (`shift = ln(16.0) = 2.77259`, patched via `ModelSamplingFlux`, versus base model shift `ln(6.93) = 1.93586`)
+- Prompt upsampler: node 127 runs an LLM upsampler (`qwen3.5_9b_flux3_prompt_upsampler_bf16.safetensors`), which is bypassed in `smoke.py` and is a non-goal for golem.
 
 ## Headless execution
 

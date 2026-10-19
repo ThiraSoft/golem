@@ -1,7 +1,11 @@
 """Headless smoke test for FLUX 3 Image Klein in ComfyUI.
 
-Runs the text-to-image workflow through ComfyUI's own nodes in-process, using
-the workflow's defaults, and writes testdata/flux3/smoke.png.
+Runs the text-to-image workflow through ComfyUI's own nodes in-process.
+
+Upstream workflow defaults size to 2048 x 2048 (node 19 ResolutionSelector with
+4.0 MP square); golem defaults to 1024 x 1024 for the 16 GB card budget. This
+smoke test runs at 1024 x 1024 with the optional LLM prompt upsampler (node 127)
+bypassed, which is a non-goal for golem.
 """
 
 import math
@@ -85,7 +89,8 @@ def main():
     arr = 255.0 * decoded[0].cpu().numpy()
     img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
 
-    out_path = "/home/ricardo/dev/golem-flux3/testdata/flux3/smoke.png"
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    out_path = os.path.join(root, "testdata", "flux3", "smoke.png")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     img.save(out_path)
     print(f"Wrote smoke picture to {out_path} ({img.size})")
