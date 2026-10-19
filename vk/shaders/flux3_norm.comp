@@ -1,0 +1,100 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// LayerNorm with adaLN modulation: (x - mean) / sqrt(var + eps) * (1 + scale) + shift,
+// one workgroup of 256 threads per row.
+// scale and shift are vectors in the arena (computed dynamically by the timestep modulation).
+// With halves != 0, the output is written as fp16 into ah at dst (counted in halves).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint src, srcStride;
+    uint dst, dstStride;
+    uint n, rows;
+    uint scale, shift;
+    float eps;
+    uint halves;
+} p;
+
+layout(std430, binding = 1) buffer AH { uint ah[]; };
+
+shared float partial[32];
+
+void main() {
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (row >= p.rows) return;
+    uint t = gl_LocalInvocationID.x;
+    uint src = p.src + row * p.srcStride;
+
+    // 1. Mean
+    float sum = 0.0;
+    for (uint i = t; i < p.n; i += 256u) {
+        sum += a[src + i];
+    }
+    sum = subgroupAdd(sum);
+    if (subgroupElect()) {
+        partial[gl_SubgroupID] = sum;
+    }
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        float s = (t < gl_NumSubgroups) ? partial[t] : 0.0;
+        s = subgroupAdd(s);
+        if (t == 0u) partial[0] = s / float(p.n);
+    }
+    barrier();
+    float mean = partial[0];
+
+    // 2. Variance
+    float varSum = 0.0;
+    for (uint i = t; i < p.n; i += 256u) {
+        float diff = a[src + i] - mean;
+        varSum += diff * diff;
+    }
+    varSum = subgroupAdd(varSum);
+    if (subgroupElect()) {
+        partial[gl_SubgroupID] = varSum;
+    }
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        float s = (t < gl_NumSubgroups) ? partial[t] : 0.0;
+        s = subgroupAdd(s);
+        if (t == 0u) partial[0] = inversesqrt(s / float(p.n) + p.eps);
+    }
+    barrier();
+    float inv = partial[0];
+
+    // 3. Modulate and write
+    if (p.halves != 0u) {
+        uint dst = p.dst + row * p.dstStride;
+        for (uint i = 2u * t; i < p.n; i += 512u) {
+            float d0 = (a[src + i] - mean) * inv;
+            float d1 = (a[src + i + 1u] - mean) * inv;
+            if (p.scale != ~0u) {
+                float s0 = a[p.scale + i], s1 = a[p.scale + i + 1u];
+                float h0 = a[p.shift + i], h1 = a[p.shift + i + 1u];
+                d0 = d0 * (1.0 + s0) + h0;
+                d1 = d1 * (1.0 + s1) + h1;
+            }
+            vec2 v = clamp(vec2(d0, d1), vec2(-65504.0), vec2(65504.0));
+            ah[(dst + i) >> 1] = packFloat2x16(f16vec2(v));
+        }
+    } else {
+        uint dst = p.dst + row * p.dstStride;
+        for (uint i = t; i < p.n; i += 256u) {
+            float d = (a[src + i] - mean) * inv;
+            if (p.scale != ~0u) {
+                float s = a[p.scale + i];
+                float h = a[p.shift + i];
+                d = d * (1.0 + s) + h;
+            }
+            a[dst + i] = d;
+        }
+    }
+}

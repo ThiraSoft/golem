@@ -32,6 +32,8 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DHD=384 -DBC=16 shaders/krea2_attn.comp -o shaders/krea2_attn384.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_conv.comp -o shaders/krea2_conv.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_pix.comp -o shaders/krea2_pix.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_norm.comp -o shaders/flux3_norm.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_gate.comp -o shaders/flux3_gate.spv
 
 //go:embed shaders/krea2_mm8.spv
 var krea2MM8SPIRV []byte
@@ -69,6 +71,12 @@ var krea2ConvSPIRV []byte
 //go:embed shaders/krea2_pix.spv
 var krea2PixSPIRV []byte
 
+//go:embed shaders/flux3_norm.spv
+var flux3NormSPIRV []byte
+
+//go:embed shaders/flux3_gate.spv
+var flux3GateSPIRV []byte
+
 type k2Kernel int
 
 const (
@@ -84,6 +92,8 @@ const (
 	k2Attn384
 	k2Conv
 	k2Pix
+	k2Flux3Norm
+	k2Flux3Gate
 	k2Kernels
 )
 
@@ -218,6 +228,24 @@ type K2Pix struct {
 	Residual uint32
 }
 
+// K2Flux3Norm is LayerNorm with adaLN modulation.
+type K2Flux3Norm struct {
+	Src, SrcStride uint32
+	Dst, DstStride uint32
+	N, Rows        uint32
+	Scale, Shift   uint32
+	Eps            float32
+	Halves         uint32
+}
+
+// K2Flux3Gate is gated addition: X += Out * Gate.
+type K2Flux3Gate struct {
+	X, XStride     uint32
+	Out, OutStride uint32
+	Gate           uint32
+	N, Rows        uint32
+}
+
 // K2 is a device set up for Krea 2's kernels, with one arena and one
 // parameter buffer.
 type K2 struct {
@@ -241,18 +269,20 @@ var k2Specs = [k2Kernels]struct {
 	spirv *[]byte
 	push  uintptr
 }{
-	k2MM8:     {&krea2MM8SPIRV, unsafe.Sizeof(K2MM{})},
-	k2MM16:    {&krea2MM16SPIRV, unsafe.Sizeof(K2MM{})},
-	k2MM8H:    {&krea2MM8HSPIRV, unsafe.Sizeof(K2MM{})},
-	k2MM16H:   {&krea2MM16HSPIRV, unsafe.Sizeof(K2MM{})},
-	k2MM8HB:   {&krea2MM8HBSPIRV, unsafe.Sizeof(K2MM{})},
-	k2Norm:    {&krea2NormSPIRV, unsafe.Sizeof(K2Norm{})},
-	k2Rope:    {&krea2RopeSPIRV, unsafe.Sizeof(K2Rope{})},
-	k2Act:     {&krea2ActSPIRV, unsafe.Sizeof(K2Act{})},
-	k2Attn128: {&krea2Attn128SPIRV, 18 * 4},
-	k2Attn384: {&krea2Attn384SPIRV, 18 * 4},
-	k2Conv:    {&krea2ConvSPIRV, unsafe.Sizeof(K2Conv{})},
-	k2Pix:     {&krea2PixSPIRV, unsafe.Sizeof(K2Pix{})},
+	k2MM8:       {&krea2MM8SPIRV, unsafe.Sizeof(K2MM{})},
+	k2MM16:      {&krea2MM16SPIRV, unsafe.Sizeof(K2MM{})},
+	k2MM8H:      {&krea2MM8HSPIRV, unsafe.Sizeof(K2MM{})},
+	k2MM16H:     {&krea2MM16HSPIRV, unsafe.Sizeof(K2MM{})},
+	k2MM8HB:     {&krea2MM8HBSPIRV, unsafe.Sizeof(K2MM{})},
+	k2Norm:      {&krea2NormSPIRV, unsafe.Sizeof(K2Norm{})},
+	k2Rope:      {&krea2RopeSPIRV, unsafe.Sizeof(K2Rope{})},
+	k2Act:       {&krea2ActSPIRV, unsafe.Sizeof(K2Act{})},
+	k2Attn128:   {&krea2Attn128SPIRV, 18 * 4},
+	k2Attn384:   {&krea2Attn384SPIRV, 18 * 4},
+	k2Conv:      {&krea2ConvSPIRV, unsafe.Sizeof(K2Conv{})},
+	k2Pix:       {&krea2PixSPIRV, unsafe.Sizeof(K2Pix{})},
+	k2Flux3Norm: {&flux3NormSPIRV, unsafe.Sizeof(K2Flux3Norm{})},
+	k2Flux3Gate: {&flux3GateSPIRV, unsafe.Sizeof(K2Flux3Gate{})},
 }
 
 // NewK2 makes the pipelines, an arena of arenaFloats and a parameter buffer
@@ -521,6 +551,14 @@ func (k *K2) Pix(r *Recorder, p K2Pix) {
 		n = int(p.C * p.H * p.W)
 	}
 	k.dispatch(r, k2Pix, -1, groups256(n), unsafe.Pointer(&p))
+}
+
+func (k *K2) Flux3Norm(r *Recorder, n K2Flux3Norm) {
+	k.dispatch(r, k2Flux3Norm, -1, int(n.Rows), unsafe.Pointer(&n))
+}
+
+func (k *K2) Flux3Gate(r *Recorder, g K2Flux3Gate) {
+	k.dispatch(r, k2Flux3Gate, -1, groups256(int(g.N*g.Rows)), unsafe.Pointer(&g))
 }
 
 // Compile records a program over this machine's buffers.

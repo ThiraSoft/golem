@@ -87,7 +87,7 @@ func compareRMS(t testing.TB, name string, got, want []float32, tolerance float6
 	}
 	e := rmsError(got, want)
 	if !(e <= tolerance) {
-		t.Errorf("%s: rms error %.4f%%, beyond %.4f%%", name, e*100, tolerance*100)
+		t.Errorf("%s: rms error %.4f%%, beyond %.4f%%\n got:  %v\n want: %v", name, e*100, tolerance*100, got[:min(len(got), 5)], want[:min(len(want), 5)])
 		return
 	}
 	t.Logf("%s: rms error %.4f%%", name, e*100)

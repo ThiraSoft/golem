@@ -587,3 +587,94 @@ func TestK2ProductLoRA(t *testing.T) {
 		k2Compare(t, "mm with a LoRA", got, want, 5e-5)
 	}
 }
+
+func TestK2Flux3(t *testing.T) {
+	r := rand.New(rand.NewSource(13))
+	rows, n := 4, 3072
+	x := randomFloats(r, rows*n, 1)
+	scale := randomFloats(r, n, 0.5)
+	shift := randomFloats(r, n, 0.5)
+
+	// Test 1: Flux3Norm float32
+	k := newK2(t, 2*rows*n+2*n, nil)
+	k.Write(0, x)
+	k.Write(2*rows*n, scale)
+	k.Write(2*rows*n+n, shift)
+	run(t, k, func(rec *Recorder) {
+		k.Flux3Norm(rec, K2Flux3Norm{
+			Src: 0, SrcStride: uint32(n),
+			Dst: uint32(rows * n), DstStride: uint32(n),
+			N: uint32(n), Rows: uint32(rows),
+			Scale: uint32(2 * rows * n), Shift: uint32(2*rows*n + n),
+			Eps: 1e-6, Halves: 0,
+		})
+	})
+	got, _ := k.Read(rows*n, rows*n)
+	want := make([]float32, rows*n)
+	for row := 0; row < rows; row++ {
+		var sum float64
+		for i := 0; i < n; i++ {
+			sum += float64(x[row*n+i])
+		}
+		mean := sum / float64(n)
+		var varSum float64
+		for i := 0; i < n; i++ {
+			diff := float64(x[row*n+i]) - mean
+			varSum += diff * diff
+		}
+		inv := 1.0 / math.Sqrt(varSum/float64(n)+1e-6)
+		for i := 0; i < n; i++ {
+			d := (float64(x[row*n+i]) - mean) * inv
+			want[row*n+i] = float32(d*(1.0+float64(scale[i])) + float64(shift[i]))
+		}
+	}
+	k2Compare(t, "flux3_norm f32", got, want, 1e-5)
+
+	// Test 1b: Flux3Norm fp16 halves
+	kHalves := newK2(t, 2*rows*n+2*n, nil)
+	kHalves.Write(0, x)
+	kHalves.Write(2*rows*n, scale)
+	kHalves.Write(2*rows*n+n, shift)
+	run(t, kHalves, func(rec *Recorder) {
+		kHalves.Flux3Norm(rec, K2Flux3Norm{
+			Src: 0, SrcStride: uint32(n),
+			Dst: uint32(2 * rows * n), DstStride: uint32(n),
+			N: uint32(n), Rows: uint32(rows),
+			Scale: uint32(2 * rows * n), Shift: uint32(2*rows*n + n),
+			Eps: 1e-6, Halves: 1,
+		})
+	})
+	gotH, _ := kHalves.Read(rows*n, rows*n)
+	gotF := make([]float32, rows*n)
+	for i := 0; i < rows*n; i += 2 {
+		bits := math.Float32bits(gotH[i/2])
+		gotF[i] = f16ToF32(uint16(bits & 0xffff))
+		gotF[i+1] = f16ToF32(uint16(bits >> 16))
+	}
+	k2Compare(t, "flux3_norm fp16", gotF, want, 2e-3)
+
+	// Test 2: Flux3Gate
+	gate := randomFloats(r, n, 0.5)
+	out := randomFloats(r, rows*n, 1)
+	xBase := randomFloats(r, rows*n, 1)
+	kGate := newK2(t, 2*rows*n+n, nil)
+	kGate.Write(0, xBase)
+	kGate.Write(rows*n, out)
+	kGate.Write(2*rows*n, gate)
+	run(t, kGate, func(rec *Recorder) {
+		kGate.Flux3Gate(rec, K2Flux3Gate{
+			X: 0, XStride: uint32(n),
+			Out: uint32(rows * n), OutStride: uint32(n),
+			Gate: uint32(2 * rows * n),
+			N:    uint32(n), Rows: uint32(rows),
+		})
+	})
+	gotGate, _ := kGate.Read(0, rows*n)
+	wantGate := make([]float32, rows*n)
+	for row := 0; row < rows; row++ {
+		for i := 0; i < n; i++ {
+			wantGate[row*n+i] = xBase[row*n+i] + out[row*n+i]*gate[i]
+		}
+	}
+	k2Compare(t, "flux3_gate", gotGate, wantGate, 1e-5)
+}
