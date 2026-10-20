@@ -180,8 +180,18 @@ var yue2AttnMergeSPIRV []byte
 // yue2Splits is how many stretches a column's visible range is cut into, and
 // yue2SplitColumns how many columns of a pass may take the split attention:
 // the scratch holds that many.
+//
+// Thirty-two, measured on the Guerreros codes, 4870 tokens read behind a
+// prompt of 3006 (yue2's BenchmarkARCodes): the stage takes 27.14 s at
+// sixteen, 25.76 at twenty-four, 25.40 at thirty-two, 27.31 at forty-eight
+// and 26.95 at sixty-four. The kernel waits on its loads rather than on the
+// bus, so it wants workgroups in flight, five hundred and twelve of them at
+// sixteen heads, until the folds of the merge cost more than they cover.
+// Reading a key head once for both of the query heads that share it, with
+// half the workgroups, lost: 5.34 ms a token at the same five hundred and
+// twelve workgroups against 5.07.
 const (
-	yue2Splits       = 16
+	yue2Splits       = 32
 	yue2SplitColumns = 8
 )
 
@@ -203,7 +213,7 @@ type yue2Split struct {
 // yue2SplitColumns columns (a token being drawn, a guided pair, a stretch of
 // a prompt read eight at a time) read its keys a column at a time through
 // yue2_attn_split.comp and yue2_attn_merge.comp, rather than through
-// attn_one.comp or attn_scores.comp: sixteen workgroups to a head and a
+// attn_one.comp or attn_scores.comp: yue2Splits workgroups to a head and a
 // column instead of one to a head. It is called once every block has been
 // added; an Attention that never calls it records what it always did.
 func (a *Attention) UseSplitDecode() error {
