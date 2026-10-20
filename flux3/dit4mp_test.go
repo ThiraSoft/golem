@@ -151,3 +151,59 @@ func TestDiT4MPMatchesComfyUI(t *testing.T) {
 			stage, req.Width, req.Height, m.refTokens[0], m.ctxTokens[0], took, used>>20, ok)
 	}
 }
+
+// gttUsed is the system memory the card maps, summed over its sysfs nodes.
+func gttUsed() (int64, bool) {
+	paths, _ := filepath.Glob("/sys/class/drm/card*/device/mem_info_gtt_used")
+	var total int64
+	for _, p := range paths {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		n, _ := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+		total += n
+	}
+	return total, len(paths) > 0
+}
+
+// TestVAEArenaAfterDiTLandsOnCard: the DiT's 4 MP arena freed, the VAE's
+// asked for at once must still go on the card, not in system memory, where
+// the decode outlasts the kernel's timeout and the card is reset.
+func TestVAEArenaAfterDiTLandsOnCard(t *testing.T) {
+	f := loadFixtures(t)
+	needFile(t, ditPath())
+	needFile(t, vaePath())
+	if _, ok := gttUsed(); !ok {
+		t.Skip("the driver does not say where memory is")
+	}
+	d := device(t)
+	v, err := OpenVAE(d, vaePath(), 4456448/256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	v.Trim()
+	m, err := OpenDiTSized(d, ditPath(), PrecisionFP16, 4456448/256, MaxRefs*RefTokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	inCtx := f.read(t, "t2i4/in.ctx")
+	if err := m.SetText(0, inCtx, len(inCtx)/CondWidth); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Step(0, f.read(t, "t2i4/in.x"), 128, 128, 0.5, 0.4); err != nil {
+		t.Fatal(err)
+	}
+	m.Trim()
+	before, _ := gttUsed()
+	if err := v.k.Arena(); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := gttUsed()
+	t.Logf("system memory mapped by the card: %d MB before the VAE arena, %d MB after", before>>20, after>>20)
+	if after-before > 256<<20 {
+		t.Errorf("the VAE arena took %d MB of system memory, want it on the card", (after-before)>>20)
+	}
+}

@@ -17,6 +17,7 @@ package vk
 import (
 	_ "embed"
 	"fmt"
+	"time"
 	"unsafe"
 )
 
@@ -440,9 +441,21 @@ func (k *K2) FreeWeights(handles ...int) {
 }
 
 // Arena makes sure the arena exists, making it again after FreeArena.
+//
+// The arena of another machine freed just before (FLUX 3's DiT before its
+// VAE decodes) goes back to the card some tens of milliseconds later: asked
+// for at once, a large arena lands in system memory, where a decode takes
+// past the kernel's ten seconds and the card is reset. So it waits, a second
+// at most, for the room DeviceLocalFree reports, then asks whatever it got.
 func (k *K2) Arena() error {
 	if k.arena != nil {
 		return nil
+	}
+	want := uint64(k.arenaFloats) * 4
+	for deadline := time.Now().Add(time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if free := k.d.DeviceLocalFree(); free == 0 || free >= want || time.Now().After(deadline) {
+			break
+		}
 	}
 	var err error
 	k.arena, err = k.d.Local(k.arenaFloats*4, bufferUsageStorage|bufferUsageTransferSrc|bufferUsageTransferDst)
