@@ -89,3 +89,26 @@ Last profile, one t2i4 block: attention 31.7 ms, MLP in 15.7, q/k/v/out
 13.0, MLP out 9.7, qkrope 1.5, LayerNorm 0.5. The rms against ComfyUI's
 first 4 MP call stayed at 0.68% (t2i4) and 1.27-1.28% (mi2i4).
 
+## Final (branch flux3-4mp-attn, warm, DiT kept)
+
+| picture | step before | step after | total before | total after | ComfyUI step / total |
+|---|---:|---:|---:|---:|---:|
+| t2i4 | 4.629 s | 2.462 s | 82.23 s | 47.88 s | 3.69 / 74.5 s |
+| i2i4 | 6.265 s | 3.316 s | 109.48 s | 62.79 s | 5.15 / 98.5 s |
+| mi2i4 | 13.072 s | 6.811 s | 219.58 s | 120.09 s | 10.84 / 190.7 s |
+
+main's t2i4 run again right after the branch's: 4.636 s a step, 82.38 s.
+
+- 1 MP step: FP16 750 -> 431-434 ms, FP8 570 -> 436-439 ms (FP8 is no
+  longer the quicker: its products were not the ones that moved).
+- Krea 2 DiT step 768x1024: 1.005 -> 0.869 s.
+- DiT load, warm, back to back: main 3.57 s, branch 3.74 s.
+- Fidelity: accept FP16 34.12 -> 34.13 dB, FP8 23.69 -> 23.70 dB; 4 MP
+  against ComfyUI's latents 24.96/35.29/37.52 -> 24.97/35.27/37.54 dB;
+  TestDiT4MPMatchesComfyUI rms 0.68% / 1.28%; TestDiTMatchesComfyUI out
+  1.517% -> 1.518% (FP16), 4.072% -> 4.071% (FP8).
+- Tests: ./vk (TestRopeTableMatchesTheCPU fails as on main), ./krea2 and
+  GOLEM_FULL_TEST=1 ./krea2, ./flux3 pass.
+- TestFullSizeTimings' FP16 8-step rows came out slow (5.6 s at 1024²)
+  after its cold pipeline; one pipeline alone gives 4.41 s, which is the
+  figure kept.
