@@ -1,0 +1,30 @@
+#version 450
+
+// yue2_axpy: computes dst = a + s * b, and optionally dst2 = dst.
+// Used by the YuE2 flow matching ODE solver to update state on the card.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint dst;
+    uint dst2;
+    uint a;
+    uint b;
+    uint n;
+    float s;
+    uint hasDst2;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u;
+    if (i >= p.n) return;
+    float v = a[p.a + i] + p.s * a[p.b + i];
+    a[p.dst + i] = v;
+    if (p.hasDst2 != 0u) {
+        a[p.dst2 + i] = v;
+    }
+}

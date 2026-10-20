@@ -19,12 +19,32 @@ import (
 
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/yue2_qkrope.comp -o shaders/yue2_qkrope.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/yue2_kvimport.comp -o shaders/yue2_kvimport.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/yue2_axpy.comp -o shaders/yue2_axpy.spv
 
 //go:embed shaders/yue2_qkrope.spv
 var yue2QKRopeSPIRV []byte
 
 //go:embed shaders/yue2_kvimport.spv
 var yue2KVImportSPIRV []byte
+
+//go:embed shaders/yue2_axpy.spv
+var yue2AxpySPIRV []byte
+
+// K2Yue2Axpy computes dst = a + s*b, and optionally dst2 = dst.
+type K2Yue2Axpy struct {
+	Dst, Dst2 uint32
+	A, B      uint32
+	N         uint32
+	S         float32
+	HasDst2   uint32
+}
+
+func (k *K2) Yue2Axpy(r *Recorder, p K2Yue2Axpy) {
+	if p.N == 0 {
+		return
+	}
+	k.dispatch(r, k2Yue2Axpy, -1, int((p.N+255)/256), unsafe.Pointer(&p))
+}
 
 // K2Yue2QKRope is the RMS norm of every head of 128 of the queries and the
 // keys, times their weights, then the NeoX rotation (i with i + 64) from a

@@ -57,7 +57,7 @@ type NAR struct {
 	xin, feats, tA, temb uint32
 	pos, table           uint32
 	x, nh, qkv, att, ffn uint32
-	out                  uint32
+	out, state           uint32
 	floats               int
 
 	progs map[int]*vk.Program
@@ -103,6 +103,7 @@ func NewNAR(d *vk.Device, b *Backbone, maxFrames, maxPrefix int) (*NAR, error) {
 	n.att = room(dim * maxN)
 	n.ffn = room(ffn * maxN / 2)
 	n.out = room(cfg.LatentDim * maxN)
+	n.state = room(cfg.LatentDim * maxN)
 	n.floats = at
 
 	var params []float32
@@ -453,18 +454,31 @@ func (n *NAR) recordHead(r *vk.Recorder, tokens int) {
 		Y: n.out, YStride: lat, Bias: n.llm2vaeB, Mode: vk.K2Store, XHalves: 1})
 }
 
-// prepare writes the latent block, the timestep's features and, on a new
-// shape, the frame embedding and the rotation table.
-func (n *NAR) prepare(x []float32, frames int, rawT float32) error {
+// logitClamped is nar_logit_clamped: logit(t) saturated to ±20.
+func logitClamped(t float32) float32 {
+	if t >= 1.0 {
+		return 20.0
+	}
+	if t <= 0.0 {
+		return -20.0
+	}
+	v := float32(math.Log(float64(t / (1.0 - t))))
+	if v > 20.0 {
+		return 20.0
+	}
+	if v < -20.0 {
+		return -20.0
+	}
+	return v
+}
+
+// prepareTables writes the frame embedding and the rotation table on a new shape.
+func (n *NAR) prepareTables(frames int) error {
 	if n.arLen == 0 {
-		return fmt.Errorf("yue2: a velocity before SetPrefix")
+		return fmt.Errorf("yue2: NAR called before SetPrefix")
 	}
 	if frames < 1 || frames > n.maxFrames {
 		return fmt.Errorf("yue2: %d frames, past the %d the arena holds", frames, n.maxFrames)
-	}
-	lat := n.cfg.LatentDim
-	if len(x) < lat*frames {
-		return fmt.Errorf("yue2: %d latents for %d frames", len(x), frames)
 	}
 	tokens := frames + 2
 	if n.tables != frames {
@@ -476,6 +490,20 @@ func (n *NAR) prepare(x []float32, frames int, rawT float32) error {
 		}
 		n.tables = frames
 	}
+	return nil
+}
+
+// prepare writes the latent block, the timestep's features and, on a new
+// shape, the frame embedding and the rotation table.
+func (n *NAR) prepare(x []float32, frames int, rawT float32) error {
+	if err := n.prepareTables(frames); err != nil {
+		return err
+	}
+	lat := n.cfg.LatentDim
+	if len(x) < lat*frames {
+		return fmt.Errorf("yue2: %d latents for %d frames", len(x), frames)
+	}
+	tokens := frames + 2
 	// LATENT_START and LATENT_END are zero rows around the frames.
 	in := make([]float32, lat*tokens)
 	copy(in[lat:], x[:lat*frames])
@@ -521,6 +549,113 @@ func (n *NAR) program(frames int) (*vk.Program, error) {
 	}
 	n.progs[frames] = p
 	return p, nil
+}
+
+// Solve integrates the ODE on the card: noise is frames frames of 64 channels
+// time-major, steps midpoint steps from t = 1 down to 0. It returns the
+// latents at t = 0 in the layout of noise.
+//
+// The state stays resident on the card across all 2*steps evaluations; only the
+// 256 sinusoidal timestep features cross the bus per evaluation.
+func (n *NAR) Solve(noise []float32, frames, steps int, cancel func() bool) ([]float32, error) {
+	return n.solveWithHook(noise, frames, steps, cancel, nil)
+}
+
+func (n *NAR) solveWithHook(noise []float32, frames, steps int, cancel func() bool, hook func(step int, state []float32)) ([]float32, error) {
+	if err := n.prepareTables(frames); err != nil {
+		return nil, err
+	}
+	lat := n.cfg.LatentDim
+	if len(noise) < lat*frames {
+		return nil, fmt.Errorf("yue2: %d noise floats for %d frames", len(noise), frames)
+	}
+	if steps < 1 {
+		return nil, fmt.Errorf("yue2: %d steps", steps)
+	}
+	tokens := frames + 2
+	// LATENT_START and LATENT_END are zero rows around the frames.
+	in := make([]float32, lat*tokens)
+	copy(in[lat:], noise[:lat*frames])
+	if err := n.k.Write(int(n.state), in); err != nil {
+		return nil, err
+	}
+	if err := n.k.Write(int(n.xin), in); err != nil {
+		return nil, err
+	}
+
+	pEval, err := n.program(frames)
+	if err != nil {
+		return nil, err
+	}
+
+	dt := float32(1.0) / float32(steps)
+	pMid, err := n.k.Compile(func(r *vk.Recorder) {
+		n.k.Yue2Axpy(r, vk.K2Yue2Axpy{
+			Dst: n.xin + uint32(lat),
+			A:   n.state + uint32(lat),
+			B:   n.out + uint32(lat),
+			N:   uint32(frames * lat),
+			S:   -0.5 * dt,
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer pMid.Close()
+
+	pStep, err := n.k.Compile(func(r *vk.Recorder) {
+		n.k.Yue2Axpy(r, vk.K2Yue2Axpy{
+			Dst:     n.state + uint32(lat),
+			Dst2:    n.xin + uint32(lat),
+			A:       n.state + uint32(lat),
+			B:       n.out + uint32(lat),
+			N:       uint32(frames * lat),
+			S:       -dt,
+			HasDst2: 1,
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer pStep.Close()
+
+	for step := range steps {
+		if cancel != nil && cancel() {
+			return nil, fmt.Errorf("yue2: solve cancelled at step %d", step)
+		}
+		t := float32(1.0) - float32(step)*dt
+		rawT := logitClamped(t)
+		if err := n.k.Write(int(n.feats), timeFeatures(n.shiftT(rawT))); err != nil {
+			return nil, err
+		}
+		if err := pEval.Run(); err != nil {
+			return nil, err
+		}
+		if err := pMid.Run(); err != nil {
+			return nil, err
+		}
+
+		rawTMid := logitClamped(t - 0.5*dt)
+		if err := n.k.Write(int(n.feats), timeFeatures(n.shiftT(rawTMid))); err != nil {
+			return nil, err
+		}
+		if err := pEval.Run(); err != nil {
+			return nil, err
+		}
+		if err := pStep.Run(); err != nil {
+			return nil, err
+		}
+
+		if hook != nil {
+			s, err := n.k.Read(int(n.state)+lat, lat*frames)
+			if err != nil {
+				return nil, err
+			}
+			hook(step, s)
+		}
+	}
+
+	return n.k.Read(int(n.state)+lat, lat*frames)
 }
 
 // waypoints is one evaluation in pieces, a program each, reading back what

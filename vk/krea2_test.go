@@ -834,3 +834,53 @@ func TestK2Flux3(t *testing.T) {
 	}
 	k2Compare(t, "flux3_gate", gotGate, wantGate, 1e-5)
 }
+
+func TestK2Yue2Axpy(t *testing.T) {
+	r := rand.New(rand.NewSource(42))
+	n := 4096
+	a := randomFloats(r, n, 2)
+	b := randomFloats(r, n, 2)
+	s := float32(-0.015625)
+
+	// Test single destination: dst = a + s * b
+	arena := 3 * n
+	k := newK2(t, arena, nil)
+	k.Write(0, a)
+	k.Write(n, b)
+	run(t, k, func(rec *Recorder) {
+		k.Yue2Axpy(rec, K2Yue2Axpy{
+			N:   uint32(n),
+			Dst: uint32(2 * n),
+			A:   0,
+			B:   uint32(n),
+			S:   s,
+		})
+	})
+	got, _ := k.Read(2*n, n)
+	want := make([]float32, n)
+	for i := range want {
+		want[i] = a[i] + s*b[i]
+	}
+	k2Compare(t, "yue2_axpy_single", got, want, 1e-6)
+
+	// Test dual destination: dst = dst2 = a + s * b
+	arenaDual := 4 * n
+	k2 := newK2(t, arenaDual, nil)
+	k2.Write(0, a)
+	k2.Write(n, b)
+	run(t, k2, func(rec *Recorder) {
+		k2.Yue2Axpy(rec, K2Yue2Axpy{
+			N:       uint32(n),
+			Dst:     uint32(2 * n),
+			A:       0,
+			B:       uint32(n),
+			S:       s,
+			Dst2:    uint32(3 * n),
+			HasDst2: 1,
+		})
+	})
+	got1, _ := k2.Read(2*n, n)
+	got2, _ := k2.Read(3*n, n)
+	k2Compare(t, "yue2_axpy_dual_dst1", got1, want, 1e-6)
+	k2Compare(t, "yue2_axpy_dual_dst2", got2, want, 1e-6)
+}
