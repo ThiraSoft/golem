@@ -171,8 +171,13 @@ func (h *Yue2Head) Close() {
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/yue2_attn_split.comp -o shaders/yue2_attn_split.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/yue2_attn_merge.comp -o shaders/yue2_attn_merge.spv
 
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/yue2_attn_wide.comp -o shaders/yue2_attn_wide.spv
+
 //go:embed shaders/yue2_attn_split.spv
 var yue2AttnSplitSPIRV []byte
+
+//go:embed shaders/yue2_attn_wide.spv
+var yue2AttnWideSPIRV []byte
 
 //go:embed shaders/yue2_attn_merge.spv
 var yue2AttnMergeSPIRV []byte
@@ -207,6 +212,13 @@ type yue2Split struct {
 	part         *Buffer
 	splitSets    []*Set // by block
 	mergeSet     *Set
+
+	// wide is yue2_attn_wide.comp, which takes the runs past the split
+	// columns on a card with matrix cores, a pass of a prompt; wideSets[block]
+	// is nil for a block whose heads are not 128 wide, which keeps
+	// attn_scores.comp.
+	wide     *Pipeline
+	wideSets []*Set
 }
 
 // UseSplitDecode makes every run of a pass within its first
@@ -263,6 +275,29 @@ func (a *Attention) UseSplitDecode() error {
 	if s.mergeSet, err = s.merge.NewSet([]*Buffer{s.part, a.aq, a.as}); err != nil {
 		return fail(err)
 	}
+	if a.coop {
+		for _, b := range a.blocks {
+			if b.shape.HeadDim != 128 {
+				s.wideSets = append(s.wideSets, nil)
+				continue
+			}
+			if s.wide == nil {
+				// The cores' wave, as attn_scores.comp's pipeline asks.
+				if s.wide, err = a.d.newPipeline(yue2AttnWideSPIRV, 7, uint32(unsafe.Sizeof(scorePush{})), coopmatWave, nil); err != nil {
+					return fail(err)
+				}
+			}
+			ck, cv := b.caches()
+			if ck == nil {
+				ck, cv = b.shape.Cache[0], b.shape.Cache[1]
+			}
+			set, err := s.wide.NewSet([]*Buffer{a.qh, ck, cv, a.scoreRows, a.aq, a.as, a.where})
+			if err != nil {
+				return fail(err)
+			}
+			s.wideSets = append(s.wideSets, set)
+		}
+	}
 	a.split = s
 	return nil
 }
@@ -274,7 +309,14 @@ func (a *Attention) UseSplitDecode() error {
 func (a *Attention) recordSplitRun(r *Recorder, block int, run span, score scorePush) bool {
 	s := a.split
 	if run.first+run.count > yue2SplitColumns {
-		return false
+		if s.wideSets == nil || s.wideSets[block] == nil {
+			return false
+		}
+		// A pass of a prompt: the tiles of attn_scores.comp, through its
+		// fork for heads of 128.
+		tiles := uint32((run.count + scoreColumns - 1) / scoreColumns)
+		r.DispatchColumns(s.wideSets[block], score.heads, tiles, unsafe.Pointer(&score))
+		return true
 	}
 	push := yue2SplitPush{score, yue2Splits}
 	for c := 0; c < run.count; c++ {
@@ -295,17 +337,17 @@ func (s *yue2Split) close() {
 	if s == nil {
 		return
 	}
-	for _, set := range append(s.splitSets, s.mergeSet) {
+	for _, set := range append(append(s.splitSets, s.wideSets...), s.mergeSet) {
 		if set != nil {
 			set.Close()
 		}
 	}
-	s.splitSets, s.mergeSet = nil, nil
+	s.splitSets, s.wideSets, s.mergeSet = nil, nil, nil
 	if s.part != nil {
 		s.part.Close()
 		s.part = nil
 	}
-	for _, p := range []**Pipeline{&s.split, &s.merge} {
+	for _, p := range []**Pipeline{&s.split, &s.wide, &s.merge} {
 		if *p != nil {
 			(*p).Close()
 			*p = nil
