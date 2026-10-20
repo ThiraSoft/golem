@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/flux3"
+	_ "golang.org/x/image/webp"
 )
 
 type stringList []string
@@ -49,7 +50,7 @@ func main() {
 	vae := flag.String("vae", flux3.VAEPath(), "the VAE")
 	tokenizer := flag.String("tokenizer", flux3.TokenizerDir(), "a directory with vocab.json, merges.txt and tokenizer_config.json")
 	fp8 := flag.Bool("fp8", false, "store DiT weights in FP8 instead of FP16 (default is FP16)")
-	mp := flag.Float64("megapixels", 4.0, "megapixels for reference image scaling")
+	mp := flag.Float64("megapixels", 1.0, "megapixels for reference image scaling")
 	hidePrompt := flag.Bool("hide-prompt", false, "leave the prompt and the negative prompt out of the PNG's metadata")
 
 	var imagePaths stringList
@@ -70,7 +71,7 @@ func main() {
 		if err != nil {
 			fail(err)
 		}
-		img, _, err := image.Decode(f)
+		img, err := flux3.DecodeImage(f)
 		f.Close()
 		if err != nil {
 			fail(fmt.Errorf("decode reference image %s: %w", p, err))
@@ -90,7 +91,7 @@ func main() {
 		VAE:       *vae,
 		Tokenizer: *tokenizer,
 		Keep:      *n > 1,
-		MaxPixels: max(*width**height, 1024*1024),
+		MaxPixels: 1024 * 1024,
 		Precision: prec,
 	})
 	if err != nil {

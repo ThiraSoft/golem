@@ -386,6 +386,26 @@ func TestStepTimings(t *testing.T) {
 		}
 		dur1024 := time.Since(start1024) / iters1024
 		t.Logf("%s Step timing at 1024x1024 (4096 img tokens + %d text tokens): %v per step", name, tokens, dur1024)
+
+		// 1024x1024 with 2 CFG slots
+		if err := m.SetText(1, inCtx, tokens); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.Step(1, latent1024, 64, 64, inT, inNext); err != nil {
+			t.Fatal(err)
+		}
+		startCFG := time.Now()
+		const itersCFG = 3
+		for i := 0; i < itersCFG; i++ {
+			if _, err := m.Step(0, latent1024, 64, 64, inT, inNext); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := m.Step(1, latent1024, 64, 64, inT, inNext); err != nil {
+				t.Fatal(err)
+			}
+		}
+		durCFG := time.Since(startCFG) / itersCFG
+		t.Logf("%s 2-slot CFG step timing at 1024x1024: %v per step", name, durCFG)
 	}
 
 	measure(PrecisionFP8, "FP8")

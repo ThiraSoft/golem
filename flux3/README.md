@@ -69,8 +69,8 @@ Without Keep (loading the DiT on every picture):
 | 768 x 1024 | 16 | 13.40 s | 13.79 s |
 
 VRAM footprint:
-- FP16: weights 10.34 GB, arena 1.84 GB, total 12.17 GB
-- FP8: weights 5.17 GB, arena 1.84 GB, total 7.00 GB
+- FP16: weights 10.34 GB, arena 2.00 GB, total 12.33 GB
+- FP8: weights 5.17 GB, arena 2.00 GB, total 7.16 GB
 
 ## Reference Images
 
@@ -82,7 +82,8 @@ The output image dimensions follow the request's `Width` and `Height`.
 Each reference image is resized using a Lanczos3 filter to match the requested
 `MegaPixels` (1.0 MP by default, matching the `ReferenceMultiLatent` widget in
 ComfyUI's workflow), capped so the token budget does not exceed `MaxRefTokens`
-(4096 tokens total).
+(4096 tokens total). With 2 or more references, each gets `MaxRefTokens/n`
+(0.5 MP for two), which differs from ComfyUI's 1 MP each.
 
 The resized images are encoded by the VAE into 128-channel latents. Reference RoPE
 position IDs use `l = -1, -2, ...` across consecutive reference inputs, matching

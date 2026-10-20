@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	"image/color"
 	_ "image/jpeg"
 	_ "image/png"
 	"math"
@@ -13,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ThiraSoft/golem/token/bytebpe"
 )
 
 // psnr computes the Peak Signal-to-Noise Ratio between an image.NRGBA
@@ -111,6 +114,51 @@ func TestCheckRefusesBadSizes(t *testing.T) {
 	if err := p.check(Request{Prompt: "a cat", Width: 256, Height: 256, Steps: 16, CFG: 0.0}); err == nil {
 		t.Error("p.check(CFG=0) succeeded, want error")
 	}
+	if err := p.check(Request{Prompt: "a cat", Width: 256, Height: 256, Steps: 16, CFG: -1.0}); err == nil {
+		t.Error("p.check(CFG=-1) succeeded, want error")
+	}
+}
+
+func TestPromptOverLimitFailsBeforeDiTOpen(t *testing.T) {
+	tokDir := TokenizerDir()
+	needFile(t, filepath.Join(tokDir, "vocab.json"))
+	tok, err := bytebpe.LoadFiles(tokDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &Pipeline{
+		tok: tok,
+		o:   Options{MaxPixels: 1024 * 1024},
+	}
+	longPrompt := strings.Repeat("unbelievable extraordinary fantastic magnificent ", 250)
+	_, _, err = p.Generate(Request{
+		Prompt: longPrompt,
+		Width:  256,
+		Height: 256,
+		Steps:  16,
+		CFG:    1.0,
+	}, nil)
+	if err == nil {
+		t.Fatal("Generate with long prompt succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "960") {
+		t.Errorf("error %q does not name limit 960", err.Error())
+	}
+	if p.dit != nil {
+		t.Errorf("p.dit was opened (%v), want nil", p.dit)
+	}
+}
+
+func TestOpenRefusesExcessMaxPixels(t *testing.T) {
+	_, err := Open(Options{
+		MaxPixels: 2048 * 2048,
+	})
+	if err == nil {
+		t.Fatal("Open with MaxPixels > 1 MP succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "1 MP DiT limit") {
+		t.Errorf("error %q does not name 1 MP DiT limit", err.Error())
+	}
 }
 
 // TestPNGCanHideThePrompt asserts that when HidePrompt is true, neither the prompt
@@ -197,6 +245,24 @@ func TestResizeMatchesComfyUI(t *testing.T) {
 	t.Logf("Great wave Lanczos resize PSNR: %.2f dB against mi2i/ref_rgb1", psnrWave)
 	if psnrWave < 50.0 {
 		t.Errorf("Great wave PSNR %.2f dB < 50 dB", psnrWave)
+	}
+}
+
+func TestResizeReferenceAlphaPreservesStraightRGB(t *testing.T) {
+	// 32x32 image with transparent red (R=255, G=0, B=0, A=0)
+	nrgba := image.NewNRGBA(image.Rect(0, 0, 32, 32))
+	for y := 0; y < 32; y++ {
+		for x := 0; x < 32; x++ {
+			nrgba.SetNRGBA(x, y, color.NRGBA{R: 255, G: 0, B: 0, A: 0})
+		}
+	}
+	rgb, rw, rh := ResizeReference(nrgba, 0.001, MaxRefTokens)
+	if rw <= 0 || rh <= 0 {
+		t.Fatalf("invalid resized dimensions: %dx%d", rw, rh)
+	}
+	// Straight RGB preserves R=1.0 despite A=0
+	if rgb[0] < 0.95 {
+		t.Errorf("R channel is %f, want ~1.0 (straight RGB preserved)", rgb[0])
 	}
 }
 

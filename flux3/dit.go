@@ -41,7 +41,7 @@ const (
 	ditEps         = 1e-6
 	MaxImageTokens = 4096 // 1024x1024: (1024/16)*(1024/16) = 64*64 = 4096
 	MaxRefTokens   = 4096
-	MaxTextTokens  = 512
+	MaxTextTokens  = 960
 )
 
 // Precision specifies the weight storage precision in DiT.
@@ -176,7 +176,6 @@ type earlyRKey struct {
 
 type ropeKey struct {
 	h, w      int
-	slot      int
 	refTokens int
 	txtTokens int
 	refShapes string
@@ -1492,7 +1491,7 @@ func (m *DiT) stepWithWaypoints(slot int, latent []float32, h, w int, sigma, nex
 	}
 
 	rKey := ropeKey{
-		h: h, w: w, slot: slot,
+		h: h, w: w,
 		refTokens: R,
 		txtTokens: T,
 		refShapes: fmt.Sprint(m.refShapes[slot]),

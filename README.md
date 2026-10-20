@@ -53,7 +53,7 @@ On one RX 9070 XT, every figure a benchmark in this repository:
 | **Vision** | Gemma 4 and Qwen3.8, from a projector file |
 | **Audio in** | Gemma 4 hears WAV, MP3 and FLAC. Kyutai STT transcribes English and French, live from the microphone |
 | **Audio out** | Kyutai Pocket TTS, 12 shipped models across 6 languages, and voice cloning from 20 seconds of audio |
-| **Images** | Krea 2 and FLUX 3 Image Klein from ComfyUI's files, LoRA and multi-reference, the same picture as ComfyUI |
+| **Images** | Krea 2 (with LoRA) and FLUX 3 Image Klein from ComfyUI's files, multi-reference, the same picture as ComfyUI |
 | **Decisions** | Laya, the open Jev: a state and typed questions in, calibrated probabilities out, in one encoder pass |
 | **Embeddings** | nomic-embed-text-v2-moe, behind OpenAI's and ollama's endpoints |
 | **Serving** | OpenAI-compatible HTTP API, Jev's decision endpoint, tool calls, continuous batching, JSON schemas and GBNF grammars |

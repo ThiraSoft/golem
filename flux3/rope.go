@@ -53,6 +53,15 @@ func TextIDs(length int) []float32 {
 	return ids
 }
 
+var ropeOmegas = func() [RopeAxisDim / 2]float64 {
+	var omegas [RopeAxisDim / 2]float64
+	for i := 0; i < RopeAxisDim/2; i++ {
+		scale := float64(2*i) / float64(RopeAxisDim)
+		omegas[i] = 1.0 / math.Pow(RopeTheta, scale)
+	}
+	return omegas
+}()
+
 // EmbedPE computes the [1, N, 1, 64, 2, 2] position embeddings matching ComfyUI's
 // EmbedND / Flux3.rope. For each token and each of the 64 pairs, it produces a 2x2
 // rotation matrix [[cos, -sin], [sin, cos]], formatted as 4 consecutive floats.
@@ -65,9 +74,7 @@ func EmbedPE(ids []float32) []float32 {
 		for axis := 0; axis < RopeAxes; axis++ {
 			pos := float64(ids[tok*4+axis])
 			for i := 0; i < RopeAxisDim/2; i++ {
-				scale := float64(2*i) / float64(RopeAxisDim)
-				omega := 1.0 / math.Pow(RopeTheta, scale)
-				arg := pos * omega
+				arg := pos * ropeOmegas[i]
 				cos := float32(math.Cos(arg))
 				sin := float32(math.Sin(arg))
 
@@ -94,9 +101,7 @@ func RopeTable(ids []float32) []float32 {
 		for axis := 0; axis < RopeAxes; axis++ {
 			pos := float64(ids[tok*4+axis])
 			for i := 0; i < RopeAxisDim/2; i++ {
-				scale := float64(2*i) / float64(RopeAxisDim)
-				omega := 1.0 / math.Pow(RopeTheta, scale)
-				arg := pos * omega
+				arg := pos * ropeOmegas[i]
 				out[base+pairIdx] = float32(math.Cos(arg))
 				out[base+64+pairIdx] = float32(math.Sin(arg))
 				pairIdx++

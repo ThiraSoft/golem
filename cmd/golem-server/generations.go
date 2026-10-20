@@ -29,6 +29,7 @@ import (
 
 	"github.com/ThiraSoft/golem/flux3"
 	"github.com/ThiraSoft/golem/krea2"
+	_ "golang.org/x/image/webp"
 )
 
 // PictureRequest carries what any pipeline needs to draw one picture.
@@ -293,7 +294,7 @@ func decodeImageBase64(s string) (image.Image, error) {
 	if cfg.Width > maxDim || cfg.Height > maxDim {
 		return nil, fmt.Errorf("image dimension %dx%d exceeds %dx%d limit", cfg.Width, cfg.Height, maxDim, maxDim)
 	}
-	img, _, err := image.Decode(bytes.NewReader(data))
+	img, err := flux3.DecodeImage(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("decode image: %w", err)
 	}

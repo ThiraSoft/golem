@@ -3,6 +3,7 @@ package flux3
 import (
 	"fmt"
 	"image"
+	"image/color"
 	"io"
 	"math"
 	"path/filepath"
@@ -75,6 +76,9 @@ func Open(o Options) (*Pipeline, error) {
 	if o.MaxPixels == 0 {
 		o.MaxPixels = 1024 * 1024
 	}
+	if o.MaxPixels > MaxImageTokens*256 {
+		return nil, fmt.Errorf("flux3: MaxPixels %d exceeds limit of %d (1 MP DiT limit)", o.MaxPixels, MaxImageTokens*256)
+	}
 	p := &Pipeline{o: o}
 	fail := func(err error) (*Pipeline, error) {
 		p.Close()
@@ -105,7 +109,7 @@ func (p *Pipeline) check(r Request) error {
 	case r.Width < 64 || r.Height < 64 || r.Width%16 != 0 || r.Height%16 != 0:
 		return fmt.Errorf("flux3: %d × %d: width and height are multiples of 16, from 64", r.Width, r.Height)
 	case r.Width*r.Height > p.o.MaxPixels:
-		return fmt.Errorf("flux3: %d × %d is past the %d pixels this pipeline was opened for", r.Width, r.Height, p.o.MaxPixels)
+		return fmt.Errorf("flux3: %d × %d is past the %d pixels this pipeline was opened for (1 MP DiT limit)", r.Width, r.Height, p.o.MaxPixels)
 	case r.Steps < 1 || r.Steps > 100:
 		return fmt.Errorf("flux3: %d steps", r.Steps)
 	case r.CFG <= 0:
@@ -162,6 +166,8 @@ func ResizeReference(img image.Image, mp float64, maxTokens int) ([]float32, int
 		}
 	}
 
+	img = ensureOpaque(img)
+	bounds = img.Bounds()
 	dst := image.NewRGBA(image.Rect(0, 0, rw, rh))
 	lanczosKernel.Scale(dst, dst.Bounds(), img, bounds, draw.Src, nil)
 
@@ -178,6 +184,24 @@ func ResizeReference(img image.Image, mp float64, maxTokens int) ([]float32, int
 	return rgb, rw, rh
 }
 
+// ensureOpaque ensures reference images with alpha are composited onto opaque
+// (straight RGB like PIL convert("RGB"), via NRGBA).
+func ensureOpaque(img image.Image) image.Image {
+	if op, ok := img.(interface{ Opaque() bool }); ok && op.Opaque() {
+		return img
+	}
+	bounds := img.Bounds()
+	w, h := bounds.Dx(), bounds.Dy()
+	opaque := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			c := color.NRGBAModel.Convert(img.At(bounds.Min.X+x, bounds.Min.Y+y)).(color.NRGBA)
+			opaque.SetRGBA(x, y, color.RGBA{R: c.R, G: c.G, B: c.B, A: 255})
+		}
+	}
+	return opaque
+}
+
 // Generate draws one picture. progress, if set, hears about each step.
 func (p *Pipeline) Generate(r Request, progress krea2.Progress) (*image.NRGBA, krea2.Timings, error) {
 	var tm krea2.Timings
@@ -185,7 +209,7 @@ func (p *Pipeline) Generate(r Request, progress krea2.Progress) (*image.NRGBA, k
 	if r.Steps == 0 {
 		r.Steps = Defaults.Steps
 	}
-	if r.CFG <= 0 {
+	if r.CFG == 0 {
 		r.CFG = Defaults.CFG
 	}
 	if err := p.check(r); err != nil {
@@ -195,6 +219,19 @@ func (p *Pipeline) Generate(r Request, progress krea2.Progress) (*image.NRGBA, k
 
 	// 1. Text encoding
 	posIDs, posReal := Tokenize(p.tok, r.Prompt)
+	if len(posIDs) > MaxTextTokens {
+		return nil, tm, fmt.Errorf("flux3: prompt token count %d exceeds limit of %d", len(posIDs), MaxTextTokens)
+	}
+
+	var negIDs []int32
+	var negReal int
+	if cfg {
+		negIDs, negReal = Tokenize(p.tok, r.Negative)
+		if len(negIDs) > MaxTextTokens {
+			return nil, tm, fmt.Errorf("flux3: negative prompt token count %d exceeds limit of %d", len(negIDs), MaxTextTokens)
+		}
+	}
+
 	pos, err := p.enc.EncodeMasked(posIDs, posReal)
 	if err != nil {
 		return nil, tm, err
@@ -204,7 +241,6 @@ func (p *Pipeline) Generate(r Request, progress krea2.Progress) (*image.NRGBA, k
 	var neg []float32
 	var negTokens int
 	if cfg {
-		negIDs, negReal := Tokenize(p.tok, r.Negative)
 		neg, err = p.enc.EncodeMasked(negIDs, negReal)
 		if err != nil {
 			return nil, tm, err
