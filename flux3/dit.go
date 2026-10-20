@@ -9,6 +9,8 @@ import (
 	"math"
 	"runtime"
 	"runtime/debug"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 
@@ -46,8 +48,8 @@ const (
 type Precision int
 
 const (
-	PrecisionFP8 Precision = iota
-	PrecisionFP16
+	PrecisionFP16 Precision = iota
+	PrecisionFP8
 )
 
 // e4m3 decodes an fp8 e4m3fn byte into float32.
@@ -294,7 +296,7 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 		return nil, fmt.Errorf("flux3: %s: %w", path, err)
 	}
 
-	precision := PrecisionFP8
+	precision := PrecisionFP16
 	if len(prec) > 0 {
 		precision = prec[0]
 	}
@@ -483,14 +485,44 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 			} else {
 				f16Buf = f16Buf[:2*n]
 			}
-			var overflows int
-			for i := 0; i < n; i++ {
-				u := binary.LittleEndian.Uint16(raw[i*2:])
-				h := bf16ToHalfLUT[u]
-				if (h & 0x7c00) == 0x7c00 {
-					overflows++
+			var overflows int64
+			numWorkers := runtime.GOMAXPROCS(0)
+			if numWorkers > 1 && n >= 65536 {
+				var wg sync.WaitGroup
+				chunk := (n + numWorkers - 1) / numWorkers
+				for w := 0; w < numWorkers; w++ {
+					start := w * chunk
+					end := min(start+chunk, n)
+					if start >= end {
+						continue
+					}
+					wg.Add(1)
+					go func(s, e int) {
+						defer wg.Done()
+						var ov int64
+						for i := s; i < e; i++ {
+							u := binary.LittleEndian.Uint16(raw[i*2:])
+							h := bf16ToHalfLUT[u]
+							if (h & 0x7c00) == 0x7c00 {
+								ov++
+							}
+							binary.LittleEndian.PutUint16(f16Buf[i*2:], h)
+						}
+						if ov > 0 {
+							atomic.AddInt64(&overflows, ov)
+						}
+					}(start, end)
 				}
-				binary.LittleEndian.PutUint16(f16Buf[i*2:], h)
+				wg.Wait()
+			} else {
+				for i := 0; i < n; i++ {
+					u := binary.LittleEndian.Uint16(raw[i*2:])
+					h := bf16ToHalfLUT[u]
+					if (h & 0x7c00) == 0x7c00 {
+						overflows++
+					}
+					binary.LittleEndian.PutUint16(f16Buf[i*2:], h)
+				}
 			}
 			madviseDontNeed(raw)
 			if overflows > 0 {
@@ -504,14 +536,50 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 		}
 
 		var maxAbs float32
-		for i := 0; i < n; i++ {
-			u := binary.LittleEndian.Uint16(raw[i*2:])
-			f := math.Float32frombits(uint32(u) << 16)
-			if f < 0 {
-				f = -f
+		numWorkers := runtime.GOMAXPROCS(0)
+		if numWorkers > 1 && n >= 65536 {
+			var wg sync.WaitGroup
+			chunk := (n + numWorkers - 1) / numWorkers
+			localMax := make([]float32, numWorkers)
+			for w := 0; w < numWorkers; w++ {
+				start := w * chunk
+				end := min(start+chunk, n)
+				if start >= end {
+					continue
+				}
+				wg.Add(1)
+				go func(idx, s, e int) {
+					defer wg.Done()
+					var mVal float32
+					for i := s; i < e; i++ {
+						u := binary.LittleEndian.Uint16(raw[i*2:])
+						f := math.Float32frombits(uint32(u) << 16)
+						if f < 0 {
+							f = -f
+						}
+						if f > mVal {
+							mVal = f
+						}
+					}
+					localMax[idx] = mVal
+				}(w, start, end)
 			}
-			if f > maxAbs {
-				maxAbs = f
+			wg.Wait()
+			for _, mVal := range localMax {
+				if mVal > maxAbs {
+					maxAbs = mVal
+				}
+			}
+		} else {
+			for i := 0; i < n; i++ {
+				u := binary.LittleEndian.Uint16(raw[i*2:])
+				f := math.Float32frombits(uint32(u) << 16)
+				if f < 0 {
+					f = -f
+				}
+				if f > maxAbs {
+					maxAbs = f
+				}
 			}
 		}
 		scale := maxAbs / 448.0
@@ -531,9 +599,30 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 		} else {
 			f8Buf = f8Buf[:n]
 		}
-		for i := 0; i < n; i++ {
-			u := binary.LittleEndian.Uint16(raw[i*2:])
-			f8Buf[i] = lut[u]
+		if numWorkers > 1 && n >= 65536 {
+			var wg sync.WaitGroup
+			chunk := (n + numWorkers - 1) / numWorkers
+			for w := 0; w < numWorkers; w++ {
+				start := w * chunk
+				end := min(start+chunk, n)
+				if start >= end {
+					continue
+				}
+				wg.Add(1)
+				go func(s, e int) {
+					defer wg.Done()
+					for i := s; i < e; i++ {
+						u := binary.LittleEndian.Uint16(raw[i*2:])
+						f8Buf[i] = lut[u]
+					}
+				}(start, end)
+			}
+			wg.Wait()
+		} else {
+			for i := 0; i < n; i++ {
+				u := binary.LittleEndian.Uint16(raw[i*2:])
+				f8Buf[i] = lut[u]
+			}
 		}
 		madviseDontNeed(raw)
 

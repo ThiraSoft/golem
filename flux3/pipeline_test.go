@@ -387,6 +387,7 @@ func TestCFGTwoSlotMatchesComfyUI(t *testing.T) {
 	defer p.Close()
 
 	var stepLatents [][]float32
+	p.saveLatent = true
 	p.onStep = func(step int, x []float32) {
 		stepLatents = append(stepLatents, append([]float32(nil), x...))
 	}
@@ -430,11 +431,17 @@ func TestCFGTwoSlotMatchesComfyUI(t *testing.T) {
 		}
 	}
 	t.Logf("worst per-step latent rms error: %.4f%% at step %d", worstRMS*100, worstStep)
+	// In CFG mode (scale 2.0), errors accumulate across 16 steps with two DiT passes
+	// per step. Intermediate latents x_step drift up to ~7% RMS against the bf16 reference;
+	// 8.0% provides a tight bound that catches algorithmic regressions.
 	if worstRMS > 0.08 {
 		t.Errorf("worst per-step latent rms %.4f%% > 8.0%%", worstRMS*100)
 	}
 
 	// Compare final latent against sample_cfg/latent
+	// The final unscaled latent differences accumulate further after 16 extrapolation steps
+	// (denoised = uncond + cfg * (cond - uncond)) reaching ~18-20% RMS; 22.0% bounds this
+	// while the decoded RGB image still achieves >26 dB PSNR.
 	wantLatent := f.read(t, "sample_cfg/latent")
 	latErr := rmsError(p.lastLatent, wantLatent)
 	t.Logf("sample_cfg/latent: rms error %.4f%%", latErr*100)

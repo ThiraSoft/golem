@@ -122,7 +122,7 @@ func (fi *flux3Imager) WritePNG(w io.Writer, img image.Image, r PictureRequest) 
 }
 
 func (fi *flux3Imager) Defaults() (string, int) {
-	return "1024x1024", 16
+	return "1024x1024", flux3.Defaults.Steps
 }
 
 func (fi *flux3Imager) SupportsImages() bool { return true }

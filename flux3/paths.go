@@ -46,6 +46,6 @@ func ComfyUI(dir string) Options {
 		Encoder:   filepath.Join(dir, "models", "text_encoders", "qwen3vl_4b_fp8_scaled.safetensors"),
 		VAE:       filepath.Join(dir, "models", "vae", "flux2-vae.safetensors"),
 		Tokenizer: filepath.Join(dir, "comfy", "text_encoders", "qwen25_tokenizer"),
-		Precision: PrecisionFP8,
+		Precision: PrecisionFP16,
 	}
 }

@@ -55,6 +55,7 @@ type Pipeline struct {
 	onStep     func(step int, x []float32)
 	lastLatent []float32
 	lastTokens [2]int
+	saveLatent bool
 }
 
 // Open readies a pipeline. The DiT is loaded on the first picture if not kept.
@@ -282,7 +283,9 @@ func (p *Pipeline) Generate(r Request, progress krea2.Progress) (*image.NRGBA, k
 	if err != nil {
 		return nil, tm, err
 	}
-	p.lastLatent = append([]float32(nil), latent...)
+	if p.saveLatent {
+		p.lastLatent = append([]float32(nil), latent...)
+	}
 	tm.Sample = time.Since(tSample)
 
 	// 5. VAE Decode
