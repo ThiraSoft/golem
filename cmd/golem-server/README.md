@@ -27,7 +27,7 @@ The endpoints:
 | `POST /synth` | song synthesis with YuE2, returning a job ID (requires `-yue2`) |
 | `GET /job` | poll job status or fetch multipart audio, replay JSON and latents (requires `-yue2`) |
 | `POST /job` | cancel a synthesis job (requires `-yue2`) |
-| `GET /health` | server health check |
+| `GET /health` | server health check (requires `-yue2`) |
 | `GET /props` | server capabilities, model context and request defaults (requires `-yue2`) |
 | `GET /v1/models` | the loaded models, for clients that probe at startup |
 
@@ -490,11 +490,15 @@ parts: the replay JSON (`application/json`), the rendered WAV audio
 `wav16`, `wav24`, and `wav32` output formats are supported (mp3 returns 400).
 Cancel an in-flight job with `POST /job?id=N&cancel=1`.
 
+YuE2 requires substantial VRAM (approximately 13.45 GB at the default context of
+24576 positions). Because of this memory footprint, `-yue2` cannot be combined
+with `-model`, `-krea2`, or `-flux3` on the card.
+
 ## Flags
 
 | | |
 |---|---|
-| `-model` | the GGUF, or `GOLEM_MODEL`; not required when `-stt`, `-embed`, `-krea2` or `-laya` is given |
+| `-model` | the GGUF, or `GOLEM_MODEL`; not required when `-stt`, `-embed`, `-krea2`, `-laya` or `-yue2` is given |
 | `-yue2` | directory holding YuE2 GGUF files (YuE2-3B-Q8_0.gguf, YuE2-Vae-F32.gguf), or `GOLEM_YUE2` |
 | `-yue2-context` | positions to keep in YuE2's KV cache; 24576 by default |
 | `-stt` | directory holding the Kyutai STT model, or `GOLEM_STT`; a server may carry it alone, and then answers `/v1/models` and `/v1/audio/transcriptions` and nothing else |

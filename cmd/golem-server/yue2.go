@@ -18,6 +18,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 
@@ -54,7 +55,6 @@ type yue2Job struct {
 	resultBody []byte
 	mimeType   string
 	err        string
-	done       chan struct{}
 }
 
 type yue2Queue struct {
@@ -62,11 +62,12 @@ type yue2Queue struct {
 	model    string
 
 	mu         sync.Mutex
+	cond       *sync.Cond
 	jobs       map[string]*yue2Job
 	order      []string
-	workCh     chan *yue2Job
+	pending    []*yue2Job
 	active     *yue2Job
-	stop       chan struct{}
+	stopped    bool
 	workerDone chan struct{}
 }
 
@@ -75,10 +76,9 @@ func newYuE2Queue(p YuE2Pipeline, model string) *yue2Queue {
 		pipeline:   p,
 		model:      model,
 		jobs:       make(map[string]*yue2Job),
-		workCh:     make(chan *yue2Job, 64),
-		stop:       make(chan struct{}),
 		workerDone: make(chan struct{}),
 	}
+	q.cond = sync.NewCond(&q.mu)
 	go q.worker()
 	return q
 }
@@ -89,24 +89,36 @@ func (s *Server) SetYuE2(p YuE2Pipeline, modelName string) {
 }
 
 func (q *yue2Queue) Close() {
-	select {
-	case <-q.stop:
-		return
-	default:
-		close(q.stop)
+	q.mu.Lock()
+	if !q.stopped {
+		q.stopped = true
+		for _, job := range q.pending {
+			job.status = statusCancelled
+		}
+		q.pending = nil
+		q.cond.Broadcast()
 	}
+	q.mu.Unlock()
 	<-q.workerDone
 }
 
 func (q *yue2Queue) worker() {
 	defer close(q.workerDone)
 	for {
-		select {
-		case <-q.stop:
-			return
-		case job := <-q.workCh:
-			q.runJob(job)
+		q.mu.Lock()
+		for len(q.pending) == 0 && !q.stopped {
+			q.cond.Wait()
 		}
+		if q.stopped {
+			q.mu.Unlock()
+			return
+		}
+		job := q.pending[0]
+		q.pending = q.pending[1:]
+		q.active = job
+		q.mu.Unlock()
+
+		q.runJob(job)
 	}
 }
 
@@ -114,17 +126,16 @@ func (q *yue2Queue) runJob(job *yue2Job) {
 	q.mu.Lock()
 	if job.cancel.Load() {
 		job.status = statusCancelled
-		close(job.done)
 		q.mu.Unlock()
 		return
 	}
-	q.active = job
 	q.mu.Unlock()
 
 	defer func() {
 		q.mu.Lock()
-		q.active = nil
-		close(job.done)
+		if q.active == job {
+			q.active = nil
+		}
 		q.mu.Unlock()
 	}()
 
@@ -134,24 +145,29 @@ func (q *yue2Queue) runJob(job *yue2Job) {
 
 	song, err := q.pipeline.Generate(job.req, cancelFunc)
 
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
 	if job.cancel.Load() || errors.Is(err, yue2.ErrCancelled) {
+		q.mu.Lock()
 		job.status = statusCancelled
+		q.mu.Unlock()
 		return
 	}
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "yue2: job %s failed: %v\n", job.id, err)
+		q.mu.Lock()
 		job.status = statusFailed
 		job.err = err.Error()
+		q.mu.Unlock()
 		return
 	}
 
 	replayJSON := song.Replay(job.req).JSON()
 	audioBytes, err := song.Encode(job.req.OutputFormat, job.req.PeakClip)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "yue2: job %s encoding failed: %v\n", job.id, err)
+		q.mu.Lock()
 		job.status = statusFailed
 		job.err = err.Error()
+		q.mu.Unlock()
 		return
 	}
 	latentBytes := make([]byte, len(song.Latents)*4)
@@ -159,9 +175,14 @@ func (q *yue2Queue) runJob(job *yue2Job) {
 		binary.LittleEndian.PutUint32(latentBytes[i*4:], math.Float32bits(f))
 	}
 
-	job.resultBody = buildMultipartResponse(replayJSON, audioBytes, latentBytes)
-	job.mimeType = "multipart/mixed; boundary=" + yue2MultipartBoundary
+	multipartBody := buildMultipartResponse(replayJSON, audioBytes, latentBytes)
+	mimeType := "multipart/mixed; boundary=" + yue2MultipartBoundary
+
+	q.mu.Lock()
+	job.resultBody = multipartBody
+	job.mimeType = mimeType
 	job.status = statusDone
+	q.mu.Unlock()
 }
 
 func (q *yue2Queue) evictOldestLocked() {
@@ -169,12 +190,18 @@ func (q *yue2Queue) evictOldestLocked() {
 		evicted := false
 		for i, id := range q.order {
 			job, ok := q.jobs[id]
-			if !ok || job.status != statusRunning {
-				delete(q.jobs, id)
+			if !ok {
 				q.order = append(q.order[:i], q.order[i+1:]...)
 				evicted = true
 				break
 			}
+			if job.status == statusRunning || job == q.active {
+				continue
+			}
+			delete(q.jobs, id)
+			q.order = append(q.order[:i], q.order[i+1:]...)
+			evicted = true
+			break
 		}
 		if !evicted {
 			break
@@ -199,12 +226,12 @@ func (q *yue2Queue) enqueue(req yue2.Request) string {
 		id:     id,
 		req:    req,
 		status: statusRunning,
-		done:   make(chan struct{}),
 	}
 	q.jobs[id] = job
 	q.order = append(q.order, id)
+	q.pending = append(q.pending, job)
 	q.evictOldestLocked()
-	q.workCh <- job
+	q.cond.Signal()
 	return id
 }
 
@@ -229,6 +256,8 @@ func (q *yue2Queue) getJob(w http.ResponseWriter, r *http.Request) {
 		yue2Error(w, http.StatusNotFound, "job not found")
 		return
 	}
+	hasResult := r.URL.Query().Has("result")
+
 	q.mu.Lock()
 	job, ok := q.jobs[id]
 	if !ok {
@@ -237,12 +266,17 @@ func (q *yue2Queue) getJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status := job.status
+	errMsg := job.err
 	resultBody := job.resultBody
 	mimeType := job.mimeType
 	q.mu.Unlock()
 
-	if !r.URL.Query().Has("result") {
-		writeJSON(w, http.StatusOK, map[string]string{"status": string(status)})
+	if !hasResult {
+		resp := map[string]string{"status": string(status)}
+		if status == statusFailed && errMsg != "" {
+			resp["error"] = errMsg
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 
@@ -292,6 +326,7 @@ func (q *yue2Queue) props(w http.ResponseWriter, r *http.Request) {
 		"sample_rate": yue2.SampleRate,
 		"frame_rate":  yue2.FrameRate,
 		"context":     q.pipeline.Context(),
+		"adapters":    []any{},
 		"defaults":    defaultsMap(),
 	})
 }

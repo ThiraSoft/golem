@@ -350,7 +350,7 @@ func serveWithoutConversation(dir, embedPath, krea2Dir string, krea2Keep bool, f
 			fail(err)
 		}
 		defer p.Close()
-		server.SetYuE2(p, yue2Dir)
+		server.SetYuE2(p, filepath.Join(yue2Dir, "YuE2-3B-Q8_0.gguf"))
 		defer server.Close()
 		if name == "" {
 			name = "yue2"

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -320,10 +321,13 @@ func TestYuE2ResultNotReady404(t *testing.T) {
 }
 
 func TestYuE2Cancel(t *testing.T) {
+	started := make(chan struct{})
 	cancelled := make(chan struct{})
+	var onceStarted sync.Once
 	stub := &stubPipeline{
 		generate: func(r yue2.Request, cancel func() bool) (*yue2.Song, error) {
-			for i := 0; i < 50; i++ {
+			onceStarted.Do(func() { close(started) })
+			for i := 0; i < 100; i++ {
 				if cancel != nil && cancel() {
 					close(cancelled)
 					return nil, yue2.ErrCancelled
@@ -346,7 +350,16 @@ func TestYuE2Cancel(t *testing.T) {
 	var out struct {
 		ID string `json:"id"`
 	}
-	json.NewDecoder(resp.Body).Decode(&out)
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode /synth response: %v", err)
+	}
+
+	// Wait until stub's generate is actively executing
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("pipeline did not start generate")
+	}
 
 	// Cancel job
 	cancelResp, err := http.Post(fmt.Sprintf("%s/job?id=%s&cancel=1", ts.URL, out.ID), "", nil)
@@ -360,7 +373,9 @@ func TestYuE2Cancel(t *testing.T) {
 	var cancelOut struct {
 		Status string `json:"status"`
 	}
-	json.NewDecoder(cancelResp.Body).Decode(&cancelOut)
+	if err := json.NewDecoder(cancelResp.Body).Decode(&cancelOut); err != nil {
+		t.Fatalf("decode cancel response: %v", err)
+	}
 	if cancelOut.Status != "cancelled" {
 		t.Fatalf("cancel response status %q != cancelled", cancelOut.Status)
 	}
@@ -380,7 +395,9 @@ func TestYuE2Cancel(t *testing.T) {
 	var st struct {
 		Status string `json:"status"`
 	}
-	json.NewDecoder(pollResp.Body).Decode(&st)
+	if err := json.NewDecoder(pollResp.Body).Decode(&st); err != nil {
+		t.Fatalf("decode poll response: %v", err)
+	}
 	if st.Status != "cancelled" {
 		t.Fatalf("final job status %q != cancelled", st.Status)
 	}
@@ -582,5 +599,254 @@ func TestYuE2Eviction(t *testing.T) {
 	defer latestResp.Body.Close()
 	if latestResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected latest job %s to be kept (200), got %d", ids[len(ids)-1], latestResp.StatusCode)
+	}
+}
+
+// TestYuE2DeepQueue verifies that enqueueing more than 64 jobs (> channel buffer)
+// does not deadlock the server under mutex contention, and that GET /job continues
+// answering promptly for queued jobs.
+func TestYuE2DeepQueue(t *testing.T) {
+	unblock := make(chan struct{})
+	started := make(chan struct{})
+	var onceStarted sync.Once
+	stub := &stubPipeline{
+		generate: func(r yue2.Request, cancel func() bool) (*yue2.Song, error) {
+			onceStarted.Do(func() { close(started) })
+			<-unblock
+			return &yue2.Song{
+				Samples: 48000,
+				Audio:   make([]float32, 48000*2),
+				Latents: make([]float32, 25*64),
+			}, nil
+		},
+	}
+	srv, ts := newTestYuE2Server(stub)
+	defer srv.Close()
+	defer ts.Close()
+
+	// Enqueue 80 jobs (> 64)
+	const numJobs = 80
+	jobIDs := make([]string, numJobs)
+	for i := 0; i < numJobs; i++ {
+		resp, err := http.Post(ts.URL+"/synth", "application/json", strings.NewReader(`{"output_format":"wav16"}`))
+		if err != nil {
+			t.Fatalf("job %d POST /synth failed: %v", i, err)
+		}
+		var out struct {
+			ID string `json:"id"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			resp.Body.Close()
+			t.Fatalf("job %d decode error: %v", i, err)
+		}
+		resp.Body.Close()
+		if out.ID == "" {
+			t.Fatalf("job %d received empty ID", i)
+		}
+		jobIDs[i] = out.ID
+	}
+
+	// Verify worker picked up and started the first job
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("worker did not start first job within deadline")
+	}
+
+	// Verify GET /job answers for queued jobs without deadlock
+	for _, idx := range []int{0, 63, 64, numJobs - 1} {
+		pollResp, err := http.Get(fmt.Sprintf("%s/job?id=%s", ts.URL, jobIDs[idx]))
+		if err != nil {
+			t.Fatalf("GET /job for job %d failed: %v", idx, err)
+		}
+		var st struct {
+			Status string `json:"status"`
+		}
+		err = json.NewDecoder(pollResp.Body).Decode(&st)
+		pollResp.Body.Close()
+		if err != nil {
+			t.Fatalf("job %d decode poll error: %v", idx, err)
+		}
+		if st.Status != "running" {
+			t.Fatalf("job %d expected status 'running', got %q", idx, st.Status)
+		}
+	}
+
+	// Unblock worker and let jobs complete
+	close(unblock)
+}
+
+// TestYuE2FailingGenerate verifies that when pipeline generation fails,
+// GET /job?id=N returns {"status":"failed","error":"<message>"} and
+// GET /job?id=N&result=1 returns HTTP 404.
+func TestYuE2FailingGenerate(t *testing.T) {
+	stub := &stubPipeline{
+		generate: func(r yue2.Request, cancel func() bool) (*yue2.Song, error) {
+			return nil, errors.New("simulated VRAM allocation failure")
+		},
+	}
+	srv, ts := newTestYuE2Server(stub)
+	defer srv.Close()
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/synth", "application/json", strings.NewReader(`{"output_format":"wav16"}`))
+	if err != nil {
+		t.Fatalf("POST /synth: %v", err)
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+
+	// Poll until status is failed
+	var pollOut struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		pollResp, err := http.Get(fmt.Sprintf("%s/job?id=%s", ts.URL, out.ID))
+		if err != nil {
+			t.Fatalf("GET /job: %v", err)
+		}
+		json.NewDecoder(pollResp.Body).Decode(&pollOut)
+		pollResp.Body.Close()
+		if pollOut.Status == "failed" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if pollOut.Status != "failed" {
+		t.Fatalf("expected status 'failed', got %q", pollOut.Status)
+	}
+	if !strings.Contains(pollOut.Error, "simulated VRAM allocation failure") {
+		t.Fatalf("expected error message to contain failure details, got %q", pollOut.Error)
+	}
+
+	// Fetch result while failed should return 404
+	resultResp, err := http.Get(fmt.Sprintf("%s/job?id=%s&result=1", ts.URL, out.ID))
+	if err != nil {
+		t.Fatalf("GET /job?result=1: %v", err)
+	}
+	defer resultResp.Body.Close()
+	if resultResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for failed job result, got %d", resultResp.StatusCode)
+	}
+}
+
+// TestYuE2WavFormats verifies that wav24 and wav32 outputs are accepted and produced.
+func TestYuE2WavFormats(t *testing.T) {
+	for _, fmtName := range []string{"wav24", "wav32"} {
+		t.Run(fmtName, func(t *testing.T) {
+			stub := &stubPipeline{}
+			srv, ts := newTestYuE2Server(stub)
+			defer srv.Close()
+			defer ts.Close()
+
+			resp, err := http.Post(ts.URL+"/synth", "application/json", strings.NewReader(fmt.Sprintf(`{"output_format":%q}`, fmtName)))
+			if err != nil {
+				t.Fatalf("POST /synth: %v", err)
+			}
+			var out struct {
+				ID string `json:"id"`
+			}
+			json.NewDecoder(resp.Body).Decode(&out)
+			resp.Body.Close()
+
+			// Wait for done
+			for i := 0; i < 50; i++ {
+				pResp, err := http.Get(fmt.Sprintf("%s/job?id=%s", ts.URL, out.ID))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var st struct {
+					Status string `json:"status"`
+				}
+				json.NewDecoder(pResp.Body).Decode(&st)
+				pResp.Body.Close()
+				if st.Status == "done" {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			// Fetch result
+			resResp, err := http.Get(fmt.Sprintf("%s/job?id=%s&result=1", ts.URL, out.ID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resResp.Body.Close()
+			if resResp.StatusCode != http.StatusOK {
+				t.Fatalf("expected 200, got %d", resResp.StatusCode)
+			}
+		})
+	}
+}
+
+// TestYuE2FIFOOrder verifies that multiple queued jobs are processed in the order received.
+func TestYuE2FIFOOrder(t *testing.T) {
+	var mu sync.Mutex
+	var executed []string
+
+	stub := &stubPipeline{
+		generate: func(r yue2.Request, cancel func() bool) (*yue2.Song, error) {
+			mu.Lock()
+			executed = append(executed, r.Style)
+			mu.Unlock()
+			return &yue2.Song{
+				Samples: 48000,
+				Audio:   make([]float32, 48000*2),
+				Latents: make([]float32, 25*64),
+			}, nil
+		},
+	}
+	srv, ts := newTestYuE2Server(stub)
+	defer srv.Close()
+	defer ts.Close()
+
+	names := []string{"first", "second", "third", "fourth"}
+	var lastID string
+	for _, name := range names {
+		resp, err := http.Post(ts.URL+"/synth", "application/json", strings.NewReader(fmt.Sprintf(`{"style":%q,"output_format":"wav16"}`, name)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out struct {
+			ID string `json:"id"`
+		}
+		json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		lastID = out.ID
+	}
+
+	// Wait until last job is done
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		pResp, err := http.Get(fmt.Sprintf("%s/job?id=%s", ts.URL, lastID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var st struct {
+			Status string `json:"status"`
+		}
+		json.NewDecoder(pResp.Body).Decode(&st)
+		pResp.Body.Close()
+		if st.Status == "done" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(executed) != len(names) {
+		t.Fatalf("expected %d executed jobs, got %d", len(names), len(executed))
+	}
+	for i, want := range names {
+		if executed[i] != want {
+			t.Fatalf("job index %d: expected %q, got %q", i, want, executed[i])
+		}
 	}
 }
