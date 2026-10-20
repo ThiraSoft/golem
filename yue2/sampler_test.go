@@ -2,6 +2,8 @@ package yue2
 
 import (
 	"math"
+	"slices"
+	"sort"
 	"testing"
 )
 
@@ -102,4 +104,126 @@ func TestDistributionAndDraw(t *testing.T) {
 			}
 		})
 	}
+}
+
+// BenchmarkDistribution times one score phase step: the whole ABC window of a
+// recorded head (151849 rows), a full penalty window of 100 tokens with
+// repeats, and the candidate buffer carried from step to step as Generate does.
+func BenchmarkDistribution(b *testing.B) {
+	f := loadFixtures(b)
+	logits := f.read(b, "sample/score_0_logits")
+	history := make([]int32, 100)
+	for i := range history {
+		history[i] = int32((i * 37) % 61 * 97)
+	}
+	var out []Candidate
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out = Distribution(logits, ABCSampling, history, 100, PhaseABC, out)
+	}
+	b.ReportMetric(float64(b.Elapsed().Microseconds())/1e3/float64(b.N), "ms/step")
+	if len(out) == 0 {
+		b.Fatal("no candidate")
+	}
+}
+
+// distributionBySort is the top-k and nucleus cut the way it reads in
+// yue2.cpp's sampling.h with the whole window sorted first: every candidate at
+// or above the k-th score survives. It takes the scores after penalty and
+// temperature, which Distribution computes before cutting.
+func distributionBySort(c []Candidate, k int, topP float32) []Candidate {
+	c = slices.Clone(c)
+	sort.SliceStable(c, func(i, j int) bool {
+		if c[i].Score != c[j].Score {
+			return c[i].Score > c[j].Score
+		}
+		return c[i].ID < c[j].ID
+	})
+	k = min(k, len(c))
+	threshold := c[k-1].Score
+	kept := k
+	for kept < len(c) && c[kept].Score >= threshold {
+		kept++
+	}
+	c = c[:kept]
+	if topP >= 1 {
+		return c
+	}
+	var sum, cumulative float64
+	for i := range c {
+		sum += math.Exp(float64(c[i].Score - c[0].Score))
+	}
+	for i := range c {
+		if i > 0 && cumulative > float64(topP) {
+			return c[:i]
+		}
+		cumulative += math.Exp(float64(c[i].Score-c[0].Score)) / sum
+	}
+	return c
+}
+
+// TestDistributionTies puts many candidates on the same few scores, so the
+// k-th score is shared by several of them, and checks that the selection keeps
+// exactly the set and order a sort of the whole window gives.
+func TestDistributionTies(t *testing.T) {
+	_, rows := PhaseRows(PhaseABC)
+	logits := make([]float32, rows)
+	rng := uint32(12345)
+	next := func() uint32 { rng = rng*1664525 + 1013904223; return rng >> 8 }
+
+	// The hand case first: three leaders, then four candidates tied at the
+	// fifth score, then the rest below.
+	for i := range logits {
+		logits[i] = -10
+	}
+	for i, id := range []int{70, 30, 900} {
+		logits[id] = float32(9 - i)
+	}
+	for _, id := range []int{5, 4000, 151000, 77} {
+		logits[id] = 5
+	}
+	s := Sampling{Temperature: 1, TopP: 1, TopK: 5, RepetitionPenalty: 1, PenaltyWindow: 1, MinTokens: 0, MaxTokens: 1}
+	got := Distribution(logits, s, nil, 0, PhaseABC, nil)
+	want := []int32{70, 30, 900, 5, 77, 4000, 151000} // ties by id
+	if !slices.Equal(candidateIDs(got), want) {
+		t.Fatalf("hand case: kept %v, want %v", candidateIDs(got), want)
+	}
+
+	var out []Candidate
+	for trial := 0; trial < 40; trial++ {
+		for i := range logits {
+			logits[i] = float32(int(next()%9)) - 8 // nine scores, thousands of ties on each
+		}
+		for i := 0; i < int(next()%20); i++ {
+			logits[next()%uint32(rows)] = float32(next()%4) + 1 // a few leaders, tied too
+		}
+		s := ABCSampling
+		s.TopK = 1 + int(next()%40)
+		if trial%3 == 0 {
+			s.TopP = 1
+		}
+		history := make([]int32, 100)
+		for i := range history {
+			history[i] = int32(next() % 300)
+		}
+		// The reference sees the same scores Distribution cuts: run it with no
+		// cut at all (k as large as the window, no nucleus) and cut that.
+		all := s
+		all.TopK, all.TopP = rows, 1
+		full := Distribution(logits, all, history, 100, PhaseABC, nil)
+		want := distributionBySort(full, s.TopK, s.TopP)
+		out = Distribution(logits, s, history, 100, PhaseABC, out)
+		if !slices.Equal(out, want) {
+			t.Fatalf("trial %d (top_k %d, top_p %g): kept %d candidates %v, want %d %v",
+				trial, s.TopK, s.TopP, len(out), candidateIDs(out), len(want), candidateIDs(want))
+		}
+	}
+}
+
+func candidateIDs(c []Candidate) []int32 {
+	ids := make([]int32, len(c))
+	for i := range c {
+		ids[i] = c[i].ID
+	}
+	return ids
 }

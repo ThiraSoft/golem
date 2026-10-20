@@ -1,9 +1,10 @@
 package yue2
 
 import (
+	"cmp"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 )
 
 // Phase designates the autoregressive stage currently sampling from the LM head.
@@ -159,20 +160,35 @@ func Distribution(logits []float32, s Sampling, history []int32, step int, p Pha
 		return append(out[:0], winner)
 	}
 
-	// Top-k truncation keeps all candidates at or above the k-th score, ties included.
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].Score > out[j].Score
-	})
+	// Top-k truncation keeps all candidates at or above the k-th score, ties
+	// included. Only the k-th score is needed to cut, so it is selected with a
+	// heap of k scores rather than by sorting the whole window (151849 entries
+	// in the score phase, 19 ms a step when sorted). The survivors are then a
+	// few dozen and sorted alone, as yue2.cpp sorts its kept set.
 	k := s.TopK
 	if k > len(out) {
 		k = len(out)
 	}
-	threshold := out[k-1].Score
-	kept := k
-	for kept < len(out) && out[kept].Score >= threshold {
-		kept++
+	threshold := kthLargest(out, k)
+	kept := 0
+	for i := range out {
+		if out[i].Score >= threshold {
+			out[kept] = out[i]
+			kept++
+		}
 	}
 	out = out[:kept]
+	// Equal scores go by id so the order, and with it the nucleus cut and the
+	// draw, never depends on how the sort happens to break ties.
+	slices.SortFunc(out, func(a, b Candidate) int {
+		if a.Score != b.Score {
+			if a.Score > b.Score {
+				return -1
+			}
+			return 1
+		}
+		return cmp.Compare(a.ID, b.ID)
+	})
 
 	if s.TopP >= 1.0 {
 		return out
@@ -196,6 +212,52 @@ func Distribution(logits []float32, s Sampling, history []int32, step int, p Pha
 	}
 
 	return out
+}
+
+// kthLargest returns the k-th largest score of c, counting equal scores
+// separately, as out[k-1] of a descending sort would. It keeps the k largest
+// scores seen in a min-heap, so most candidates cost one comparison with its
+// root.
+func kthLargest(c []Candidate, k int) float32 {
+	var small [128]float32
+	h := small[:0]
+	if k > len(small) {
+		h = make([]float32, 0, k)
+	}
+	for i := range c {
+		x := c[i].Score
+		if len(h) < k {
+			h = append(h, x)
+			for j := len(h) - 1; j > 0; {
+				p := (j - 1) / 2
+				if h[p] <= h[j] {
+					break
+				}
+				h[p], h[j] = h[j], h[p]
+				j = p
+			}
+			continue
+		}
+		if x <= h[0] {
+			continue
+		}
+		h[0] = x
+		for j := 0; ; {
+			l, m := 2*j+1, j
+			if l < k && h[l] < h[m] {
+				m = l
+			}
+			if l+1 < k && h[l+1] < h[m] {
+				m = l + 1
+			}
+			if m == j {
+				break
+			}
+			h[j], h[m] = h[m], h[j]
+			j = m
+		}
+	}
+	return h[0]
 }
 
 const curand2Pow32Inv = float32(2.3283064365386963e-10)
