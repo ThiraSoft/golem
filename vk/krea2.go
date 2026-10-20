@@ -642,6 +642,25 @@ func (k *K2) Flux3VAEPatch(r *Recorder, p K2Flux3VAEPatch) {
 	k.dispatch(r, k2Flux3VAEPatch, -1, groups256(n), unsafe.Pointer(&p))
 }
 
+// CopyStrided records count copies of n floats inside the arena, the i-th
+// from src+i*srcStride to dst+i*dstStride (all in floats), in one transfer,
+// then a barrier. It is how a band of planes is cut out of a picture.
+func (k *K2) CopyStrided(r *Recorder, dst, dstStride, src, srcStride, n, count uint32) {
+	if count == 0 || n == 0 {
+		return
+	}
+	regions := make([]bufferCopy, count)
+	for i := range regions {
+		regions[i] = bufferCopy{
+			srcOffset: 4 * (uint64(src) + uint64(i)*uint64(srcStride)),
+			dstOffset: 4 * (uint64(dst) + uint64(i)*uint64(dstStride)),
+			size:      4 * uint64(n),
+		}
+	}
+	vkCmdCopyBuffer(r.cb, k.arena.handle, k.arena.handle, count, &regions[0])
+	r.Barrier()
+}
+
 // Compile records a program over this machine's buffers.
 func (k *K2) Compile(record func(r *Recorder)) (*Program, error) {
 	if err := k.Arena(); err != nil {
