@@ -482,25 +482,16 @@ func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens
 	var f16Buf []byte
 	// runs, when set, is the stacked SwiGLU weight up is reading: its rows go
 	// to the card in runs of 32 of the gate's and the up's in turn
-	// (vk.SwiGLURow), which the MLP input's product wants.
+	// (vk.SwiGLURow), which the MLP input's product wants. The conversions
+	// write each element where its run goes: shift is how far, for element
+	// i, and the first element past i's run.
 	runs := false
-	var runBuf []byte
-	inRuns := func(b []byte, rows, cols, size int) []byte {
+	shift := func(i, rows, cols int) (by, end int) {
 		if !runs {
-			return b
+			return 0, rows * cols
 		}
-		if cap(runBuf) < len(b) {
-			runBuf = make([]byte, len(b))
-		}
-		runBuf = runBuf[:len(b)]
-		run := 32 * cols * size
-		parallelChunks(rows/32, func(w, s, e int) {
-			for i := s; i < e; i++ {
-				to := vk.SwiGLURow(i*32, rows/2) * cols * size
-				copy(runBuf[to:to+run], b[i*run:(i+1)*run])
-			}
-		})
-		return runBuf
+		run := i / (32 * cols)
+		return (vk.SwiGLURow(run*32, rows/2) - run*32) * cols, (run + 1) * 32 * cols
 	}
 	var lut [65536]byte
 	lastInvScale := float32(-1)
@@ -525,13 +516,16 @@ func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens
 			var overflows int64
 			parallelChunks(n, func(w, s, e int) {
 				var ov int64
-				for i := s; i < e; i++ {
-					u := binary.LittleEndian.Uint16(raw[i*2:])
-					h := bf16ToHalfLUT[u]
-					if (h & 0x7c00) == 0x7c00 {
-						ov++
+				for i := s; i < e; {
+					by, end := shift(i, rows, cols)
+					for ; i < min(end, e); i++ {
+						u := binary.LittleEndian.Uint16(raw[i*2:])
+						h := bf16ToHalfLUT[u]
+						if (h & 0x7c00) == 0x7c00 {
+							ov++
+						}
+						binary.LittleEndian.PutUint16(f16Buf[(i+by)*2:], h)
 					}
-					binary.LittleEndian.PutUint16(f16Buf[i*2:], h)
 				}
 				if ov > 0 {
 					atomic.AddInt64(&overflows, ov)
@@ -541,7 +535,7 @@ func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens
 			if overflows > 0 {
 				return linearWeight{}, fmt.Errorf("flux3: %s had %d bf16 values overflow to inf/nan in fp16", name, overflows)
 			}
-			h, err := m.k.AddWeights(inRuns(f16Buf, rows, cols, 2))
+			h, err := m.k.AddWeights(f16Buf)
 			if err != nil {
 				return linearWeight{}, err
 			}
@@ -590,14 +584,16 @@ func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens
 			f8Buf = f8Buf[:n]
 		}
 		parallelChunks(n, func(w, s, e int) {
-			for i := s; i < e; i++ {
-				u := binary.LittleEndian.Uint16(raw[i*2:])
-				f8Buf[i] = lut[u]
+			for i := s; i < e; {
+				by, end := shift(i, rows, cols)
+				for ; i < min(end, e); i++ {
+					f8Buf[i+by] = lut[binary.LittleEndian.Uint16(raw[i*2:])]
+				}
 			}
 		})
 		madviseDontNeed(raw)
 
-		h, err := m.k.AddWeights(inRuns(f8Buf, rows, cols, 1))
+		h, err := m.k.AddWeights(f8Buf)
 		if err != nil {
 			return linearWeight{}, err
 		}
