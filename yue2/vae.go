@@ -13,10 +13,9 @@ package yue2
 // ggml's [c][t] and are compared after a transpose.
 
 import (
-	"encoding/binary"
 	"fmt"
+	"unsafe"
 
-	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/vk"
 )
 
@@ -149,16 +148,23 @@ func NewVAE(d *vk.Device, w *VAEWeights, maxFrames int) (*VAE, error) {
 	}
 	v.k = k
 	// A convolution's weight [OC][IC][K] is already the product's rows of
-	// ic*K + k, the order the operand is written in.
+	// ic*K + k, the order the operand is written in. The rows are narrowed
+	// to fp16 over the cores straight into the staging buffers, while the
+	// card takes the chunk before (vk.K2.AddWeightRows): one core narrowing
+	// into a slice and then uploading it was 0.93 s of an open.
 	upload := func(c *vaeConv, rows, inputs int, at func(row, i int) float32) error {
-		b := make([]byte, 2*rows*inputs)
-		for r := range rows {
-			for i := range inputs {
-				binary.LittleEndian.PutUint16(b[2*(r*inputs+i):], nn.Half(at(r, i)))
-			}
-		}
 		c.outputs, c.inputs = uint32(rows), uint32(inputs)
-		c.w, err = k.AddWeights(b)
+		c.w, err = k.AddWeightRows(rows, 2*inputs, func(dst []byte, first, n int) {
+			out := unsafe.Slice((*uint16)(unsafe.Pointer(&dst[0])), len(dst)/2)
+			spread(n, func(lo, hi int) {
+				for r := lo; r < hi; r++ {
+					row := out[r*inputs : (r+1)*inputs]
+					for i := range row {
+						row[i] = narrow(at(first+r, i))
+					}
+				}
+			})
+		})
 		return err
 	}
 	plain := func(c *vaeConv, wt []float32, oc int) error {
