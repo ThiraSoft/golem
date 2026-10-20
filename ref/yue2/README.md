@@ -217,9 +217,11 @@ Facts these runs establish:
 
 - Q8_0 full regenerates the replay's 4870 codes exactly: yue2.cpp is
   deterministic against itself on one file.
-- **BF16 and Q8_0 with the same seeds diverge at the first semantic token**
-  (and write different scores). Same seeds give the same song only for the
-  same arithmetic; golem's own logits will put it in the same position.
+- **BF16 and Q8_0 with the same seeds write different scores** (2883 and
+  2433 tokens) and different codes. Same seeds give the same song only for
+  the same arithmetic. golem with the same seeds leaves the Q8_0 score at
+  its token 873 and differs in the codes from the first (task 10,
+  `yue2/README.md`, "Same seeds").
 - **SNR floor of the reference against itself**: the Q8_0 full run and the
   Q8_0 replay of the same codes differ (prefill versus decode-written cache)
   by **34.8 dB** on the wav16; Q8_0 replay against BF16 replay is
@@ -251,7 +253,11 @@ scope ref/yue2/bench_golem.sh /tmp/yue2 $B/guerreros-full.json $O/golem-full-2 -
 ```
 
 `-compare` prints where golem's score and codes first leave yue2.cpp's run,
-and the wav16's SNR against its wav when the lengths agree. The results
+and the wav16's SNR against its wav when the lengths agree. In the
+2026-10-20 sitting the second forced run compared against `bench/q8-replay`
+(tokens only, identical); the 32.78 dB against `bench/q8-full.wav` comes
+from a third forced run, `golem-forced-3`, and the replay's 34.52 dB from
+`golem-replay-3`, both with the flags shown. The results
 are in `yue2/README.md` ("Speed", "Same seeds"). On 2026-10-20 yue2.cpp
 reproduced `bench/q8-full.tokens.csv` and `bench/q8-full.abc` byte for byte
 on both of its free runs, and its stage times were within 0.4 s of the

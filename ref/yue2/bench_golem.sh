@@ -9,6 +9,7 @@ set -euo pipefail
 export LC_ALL=C
 bin=$1 req=$2 out=$3
 shift 3
+mkdir -p "$(dirname "$out")"
 start=$(date +%s.%N)
 "$bin" -request "$req" -out "$out.wav" \
 	-tokens "$out.tokens.csv" -score "$out.abc" "$@" 2>"$out.log"
@@ -17,5 +18,7 @@ echo "wall $(awk "BEGIN{print $end - $start}") s" | tee -a "$out.log"
 grep -E "^\[(Load|Time|Done|Compare)\]" "$out.log" || true
 # The scope systemd-run puts the script in (ref/yue2/README.md): its peak,
 # the page cache of the mmapped weights included, so not a resident size.
+# Meaningful only inside that scope: run bare, this is the login session's
+# cgroup and its peak is the whole desktop's.
 peak=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.peak
 if [ -r "$peak" ]; then echo "cgroup memory.peak $(($(cat "$peak") / 1048576)) MiB" | tee -a "$out.log"; fi
