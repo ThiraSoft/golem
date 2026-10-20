@@ -47,8 +47,8 @@ const (
 	RefTokens = 4096
 	MaxRefs   = 4
 	// mlpChunk is how many tokens one pass of a block's MLP covers: its
-	// 2 x 9216 wide input is the largest buffer a token needs, so the arena
-	// holds it for these tokens only.
+	// 9216 wide hidden layer, in fp16, is held for these tokens only. The
+	// products are as quick over 4096 tokens as over 8192.
 	mlpChunk = 4096
 )
 
@@ -260,7 +260,7 @@ type DiT struct {
 	embImgBuf uint32
 	imgOut    uint32
 
-	x, nh, q, kBuf, vBuf, att, mlp, half, table uint32
+	x, nh, q, kBuf, vBuf, att, half, table uint32
 	// zeroPar is ditWidth zeros in the parameters: the gated adds' second gate.
 	zeroPar uint32
 
@@ -480,6 +480,28 @@ func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens
 
 	var f8Buf []byte
 	var f16Buf []byte
+	// runs, when set, is the stacked SwiGLU weight up is reading: its rows go
+	// to the card in runs of 32 of the gate's and the up's in turn
+	// (vk.SwiGLURow), which the MLP input's product wants.
+	runs := false
+	var runBuf []byte
+	inRuns := func(b []byte, rows, cols, size int) []byte {
+		if !runs {
+			return b
+		}
+		if cap(runBuf) < len(b) {
+			runBuf = make([]byte, len(b))
+		}
+		runBuf = runBuf[:len(b)]
+		run := 32 * cols * size
+		parallelChunks(rows/32, func(w, s, e int) {
+			for i := s; i < e; i++ {
+				to := vk.SwiGLURow(i*32, rows/2) * cols * size
+				copy(runBuf[to:to+run], b[i*run:(i+1)*run])
+			}
+		})
+		return runBuf
+	}
 	var lut [65536]byte
 	lastInvScale := float32(-1)
 	up := func(name string, rows, cols int) (linearWeight, error) {
@@ -519,7 +541,7 @@ func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens
 			if overflows > 0 {
 				return linearWeight{}, fmt.Errorf("flux3: %s had %d bf16 values overflow to inf/nan in fp16", name, overflows)
 			}
-			h, err := m.k.AddWeights(f16Buf)
+			h, err := m.k.AddWeights(inRuns(f16Buf, rows, cols, 2))
 			if err != nil {
 				return linearWeight{}, err
 			}
@@ -575,7 +597,7 @@ func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens
 		})
 		madviseDontNeed(raw)
 
-		h, err := m.k.AddWeights(f8Buf)
+		h, err := m.k.AddWeights(inRuns(f8Buf, rows, cols, 1))
 		if err != nil {
 			return linearWeight{}, err
 		}
@@ -595,7 +617,10 @@ func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens
 		if b.attnOut, err = up(prefix+"attn_out.weight", ditWidth, ditWidth); err != nil {
 			return err
 		}
-		if b.mlpIn, err = up(prefix+"mlp_in.weight", 2*ditFFN, ditWidth); err != nil {
+		runs = true
+		b.mlpIn, err = up(prefix+"mlp_in.weight", 2*ditFFN, ditWidth)
+		runs = false
+		if err != nil {
 			return err
 		}
 		b.mlpOut, err = up(prefix+"mlp_out.weight", ditWidth, ditFFN)
@@ -730,7 +755,6 @@ func (m *DiT) layout(a *arena) {
 	m.kBuf = a.take(N * ditWidth)
 	m.vBuf = a.take(N * ditWidth)
 	m.att = a.take(N * ditWidth)
-	m.mlp = a.take(mlpChunk * 2 * ditFFN)
 	m.table = a.take(N * ditHeadDim)
 }
 
@@ -1058,7 +1082,7 @@ func (m *DiT) recordBlock(r *vk.Recorder, b *ditBlock, tokens int, xOffset uint3
 	})
 
 	// 6-9. Attention Out, then the MLP from nh mlpChunk tokens at a time
-	// (MLP In, SwiGLU into half as fp16, MLP Out), each added to x times its
+	// (MLP In with its SwiGLU into half as fp16, MLP Out), each added to x times its
 	// span's gate: x += g·(attn + mlp) as two gated adds, with no buffer
 	// between. Neither reads x, which the norm above was the last to read.
 	for _, sp := range spans {
@@ -1075,15 +1099,8 @@ func (m *DiT) recordBlock(r *vk.Recorder, b *ditBlock, tokens int, xOffset uint3
 			m.mm(r, b.mlpIn.w, vk.K2MM{
 				Outputs: uint32(2 * ditFFN), Inputs: uint32(ditWidth), Cols: cols,
 				X: nhHalves + uint32(c0*ditWidth), XStride: uint32(ditWidth),
-				Y: m.mlp, YStride: uint32(2 * ditFFN),
-				Bias: vk.K2None, Scale: b.mlpIn.scale, Mode: vk.K2Store, XHalves: 1,
-			})
-			m.act(r, vk.K2Act{
-				X: m.mlp, XStride: uint32(2 * ditFFN),
-				Y: m.mlp + uint32(ditFFN), YStride: uint32(2 * ditFFN),
-				N: uint32(ditFFN), Rows: cols,
-				Op:  vk.K2SwiGLU,
-				Dst: 2 * m.half, DstStride: uint32(ditFFN), Halves: 1,
+				Y: 2 * m.half, YStride: uint32(ditFFN),
+				Bias: vk.K2None, Scale: b.mlpIn.scale, Mode: vk.K2SwiGLUHalves, XHalves: 1,
 			})
 			m.mm(r, b.mlpOut.w, vk.K2MM{
 				Outputs: uint32(ditWidth), Inputs: uint32(ditFFN), Cols: cols,

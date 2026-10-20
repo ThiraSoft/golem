@@ -9,6 +9,7 @@ package vk
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
 	"math/rand"
 	"testing"
@@ -185,6 +186,78 @@ func TestK2ProductFP16(t *testing.T) {
 		}
 	}
 	k2Compare(t, "mm16", got, want, 1e-5)
+}
+
+// TestK2ProductSwiGLU: a SwiGLU's stacked weight in runs (SwiGLURow), X in
+// fp16, silu(gate)·up out as fp16; with fp16 weights in tiles of 128 and of
+// 256, and fp8 ones.
+func TestK2ProductSwiGLU(t *testing.T) {
+	r := rand.New(rand.NewSource(9))
+	for _, c := range []struct {
+		n, ins, cols int
+		fp8          bool
+	}{{352, 96, 200, false}, {9216, 32, 2000, false}, {352, 96, 200, true}} {
+		outs := 2 * c.n
+		wf := randomFloats(r, outs*c.ins, 0.1)
+		wq := make([]float32, len(wf)) // what the card sees of each weight
+		var w []byte
+		if c.fp8 {
+			w8 := randomFP8(r, outs*c.ins)
+			for i := range wq {
+				wq[i] = e4m3(w8[i])
+			}
+			w = make([]byte, len(w8))
+			for o := 0; o < outs; o++ {
+				copy(w[SwiGLURow(o, c.n)*c.ins:], w8[o*c.ins:(o+1)*c.ins])
+			}
+		} else {
+			w = make([]byte, 2*len(wf))
+			for o := 0; o < outs; o++ {
+				at := SwiGLURow(o, c.n) * c.ins
+				for i := 0; i < c.ins; i++ {
+					h := f32ToF16(wf[o*c.ins+i])
+					wq[o*c.ins+i] = f16ToF32(h)
+					binary.LittleEndian.PutUint16(w[2*(at+i):], h)
+				}
+			}
+		}
+		x := randomFloats(r, c.cols*c.ins, 1)
+		xh := make([]float32, len(x)/2) // x as fp16, two to a float
+		for i := 0; i < len(x); i += 2 {
+			lo, hi := uint32(f32ToF16(x[i])), uint32(f32ToF16(x[i+1]))
+			xh[i/2] = math.Float32frombits(lo | hi<<16)
+		}
+		const scale = 0.8
+		yAt := len(xh)
+		k := newK2(t, yAt+c.cols*c.n/2, []float32{0})
+		wb, _ := k.AddWeights(w)
+		k.Write(0, xh)
+		run(t, k, func(rec *Recorder) {
+			k.MM(rec, wb, c.fp8, K2MM{Outputs: uint32(outs), Inputs: uint32(c.ins), Cols: uint32(c.cols),
+				XStride: uint32(c.ins), Y: uint32(2 * yAt), YStride: uint32(c.n), Bias: K2None, Scale: scale,
+				Mode: K2SwiGLUHalves, XHalves: 1})
+		})
+		raw, _ := k.Read(yAt, c.cols*c.n/2)
+		got := make([]float32, c.cols*c.n)
+		for i, v := range raw {
+			b := math.Float32bits(v)
+			got[2*i], got[2*i+1] = f16ToF32(uint16(b)), f16ToF32(uint16(b>>16))
+		}
+		want := make([]float32, c.cols*c.n)
+		for col := 0; col < c.cols; col++ {
+			for g := 0; g < c.n; g++ {
+				var a, u float64
+				for i := 0; i < c.ins; i++ {
+					xi := float64(f16ToF32(f32ToF16(x[col*c.ins+i])))
+					a += float64(wq[g*c.ins+i]) * xi
+					u += float64(wq[(c.n+g)*c.ins+i]) * xi
+				}
+				a, u = a*scale, u*scale
+				want[col*c.n+g] = f16ToF32(f32ToF16(float32(a / (1 + math.Exp(-a)) * u)))
+			}
+		}
+		k2Compare(t, fmt.Sprintf("swiglu %d x %d x %d, fp8 %v", outs, c.ins, c.cols, c.fp8), got, want, 1e-2) // an fp16 step of the largest either side
+	}
 }
 
 func TestK2Norm(t *testing.T) {

@@ -169,7 +169,21 @@ const (
 	K2Store    = 0
 	K2Add      = 1
 	K2GatedAdd = 2
+	// K2SwiGLUHalves writes silu(gate)·up as fp16, Outputs/2 a column, Y and
+	// YStride counting halves, from weights whose rows go in runs of 32 of
+	// the gate's then 32 of the up's (SwiGLURows).
+	K2SwiGLUHalves = 3
 )
+
+// SwiGLURow is where row r of a SwiGLU's stacked weight, the gate's n rows
+// then the up's, goes for K2SwiGLUHalves: runs of 32 of each in turn.
+func SwiGLURow(r, n int) int {
+	up := 0
+	if r >= n {
+		r, up = r-n, 32
+	}
+	return r/32*64 + up + r%32
+}
 
 // K2None is the offset that says a kernel has no such input.
 const K2None = ^uint32(0)
