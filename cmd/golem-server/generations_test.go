@@ -22,7 +22,11 @@ type fakeImager struct {
 	steps          int
 	disallowImages bool
 	disallowLoRA   bool
+	refuse         error // what Check answers
+	drew           bool
 }
+
+func (f *fakeImager) Check(r PictureRequest) error { return f.refuse }
 
 func (f *fakeImager) Defaults() (string, int) {
 	s, st := f.size, f.steps
@@ -46,7 +50,7 @@ func (f *fakeImager) WritePNG(w io.Writer, img image.Image, r PictureRequest) er
 }
 
 func (f *fakeImager) Generate(r PictureRequest, progress krea2.Progress) (*image.NRGBA, krea2.Timings, error) {
-	f.got = r
+	f.got, f.drew = r, true
 	if progress != nil {
 		for i := 1; i <= r.Steps; i++ {
 			progress(i, r.Steps)
@@ -291,7 +295,7 @@ func TestGenerationsRefusesOversizedImageDimensions(t *testing.T) {
 }
 
 func TestGenerationsFlux3Defaults(t *testing.T) {
-	f := &fakeImager{size: "1024x1024", steps: 16, disallowLoRA: true}
+	f := &fakeImager{size: "2048x2048", steps: 16, disallowLoRA: true}
 	s := NewServer(nil, nil, "flux3", nil, sample.Params{})
 	s.SetImager(f)
 	rec := httptest.NewRecorder()
@@ -299,7 +303,65 @@ func TestGenerationsFlux3Defaults(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
-	if f.got.Width != 1024 || f.got.Height != 1024 || f.got.Steps != 16 {
-		t.Fatalf("drew %+v, want 1024x1024, 16 steps", f.got)
+	if f.got.Width != 2048 || f.got.Height != 2048 || f.got.Steps != 16 {
+		t.Fatalf("drew %+v, want 2048x2048, 16 steps", f.got)
+	}
+}
+
+func tinyPNG(t *testing.T) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewNRGBA(image.Rect(0, 0, 2, 2))); err != nil {
+		t.Fatal(err)
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+func TestFlux3MatchImageCarried(t *testing.T) {
+	f := &fakeImager{size: "2048x2048", steps: 16, disallowLoRA: true}
+	s := NewServer(nil, nil, "flux3", nil, sample.Params{})
+	s.SetImager(f)
+	rec := httptest.NewRecorder()
+	body := fmt.Sprintf(`{"prompt":"a cat","match_image":true,"images":["%s"]}`, tinyPNG(t))
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/images/generations", strings.NewReader(body)))
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if !f.got.MatchImage {
+		t.Error("match_image did not reach the imager")
+	}
+	if toFlux3(f.got).MatchImage != true {
+		t.Error("toFlux3 drops MatchImage")
+	}
+}
+
+func TestFlux3MatchImageWithoutImagesIs400(t *testing.T) {
+	_, rec := generate(t, `{"prompt":"a cat","match_image":true}`)
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "match_image") {
+		t.Fatalf("status %d %s, want 400 naming match_image", rec.Code, rec.Body)
+	}
+}
+
+func TestFlux3DefaultSize(t *testing.T) {
+	if size, steps := (&flux3Imager{}).Defaults(); size != "2048x2048" || steps != 16 {
+		t.Errorf("FLUX 3 defaults %s, %d steps; want 2048x2048, 16", size, steps)
+	}
+}
+
+func TestFlux3SizePastLimitIs400(t *testing.T) {
+	f := &fakeImager{size: "2048x2048", steps: 16, disallowLoRA: true,
+		refuse: fmt.Errorf("flux3: 2560 × 2560 is past the 4456448 pixels this pipeline was opened for")}
+	s := NewServer(nil, nil, "flux3", nil, sample.Params{})
+	s.SetImager(f)
+	for _, stream := range []bool{false, true} {
+		rec := httptest.NewRecorder()
+		body := fmt.Sprintf(`{"prompt":"a cat","size":"2560x2560","stream":%v}`, stream)
+		s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/images/generations", strings.NewReader(body)))
+		if rec.Code != 400 || !strings.Contains(rec.Body.String(), "4456448") {
+			t.Errorf("stream %v: status %d %s, want 400 naming 4456448", stream, rec.Code, rec.Body)
+		}
+	}
+	if f.drew {
+		t.Error("the imager drew a picture its Check refused")
 	}
 }

@@ -3,10 +3,11 @@
 // for the same seed the same picture.
 //
 //	flux3 -prompt "a cat on a wooden table" -seed 42 -out cat.png
-//	flux3 -prompt "..." -image photo.jpg -out out.png
+//	flux3 -prompt "..." -image photo.jpg -match-image -out out.png
 //
-// It needs a Vulkan device with cooperative matrices and about thirteen
-// gigabytes on it.
+// It draws at 2048 x 2048 by default, the workflows' 4 MP; -match-image
+// sizes the picture after the first -image instead. It needs a Vulkan
+// device with cooperative matrices and about sixteen gigabytes on it.
 package main
 
 import (
@@ -38,8 +39,9 @@ func (s *stringList) Set(val string) error {
 func main() {
 	prompt := flag.String("prompt", "", "what to draw")
 	negative := flag.String("negative", "", "what not to draw; read only when -cfg is not 1")
-	width := flag.Int("width", 1024, "width, a multiple of 16")
-	height := flag.Int("height", 1024, "height, a multiple of 16")
+	width := flag.Int("width", 2048, "width, a multiple of 16")
+	height := flag.Int("height", 2048, "height, a multiple of 16")
+	matchImage := flag.Bool("match-image", false, "size the picture after the first -image scaled to 4 MP, as the workflows' match_input_image")
 	steps := flag.Int("steps", 16, "sampling steps")
 	cfg := flag.Float64("cfg", 1, "classifier-free guidance; 1 skips the negative prompt")
 	seed := flag.Int64("seed", -1, "the seed; -1 draws one")
@@ -63,6 +65,10 @@ func main() {
 	}
 	if *seed < 0 {
 		*seed = rand.Int63()
+	}
+	if *matchImage && len(imagePaths) == 0 {
+		fmt.Fprintln(os.Stderr, "flux3: -match-image needs an -image")
+		os.Exit(2)
 	}
 
 	var refImages []image.Image
@@ -91,7 +97,6 @@ func main() {
 		VAE:       *vae,
 		Tokenizer: *tokenizer,
 		Keep:      *n > 1,
-		MaxPixels: 1024 * 1024,
 		Precision: prec,
 	})
 	if err != nil {
@@ -112,6 +117,7 @@ func main() {
 			Images:     refImages,
 			MegaPixels: *mp,
 			HidePrompt: *hidePrompt,
+			MatchImage: *matchImage,
 		}
 		img, tm, err := p.Generate(r, func(step, steps int) { fmt.Fprintf(os.Stderr, "\rstep %d/%d", step, steps) })
 		if err != nil {

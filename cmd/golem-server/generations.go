@@ -48,6 +48,9 @@ type PictureRequest struct {
 	ChromaSpread   float32
 	HidePrompt     bool
 	Images         []image.Image
+	// MatchImage sizes the picture after Images[0], the workflows'
+	// match_input_image; FLUX 3 only.
+	MatchImage bool
 }
 
 // Imager draws pictures. krea2Imager and flux3Imager are two; the tests have another.
@@ -88,6 +91,7 @@ func toFlux3(r PictureRequest) flux3.Request {
 		Seed:       r.Seed,
 		Images:     r.Images,
 		HidePrompt: r.HidePrompt,
+		MatchImage: r.MatchImage,
 	}
 }
 
@@ -123,7 +127,15 @@ func (fi *flux3Imager) WritePNG(w io.Writer, img image.Image, r PictureRequest) 
 }
 
 func (fi *flux3Imager) Defaults() (string, int) {
-	return "1024x1024", flux3.Defaults.Steps
+	return "2048x2048", flux3.Defaults.Steps
+}
+
+// Check refuses what the pipeline would, before the picture is queued.
+func (fi *flux3Imager) Check(r PictureRequest) error { return fi.p.Check(toFlux3(r)) }
+
+// checker is an Imager that can say beforehand that it would refuse a picture.
+type checker interface {
+	Check(r PictureRequest) error
 }
 
 func (fi *flux3Imager) SupportsImages() bool { return true }
@@ -143,6 +155,14 @@ func (l *lockedImager) Generate(r PictureRequest, p krea2.Progress) (*image.NRGB
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.im.Generate(r, p)
+}
+
+// Check needs no lock: it reads the request, not the card.
+func (l *lockedImager) Check(r PictureRequest) error {
+	if c, ok := l.im.(checker); ok {
+		return c.Check(r)
+	}
+	return nil
 }
 
 func (l *lockedImager) Defaults() (string, int) {
@@ -184,6 +204,8 @@ type generationRequest struct {
 	HidePrompt bool `json:"hide_prompt"`
 	// Stream answers with server-sent events: one a step, then the picture.
 	Stream bool `json:"stream"`
+	// MatchImage sizes the picture after the first image (FLUX 3).
+	MatchImage bool `json:"match_image"`
 }
 
 // The mobile front's defaults.
@@ -203,6 +225,9 @@ func (s *Server) generations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	k, err := req.pictureRequest(s.imager)
+	if c, ok := s.imager.(checker); ok && err == nil {
+		err = c.Check(k)
+	}
 	if err != nil {
 		refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -372,6 +397,15 @@ func (req generationRequest) pictureRequest(im Imager) (PictureRequest, error) {
 			}
 			p.Images = append(p.Images, img)
 		}
+	}
+	if req.MatchImage {
+		if im != nil && !im.SupportsImages() {
+			return p, fmt.Errorf("match_image is not supported by this model")
+		}
+		if len(p.Images) == 0 {
+			return p, fmt.Errorf("match_image needs at least one image")
+		}
+		p.MatchImage = true
 	}
 	if req.Seed != nil && *req.Seed >= 0 {
 		p.Seed = uint64(*req.Seed)
