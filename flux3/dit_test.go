@@ -461,8 +461,8 @@ func TestBoundsChecks(t *testing.T) {
 	if err := m.SetRefs(0, [][]float32{dummyLat}, [][2]int{}); err == nil {
 		t.Error("SetRefs with len(shapes) != len(latents) succeeded, want error")
 	}
-	oversizedRef := make([]float32, 64*64*ditInChannels)
-	if err := m.SetRefs(0, [][]float32{oversizedRef}, [][2]int{{64, 64}}); err == nil {
+	oversizedRef := make([]float32, (MaxRefTokens+1)*ditInChannels)
+	if err := m.SetRefs(0, [][]float32{oversizedRef}, [][2]int{{1, MaxRefTokens + 1}}); err == nil {
 		t.Error("SetRefs with total ref tokens > MaxRefTokens succeeded, want error")
 	}
 
@@ -496,4 +496,29 @@ func TestOpenDiTPeakRSS(t *testing.T) {
 
 	measure(PrecisionFP8, "FP8")
 	measure(PrecisionFP16, "FP16")
+}
+
+func TestDiTVRAMFootprint(t *testing.T) {
+	path := ditPath()
+	needFile(t, path)
+	d := device(t)
+
+	for _, prec := range []struct {
+		name string
+		p    Precision
+	}{
+		{"FP8", PrecisionFP8},
+		{"FP16", PrecisionFP16},
+	} {
+		m, err := OpenDiT(d, path, prec.p)
+		if err != nil {
+			t.Fatalf("OpenDiT(%s) failed: %v", prec.name, err)
+		}
+		wb := m.WeightBytes()
+		ab := m.ArenaBytes()
+		total := wb + ab
+		t.Logf("%s: weights %d bytes (%.2f GB), arena %d bytes (%.2f GB), total %d bytes (%.2f GB)",
+			prec.name, wb, float64(wb)/(1024*1024*1024), ab, float64(ab)/(1024*1024*1024), total, float64(total)/(1024*1024*1024))
+		m.Close()
+	}
 }

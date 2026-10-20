@@ -1,13 +1,17 @@
 package flux3
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -79,7 +83,7 @@ func TestCheckRefusesBadSizes(t *testing.T) {
 	if err == nil {
 		t.Fatal("p.check(1000x1000) succeeded, want error")
 	}
-	if wantSub := "multiples of 16"; !contains(err.Error(), wantSub) {
+	if wantSub := "multiples of 16"; !strings.Contains(err.Error(), wantSub) {
 		t.Errorf("error %q does not name limit %q", err.Error(), wantSub)
 	}
 
@@ -94,7 +98,7 @@ func TestCheckRefusesBadSizes(t *testing.T) {
 	if err == nil {
 		t.Fatal("p.check(4096x4096) succeeded, want error")
 	}
-	if wantSub := "1048576 pixels"; !contains(err.Error(), wantSub) {
+	if wantSub := "1048576 pixels"; !strings.Contains(err.Error(), wantSub) {
 		t.Errorf("error %q does not name limit %q", err.Error(), wantSub)
 	}
 
@@ -109,17 +113,53 @@ func TestCheckRefusesBadSizes(t *testing.T) {
 	}
 }
 
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(substr) == 0 || filepath.Base(s) != "" && containsStr(s, substr))
-}
+// TestPNGCanHideThePrompt asserts that when HidePrompt is true, neither the prompt
+// nor the negative prompt appears in the PNG parameters, JSON chunk, or any chunk.
+func TestPNGCanHideThePrompt(t *testing.T) {
+	img := image.NewNRGBA(image.Rect(0, 0, 64, 64))
+	r := Request{
+		Prompt:     "secret-super-confidential-prompt",
+		Negative:   "secret-negative-prompt",
+		HidePrompt: true,
+		Width:      64,
+		Height:     64,
+		Steps:      16,
+		CFG:        1.0,
+		Seed:       42,
+	}
+	var buf bytes.Buffer
+	if err := WritePNG(&buf, img, r, "test-model"); err != nil {
+		t.Fatalf("WritePNG failed: %v", err)
+	}
+	data := buf.Bytes()
+	if bytes.Contains(data, []byte("secret-super-confidential-prompt")) {
+		t.Errorf("PNG data contains prompt despite HidePrompt")
+	}
+	if bytes.Contains(data, []byte("secret-negative-prompt")) {
+		t.Errorf("PNG data contains negative prompt despite HidePrompt")
+	}
 
-func containsStr(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
+	const sig = 8
+	if len(data) < sig || string(data[:sig]) != "\x89PNG\r\n\x1a\n" {
+		t.Fatalf("invalid PNG signature")
+	}
+	offset := sig
+	for offset+8 <= len(data) {
+		length := int(binary.BigEndian.Uint32(data[offset : offset+4]))
+		chunkType := string(data[offset+4 : offset+8])
+		offset += 8
+		if offset+length+4 > len(data) {
+			t.Fatalf("chunk %s overflows PNG data", chunkType)
+		}
+		chunkData := data[offset : offset+length]
+		offset += length + 4
+		if bytes.Contains(chunkData, []byte("secret-super-confidential-prompt")) {
+			t.Errorf("chunk %s contains prompt", chunkType)
+		}
+		if bytes.Contains(chunkData, []byte("secret-negative-prompt")) {
+			t.Errorf("chunk %s contains negative prompt", chunkType)
 		}
 	}
-	return false
 }
 
 // TestResizeMatchesComfyUI tests Lanczos reference image resizing against
@@ -238,10 +278,8 @@ func TestI2IMatchesComfyUI(t *testing.T) {
 	t.Logf("i2i/ (256x256, 1 ref, 16 steps): PSNR %.2f dB; encode %v, load %v, sample %v, decode %v, total %v",
 		val, tm.Encode, tm.Load, tm.Sample, tm.Decode, tm.Total)
 
-	// Note: ComfyUI's i2i fixture recorded frozen dit.out0 across all steps
-	// due to hook return value in dump.py; golem computes true evolving steps.
-	if val < 13.0 {
-		t.Errorf("i2i/ PSNR %.2f dB < 13 dB", val)
+	if val < 25.0 {
+		t.Errorf("i2i/ PSNR %.2f dB < 25 dB", val)
 	}
 }
 
@@ -254,8 +292,17 @@ func TestMultiRefMatchesComfyUI(t *testing.T) {
 	needFile(t, VAEPath())
 	needFile(t, filepath.Join(TokenizerDir(), "vocab.json"))
 
-	// Review Focus 3: Reference IDs with l = -1, -2
-	shapes := [][2]int{{13, 19}, {13, 19}}
+	toastPath := filepath.Join("..", "ref", "flux3", "workflows", "klein_ref_toast.jpg")
+	wavePath := filepath.Join("..", "ref", "flux3", "workflows", "klein_ref_great_wave.jpg")
+	needFile(t, toastPath)
+	needFile(t, wavePath)
+	toastImg := loadImage(t, toastPath)
+	waveImg := loadImage(t, wavePath)
+
+	// Review Focus 3: Reference IDs with l = -1, -2, shapes computed from ResizeReference
+	_, rw1, rh1 := ResizeReference(toastImg, 0.0625, MaxRefTokens)
+	_, rw2, rh2 := ResizeReference(waveImg, 0.0625, MaxRefTokens)
+	shapes := [][2]int{{rh1 / 16, rw1 / 16}, {rh2 / 16, rw2 / 16}}
 	refIDs := RefIDs(shapes)
 	wantIDs := f.read(t, "mi2i/ref_ids")
 	if len(refIDs) != len(wantIDs) {
@@ -267,13 +314,15 @@ func TestMultiRefMatchesComfyUI(t *testing.T) {
 		}
 	}
 	// Check l = -1 for first reference, l = -2 for second reference
-	for tok := 0; tok < 13*19; tok++ {
+	n0 := shapes[0][0] * shapes[0][1]
+	n1 := shapes[1][0] * shapes[1][1]
+	for tok := 0; tok < n0; tok++ {
 		l := refIDs[tok*4+3]
 		if l != -1.0 {
 			t.Fatalf("ref 0 token %d l axis = %g, want -1.0", tok, l)
 		}
 	}
-	for tok := 13 * 19; tok < 2*13*19; tok++ {
+	for tok := n0; tok < n0+n1; tok++ {
 		l := refIDs[tok*4+3]
 		if l != -2.0 {
 			t.Fatalf("ref 1 token %d l axis = %g, want -2.0", tok, l)
@@ -289,13 +338,6 @@ func TestMultiRefMatchesComfyUI(t *testing.T) {
 	if ids256x384[3] != -1.0 {
 		t.Errorf("RefIDs(16x24) l axis = %g, want -1.0", ids256x384[3])
 	}
-
-	toastPath := filepath.Join("..", "ref", "flux3", "workflows", "klein_ref_toast.jpg")
-	wavePath := filepath.Join("..", "ref", "flux3", "workflows", "klein_ref_great_wave.jpg")
-	needFile(t, toastPath)
-	needFile(t, wavePath)
-	toastImg := loadImage(t, toastPath)
-	waveImg := loadImage(t, wavePath)
 
 	p, err := Open(Options{Keep: true, Precision: PrecisionFP8})
 	if err != nil {
@@ -324,8 +366,8 @@ func TestMultiRefMatchesComfyUI(t *testing.T) {
 	t.Logf("mi2i/ (256x256, 2 refs, 16 steps): PSNR %.2f dB; encode %v, load %v, sample %v, decode %v, total %v",
 		val, tm.Encode, tm.Load, tm.Sample, tm.Decode, tm.Total)
 
-	if val < 20.0 {
-		t.Errorf("mi2i/ PSNR %.2f dB < 20 dB", val)
+	if val < 25.0 {
+		t.Errorf("mi2i/ PSNR %.2f dB < 25 dB", val)
 	}
 }
 
@@ -344,6 +386,11 @@ func TestCFGTwoSlotMatchesComfyUI(t *testing.T) {
 	}
 	defer p.Close()
 
+	var stepLatents [][]float32
+	p.onStep = func(step int, x []float32) {
+		stepLatents = append(stepLatents, append([]float32(nil), x...))
+	}
+
 	raw, err := os.ReadFile(filepath.Join(f.dir, "sample_cfg", "request.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -358,12 +405,49 @@ func TestCFGTwoSlotMatchesComfyUI(t *testing.T) {
 		t.Fatalf("Generate failed: %v", err)
 	}
 
+	// Slot check: slot 0 ran with 160 tokens, slot 1 with 80 tokens
+	if p.lastTokens[0] != 160 || p.lastTokens[1] != 80 {
+		t.Fatalf("slot tokens: slot 0 has %d, slot 1 has %d, want 160 and 80",
+			p.lastTokens[0], p.lastTokens[1])
+	}
+	t.Logf("slot tokens confirmed: slot 0 = %d tokens, slot 1 = %d tokens",
+		p.lastTokens[0], p.lastTokens[1])
+
+	// Compare per-step latents x_n against sample_cfg/x_n
+	var worstRMS float64
+	var worstStep int
+	for step := 0; step < len(stepLatents); step++ {
+		key := fmt.Sprintf("sample_cfg/x_%d", step)
+		if !f.has(key) {
+			continue
+		}
+		wantX := f.read(t, key)
+		e := rmsError(stepLatents[step], wantX)
+		t.Logf("sample_cfg/x_%d: rms error %.4f%%", step, e*100)
+		if e > worstRMS {
+			worstRMS = e
+			worstStep = step
+		}
+	}
+	t.Logf("worst per-step latent rms error: %.4f%% at step %d", worstRMS*100, worstStep)
+	if worstRMS > 0.08 {
+		t.Errorf("worst per-step latent rms %.4f%% > 8.0%%", worstRMS*100)
+	}
+
+	// Compare final latent against sample_cfg/latent
+	wantLatent := f.read(t, "sample_cfg/latent")
+	latErr := rmsError(p.lastLatent, wantLatent)
+	t.Logf("sample_cfg/latent: rms error %.4f%%", latErr*100)
+	if latErr > 0.22 {
+		t.Errorf("final latent rms %.4f%% > 22.0%%", latErr*100)
+	}
+
 	wantRGB := f.read(t, "sample_cfg/rgb")
 	val := psnr(img, wantRGB)
 	t.Logf("sample_cfg/ (256x256, CFG 2.0, 16 steps): PSNR %.2f dB; encode %v, load %v, sample %v, decode %v, total %v",
 		val, tm.Encode, tm.Load, tm.Sample, tm.Decode, tm.Total)
 
-	if val < 20.0 {
-		t.Errorf("sample_cfg/ PSNR %.2f dB < 20 dB", val)
+	if val < 25.0 {
+		t.Errorf("sample_cfg/ PSNR %.2f dB < 25 dB", val)
 	}
 }

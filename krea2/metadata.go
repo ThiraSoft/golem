@@ -51,6 +51,13 @@ func WritePNG(w io.Writer, img image.Image, r Request, model string) error {
 	if r.HidePrompt {
 		r.Prompt, r.Negative, r.HidePrompt = "", "", false
 	}
+	return WritePNGWithMetadata(w, img, r.Parameters(model), r)
+}
+
+// WritePNGWithMetadata writes img as a PNG with three text chunks after its header:
+// "parameters" with params, "Software" with the golem version, and "golem" with
+// the json-encoded meta value.
+func WritePNGWithMetadata(w io.Writer, img image.Image, params string, meta any) error {
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
 		return err
@@ -60,7 +67,7 @@ func WritePNG(w io.Writer, img image.Image, r Request, model string) error {
 	// data, four of CRC. The text goes right after it.
 	const sig = 8
 	end := sig + 12 + int(binary.BigEndian.Uint32(raw[sig:]))
-	req, err := json.Marshal(r)
+	req, err := json.Marshal(meta)
 	if err != nil {
 		return err
 	}
@@ -68,7 +75,7 @@ func WritePNG(w io.Writer, img image.Image, r Request, model string) error {
 		return err
 	}
 	for _, kv := range [][2]string{
-		{"parameters", r.Parameters(model)},
+		{"parameters", params},
 		{"Software", "golem " + version.String()},
 		{"golem", string(req)},
 	} {

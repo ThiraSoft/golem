@@ -53,6 +53,41 @@ type PictureRequest struct {
 type Imager interface {
 	Generate(r PictureRequest, progress krea2.Progress) (*image.NRGBA, krea2.Timings, error)
 	WritePNG(w io.Writer, img image.Image, r PictureRequest) error
+	Defaults() (size string, steps int)
+	SupportsImages() bool
+	SupportsLoRA() bool
+}
+
+func toKrea2(r PictureRequest) krea2.Request {
+	return krea2.Request{
+		Prompt:         r.Prompt,
+		Negative:       r.Negative,
+		Width:          r.Width,
+		Height:         r.Height,
+		Steps:          r.Steps,
+		CFG:            r.CFG,
+		Seed:           r.Seed,
+		Lora:           r.Lora,
+		LoraStrength:   r.LoraStrength,
+		Chroma:         r.Chroma,
+		ChromaStrength: r.ChromaStrength,
+		ChromaSpread:   r.ChromaSpread,
+		HidePrompt:     r.HidePrompt,
+	}
+}
+
+func toFlux3(r PictureRequest) flux3.Request {
+	return flux3.Request{
+		Prompt:     r.Prompt,
+		Negative:   r.Negative,
+		Width:      r.Width,
+		Height:     r.Height,
+		Steps:      r.Steps,
+		CFG:        r.CFG,
+		Seed:       r.Seed,
+		Images:     r.Images,
+		HidePrompt: r.HidePrompt,
+	}
 }
 
 type krea2Imager struct {
@@ -60,72 +95,38 @@ type krea2Imager struct {
 }
 
 func (ki *krea2Imager) Generate(r PictureRequest, progress krea2.Progress) (*image.NRGBA, krea2.Timings, error) {
-	return ki.p.Generate(krea2.Request{
-		Prompt:         r.Prompt,
-		Negative:       r.Negative,
-		Width:          r.Width,
-		Height:         r.Height,
-		Steps:          r.Steps,
-		CFG:            r.CFG,
-		Seed:           r.Seed,
-		Lora:           r.Lora,
-		LoraStrength:   r.LoraStrength,
-		Chroma:         r.Chroma,
-		ChromaStrength: r.ChromaStrength,
-		ChromaSpread:   r.ChromaSpread,
-		HidePrompt:     r.HidePrompt,
-	}, progress)
+	return ki.p.Generate(toKrea2(r), progress)
 }
 
 func (ki *krea2Imager) WritePNG(w io.Writer, img image.Image, r PictureRequest) error {
-	return ki.p.WritePNG(w, img, krea2.Request{
-		Prompt:         r.Prompt,
-		Negative:       r.Negative,
-		Width:          r.Width,
-		Height:         r.Height,
-		Steps:          r.Steps,
-		CFG:            r.CFG,
-		Seed:           r.Seed,
-		Lora:           r.Lora,
-		LoraStrength:   r.LoraStrength,
-		Chroma:         r.Chroma,
-		ChromaStrength: r.ChromaStrength,
-		ChromaSpread:   r.ChromaSpread,
-		HidePrompt:     r.HidePrompt,
-	})
+	return ki.p.WritePNG(w, img, toKrea2(r))
 }
+
+func (ki *krea2Imager) Defaults() (string, int) {
+	return defaultSize, defaultSteps
+}
+
+func (ki *krea2Imager) SupportsImages() bool { return false }
+func (ki *krea2Imager) SupportsLoRA() bool   { return true }
 
 type flux3Imager struct {
 	p *flux3.Pipeline
 }
 
 func (fi *flux3Imager) Generate(r PictureRequest, progress krea2.Progress) (*image.NRGBA, krea2.Timings, error) {
-	return fi.p.Generate(flux3.Request{
-		Prompt:     r.Prompt,
-		Negative:   r.Negative,
-		Width:      r.Width,
-		Height:     r.Height,
-		Steps:      r.Steps,
-		CFG:        r.CFG,
-		Seed:       r.Seed,
-		Images:     r.Images,
-		HidePrompt: r.HidePrompt,
-	}, progress)
+	return fi.p.Generate(toFlux3(r), progress)
 }
 
 func (fi *flux3Imager) WritePNG(w io.Writer, img image.Image, r PictureRequest) error {
-	return fi.p.WritePNG(w, img, flux3.Request{
-		Prompt:     r.Prompt,
-		Negative:   r.Negative,
-		Width:      r.Width,
-		Height:     r.Height,
-		Steps:      r.Steps,
-		CFG:        r.CFG,
-		Seed:       r.Seed,
-		Images:     r.Images,
-		HidePrompt: r.HidePrompt,
-	})
+	return fi.p.WritePNG(w, img, toFlux3(r))
 }
+
+func (fi *flux3Imager) Defaults() (string, int) {
+	return "1024x1024", 16
+}
+
+func (fi *flux3Imager) SupportsImages() bool { return true }
+func (fi *flux3Imager) SupportsLoRA() bool   { return false }
 
 // lockedImager lets one picture be drawn at a time: the card holds one.
 type lockedImager struct {
@@ -141,6 +142,18 @@ func (l *lockedImager) Generate(r PictureRequest, p krea2.Progress) (*image.NRGB
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.im.Generate(r, p)
+}
+
+func (l *lockedImager) Defaults() (string, int) {
+	return l.im.Defaults()
+}
+
+func (l *lockedImager) SupportsImages() bool {
+	return l.im.SupportsImages()
+}
+
+func (l *lockedImager) SupportsLoRA() bool {
+	return l.im.SupportsLoRA()
 }
 
 // SetImager lets this server draw pictures.
@@ -179,12 +192,16 @@ const (
 )
 
 func (s *Server) generations(w http.ResponseWriter, r *http.Request) {
+	if s.imager == nil {
+		refuse(w, http.StatusNotFound, "not_found", "this server does not draw pictures")
+		return
+	}
 	var req generationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		refuse(w, http.StatusBadRequest, "invalid_request_error", "the request body is not the JSON this endpoint reads: "+err.Error())
 		return
 	}
-	k, err := req.pictureRequest(s.name)
+	k, err := req.pictureRequest(s.imager)
 	if err != nil {
 		refuse(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -268,6 +285,14 @@ func decodeImageBase64(s string) (image.Image, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid base64 image: %w", err)
 	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("decode image config: %w", err)
+	}
+	const maxDim = 4096
+	if cfg.Width > maxDim || cfg.Height > maxDim {
+		return nil, fmt.Errorf("image dimension %dx%d exceeds %dx%d limit", cfg.Width, cfg.Height, maxDim, maxDim)
+	}
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("decode image: %w", err)
@@ -276,7 +301,7 @@ func decodeImageBase64(s string) (image.Image, error) {
 }
 
 // pictureRequest reads the request, refusing what it cannot do.
-func (req generationRequest) pictureRequest(model string) (PictureRequest, error) {
+func (req generationRequest) pictureRequest(im Imager) (PictureRequest, error) {
 	var p PictureRequest
 	if strings.TrimSpace(req.Prompt) == "" {
 		return p, fmt.Errorf("prompt is required")
@@ -287,13 +312,13 @@ func (req generationRequest) pictureRequest(model string) (PictureRequest, error
 	if req.ResponseFormat != "" && req.ResponseFormat != "b64_json" {
 		return p, fmt.Errorf("response_format %q: only b64_json, there is nowhere to host a url", req.ResponseFormat)
 	}
+	defSize, defSteps := defaultSize, defaultSteps
+	if im != nil {
+		defSize, defSteps = im.Defaults()
+	}
 	size := req.Size
 	if size == "" {
-		if strings.Contains(model, "flux3") {
-			size = "1024x1024"
-		} else {
-			size = defaultSize
-		}
+		size = defSize
 	}
 	ws, hs, ok := strings.Cut(size, "x")
 	width, err1 := strconv.Atoi(ws)
@@ -301,26 +326,26 @@ func (req generationRequest) pictureRequest(model string) (PictureRequest, error
 	if !ok || err1 != nil || err2 != nil {
 		return p, fmt.Errorf("size %q is not WIDTHxHEIGHT", req.Size)
 	}
+	steps := req.Steps
+	if steps == 0 {
+		steps = defSteps
+	}
 	p = PictureRequest{
 		Prompt:     req.Prompt,
 		Negative:   req.NegativePrompt,
 		Width:      width,
 		Height:     height,
-		Steps:      req.Steps,
+		Steps:      steps,
 		CFG:        1,
 		HidePrompt: req.HidePrompt,
-	}
-	if p.Steps == 0 {
-		if strings.Contains(model, "flux3") {
-			p.Steps = 16
-		} else {
-			p.Steps = defaultSteps
-		}
 	}
 	if req.CFG != nil {
 		p.CFG = *req.CFG
 	}
 	if req.Lora != "" {
+		if im != nil && !im.SupportsLoRA() {
+			return p, fmt.Errorf("lora is not supported by this model")
+		}
 		if req.Lora != filepath.Base(req.Lora) || strings.HasPrefix(req.Lora, ".") {
 			return p, fmt.Errorf("lora %q: a file name in the LoRA directory", req.Lora)
 		}
@@ -332,12 +357,20 @@ func (req generationRequest) pictureRequest(model string) (PictureRequest, error
 			return p, fmt.Errorf("lora_strength %g: from 0 to %d", p.LoraStrength, krea2.MaxLoRAStrength)
 		}
 	}
-	for i, raw := range req.Images {
-		img, err := decodeImageBase64(raw)
-		if err != nil {
-			return p, fmt.Errorf("images[%d]: %w", i, err)
+	if len(req.Images) > 0 {
+		if im != nil && !im.SupportsImages() {
+			return p, fmt.Errorf("images is not supported by this model")
 		}
-		p.Images = append(p.Images, img)
+		if len(req.Images) > 4 {
+			return p, fmt.Errorf("images: at most 4 reference images, got %d", len(req.Images))
+		}
+		for i, raw := range req.Images {
+			img, err := decodeImageBase64(raw)
+			if err != nil {
+				return p, fmt.Errorf("images[%d]: %w", i, err)
+			}
+			p.Images = append(p.Images, img)
+		}
 	}
 	if req.Seed != nil && *req.Seed >= 0 {
 		p.Seed = uint64(*req.Seed)

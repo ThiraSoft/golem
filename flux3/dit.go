@@ -38,7 +38,7 @@ const (
 	ditTDim        = 256
 	ditEps         = 1e-6
 	MaxImageTokens = 4096 // 1024x1024: (1024/16)*(1024/16) = 64*64 = 4096
-	MaxRefTokens   = 2048
+	MaxRefTokens   = 4096
 	MaxTextTokens  = 512
 )
 

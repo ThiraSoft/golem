@@ -71,6 +71,9 @@ func main() {
 	if *model == "" && *sttDir == "" && *embedPath == "" && *krea2Dir == "" && *flux3Dir == "" && *layaDir == "" {
 		fail(fmt.Errorf("no model: pass -model, -stt, -embed, -krea2, -flux3 or -laya, or set GOLEM_MODEL, GOLEM_STT, GOLEM_EMBED, GOLEM_KREA2, GOLEM_FLUX3 or GOLEM_LAYA"))
 	}
+	if *krea2Dir != "" && *flux3Dir != "" {
+		fail(fmt.Errorf("cannot use -krea2 and -flux3 together"))
+	}
 	// A transcriber or an embedder alone is a whole server. It holds no
 	// conversation, so nothing below this — the runner, the slots, the
 	// generators — has anything to own, and building them around a model that

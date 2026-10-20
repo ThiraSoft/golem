@@ -36,24 +36,13 @@ stays in system memory and the card reads it across the bus, under 300 ms a prom
 `Request.Images` (`-image`, `images` in the server request) passes reference
 images for image-to-image or multi-reference conditioning.
 
+The output image dimensions follow the request's `Width` and `Height`.
+
 Each reference image is resized using a Lanczos3 filter to match the requested
-`MegaPixels` (4.0 by default, matching node 145 of the ComfyUI workflow), capped
-so the token budget does not exceed `MaxRefTokens` (1024 tokens total).
+`MegaPixels` (1.0 MP by default, matching the `ReferenceMultiLatent` widget in
+ComfyUI's workflow), capped so the token budget does not exceed `MaxRefTokens`
+(4096 tokens total).
 
 The resized images are encoded by the VAE into 128-channel latents. Reference RoPE
 position IDs use `l = -1, -2, ...` across consecutive reference inputs, matching
 ComfyUI's `ref_ids`.
-
-## Measured
-
-RX 9070 XT, RADV, 16 steps, Euler / simple schedule, warm DiT:
-
-| Resolution | Precision | Sample time | Total time | ms / step |
-|---|---|---:|---:|---:|
-| 1024 x 1024 | FP8 | 9.30 s | 10.18 s | 581.0 ms |
-| 1024 x 1024 | FP16 | 12.00 s | 12.89 s | 750.2 ms |
-| 768 x 1024 | FP8 | 6.66 s | 7.39 s | 416.1 ms |
-| 768 x 1024 | FP16 | 8.78 s | 9.52 s | 548.8 ms |
-
-At 768 x 1024, FLUX 3 Image Klein in FP8 draws a 16-step picture in 7.39 s,
-faster than Krea 2's 8-step generation (8.9 s) on the same card.

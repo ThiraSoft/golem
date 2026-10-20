@@ -16,7 +16,27 @@ import (
 	"github.com/ThiraSoft/golem/sample"
 )
 
-type fakeImager struct{ got PictureRequest }
+type fakeImager struct {
+	got            PictureRequest
+	size           string
+	steps          int
+	disallowImages bool
+	disallowLoRA   bool
+}
+
+func (f *fakeImager) Defaults() (string, int) {
+	s, st := f.size, f.steps
+	if s == "" {
+		s = "768x1024"
+	}
+	if st == 0 {
+		st = 8
+	}
+	return s, st
+}
+
+func (f *fakeImager) SupportsImages() bool { return !f.disallowImages }
+func (f *fakeImager) SupportsLoRA() bool   { return !f.disallowLoRA }
 
 func (f *fakeImager) WritePNG(w io.Writer, img image.Image, r PictureRequest) error {
 	return krea2.WritePNG(w, img, krea2.Request{
@@ -193,5 +213,93 @@ func TestGenerationsDecodesBase64Images(t *testing.T) {
 	// Bad base64 image rejected with 400
 	if _, rec := generate(t, `{"prompt":"a cat","images":["not_valid_base64!!!"]}`); rec.Code != 400 {
 		t.Errorf("status %d, want 400", rec.Code)
+	}
+}
+
+func TestGenerationsRefusesImagesOnKrea2(t *testing.T) {
+	tiny := image.NewNRGBA(image.Rect(0, 0, 2, 2))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, tiny); err != nil {
+		t.Fatal(err)
+	}
+	b64Raw := base64.StdEncoding.EncodeToString(buf.Bytes())
+
+	f := &fakeImager{disallowImages: true}
+	s := NewServer(nil, nil, "krea2", nil, sample.Params{})
+	s.SetImager(f)
+	rec := httptest.NewRecorder()
+	body := fmt.Sprintf(`{"prompt":"a cat","images":["%s"]}`, b64Raw)
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/images/generations", strings.NewReader(body)))
+	if rec.Code != 400 {
+		t.Fatalf("status %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "images") {
+		t.Errorf("error %s does not name 'images'", rec.Body.String())
+	}
+}
+
+func TestGenerationsRefusesLoRAOnFlux3(t *testing.T) {
+	f := &fakeImager{disallowLoRA: true, size: "1024x1024", steps: 16}
+	s := NewServer(nil, nil, "flux3", nil, sample.Params{})
+	s.SetImager(f)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/images/generations", strings.NewReader(`{"prompt":"a cat","lora":"style.safetensors"}`)))
+	if rec.Code != 400 {
+		t.Fatalf("status %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "lora") {
+		t.Errorf("error %s does not name 'lora'", rec.Body.String())
+	}
+}
+
+func TestGenerationsCapsImagesCount(t *testing.T) {
+	tiny := image.NewNRGBA(image.Rect(0, 0, 2, 2))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, tiny); err != nil {
+		t.Fatal(err)
+	}
+	b64Raw := base64.StdEncoding.EncodeToString(buf.Bytes())
+
+	// 5 images exceeds cap of 4
+	body := fmt.Sprintf(`{"prompt":"a cat","images":["%s","%s","%s","%s","%s"]}`, b64Raw, b64Raw, b64Raw, b64Raw, b64Raw)
+	_, rec := generate(t, body)
+	if rec.Code != 400 {
+		t.Fatalf("status %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "images") {
+		t.Errorf("error %s does not name 'images'", rec.Body.String())
+	}
+}
+
+func TestGenerationsRefusesOversizedImageDimensions(t *testing.T) {
+	// Create an image with dimension > 4096 (e.g. 4097 x 1)
+	big := image.NewNRGBA(image.Rect(0, 0, 4097, 1))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, big); err != nil {
+		t.Fatal(err)
+	}
+	b64Raw := base64.StdEncoding.EncodeToString(buf.Bytes())
+
+	body := fmt.Sprintf(`{"prompt":"a cat","images":["%s"]}`, b64Raw)
+	_, rec := generate(t, body)
+	if rec.Code != 400 {
+		t.Fatalf("status %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "limit") && !strings.Contains(rec.Body.String(), "4096") {
+		t.Errorf("error %s does not name limit", rec.Body.String())
+	}
+}
+
+func TestGenerationsFlux3Defaults(t *testing.T) {
+	f := &fakeImager{size: "1024x1024", steps: 16, disallowLoRA: true}
+	s := NewServer(nil, nil, "flux3", nil, sample.Params{})
+	s.SetImager(f)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/images/generations", strings.NewReader(`{"prompt":"a cat"}`)))
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if f.got.Width != 1024 || f.got.Height != 1024 || f.got.Steps != 16 {
+		t.Fatalf("drew %+v, want 1024x1024, 16 steps", f.got)
 	}
 }

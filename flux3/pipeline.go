@@ -1,14 +1,8 @@
 package flux3
 
 import (
-	"bytes"
-	"encoding/binary"
-	"encoding/json"
 	"fmt"
-	"hash/crc32"
 	"image"
-	"image/color"
-	"image/png"
 	"io"
 	"math"
 	"path/filepath"
@@ -57,6 +51,10 @@ type Pipeline struct {
 	enc *krea2.Encoder
 	dit *DiT
 	vae *VAE
+
+	onStep     func(step int, x []float32)
+	lastLatent []float32
+	lastTokens [2]int
 }
 
 // Open readies a pipeline. The DiT is loaded on the first picture if not kept.
@@ -137,7 +135,7 @@ func ResizeReference(img image.Image, mp float64, maxTokens int) ([]float32, int
 		return nil, 0, 0
 	}
 	if mp <= 0 {
-		mp = 4.0
+		mp = 1.0
 	}
 	// Cap mp so tokens fit in maxTokens (each token is 16x16 = 256 pixels)
 	if maxTokens > 0 {
@@ -148,8 +146,8 @@ func ResizeReference(img image.Image, mp float64, maxTokens int) ([]float32, int
 	}
 
 	scale := math.Sqrt(mp * 1024 * 1024 / float64(w*h))
-	rw := max(1, int(math.Round(float64(w)*scale)))
-	rh := max(1, int(math.Round(float64(h)*scale)))
+	rw := max(1, int(math.RoundToEven(float64(w)*scale)))
+	rh := max(1, int(math.RoundToEven(float64(h)*scale)))
 
 	if maxTokens > 0 {
 		for (rw/16)*(rh/16) > maxTokens && (rw > 16 || rh > 16) {
@@ -222,7 +220,7 @@ func (p *Pipeline) Generate(r Request, progress krea2.Progress) (*image.NRGBA, k
 		budget := MaxRefTokens / len(r.Images)
 		mp := r.MegaPixels
 		if mp <= 0 {
-			mp = 4.0
+			mp = 1.0
 		}
 		for _, img := range r.Images {
 			rgb, rw, rh := ResizeReference(img, mp, budget)
@@ -244,20 +242,31 @@ func (p *Pipeline) Generate(r Request, progress krea2.Progress) (*image.NRGBA, k
 			return nil, tm, err
 		}
 	}
+	cleanupDiT := func() {
+		if !p.o.Keep && p.dit != nil {
+			p.dit.Close()
+			p.dit = nil
+		}
+	}
 	if err := p.dit.SetText(0, pos, posTokens); err != nil {
+		cleanupDiT()
 		return nil, tm, err
 	}
 	if err := p.dit.SetRefs(0, refLatents, refShapes); err != nil {
+		cleanupDiT()
 		return nil, tm, err
 	}
 	if cfg {
 		if err := p.dit.SetText(1, neg, negTokens); err != nil {
+			cleanupDiT()
 			return nil, tm, err
 		}
 		if err := p.dit.SetRefs(1, refLatents, refShapes); err != nil {
+			cleanupDiT()
 			return nil, tm, err
 		}
 	}
+	p.lastTokens = [2]int{p.dit.ctxTokens[0], p.dit.ctxTokens[1]}
 	tm.Load = time.Since(tLoad)
 
 	// 4. Sampling
@@ -273,6 +282,7 @@ func (p *Pipeline) Generate(r Request, progress krea2.Progress) (*image.NRGBA, k
 	if err != nil {
 		return nil, tm, err
 	}
+	p.lastLatent = append([]float32(nil), latent...)
 	tm.Sample = time.Since(tSample)
 
 	// 5. VAE Decode
@@ -285,7 +295,7 @@ func (p *Pipeline) Generate(r Request, progress krea2.Progress) (*image.NRGBA, k
 	tm.Decode = time.Since(tDecode)
 	tm.Total = time.Since(start)
 
-	return Image(rgb, r.Width, r.Height), tm, nil
+	return krea2.Image(rgb, r.Width, r.Height), tm, nil
 }
 
 func (p *Pipeline) sample(posTokens, negTokens int, cfg bool, r Request, h, w int, progress krea2.Progress) ([]float32, error) {
@@ -302,6 +312,9 @@ func (p *Pipeline) sample(posTokens, negTokens int, cfg bool, r Request, h, w in
 		return denoised, nil
 	}
 	d := func(step int, x []float32, sigma float32) ([]float32, error) {
+		if p.onStep != nil {
+			p.onStep(step, x)
+		}
 		nextIdx := step + 1
 		if nextIdx >= len(sigmas) {
 			nextIdx = len(sigmas) - 1
@@ -322,21 +335,6 @@ func (p *Pipeline) sample(posTokens, negTokens int, cfg bool, r Request, h, w in
 	return Sample(d, x, sigmas, r.Seed, progress)
 }
 
-// Image converts float32 RGB values in [0, 1] to an image.NRGBA.
-func Image(rgb []float32, width, height int) *image.NRGBA {
-	img := image.NewNRGBA(image.Rect(0, 0, width, height))
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			at := 3 * (y*width + x)
-			r := byte(math.Max(0, math.Min(255, math.Round(float64(255*rgb[at])))))
-			g := byte(math.Max(0, math.Min(255, math.Round(float64(255*rgb[at+1])))))
-			b := byte(math.Max(0, math.Min(255, math.Round(float64(255*rgb[at+2])))))
-			img.SetNRGBA(x, y, color.NRGBA{r, g, b, 255})
-		}
-	}
-	return img
-}
-
 // WritePNG writes the picture as a PNG carrying the request that drew it.
 func (p *Pipeline) WritePNG(w io.Writer, img image.Image, r Request) error {
 	return WritePNG(w, img, r, strings.TrimSuffix(filepath.Base(p.o.DiT), ".safetensors"))
@@ -350,41 +348,7 @@ func WritePNG(w io.Writer, img image.Image, r Request, model string) error {
 		reqCopy.Prompt, reqCopy.Negative, reqCopy.HidePrompt = "", "", false
 	}
 	reqCopy.Images = nil
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		return err
-	}
-	raw := buf.Bytes()
-	const sig = 8
-	end := sig + 12 + int(binary.BigEndian.Uint32(raw[sig:]))
-	reqJSON, err := json.Marshal(reqCopy)
-	if err != nil {
-		return err
-	}
-	if _, err := w.Write(raw[:end]); err != nil {
-		return err
-	}
-	for _, kv := range [][2]string{
-		{"parameters", r.Parameters(model)},
-		{"Software", "golem " + version.String()},
-		{"golem", string(reqJSON)},
-	} {
-		if _, err := w.Write(itxt(kv[0], kv[1])); err != nil {
-			return err
-		}
-	}
-	_, err = w.Write(raw[end:])
-	return err
-}
-
-func itxt(key, text string) []byte {
-	data := append([]byte(key), 0, 0, 0, 0, 0)
-	data = append(data, text...)
-	chunk := make([]byte, 8, 12+len(data))
-	binary.BigEndian.PutUint32(chunk, uint32(len(data)))
-	copy(chunk[4:], "iTXt")
-	chunk = append(chunk, data...)
-	return binary.BigEndian.AppendUint32(chunk, crc32.ChecksumIEEE(chunk[4:]))
+	return krea2.WritePNGWithMetadata(w, img, reqCopy.Parameters(model), reqCopy)
 }
 
 // Close frees all GPU and host resources.

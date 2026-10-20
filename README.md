@@ -37,6 +37,7 @@ On one RX 9070 XT, every figure a benchmark in this repository:
 - **The same 26B in 5 GB of VRAM at 56 tokens a second**, experts left in system memory.
 - **Bonsai 2 27B at 46 tokens a second**, five times Prism's own llama.cpp fork, and 63 when it drafts.
 - **A Krea 2 picture in 8.9 seconds**, the same picture ComfyUI draws for the same seed, at half its time a step.
+- **A FLUX 3 Image Klein picture in 7.4 seconds (FP8)**, 16 steps, the same picture ComfyUI draws for the same seed.
 - **A Laya decision in 7.8 ms**, two and a half times faster than the checkpoint's own PyTorch.
 
 <p align="center">
@@ -233,7 +234,6 @@ Against the reference each model was written from, same card, 2026-09-28:
 | | golem | reference |
 | --- | ---: | ---: |
 | Krea 2, one DiT step at 768 × 1024 | **1.02 s** | 1.89 s (ComfyUI) |
-| FLUX 3 Image Klein, one DiT step at 768 × 1024 (FP8) | **0.42 s** | 1.02 s (Krea 2) |
 | Laya, one question | **7.8 ms** | 19.9 ms (PyTorch) |
 | Laya, 32 questions | **51 ms** | 56 ms (PyTorch) |
 
