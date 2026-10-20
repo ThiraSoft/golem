@@ -93,6 +93,8 @@ func Open(o Options) (*Pipeline, error) {
 		d.Close()
 		return nil, err
 	}
+	// The pipeline owns the device it opened, and closes it with the rest.
+	p.dev = d
 	return p, nil
 }
 
@@ -104,7 +106,9 @@ func openOn(d *vk.Device, o Options) (*Pipeline, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &Pipeline{dev: d, backbone: b}
+	// dev stays nil here: openOn's caller owns d, and a failure must not
+	// close it.
+	p := &Pipeline{backbone: b}
 	fail := func(err error) (*Pipeline, error) {
 		p.Close()
 		return nil, err

@@ -150,11 +150,13 @@ func (o fields) str(key string, dst *string) bool {
 	if !ok {
 		return false
 	}
-	var s string
-	if json.Unmarshal(raw, &s) != nil {
+	// json.Unmarshal takes null into a string as nothing at all, where
+	// yyjson_is_str refuses it: a null member keeps its default.
+	var s *string
+	if json.Unmarshal(raw, &s) != nil || s == nil {
 		return false
 	}
-	*dst = s
+	*dst = *s
 	return true
 }
 

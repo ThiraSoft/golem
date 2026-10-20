@@ -79,28 +79,33 @@ are not, and golem's products sum fp16 operands in float32:
   replay are themselves 28.5 dB apart on the audio; golem is 39.2 dB from the
   exact one and 29.1 dB from the default one (`TestPipelineShortReplay`).
 
-The tests assert 30 dB against the exact recordings and log the default
-ones. The two-chunk render (`TestPipelineChunks`, `--max-seq 3150`) is
-within 40.2 dB of yue2.cpp's default render on the audio.
+`TestPipelineShortReplay` asserts 30 dB against `pipeline/short_exact`
+(audio and latents) and against `nar/latent`; against the default render it
+asserts what yue2.cpp's exact render reaches there, 28.5 dB. `TestPipelineChunks`
+(`--max-seq 3150`, two chunks) asserts 30 dB against yue2.cpp's default
+two-chunk render, and reaches 39.95 dB on the latents and 40.20 dB on the
+audio. `TestPipelineSeal` holds a generated song's sealed first chunk to the
+replay's prefilled one. `TestNormalize` holds the output stage to yue2.cpp's
+bytes. `TestGuerrerosReplay` (cmd/yue2, heavy) renders the whole recorded
+replay and holds its normalized wav16 to yue-synth's `bench/q8-replay.wav`
+(30 dB; it reaches 34.75 dB) and its replay request to `bench/q8-replay.json`,
+field for field.
 
 ## Numbers
 
-Measured on 2026-10-20 on the RX 9070 XT (i7-9700K, 31 GB), `cmd/yue2`
-against yue-synth on the same card:
+Measured on 2026-10-20 on the RX 9070 XT (i7-9700K, 31 GB): golem's from
+the tests' logs (`TestGuerrerosReplay`, `TestPipelineShortReplay`), yue2.cpp's
+from yue-synth's log of the same request on the same card
+(`bench/q8-replay.log`).
 
 | | golem | yue2.cpp |
 |---|---|---|
-| load (both halves and the decoder, once) | 4.6 s | 0.8 + 0.5 + 0.5 s, a stage at a time |
-| Guerreros replay, 4870 frames (194.8 s of audio), one chunk | 29.5 s | 70.1 s |
-| of which the prefill of 7877 positions | 9.6 s | |
-| of which the flow, 32 steps | 19.0 s | 65.9 s |
+| Guerreros replay, 4870 frames (194.8 s of audio), one chunk | 29.2 s | 70.1 s, loads included |
+| of which the prefill of 7877 positions | 9.59 s | |
+| of which the flow, 32 steps | 18.99 s | 65.9 s |
 | of which the decoder | 0.64 s | |
-| short replay, 100 frames | 3.95 s | 4.0 s, loads included |
+| short replay, 100 frames | 3.88 s | |
 
-The full replay's normalized wav16 is 34.75 dB from yue2.cpp's
-`bench/q8-replay.wav`, and its replay JSON carries the same fields and
-values as yue2.cpp's. The prefill reads eight positions a pass (no tiled
-Q8_0 product yet). A score is slow: `-forced` on the short replay's request
-decodes its 2433 score tokens in 65.3 s, 26.8 ms a token where the AR's pass
-is about 5 ms, because `Distribution` sorts all 151849 candidates of the
-score window every step where yue2.cpp partially sorts the top k.
+The prefill reads eight positions a pass (no tiled Q8_0 product yet). A
+planned score is slow: the sampler sorts every candidate of the score
+window at every step, where yue2.cpp partially sorts the top k.

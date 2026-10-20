@@ -45,11 +45,9 @@ func sharedPipeline(t *testing.T) *Pipeline {
 			s.skip = "the pipeline wants cooperative matrices"
 			return
 		}
+		// The device is the tests', which outlives the pipeline: openOn
+		// leaves it out of the pipeline's Close.
 		s.p, s.err = openOn(d, Options{Dir: weightsDir(), Model: "Q8_0", Context: pipelineContext})
-		if s.p != nil {
-			// The device is the tests', which outlives the pipeline.
-			s.p.dev = nil
-		}
 	})
 	if s.skip != "" {
 		t.Skip(s.skip)
@@ -147,6 +145,39 @@ func TestPipelineChunks(t *testing.T) {
 		snrDB(wantLatent[:70*64], single[:70*64]), snrDB(wantLatent[70*64:], single[70*64:]))
 }
 
+// TestPipelineSeal is the first chunk of a generated song: the codes are
+// decoded token by token (GenerateForced), so the cache already holds the
+// whole stream when the acoustic stage starts, and the first chunk is sealed
+// by trimming it and forwarding the end token rather than prefilled again.
+// Without a score the request renders with cot off: a prompt of 563 and
+// guidance in a second slot. The context is cut for chunks of 70, as in
+// TestPipelineChunks, and the render is held to the replay of the same
+// request, whose first chunk is prefilled whole: the same keys by another
+// road, so only the order of the sums may differ.
+func TestPipelineSeal(t *testing.T) {
+	p := sharedPipeline(t)
+	r := shortRequest(t)
+	r.ABC = ""
+	prefix := BuildPrompt(p.tok, CotOff, r.Style, r.Lyrics, nil, false)
+	p.context = len(prefix) + 3 + 2*70
+	defer func() { p.context = pipelineContext }()
+	replay, err := p.Generate(r, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := p.GenerateForced(r, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("prompt %d, context %d; replay %v, forced %v", len(prefix), p.context, replay.Times, sealed.Times)
+	if sealed.Score != "" || sealed.Truncated || !reflect.DeepEqual(sealed.Codes, replay.Codes) {
+		t.Errorf("score %q, truncated %v, codes equal %v", sealed.Score, sealed.Truncated, reflect.DeepEqual(sealed.Codes, replay.Codes))
+	}
+	checkSNR(t, "latents, first chunk", sealed.Latents[:70*64], replay.Latents[:70*64], 60)
+	checkSNR(t, "latents, second chunk", sealed.Latents[70*64:], replay.Latents[70*64:], 60)
+	checkSNR(t, "audio", sealed.Audio, replay.Audio, 60)
+}
+
 // TestRequestReplayShapes reads the recorded replay and checks what each
 // shape of request asks of the stages.
 func TestRequestReplayShapes(t *testing.T) {
@@ -234,12 +265,12 @@ func TestRequestReplayShapes(t *testing.T) {
 	}
 
 	// A member of the wrong type keeps its default, as yyjson's getters.
-	odd, err := ParseRequest([]byte(`{"seed": 1.5, "steps": "8", "lm_seed": 12, "duration": 30}`))
+	odd, err := ParseRequest([]byte(`{"seed": 1.5, "steps": "8", "lm_seed": 12, "duration": 30, "cot": null, "output_format": null}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if odd.Seed != -1 || odd.Steps != 32 || odd.LMSeed != 12 || odd.Duration != 30 {
-		t.Errorf("seed %d, steps %d, lm_seed %d, duration %g", odd.Seed, odd.Steps, odd.LMSeed, odd.Duration)
+	if odd.Seed != -1 || odd.Steps != 32 || odd.LMSeed != 12 || odd.Duration != 30 || odd.Cot != "full" || odd.OutputFormat != FormatMP3 {
+		t.Errorf("seed %d, steps %d, lm_seed %d, duration %g, cot %q, format %q", odd.Seed, odd.Steps, odd.LMSeed, odd.Duration, odd.Cot, odd.OutputFormat)
 	}
 	res := odd.Resolve()
 	if res.LMSeed != 12 || res.Seed < 0 {
