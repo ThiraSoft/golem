@@ -128,16 +128,39 @@ product, because a `Q3_K_S` is that one format for 252 of its tensors.
 
 Q8_0 has had a tiled product too since YuE2, whose 3B is Q8_0 and reads
 prompts of thousands of positions: `shaders/matmul_coop.comp` under `-DQ80`,
-bound on cards with matrix cores. Before it, a Q8_0 projection answered a
-wide pass sixteen columns at a time through the integer mat-vec; now a pass
-of thirty-two columns or more stages the weights in fp16 for the cores, as
-every other tiled format does. So on such a card a Q8_0 checkpoint's prompt
-is no longer bit-identical to what it was, in `QwenPipeline` as in the
-stack, and a token (the mat-vec) is unchanged. A Q8_0 row has to be a
-multiple of sixty-four columns, which keeps its 34-byte blocks on a word.
+bound on cards with matrix cores. Before it, a Q8_0 projection in
+`QwenPipeline` answered a wide pass sixteen columns at a time through the
+integer mat-vec, and the stack had no binary for such a pass at all (below).
+Now a pass of thirty-two columns or more stages the weights in fp16 for the
+cores, as every other tiled format does. So on such a card a Q8_0
+checkpoint's prompt is no longer bit-identical to what it was in
+`QwenPipeline`, and a token (the mat-vec) is unchanged. A Q8_0 row has to be
+a multiple of sixty-four columns, which keeps its 34-byte blocks on a word.
 `TestQ80TiledMatchesCPU` holds the five widths, unsplit and split in four,
 to the processor; `TestARPrefill` and the yue2 pipeline tests hold the
 engine.
+
+It was checked on a model that is not YuE2's, because the binding is global:
+Qwen3-0.6B quantized to Q8_0 by llama.cpp's `llama-quantize`, the first 1024
+tokens of this file as it stood before this paragraph, every position's
+logits (golem's head on the processor), measured on 2026-10-21 against
+llama.cpp's own Vulkan build (`-ngl 999`, ubatch 512) and the BF16 checkpoint
+on that same build. Before the tiled product the stack
+could not read that prompt at all: at 335798b a pass of thirty-two columns or
+more panics in `DispatchWide` ("no binary for a pass of 32 columns; this
+pipeline was built for [2 4 8 16]"), so the old figures below are the prompt
+read eight positions a call, the widest that ran. Read that way the branch
+gives the same bytes as 335798b, so a pass of eight or fewer is unchanged.
+
+| mean KL, nats (top-1) | to BF16 | to llama.cpp Q8_0 |
+|---|---|---|
+| llama.cpp Q8_0, Vulkan | 0.001835 (97.75 %) | |
+| golem, eight a call (335798b and now) | 0.002922 (97.17 %) | 0.002431 (97.66 %) |
+| golem, passes of 512, tiled | 0.002910 (97.27 %) | 0.002442 (97.56 %) |
+
+The tiled product is as far from llama.cpp as the mat-vec is and no farther
+from BF16, so it stays bound for every engine. The gap to llama.cpp that
+both golem rows share does not come from the tiled product.
 
 A form with no kernel is an error naming it and never a guess. Eighteen bytes
 to a block of thirty-two is Q4_0 and it is also Q4_K, so a reader that checked
