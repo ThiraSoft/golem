@@ -48,8 +48,7 @@ func main() {
 	encoder := flag.String("encoder", flux3.EncoderPath(), "the text encoder, Qwen3-VL-4B fp8-scaled")
 	vae := flag.String("vae", flux3.VAEPath(), "the VAE")
 	tokenizer := flag.String("tokenizer", flux3.TokenizerDir(), "a directory with vocab.json, merges.txt and tokenizer_config.json")
-	flag.Bool("fp16", true, "store DiT weights in FP16 (default)")
-	fp8 := flag.Bool("fp8", false, "store DiT weights in FP8 instead of FP16")
+	fp8 := flag.Bool("fp8", false, "store DiT weights in FP8 instead of FP16 (default is FP16)")
 	mp := flag.Float64("megapixels", 4.0, "megapixels for reference image scaling")
 	hidePrompt := flag.Bool("hide-prompt", false, "leave the prompt and the negative prompt out of the PNG's metadata")
 

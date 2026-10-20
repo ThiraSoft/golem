@@ -12,9 +12,18 @@ import (
 	"github.com/ThiraSoft/golem/token/bytebpe"
 )
 
+// TestDefaultPrecisionIsFP16 verifies that Options zero-value selects FP16 precision.
+func TestDefaultPrecisionIsFP16(t *testing.T) {
+	var opt Options
+	if opt.Precision != PrecisionFP16 {
+		t.Fatalf("Options{}.Precision is %v, want PrecisionFP16 (%v)", opt.Precision, PrecisionFP16)
+	}
+}
+
 // TestAcceptMatchesComfyUI compares the acceptance fixture (1024x1024, seed 42,
 // 16 steps, Euler/simple) against golem generated output for both FP8 and FP16.
 func TestAcceptMatchesComfyUI(t *testing.T) {
+	heavy.Skip(t, "draws full-size accept picture")
 	f := loadFixtures(t)
 	needFile(t, DiTPath())
 	needFile(t, EncoderPath())
@@ -74,11 +83,11 @@ func TestAcceptMatchesComfyUI(t *testing.T) {
 		t.Logf("DECISION: FP8 is %.2f dB below FP16 (<= 3 dB threshold), FP8 remains acceptable", gap)
 	}
 
-	if val16 < 25.0 {
-		t.Errorf("accept/ FP16 PSNR %.2f dB < 25 dB", val16)
+	if val16 < 31.0 {
+		t.Errorf("accept/ FP16 PSNR %.2f dB < 31 dB", val16)
 	}
-	if val8 < 20.0 {
-		t.Errorf("accept/ FP8 PSNR %.2f dB < 20 dB", val8)
+	if val8 < 21.0 {
+		t.Errorf("accept/ FP8 PSNR %.2f dB < 21 dB", val8)
 	}
 }
 
@@ -167,14 +176,17 @@ func TestFullSizeTimings(t *testing.T) {
 		if _, err := v.Decode(latent, latH, latW); err != nil {
 			t.Fatal(err)
 		}
-		tStart := time.Now()
-		for iter := 0; iter < 3; iter++ {
+		bestVDur := time.Hour
+		for iter := 0; iter < 4; iter++ {
+			tRun := time.Now()
 			if _, err := v.Decode(latent, latH, latW); err != nil {
 				t.Fatal(err)
 			}
+			if d := time.Since(tRun); d < bestVDur {
+				bestVDur = d
+			}
 		}
-		vDur := time.Since(tStart) / 3
-		t.Logf("VAE decode %dx%d: %v", w, h, vDur)
+		t.Logf("VAE decode %dx%d: %v (warm min)", w, h, bestVDur)
 		v.Close()
 	}
 

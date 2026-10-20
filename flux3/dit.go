@@ -1,7 +1,7 @@
 package flux3
 
 // The DiT: FLUX 3 Image Klein's multi-modal transformer (comfy/ldm/flux3/model.py),
-// from ComfyUI's bf16 checkpoint converted to fp8 e4m3 with per-tensor scale.
+// from ComfyUI's bf16 checkpoint converted to fp16 (default) or fp8 e4m3 with per-tensor scale.
 
 import (
 	"encoding/binary"
@@ -289,6 +289,31 @@ func (p *parBuffer) add(v []float32) uint32 {
 	return uint32(at)
 }
 
+// parallelChunks partitions [0, n) across GOMAXPROCS workers, calling fn(worker, start, end).
+// When GOMAXPROCS is 1 or n < 65536, it runs fn(0, 0, n) inline.
+func parallelChunks(n int, fn func(w, s, e int)) {
+	numWorkers := runtime.GOMAXPROCS(0)
+	if numWorkers <= 1 || n < 65536 {
+		fn(0, 0, n)
+		return
+	}
+	chunk := (n + numWorkers - 1) / numWorkers
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		start := w * chunk
+		end := min(start+chunk, n)
+		if start >= end {
+			continue
+		}
+		wg.Add(1)
+		go func(worker, s, e int) {
+			defer wg.Done()
+			fn(worker, s, e)
+		}(w, start, end)
+	}
+	wg.Wait()
+}
+
 // OpenDiT loads the FLUX 3 transformer from a safetensors file onto the Vulkan device.
 func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 	tm, err := tensors.Open(path)
@@ -467,6 +492,8 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 
 	var f8Buf []byte
 	var f16Buf []byte
+	var lut [65536]byte
+	lastInvScale := float32(-1)
 	up := func(name string, rows, cols int) (linearWeight, error) {
 		t, err := tm.Get(name)
 		if err != nil {
@@ -486,44 +513,20 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 				f16Buf = f16Buf[:2*n]
 			}
 			var overflows int64
-			numWorkers := runtime.GOMAXPROCS(0)
-			if numWorkers > 1 && n >= 65536 {
-				var wg sync.WaitGroup
-				chunk := (n + numWorkers - 1) / numWorkers
-				for w := 0; w < numWorkers; w++ {
-					start := w * chunk
-					end := min(start+chunk, n)
-					if start >= end {
-						continue
-					}
-					wg.Add(1)
-					go func(s, e int) {
-						defer wg.Done()
-						var ov int64
-						for i := s; i < e; i++ {
-							u := binary.LittleEndian.Uint16(raw[i*2:])
-							h := bf16ToHalfLUT[u]
-							if (h & 0x7c00) == 0x7c00 {
-								ov++
-							}
-							binary.LittleEndian.PutUint16(f16Buf[i*2:], h)
-						}
-						if ov > 0 {
-							atomic.AddInt64(&overflows, ov)
-						}
-					}(start, end)
-				}
-				wg.Wait()
-			} else {
-				for i := 0; i < n; i++ {
+			parallelChunks(n, func(w, s, e int) {
+				var ov int64
+				for i := s; i < e; i++ {
 					u := binary.LittleEndian.Uint16(raw[i*2:])
 					h := bf16ToHalfLUT[u]
 					if (h & 0x7c00) == 0x7c00 {
-						overflows++
+						ov++
 					}
 					binary.LittleEndian.PutUint16(f16Buf[i*2:], h)
 				}
-			}
+				if ov > 0 {
+					atomic.AddInt64(&overflows, ov)
+				}
+			})
 			madviseDontNeed(raw)
 			if overflows > 0 {
 				return linearWeight{}, fmt.Errorf("flux3: %s had %d bf16 values overflow to inf/nan in fp16", name, overflows)
@@ -535,51 +538,26 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 			return linearWeight{w: h, scale: 1.0, outputs: rows, inputs: cols}, nil
 		}
 
-		var maxAbs float32
 		numWorkers := runtime.GOMAXPROCS(0)
-		if numWorkers > 1 && n >= 65536 {
-			var wg sync.WaitGroup
-			chunk := (n + numWorkers - 1) / numWorkers
-			localMax := make([]float32, numWorkers)
-			for w := 0; w < numWorkers; w++ {
-				start := w * chunk
-				end := min(start+chunk, n)
-				if start >= end {
-					continue
-				}
-				wg.Add(1)
-				go func(idx, s, e int) {
-					defer wg.Done()
-					var mVal float32
-					for i := s; i < e; i++ {
-						u := binary.LittleEndian.Uint16(raw[i*2:])
-						f := math.Float32frombits(uint32(u) << 16)
-						if f < 0 {
-							f = -f
-						}
-						if f > mVal {
-							mVal = f
-						}
-					}
-					localMax[idx] = mVal
-				}(w, start, end)
-			}
-			wg.Wait()
-			for _, mVal := range localMax {
-				if mVal > maxAbs {
-					maxAbs = mVal
-				}
-			}
-		} else {
-			for i := 0; i < n; i++ {
+		localMax := make([]float32, max(1, numWorkers))
+		parallelChunks(n, func(w, s, e int) {
+			var mVal float32
+			for i := s; i < e; i++ {
 				u := binary.LittleEndian.Uint16(raw[i*2:])
 				f := math.Float32frombits(uint32(u) << 16)
 				if f < 0 {
 					f = -f
 				}
-				if f > maxAbs {
-					maxAbs = f
+				if f > mVal {
+					mVal = f
 				}
+			}
+			localMax[w] = mVal
+		})
+		var maxAbs float32
+		for _, mVal := range localMax {
+			if mVal > maxAbs {
+				maxAbs = mVal
 			}
 		}
 		scale := maxAbs / 448.0
@@ -588,10 +566,12 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 		}
 		invScale := 1.0 / scale
 
-		var lut [65536]byte
-		for u := 0; u < 65536; u++ {
-			f := math.Float32frombits(uint32(u)<<16) * invScale
-			lut[u] = floatToE4M3(f)
+		if invScale != lastInvScale {
+			for u := 0; u < 65536; u++ {
+				f := math.Float32frombits(uint32(u)<<16) * invScale
+				lut[u] = floatToE4M3(f)
+			}
+			lastInvScale = invScale
 		}
 
 		if cap(f8Buf) < n {
@@ -599,31 +579,12 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 		} else {
 			f8Buf = f8Buf[:n]
 		}
-		if numWorkers > 1 && n >= 65536 {
-			var wg sync.WaitGroup
-			chunk := (n + numWorkers - 1) / numWorkers
-			for w := 0; w < numWorkers; w++ {
-				start := w * chunk
-				end := min(start+chunk, n)
-				if start >= end {
-					continue
-				}
-				wg.Add(1)
-				go func(s, e int) {
-					defer wg.Done()
-					for i := s; i < e; i++ {
-						u := binary.LittleEndian.Uint16(raw[i*2:])
-						f8Buf[i] = lut[u]
-					}
-				}(start, end)
-			}
-			wg.Wait()
-		} else {
-			for i := 0; i < n; i++ {
+		parallelChunks(n, func(w, s, e int) {
+			for i := s; i < e; i++ {
 				u := binary.LittleEndian.Uint16(raw[i*2:])
 				f8Buf[i] = lut[u]
 			}
-		}
+		})
 		madviseDontNeed(raw)
 
 		h, err := m.k.AddWeights(f8Buf)
