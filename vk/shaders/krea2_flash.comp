@@ -1,0 +1,222 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_vote : require
+
+// Attention without a mask over long sequences, heads of 128: the DiTs' (FLUX
+// 3's 24 heads over up to 33k tokens, Krea 2's 48 over 3k). krea2_attn.comp
+// does everything else.
+//
+// It works on the transposes. A wave of thirty-two holds its queries, sixteen
+// to a fragment, as the columns of Qᵀ, and computes Sᵀ = K·Qᵀ and Oᵀ += Vᵀ·Pᵀ.
+// On RDNA's matrix cores a lane then holds one query's column in every
+// matrix it touches: the scores of Sᵀ, the probabilities of Pᵀ (the same places, so Sᵀ turns into Pᵀ
+// element by element, without going through shared memory), and Oᵀ. The
+// softmax of a query is that lane's and its partner's sixteen lanes away, and
+// rescaling Oᵀ when the maximum moves is a multiply of the lane's own
+// elements. This leans on how the driver lays the matrices out, which the
+// cooperative matrix extension leaves to it; TestK2FlashLayout pins the
+// layout this is written for, and TestK2Attention the answer.
+//
+// The keys and values come one of two ways. With GLOBAL, from the fp16 copy
+// shaders/krea2_kvhalf.comp makes, the values already transposed: every wave
+// loads its fragments from there on its own, and the four of a workgroup
+// meet in the cache, with no shared memory and no barrier. Without, from
+// the arena in tiles of BC through shared memory, transposing the values on
+// the way in. Everything that meets the cores is fp16, and the sums are
+// float32.
+//
+// Thirty-two queries a wave and tiles of thirty-two keys: 240 registers and
+// six waves a SIMD. Sixteen queries a wave read twice the fragments for the
+// same work, tiles of sixty-four spill.
+
+#define HD 128
+#ifndef WAVES
+#define WAVES 4
+#endif
+#ifndef QF
+#define QF 2        // sixteen-query fragments a wave
+#endif
+#ifndef BC
+#define BC 32
+#endif
+#define THREADS (WAVES * 32)
+#define BR (WAVES * 16 * QF)
+#define SK (HD + 8)
+#define SV (BC + 8)
+#define DT (HD / 16)
+#define KT (BC / 16)
+#define LOG2E 1.4426950408889634
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer A4 { vec4 a4[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint q, qStride, qSeq;
+    uint k, kStride, kSeq;
+    uint v, vStride, vSeq;
+    uint o, oStride, oSeq;
+    uint queries, keys;
+    uint group;     // query heads to a key head
+    uint causal;    // always 0 here
+    uint tiles;     // query tiles a sequence
+    float scale;
+} p;
+
+#ifdef GLOBAL
+// The keys and values as shaders/krea2_kvhalf.comp leaves them: k and v count
+// halves, and vStride is the padded rows of the values.
+layout(std430, binding = 0) readonly buffer AH { float16_t ah[]; };
+#else
+shared float16_t sk[BC * SK];
+shared float16_t sv[HD * SV];
+#endif
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint wave = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint seq = gl_WorkGroupID.x / p.tiles;
+    uint head = gl_WorkGroupID.y, kvHead = head / p.group;
+    uint qBase = p.q + seq * p.qSeq + head * uint(HD);
+    uint kBase = p.k + seq * p.kSeq + kvHead * uint(HD);
+    uint vBase = p.v + seq * p.vSeq + kvHead * uint(HD);
+    uint oBase = p.o + seq * p.oSeq + head * uint(HD);
+    // The lane's first query, its next ones sixteen apart, and which eight
+    // of a fragment's sixteen rows it holds.
+    uint query0 = (gl_WorkGroupID.x % p.tiles) * uint(BR) + wave * uint(16 * QF) + (lane & 15u);
+    uint eighth = (lane >> 4) * 8u;
+    float lscale = p.scale * LOG2E;
+
+    // Qᵀ, straight from the arena into the lane's elements.
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> qb[QF][DT];
+    [[unroll]] for (uint f = 0u; f < uint(QF); f++) {
+        uint query = query0 + f * 16u;
+        bool live = query < p.queries;
+        [[unroll]] for (uint d = 0u; d < uint(DT); d++) {
+            uint at = qBase + query * p.qStride + d * 16u + eighth;
+            [[unroll]] for (uint i = 0u; i < 8u; i++) {
+                qb[f][d][i] = float16_t(live ? clamp(a[at + i], -65504.0, 65504.0) : 0.0);
+            }
+        }
+    }
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> o[QF][DT];
+    [[unroll]] for (uint f = 0u; f < uint(QF); f++) {
+        [[unroll]] for (uint j = 0u; j < uint(DT); j++) o[f][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    }
+    float peak[QF], sum[QF];   // in log2 units
+    [[unroll]] for (uint f = 0u; f < uint(QF); f++) { peak[f] = -1.0e30; sum[f] = 0.0; }
+
+#ifdef GLOBAL
+    uint np = p.vStride;
+    kBase = p.k + kvHead * np * uint(HD);
+    vBase = p.v + kvHead * uint(HD) * np;
+#endif
+    for (uint c0 = 0u; c0 < p.keys; c0 += uint(BC)) {
+#ifndef GLOBAL
+        barrier();
+        for (uint e = t; e < uint(BC * HD) / 4u; e += uint(THREADS)) {
+            uint r = e / uint(HD / 4), d = (e % uint(HD / 4)) * 4u;
+            vec4 x = vec4(0.0), y = vec4(0.0);
+            if (c0 + r < p.keys) {
+                x = a4[(kBase + (c0 + r) * p.kStride + d) >> 2];
+                y = a4[(vBase + (c0 + r) * p.vStride + d) >> 2];
+            }
+            x = clamp(x, vec4(-65504.0), vec4(65504.0));
+            y = clamp(y, vec4(-65504.0), vec4(65504.0));
+            uint s = r * uint(SK) + d;
+            sk[s] = float16_t(x.x); sk[s + 1u] = float16_t(x.y); sk[s + 2u] = float16_t(x.z); sk[s + 3u] = float16_t(x.w);
+            s = d * uint(SV) + r;
+            sv[s] = float16_t(y.x); sv[s + uint(SV)] = float16_t(y.y); sv[s + 2u * uint(SV)] = float16_t(y.z); sv[s + 3u * uint(SV)] = float16_t(y.w);
+        }
+        barrier();
+#endif
+
+        // Sᵀ: the tile's keys down, this wave's queries across.
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> s[QF][KT];
+        [[unroll]] for (uint kt = 0u; kt < uint(KT); kt++) {
+            [[unroll]] for (uint f = 0u; f < uint(QF); f++) s[f][kt] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            [[unroll]] for (uint d = 0u; d < uint(DT); d++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ka;
+#ifdef GLOBAL
+                coopMatLoad(ka, ah, kBase + (c0 + kt * 16u) * uint(HD) + d * 16u, uint(HD), gl_CooperativeMatrixLayoutRowMajor);
+#else
+                coopMatLoad(ka, sk, kt * 16u * uint(SK) + d * 16u, uint(SK), gl_CooperativeMatrixLayoutRowMajor);
+#endif
+                [[unroll]] for (uint f = 0u; f < uint(QF); f++) s[f][kt] = coopMatMulAdd(ka, qb[f][d], s[f][kt]);
+            }
+        }
+
+        // The online softmax of each of the lane's queries over its half of
+        // the keys, the maximum shared with the lane holding the other half.
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> pb[QF][KT];
+        [[unroll]] for (uint f = 0u; f < uint(QF); f++) {
+            float top = -1.0e30;
+            if (c0 + uint(BC) > p.keys) {
+                [[unroll]] for (uint kt = 0u; kt < uint(KT); kt++) {
+                    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+                        if (c0 + kt * 16u + eighth + i >= p.keys) s[f][kt][i] = -1.0e30;
+                    }
+                }
+            }
+            [[unroll]] for (uint kt = 0u; kt < uint(KT); kt++) {
+                [[unroll]] for (uint i = 0u; i < 8u; i++) {
+                    s[f][kt][i] *= lscale;
+                    top = max(top, s[f][kt][i]);
+                }
+            }
+            top = max(top, subgroupShuffleXor(top, 16u));
+            float next = max(peak[f], top);
+            float shrink = exp2(peak[f] - next);
+            peak[f] = next;
+            float got = 0.0;
+            [[unroll]] for (uint kt = 0u; kt < uint(KT); kt++) {
+                [[unroll]] for (uint i = 0u; i < 8u; i++) {
+                    float e = exp2(s[f][kt][i] - next);
+                    got += e;
+                    pb[f][kt][i] = float16_t(e);
+                }
+            }
+            sum[f] = sum[f] * shrink + got;
+            if (subgroupAny(shrink < 1.0)) {
+                [[unroll]] for (uint j = 0u; j < uint(DT); j++) {
+                    [[unroll]] for (uint i = 0u; i < 8u; i++) o[f][j][i] *= shrink;
+                }
+            }
+        }
+
+        // Oᵀ += Vᵀ·Pᵀ.
+        [[unroll]] for (uint j = 0u; j < uint(DT); j++) {
+            [[unroll]] for (uint kt = 0u; kt < uint(KT); kt++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> va;
+#ifdef GLOBAL
+                coopMatLoad(va, ah, vBase + j * 16u * np + c0 + kt * 16u, np, gl_CooperativeMatrixLayoutRowMajor);
+#else
+                coopMatLoad(va, sv, j * 16u * uint(SV) + kt * 16u, uint(SV), gl_CooperativeMatrixLayoutRowMajor);
+#endif
+                [[unroll]] for (uint f = 0u; f < uint(QF); f++) o[f][j] = coopMatMulAdd(va, pb[f][kt], o[f][j]);
+            }
+        }
+    }
+
+    [[unroll]] for (uint f = 0u; f < uint(QF); f++) {
+        float total = sum[f] + subgroupShuffleXor(sum[f], 16u);
+        uint query = query0 + f * 16u;
+        if (query < p.queries) {
+            float inv = 1.0 / total;
+            uint at = oBase + query * p.oStride + eighth;
+            [[unroll]] for (uint j = 0u; j < uint(DT); j++) {
+                [[unroll]] for (uint i = 0u; i < 8u; i++) a[at + j * 16u + i] = o[f][j][i] * inv;
+            }
+        }
+    }
+}

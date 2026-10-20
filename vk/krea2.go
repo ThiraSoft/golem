@@ -32,6 +32,9 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_attn.comp -o shaders/krea2_attn128.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DHD=384 -DBC=16 shaders/krea2_attn.comp -o shaders/krea2_attn384.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DHD=512 -DBC=16 shaders/krea2_attn.comp -o shaders/krea2_attn512.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_flash.comp -o shaders/krea2_flash128.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DGLOBAL shaders/krea2_flash.comp -o shaders/krea2_flashg128.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_kvhalf.comp -o shaders/krea2_kvhalf.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_conv.comp -o shaders/krea2_conv.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_pix.comp -o shaders/krea2_pix.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_norm.comp -o shaders/flux3_norm.spv
@@ -74,6 +77,15 @@ var krea2Attn384SPIRV []byte
 //go:embed shaders/krea2_attn512.spv
 var krea2Attn512SPIRV []byte
 
+//go:embed shaders/krea2_flash128.spv
+var krea2Flash128SPIRV []byte
+
+//go:embed shaders/krea2_flashg128.spv
+var krea2FlashG128SPIRV []byte
+
+//go:embed shaders/krea2_kvhalf.spv
+var krea2KVHalfSPIRV []byte
+
 //go:embed shaders/krea2_conv.spv
 var krea2ConvSPIRV []byte
 
@@ -112,6 +124,9 @@ const (
 	k2Attn128
 	k2Attn384
 	k2Attn512
+	k2Flash128
+	k2FlashG128
+	k2KVHalf
 	k2Conv
 	k2Pix
 	k2Flux3Norm
@@ -306,6 +321,10 @@ type K2 struct {
 	readback    *Buffer
 	weights     []*Buffer
 	lora        int // the weights the products' fourth buffer is; -1 for none
+	// The fp16 keys and values of the attention, which lives and dies with
+	// the arena; ReserveAttention sizes it.
+	kv      *Buffer
+	kvBytes int
 }
 
 type k2SetKey struct {
@@ -328,6 +347,9 @@ var k2Specs = [k2Kernels]struct {
 	k2Attn128:         {&krea2Attn128SPIRV, 18 * 4},
 	k2Attn384:         {&krea2Attn384SPIRV, 18 * 4},
 	k2Attn512:         {&krea2Attn512SPIRV, 18 * 4},
+	k2Flash128:        {&krea2Flash128SPIRV, 18 * 4},
+	k2FlashG128:       {&krea2FlashG128SPIRV, 18 * 4},
+	k2KVHalf:          {&krea2KVHalfSPIRV, 8 * 4},
 	k2Conv:            {&krea2ConvSPIRV, unsafe.Sizeof(K2Conv{})},
 	k2Pix:             {&krea2PixSPIRV, unsafe.Sizeof(K2Pix{})},
 	k2Flux3Norm:       {&flux3NormSPIRV, unsafe.Sizeof(K2Flux3Norm{})},
@@ -366,7 +388,12 @@ func NewK2(d *Device, arenaFloats int, params []float32) (*K2, error) {
 		if k2Kernel(i).product() {
 			bindings = 4
 		}
-		if k.pipes[i], err = d.newPipeline(*spec.spirv, bindings, uint32(spec.push), coopmatWave, nil); err != nil {
+		wave := uint32(coopmatWave)
+		if k2Kernel(i) == k2Flash128 || k2Kernel(i) == k2FlashG128 {
+			// Written for the matrix cores' own width; see the shader.
+			wave = 32
+		}
+		if k.pipes[i], err = d.newPipeline(*spec.spirv, bindings, uint32(spec.push), wave, nil); err != nil {
 			return fail(fmt.Errorf("vk: Krea 2 kernel %d: %w", i, err))
 		}
 	}
@@ -458,9 +485,33 @@ func (k *K2) Arena() error {
 		}
 	}
 	var err error
-	k.arena, err = k.d.Local(k.arenaFloats*4, bufferUsageStorage|bufferUsageTransferSrc|bufferUsageTransferDst)
-	return err
+	if k.arena, err = k.d.Local(k.arenaFloats*4, bufferUsageStorage|bufferUsageTransferSrc|bufferUsageTransferDst); err != nil {
+		return err
+	}
+	if k.kvBytes > 0 {
+		if k.kv, err = k.d.Local(k.kvBytes, bufferUsageStorage); err != nil {
+			k.arena.Close()
+			k.arena = nil
+			return err
+		}
+	}
+	return nil
 }
+
+// kvRows is the keys a head of the fp16 copy holds: the keys rounded up to a
+// tile of every attention kernel.
+func kvRows(keys uint32) uint32 { return (keys + 63) / 64 * 64 }
+
+// ReserveAttention makes room, beside the arena, for an fp16 copy of the
+// keys and values of attentions of up to keys keys over kvHeads heads of 128,
+// which the long attentions read instead of the arena (see Attn). It takes
+// effect with the next Arena; without it, or past it, Attn reads the arena.
+func (k *K2) ReserveAttention(keys, kvHeads int) {
+	k.kvBytes = 2 * 2 * kvHeads * 128 * int(kvRows(uint32(keys)))
+}
+
+// KVBytes is what ReserveAttention keeps on the card while the arena is.
+func (k *K2) KVBytes() int { return k.kvBytes }
 
 // FreeArena gives the arena's memory back to the card. Every program
 // recorded before it is dead: close them first, and record again after
@@ -473,6 +524,10 @@ func (k *K2) FreeArena() {
 	if k.arena != nil {
 		k.arena.Close()
 		k.arena = nil
+	}
+	if k.kv != nil {
+		k.kv.Close()
+		k.kv = nil
 	}
 }
 
@@ -495,6 +550,9 @@ func (k *K2) set(kern k2Kernel, w int) *Set {
 	first := k.params
 	if w >= 0 {
 		first = k.weights[w]
+	}
+	if kern == k2KVHalf || kern == k2FlashG128 {
+		first = k.kv
 	}
 	bufs := []*Buffer{first, k.arena, k.params}
 	if kern.product() {
@@ -584,6 +642,17 @@ func (k *K2) Act(r *Recorder, a K2Act) {
 	k.dispatch(r, k2Act, -1, groups256(n), unsafe.Pointer(&a))
 }
 
+// k2FlashRows is the queries a workgroup of shaders/krea2_flash.comp takes.
+const k2FlashRows = 128
+
+// flash says whether shaders/krea2_flash.comp takes this attention: no mask,
+// heads of 128, enough queries to fill its workgroups, and keys and values
+// it can read four floats at a time.
+func (a K2Attn) flash() bool {
+	return a.HeadDim == 128 && a.Causal == 0 && a.Queries >= 512 &&
+		(a.K|a.KStride|a.KSeq|a.V|a.VStride|a.VSeq)%4 == 0
+}
+
 // Attn records attention; HeadDim is 128, 384 or 512.
 func (k *K2) Attn(r *Recorder, a K2Attn) {
 	kern := k2Attn128
@@ -594,12 +663,37 @@ func (k *K2) Attn(r *Recorder, a K2Attn) {
 	} else if a.HeadDim != 128 {
 		panic(fmt.Sprintf("vk: Krea 2 attention has no kernel for heads of %d", a.HeadDim))
 	}
-	a.Tiles = (a.Queries + 63) / 64
+	rows := uint32(64)
+	if a.flash() {
+		kern, rows = k2Flash128, k2FlashRows
+		if a.Seqs == 1 && k.kv != nil && 2*2*(a.Heads/int(a.Group))*128*int(kvRows(a.Keys)) <= k.kvBytes {
+			k.attnFromHalves(r, a)
+			return
+		}
+	}
+	a.Tiles = (a.Queries + rows - 1) / rows
 	groups := int(a.Tiles) * a.Seqs
 	if groups > 65535 || a.Heads > 65535 {
 		panic(fmt.Sprintf("vk: Krea 2 attention of %d×%d workgroups", groups, a.Heads))
 	}
 	r.DispatchColumns(k.set(kern, -1), uint32(groups), uint32(a.Heads), a.push())
+	r.Barrier()
+}
+
+// attnFromHalves records the long attention in two: the keys and values to
+// fp16 in k.kv, the values transposed, then shaders/krea2_flash.comp reading
+// them there.
+func (k *K2) attnFromHalves(r *Recorder, a K2Attn) {
+	kvHeads := uint32(a.Heads) / a.Group
+	np := kvRows(a.Keys)
+	half := struct{ k, kStride, v, vStride, tokens, np, kh, vt uint32 }{
+		a.K, a.KStride, a.V, a.VStride, a.Keys, np, 0, kvHeads * 128 * np}
+	r.DispatchColumns(k.set(k2KVHalf, -1), np/64, kvHeads, unsafe.Pointer(&half))
+	r.Barrier()
+	a.K, a.KSeq = half.kh, 0
+	a.V, a.VStride, a.VSeq = half.vt, np, 0
+	a.Tiles = (a.Queries + k2FlashRows - 1) / k2FlashRows
+	r.DispatchColumns(k.set(k2FlashG128, -1), a.Tiles, uint32(a.Heads), a.push())
 	r.Barrier()
 }
 

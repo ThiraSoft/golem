@@ -210,6 +210,7 @@ func OpenDiT(d *vk.Device, path string) (*DiT, error) {
 	if m.k, err = vk.NewK2(d, a.n, par.data); err != nil {
 		return fail(err)
 	}
+	m.k.ReserveAttention(N, ditKVHeads)
 	up := func(h *int, name string, rows, cols int) {
 		if err == nil {
 			*h, err = ck.fp8(m.k, name, rows, cols)

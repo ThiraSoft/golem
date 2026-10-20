@@ -1,0 +1,27 @@
+#version 450
+
+// What TestK2FlashLayout reads: every element of a sixteen-square of each
+// use, loaded from a matrix whose entries are their own row and column, as
+// the lane holding it sees it. shaders/krea2_flash.comp is written for the
+// layout this finds.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+layout(local_size_x = 32) in;
+layout(std430, binding = 0) buffer M { float16_t mh[]; };
+layout(std430, binding = 1) buffer F { float mf[]; };
+layout(std430, binding = 2) buffer O { float o[]; };
+void main() {
+    uint lane = gl_SubgroupInvocationID;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c;
+    coopMatLoad(a, mh, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(b, mh, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(c, mf, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    if (lane == 0u) { o[0] = float(a.length()); o[1] = float(b.length()); o[2] = float(c.length()); o[3] = float(gl_SubgroupSize); }
+    for (int i = 0; i < a.length(); i++) o[16 + 0*1024 + lane*16 + i] = float(a[i]);
+    for (int i = 0; i < b.length(); i++) o[16 + 1*1024 + lane*16 + i] = float(b[i]);
+    for (int i = 0; i < c.length(); i++) o[16 + 2*1024 + lane*16 + i] = c[i];
+}

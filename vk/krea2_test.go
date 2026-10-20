@@ -363,30 +363,51 @@ func TestK2Attention(t *testing.T) {
 		name                         string
 		heads, group, hd, seqs, len_ int
 		causal                       uint32
+		amp                          float32
 	}{
-		{"dit", 8, 4, 128, 1, 263, 0},
-		{"encoder", 8, 4, 128, 1, 41, 1},
-		{"fusion", 4, 1, 128, 20, 12, 0},
-		{"vae", 1, 1, 384, 1, 150, 0},
+		{"dit", 8, 4, 128, 1, 263, 0, 1},
+		{"encoder", 8, 4, 128, 1, 41, 1, 1},
+		{"fusion", 4, 1, 128, 20, 12, 0, 1},
+		{"vae", 1, 1, 384, 1, 150, 0, 1},
+		// What shaders/krea2_flash.comp takes: long, with and without
+		// groups, two sequences, ragged ends, and peaked scores, which fp16
+		// keys round to 1.39% of the scale whichever kernel runs.
+		{"long", 4, 1, 128, 1, 2100, 0, 1},
+		{"long gqa", 8, 4, 128, 1, 1100, 0, 1},
+		{"long seqs", 2, 1, 128, 2, 700, 0, 1},
+		{"long peaked", 2, 1, 128, 1, 1500, 0, 3},
 	}
 	for _, c := range cases {
 		qs := c.heads * c.hd
 		ks := c.heads / c.group * c.hd
 		n := c.len_ * c.seqs
 		q, kAt, vAt, oAt := 0, n*qs, n*qs+n*ks, n*qs+2*n*ks
-		mem := randomFloats(r, oAt+n*qs, 1)
+		mem := randomFloats(r, oAt+n*qs, c.amp)
 		a := K2Attn{Q: uint32(q), QStride: uint32(qs), QSeq: uint32(c.len_ * qs),
 			K: uint32(kAt), KStride: uint32(ks), KSeq: uint32(c.len_ * ks),
 			V: uint32(vAt), VStride: uint32(ks), VSeq: uint32(c.len_ * ks),
 			O: uint32(oAt), OStride: uint32(qs), OSeq: uint32(c.len_ * qs),
 			Queries: uint32(c.len_), Keys: uint32(c.len_), Group: uint32(c.group), Causal: c.causal,
 			Scale: float32(1 / math.Sqrt(float64(c.hd))), Heads: c.heads, Seqs: c.seqs, HeadDim: c.hd}
-		k := newK2(t, len(mem), nil)
-		k.Write(0, mem)
-		run(t, k, func(rec *Recorder) { k.Attn(rec, a) })
-		got, _ := k.Read(oAt, n*qs)
 		want := attention(a, mem)[oAt:]
-		k2Compare(t, c.name, got, want, 5e-3)
+		tol := 5e-3
+		if c.amp > 1 {
+			tol = 2e-2
+		}
+		// Reading the arena, and reading the fp16 copy ReserveAttention
+		// makes room for.
+		for _, reserve := range []bool{false, true} {
+			k := newK2(t, len(mem), nil)
+			name := c.name
+			if reserve {
+				k.ReserveAttention(c.len_, c.heads/c.group)
+				name += ", fp16 copy"
+			}
+			k.Write(0, mem)
+			run(t, k, func(rec *Recorder) { k.Attn(rec, a) })
+			got, _ := k.Read(oAt, n*qs)
+			k2Compare(t, name, got, want, tol)
+		}
 	}
 }
 

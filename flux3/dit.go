@@ -215,6 +215,9 @@ type DiT struct {
 
 	recordDispatch  func()
 	earlyDispatches int
+	// timeline, when set, gets a stamp after every dispatch, named for the
+	// kernel's family: what the profile tests read.
+	timeline *vk.Timeline
 
 	embImg       linearWeight
 	embRef       linearWeight
@@ -465,10 +468,12 @@ func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens
 		}
 	}
 
-	m.arenaBytes = a.n * 4
 	if m.k, err = vk.NewK2(d, a.n, par.data); err != nil {
 		return fail(err)
 	}
+	// The attention's fp16 keys and values, beside the arena.
+	m.k.ReserveAttention(maxImageTokens+maxRefTokens+MaxTextTokens, ditHeads)
+	m.arenaBytes = a.n*4 + m.k.KVBytes()
 
 	var f8Buf []byte
 	var f16Buf []byte
@@ -745,36 +750,50 @@ func (m *DiT) dispatch() {
 func (m *DiT) mm(r *vk.Recorder, w int, mm vk.K2MM) {
 	m.dispatch()
 	m.k.MM(r, w, m.precision == PrecisionFP8, mm)
+	label := "mm"
+	switch {
+	case mm.Outputs == 2*ditFFN:
+		label = "mm mlp in"
+	case mm.Inputs == ditFFN:
+		label = "mm mlp out"
+	}
+	m.timeline.Stamp(r, label)
 }
 
 func (m *DiT) norm(r *vk.Recorder, n vk.K2Norm) {
 	m.dispatch()
 	m.k.Norm(r, n)
+	m.timeline.Stamp(r, "qknorm")
 }
 
 func (m *DiT) flux3Norm(r *vk.Recorder, n vk.K2Flux3Norm) {
 	m.dispatch()
 	m.k.Flux3Norm(r, n)
+	m.timeline.Stamp(r, "norm")
 }
 
 func (m *DiT) flux3Gate(r *vk.Recorder, g vk.K2Flux3Gate) {
 	m.dispatch()
 	m.k.Flux3Gate(r, g)
+	m.timeline.Stamp(r, "gate")
 }
 
 func (m *DiT) rope(r *vk.Recorder, p vk.K2Rope) {
 	m.dispatch()
 	m.k.Rope(r, p)
+	m.timeline.Stamp(r, "rope")
 }
 
 func (m *DiT) act(r *vk.Recorder, a vk.K2Act) {
 	m.dispatch()
 	m.k.Act(r, a)
+	m.timeline.Stamp(r, "act")
 }
 
 func (m *DiT) attn(r *vk.Recorder, a vk.K2Attn) {
 	m.dispatch()
 	m.k.Attn(r, a)
+	m.timeline.Stamp(r, "attn")
 }
 
 func (m *DiT) forget() {
