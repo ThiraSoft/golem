@@ -44,22 +44,22 @@ repository, compared to ComfyUI (worktree at origin/master with
 |---|---:|---:|---:|
 | text encoder (warm, positive prompt) | 410 ms | 325 ms | 325 ms |
 | text encoder (cold, includes CLIP upload to VRAM) | 2504 ms | 335 ms | 335 ms |
-| DiT load to VRAM (warm page cache) | 15.31 s | 3.37 s | 6.07 s |
+| DiT load (host read + upload; warm page cache) | 15.31 s (host read 13.03 s + upload; 9.54 s seen on earlier run) | 3.37 s | 6.07 s |
 | VAE decode 1024 x 1024 (warm min) | 429 ms | 581 ms | 581 ms |
 | VAE decode 768 x 1024 (warm min) | 268 ms | 435 ms | 435 ms |
-| DiT step 1024 x 1024 (steady state, no swap) | 0.902 s | 0.756 s | 0.584 s |
-| DiT step 768 x 1024 (steady state, no swap) | 0.644 s | 0.561 s | 0.419 s |
+| DiT step 1024 x 1024 | 0.902 s | 0.756 s | 0.584 s |
+| DiT step 768 x 1024 | 0.644 s | 0.561 s | 0.419 s |
 
 Total picture generation time (prompt to decoded image, DiT kept):
 
-| size | steps | ComfyUI (prompt changed, swaps) | ComfyUI (prompt cached, no swap) | golem FP16 (default) | golem FP8 |
+| size | steps | ComfyUI (prompt changed) | ComfyUI (prompt cached, encode skipped) | golem FP16 (default) | golem FP8 |
 |---|---|---:|---:|---:|---:|
 | 1024 x 1024 | 16 | 19.42 s | 16.90 s | 13.25 s | 10.41 s |
 | 1024 x 1024 | 8 | 11.18 s | 9.18 s | 7.10 s | 5.68 s |
 | 768 x 1024 | 16 | 15.44 s | 11.96 s | 9.86 s | 7.57 s |
 | 768 x 1024 | 8 | 8.94 s | 6.39 s | 5.33 s | 4.18 s |
 
-golem keeps its encoder in host memory and never swaps.
+ComfyUI's own log on this 16 GB card shows the FLUX 3 DiT loaded partially (3869 MB resident, 6714 MB offloaded) and part of it evicted when the VAE loads, so its step times include that streaming; golem holds the whole DiT and the arena on the card (12.17 GB). golem keeps its encoder in host memory and never swaps.
 
 Without Keep (loading the DiT on every picture):
 
