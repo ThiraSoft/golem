@@ -6,7 +6,7 @@
 //	golem-server -model Qwen3-4B-Q4_0.gguf -addr :8080
 //
 // Which engine reads the file is read from the file: it declares its own
-// architecture, and gemma4, qwen3 and qwen35 — which is Qwen3.8 — are the three
+// architecture, and gemma4, qwen3 and qwen35 - which is Qwen3.8 - are the three
 // that are implemented. It serves /v1/chat/completions, streamed or not, tool
 // declarations included, and /v1/models. It reports the calls the model makes;
 // running them is the client's part, as the protocol has it.
@@ -33,6 +33,7 @@ import (
 	"github.com/ThiraSoft/golem/nomic"
 	"github.com/ThiraSoft/golem/sample"
 	"github.com/ThiraSoft/golem/stt"
+	"github.com/ThiraSoft/golem/yue2"
 )
 
 func main() {
@@ -54,6 +55,8 @@ func main() {
 	krea2Dir := flag.String("krea2", os.Getenv("GOLEM_KREA2"), "a ComfyUI directory holding Krea 2's three files, to answer /v1/images/generations with (or GOLEM_KREA2)")
 	flux3Dir := flag.String("flux3", os.Getenv("GOLEM_FLUX3"), "a ComfyUI directory holding FLUX 3's three files, to answer /v1/images/generations with (or GOLEM_FLUX3)")
 	layaDir := flag.String("laya", os.Getenv("GOLEM_LAYA"), "a Laya checkpoint directory as Hugging Face ships it, to answer Jev's /v1/systemone with (or GOLEM_LAYA)")
+	yue2Dir := flag.String("yue2", os.Getenv("GOLEM_YUE2"), "directory holding YuE2's GGUF files, to answer yue-server routes with (or GOLEM_YUE2)")
+	yue2Context := flag.Int("yue2-context", 24576, "positions to keep in YuE2's KV cache; 24576 by default")
 	krea2Keep := flag.Bool("krea2-keep", false, "keep Krea 2's twelve-gigabyte DiT on the card between pictures")
 	flux3Keep := flag.Bool("flux3-keep", false, "keep FLUX 3's DiT on the card between pictures")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -68,18 +71,23 @@ func main() {
 		return
 	}
 
-	if *model == "" && *sttDir == "" && *embedPath == "" && *krea2Dir == "" && *flux3Dir == "" && *layaDir == "" {
-		fail(fmt.Errorf("no model: pass -model, -stt, -embed, -krea2, -flux3 or -laya, or set GOLEM_MODEL, GOLEM_STT, GOLEM_EMBED, GOLEM_KREA2, GOLEM_FLUX3 or GOLEM_LAYA"))
+	if *model == "" && *sttDir == "" && *embedPath == "" && *krea2Dir == "" && *flux3Dir == "" && *layaDir == "" && *yue2Dir == "" {
+		fail(fmt.Errorf("no model: pass -model, -stt, -embed, -krea2, -flux3, -laya or -yue2, or set GOLEM_MODEL, GOLEM_STT, GOLEM_EMBED, GOLEM_KREA2, GOLEM_FLUX3, GOLEM_LAYA or GOLEM_YUE2"))
 	}
 	if *krea2Dir != "" && *flux3Dir != "" {
 		fail(fmt.Errorf("cannot use -krea2 and -flux3 together"))
 	}
+	if *yue2Dir != "" {
+		if *model != "" || *krea2Dir != "" || *flux3Dir != "" {
+			fail(fmt.Errorf("cannot combine -yue2 with -model, -krea2 or -flux3 on the card"))
+		}
+	}
 	// A transcriber or an embedder alone is a whole server. It holds no
-	// conversation, so nothing below this — the runner, the slots, the
-	// generators — has anything to own, and building them around a model that
+	// conversation, so nothing below this - the runner, the slots, the
+	// generators - has anything to own, and building them around a model that
 	// was never opened would only be a longer way of writing nil.
 	if *model == "" {
-		serveWithoutConversation(*sttDir, *embedPath, *krea2Dir, *krea2Keep, *flux3Dir, *flux3Keep, *layaDir, *addr, *sttStreams, *vulkan)
+		serveWithoutConversation(*sttDir, *embedPath, *krea2Dir, *krea2Keep, *flux3Dir, *flux3Keep, *layaDir, *yue2Dir, *yue2Context, *addr, *sttStreams, *vulkan)
 		return
 	}
 	start := time.Now()
@@ -229,7 +237,7 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
-	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 — %d conversations at once, batched into one pass\n",
+	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 - %d conversations at once, batched into one pass\n",
 		listener.Addr(), m.Slots())
 	if err := http.Serve(listener, logging(os.Stderr, server.Handler())); err != nil {
 		fail(err)
@@ -270,7 +278,7 @@ func sttOnVulkan(m *stt.Model, vulkan bool, streams int) {
 // both, and no conversation. Server.Handler registers the conversation route
 // only when there is a pool, so what this listens on is /v1/models and the
 // routes of what it carries.
-func serveWithoutConversation(dir, embedPath, krea2Dir string, krea2Keep bool, flux3Dir string, flux3Keep bool, layaDir, addr string, streams int, vulkan bool) {
+func serveWithoutConversation(dir, embedPath, krea2Dir string, krea2Keep bool, flux3Dir string, flux3Keep bool, layaDir, yue2Dir string, yue2Context int, addr string, streams int, vulkan bool) {
 	start := time.Now()
 	var name string
 	var carries []string
@@ -336,6 +344,19 @@ func serveWithoutConversation(dir, embedPath, krea2Dir string, krea2Keep bool, f
 		}
 		carries = append(carries, "decisions")
 	}
+	if yue2Dir != "" {
+		p, err := openYuE2(yue2Dir, yue2Context)
+		if err != nil {
+			fail(err)
+		}
+		defer p.Close()
+		server.SetYuE2(p, yue2Dir)
+		defer server.Close()
+		if name == "" {
+			name = "yue2"
+		}
+		carries = append(carries, "songs")
+	}
 	server.name = name
 
 	listener, err := net.Listen("tcp", addr)
@@ -343,10 +364,26 @@ func serveWithoutConversation(dir, embedPath, krea2Dir string, krea2Keep bool, f
 		fail(err)
 	}
 	fmt.Fprintf(os.Stderr, "loaded in %s on %d cores\n", time.Since(start).Round(time.Millisecond), runtime.NumCPU())
-	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 — %s only\n", listener.Addr(), strings.Join(carries, " and "))
+	fmt.Fprintf(os.Stderr, "listening on http://%s/v1 - %s only\n", listener.Addr(), strings.Join(carries, " and "))
 	if err := http.Serve(listener, logging(os.Stderr, server.Handler())); err != nil {
 		fail(err)
 	}
+}
+
+// openYuE2 opens YuE2's Q8_0 backbone and VAE on Vulkan and says how long it took.
+func openYuE2(dir string, context int) (*yue2.Pipeline, error) {
+	start := time.Now()
+	p, err := yue2.Open(yue2.Options{
+		Dir:     dir,
+		Model:   "Q8_0",
+		Context: context,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("yue2: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "yue2 from %s, Q8_0, context %d, loaded in %s\n",
+		dir, p.Context(), time.Since(start).Round(time.Millisecond))
+	return p, nil
 }
 
 // openLaya opens a Laya checkpoint, on the card when -vulkan says so, and
