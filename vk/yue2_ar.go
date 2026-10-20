@@ -312,8 +312,8 @@ func (a *Attention) recordSplitRun(r *Recorder, block int, run span, score score
 		if s.wideSets == nil || s.wideSets[block] == nil {
 			return false
 		}
-		// A pass of a prompt: the tiles of attn_scores.comp, through its
-		// fork for heads of 128.
+		// A pass of a prompt: attn_scores.comp's tiles, through its form for
+		// heads of 128 with the mix on the cores.
 		tiles := uint32((run.count + scoreColumns - 1) / scoreColumns)
 		r.DispatchColumns(s.wideSets[block], score.heads, tiles, unsafe.Pointer(&score))
 		return true

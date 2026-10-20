@@ -19,12 +19,20 @@
 //   - Its shared memory holds a query tile of heads of 512, some fifty
 //     kilobytes, so a compute unit runs one workgroup at a time.
 //
-// Here the two halves of the workgroup mix the same dimension for sixteen
-// rows each, and the tiles are sized for heads of 128. Everything else is
-// attn_scores's, line for line: the score block on the cores, the mask, the
-// online softmax, the order every row's sums run in, and the Q8_0 form
-// written at the end. A row's arithmetic is the same operations in the same
-// order, so the answer is too (TestYue2AttnWideMatchesScores).
+// Here the mix runs on the cores as well: the tile's probabilities in fp16,
+// as ggml's flash attention hands them to its cores, times the tile's
+// values, into the output's rows, which live in shared memory in float32 so
+// that the online softmax can rescale them a row at a time (the cores'
+// accumulators cannot be, without leaning on how the driver lays them out).
+// The tiles are sized for heads of 128, twenty-five kilobytes less than
+// attn_scores's. The scores, the mask, the online softmax and the Q8_0 form
+// written at the end are attn_scores's, line for line.
+//
+// Measured on the Guerreros prompt (BenchmarkARPrefill, 3006 positions):
+// attn_scores 425 ms; the same arithmetic with both halves of the workgroup
+// mixing, sixteen rows each, 295 ms; this, 235 ms. Against a float64
+// attention of the same operands it lands where attn_scores does, the Q8_0
+// rounding being the whole of either's distance (TestYue2AttnWide).
 
 layout(local_size_x = 256) in;
 
@@ -55,15 +63,22 @@ const uint BR = 32u;
 const uint BC = 32u;
 const uint HD = 128u;
 const uint QW = HD / 8u;
-const uint HALF = BR / 2u;   // the rows each half of the workgroup mixes
+const uint HALF = BR / 2u;   // the rows each half of the workgroup writes out
 
 // A key row of the head, then eight halves of slack; a query row the same.
 const uint KST = HD + 8u;
 const uint QST = HD + 8u;
 
+// ks holds a tile's values once its keys are scored.
 shared float16_t ks[BC * KST];
 shared float16_t qs[BR * QST];
 shared float pr[BR * BC];
+// The probabilities in fp16 for the cores, and the output's rows in
+// float32, where the softmax rescales them.
+const uint PST = BC + 8u;
+const uint OST = HD + 4u;
+shared float16_t ps[BR * PST];
+shared float os[BR * OST];
 shared float corr[BR];
 shared float sums[BR];
 
@@ -126,11 +141,9 @@ void main() {
     uvec4 mine = where_[p.block * WHERE_COLUMNS + base + min(r0, rows - 1u)];
     bool live = r0 < rows;
 
-    // The mix geometry: a dimension, and which sixteen rows.
+    // The output's geometry: a dimension, and which sixteen rows.
     uint d  = t & (HD - 1u);
     uint rh = (t >> 7) * HALF;
-    uint half_ = d >> 1;
-    bool lowHalf = (d & 1u) == 0u;
 
     for (uint idx = t; idx < rows * QW; idx += 256u) {
         uint r = idx / QW, j = idx % QW;
@@ -139,8 +152,7 @@ void main() {
         [[unroll]] for (uint u = 0u; u < 8u; u++) qs[qat + u] = float16_t(qh[qb + u]);
     }
 
-    float acc[HALF];
-    [[unroll]] for (uint r = 0u; r < HALF; r++) acc[r] = 0.0;
+    for (uint e = t; e < BR * OST; e += 256u) os[e] = 0.0;
     float rowMax = -1.0 / 0.0, rowSum = 0.0;
 
     uint wave = gl_SubgroupID;
@@ -196,7 +208,7 @@ void main() {
         float mine_  = 0.0;
         [[unroll]] for (uint i = 0u; i < 4u; i++) {
             float pv = isinf(newMax) ? 0.0 : exp(sv[i] - newMax);
-            pr[r0 * BC + cl + (i << 3)] = pv;
+            ps[r0 * PST + cl + (i << 3)] = float16_t(pv);
             mine_ += pv;
         }
         float tileSum = subgroupClusteredAdd(mine_, 8u);
@@ -206,12 +218,42 @@ void main() {
         rowMax = newMax;
         barrier();
 
-        // The mix: this thread's dimension of its half's sixteen rows.
-        [[unroll]] for (uint r = 0u; r < HALF; r++) acc[r] *= corr[rh + r];
-        [[unroll]] for (uint c = 0u; c < got; c++) {
-            vec2 v = unpackHalf2x16(cv[(entry(lo + start + c, kv) >> 1) + half_]);
-            float val = lowHalf ? v.x : v.y;
-            [[unroll]] for (uint r = 0u; r < HALF; r++) acc[r] += pr[(rh + r) * BC + c] * val;
+        // The tile's values into ks, rows past the tile zero: their
+        // probabilities are, and a zero times whatever the cache holds there
+        // could still be a NaN.
+        for (uint idx = t; idx < BC * QW; idx += 256u) {
+            uint c = idx / QW, j = idx % QW;
+            uvec4 raw = uvec4(0u);
+            if (c < got) {
+                uint o = (entry(lo + start + c, kv) >> 1) + (j << 2);
+                raw = uvec4(cv[o], cv[o + 1u], cv[o + 2u], cv[o + 3u]);
+            }
+            uint at = c * KST + (j << 3);
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                vec2 hv = unpackHalf2x16(raw[u]);
+                ks[at + (u << 1)]      = float16_t(hv.x);
+                ks[at + (u << 1) + 1u] = float16_t(hv.y);
+            }
+        }
+        for (uint e = t; e < BR * HD; e += 256u) {
+            uint r = e / HD;
+            os[r * OST + (e % HD)] *= corr[r];
+        }
+        barrier();
+        // O += P·V on the cores: a wave owns sixteen rows and sixty-four
+        // dimensions of the output, four tiles.
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            uint d0 = ((wtc & 1u) * 4u + i) << 4;
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> O;
+            coopMatLoad(O, os, (wtr << 4) * OST + d0, OST, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint kk = 0u; kk < BC / 16u; kk++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                coopMatLoad(A, ps, (wtr << 4) * PST + (kk << 4), PST, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B, ks, (kk << 4) * KST + d0, KST, gl_CooperativeMatrixLayoutRowMajor);
+                O = coopMatMulAdd(A, B, O);
+            }
+            coopMatStore(O, os, (wtr << 4) * OST + d0, OST, gl_CooperativeMatrixLayoutRowMajor);
         }
     }
 
@@ -228,7 +270,7 @@ void main() {
         uint r = rh + i;
         if (r >= rows) break;
         float invSum = (sums[r] > 0.0) ? (1.0 / sums[r]) : 0.0;
-        float value = acc[i] * invSum;
+        float value = os[r * OST + d] * invSum;
 
         float peak = subgroupClusteredMax(abs(value), 32u);
         float scale = 0.0;
