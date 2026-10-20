@@ -151,13 +151,13 @@ func TestPromptOverLimitFailsBeforeDiTOpen(t *testing.T) {
 
 func TestOpenRefusesExcessMaxPixels(t *testing.T) {
 	_, err := Open(Options{
-		MaxPixels: 2048 * 2048,
+		MaxPixels: 4096 * 4096,
 	})
 	if err == nil {
-		t.Fatal("Open with MaxPixels > 1 MP succeeded, want error")
+		t.Fatal("Open with MaxPixels past DefaultMaxPixels succeeded, want error")
 	}
-	if !strings.Contains(err.Error(), "1 MP DiT limit") {
-		t.Errorf("error %q does not name 1 MP DiT limit", err.Error())
+	if !strings.Contains(err.Error(), "4456448") {
+		t.Errorf("error %q does not name the 4456448 pixel limit", err.Error())
 	}
 }
 

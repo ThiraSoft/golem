@@ -40,8 +40,16 @@ const (
 	ditTDim        = 256
 	ditEps         = 1e-6
 	MaxImageTokens = 4096 // 1024x1024: (1024/16)*(1024/16) = 64*64 = 4096
-	MaxRefTokens   = 4096
+	MaxRefTokens   = 4096 // what OpenDiT sizes for: one 1 MP reference
 	MaxTextTokens  = 960
+	// RefTokens is one reference at the workflows' 1 MP, MaxRefs how many
+	// ReferenceMultiLatent takes.
+	RefTokens = 4096
+	MaxRefs   = 4
+	// mlpChunk is how many tokens one pass of a block's MLP covers: its
+	// 2 x 9216 wide input is the largest buffer a token needs, so the arena
+	// holds it for these tokens only.
+	mlpChunk = 4096
 )
 
 // Precision specifies the weight storage precision in DiT.
@@ -199,6 +207,8 @@ type DiT struct {
 	depth             int
 	depthSingleBlocks int
 	arenaBytes        int
+	maxImageTokens    int
+	maxRefTokens      int
 
 	inStepEarly bool
 	zeroTarget  bool
@@ -313,28 +323,41 @@ func parallelChunks(n int, fn func(w, s, e int)) {
 	wg.Wait()
 }
 
-// OpenDiT loads the FLUX 3 transformer from a safetensors file onto the Vulkan device.
+// OpenDiT loads the FLUX 3 transformer from a safetensors file onto the Vulkan
+// device, with an arena for a 1 MP picture and one 1 MP reference.
 func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
+	precision := PrecisionFP16
+	if len(prec) > 0 {
+		precision = prec[0]
+	}
+	return OpenDiTSized(d, path, precision, MaxImageTokens, MaxRefTokens)
+}
+
+// OpenDiTSized is OpenDiT with an arena for up to maxImageTokens image tokens
+// and maxRefTokens reference tokens (all references together).
+func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens, maxRefTokens int) (*DiT, error) {
+	if precision != PrecisionFP8 && precision != PrecisionFP16 {
+		return nil, fmt.Errorf("flux3: unsupported precision %v", precision)
+	}
+	if maxImageTokens < 1 || maxRefTokens < 0 {
+		return nil, fmt.Errorf("flux3: a DiT for %d image and %d reference tokens", maxImageTokens, maxRefTokens)
+	}
+	if n := ditArenaFloats(maxImageTokens, maxRefTokens); uint64(n)*4 >= 1<<32 {
+		return nil, fmt.Errorf("flux3: a DiT arena for %d image and %d reference tokens is %d bytes, past the 4 GiB one storage buffer holds", maxImageTokens, maxRefTokens, uint64(n)*4)
+	}
 	tm, err := tensors.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("flux3: %s: %w", path, err)
 	}
 
-	precision := PrecisionFP16
-	if len(prec) > 0 {
-		precision = prec[0]
-	}
-	if precision != PrecisionFP8 && precision != PrecisionFP16 {
-		tm.Close()
-		return nil, fmt.Errorf("flux3: unsupported precision %v", precision)
-	}
-
 	m := &DiT{
-		tm:          tm,
-		precision:   precision,
-		stepProgs:   make(map[stepKey][]countedProgram),
-		earlyTProgs: make(map[earlyTKey]countedProgram),
-		earlyRProgs: make(map[earlyRKey]countedProgram),
+		tm:             tm,
+		precision:      precision,
+		maxImageTokens: maxImageTokens,
+		maxRefTokens:   maxRefTokens,
+		stepProgs:      make(map[stepKey][]countedProgram),
+		earlyTProgs:    make(map[earlyTKey]countedProgram),
+		earlyRProgs:    make(map[earlyRKey]countedProgram),
 	}
 	fail := func(err error) (*DiT, error) {
 		m.Close()
@@ -400,50 +423,8 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 		return par.add(f), nil
 	}
 
-	// Setup arena layout.
 	var a arena
-	m.temb = a.take(ditTDim)
-	m.tembNext = a.take(ditTDim)
-	m.tembZero = a.take(ditTDim)
-
-	m.tA = a.take(ditWidth)
-	m.tVec = a.take(ditWidth)
-	m.tVecZero = a.take(ditWidth)
-	m.tTarget = a.take(ditWidth)
-
-	m.modEarlyImg = a.take(3 * ditWidth)
-	m.modEarlyRef = a.take(3 * ditWidth)
-	m.modEarlyTxt = a.take(3 * ditWidth)
-	m.modSingleImg = a.take(3 * ditWidth)
-	m.modSingleRef = a.take(3 * ditWidth)
-	m.modSingleTxt = a.take(3 * ditWidth)
-	m.modFinal = a.take(2 * ditWidth)
-
-	m.ctx[0] = a.take(MaxTextTokens * ditTxtIn)
-	m.ctx[1] = a.take(MaxTextTokens * ditTxtIn)
-	m.txtStates[0] = a.take(MaxTextTokens * ditWidth)
-	m.txtStates[1] = a.take(MaxTextTokens * ditWidth)
-
-	m.refLatent[0] = a.take(MaxRefTokens * ditInChannels)
-	m.refLatent[1] = a.take(MaxRefTokens * ditInChannels)
-	m.refStates[0] = a.take(MaxRefTokens * ditWidth)
-	m.refStates[1] = a.take(MaxRefTokens * ditWidth)
-
-	m.img = a.take(MaxImageTokens * ditInChannels)
-	m.embImgBuf = a.take(MaxImageTokens * ditWidth)
-	m.imgOut = a.take(MaxImageTokens * ditInChannels)
-
-	N := MaxImageTokens + MaxRefTokens + MaxTextTokens
-	m.x = a.take(N * ditWidth)
-	m.nh = a.take(N * ditWidth)
-	m.q = a.take(N * ditWidth)
-	m.kBuf = a.take(N * ditWidth)
-	m.vBuf = a.take(N * ditWidth)
-	m.att = a.take(N * ditWidth)
-	m.out = a.take(N * ditWidth)
-	m.mlp = a.take(N * 2 * ditFFN)
-	m.half = a.take(N * ditFFN)
-	m.table = a.take(N * ditHeadDim)
+	m.layout(&a)
 
 	// Pre-load small parameter norms.
 	loadBlockNorms := func(prefix string) (qNorm, kNorm uint32, err error) {
@@ -688,6 +669,68 @@ func OpenDiT(d *vk.Device, path string, prec ...Precision) (*DiT, error) {
 	return m, nil
 }
 
+// ditArenaFloats is the arena a DiT for these limits takes, in floats.
+func ditArenaFloats(maxImageTokens, maxRefTokens int) int {
+	m := DiT{maxImageTokens: maxImageTokens, maxRefTokens: maxRefTokens}
+	var a arena
+	m.layout(&a)
+	return a.n
+}
+
+// layout places the arena's buffers for the DiT's limits. The fp16 ones come
+// first, so no index into them in halves passes 2^31; the MLP's are sized for
+// mlpChunk tokens, which recordBlock walks.
+func (m *DiT) layout(a *arena) {
+	N := m.maxImageTokens + m.maxRefTokens + MaxTextTokens
+	m.nh = a.take(N * ditWidth / 2)
+	m.half = a.take(mlpChunk * ditFFN / 2)
+
+	m.temb = a.take(ditTDim)
+	m.tembNext = a.take(ditTDim)
+	m.tembZero = a.take(ditTDim)
+
+	m.tA = a.take(ditWidth)
+	m.tVec = a.take(ditWidth)
+	m.tVecZero = a.take(ditWidth)
+	m.tTarget = a.take(ditWidth)
+
+	m.modEarlyImg = a.take(3 * ditWidth)
+	m.modEarlyRef = a.take(3 * ditWidth)
+	m.modEarlyTxt = a.take(3 * ditWidth)
+	m.modSingleImg = a.take(3 * ditWidth)
+	m.modSingleRef = a.take(3 * ditWidth)
+	m.modSingleTxt = a.take(3 * ditWidth)
+	m.modFinal = a.take(2 * ditWidth)
+
+	m.ctx[0] = a.take(MaxTextTokens * ditTxtIn)
+	m.ctx[1] = a.take(MaxTextTokens * ditTxtIn)
+	m.txtStates[0] = a.take(MaxTextTokens * ditWidth)
+	m.txtStates[1] = a.take(MaxTextTokens * ditWidth)
+
+	m.refLatent[0] = a.take(m.maxRefTokens * ditInChannels)
+	m.refLatent[1] = a.take(m.maxRefTokens * ditInChannels)
+	m.refStates[0] = a.take(m.maxRefTokens * ditWidth)
+	m.refStates[1] = a.take(m.maxRefTokens * ditWidth)
+
+	m.img = a.take(m.maxImageTokens * ditInChannels)
+	// The image stream's embedding, kept for the waypoint tests up to 1 MP.
+	m.embImgBuf = a.take(min(m.maxImageTokens, MaxImageTokens) * ditWidth)
+	m.imgOut = a.take(m.maxImageTokens * ditInChannels)
+
+	m.x = a.take(N * ditWidth)
+	m.q = a.take(N * ditWidth)
+	m.kBuf = a.take(N * ditWidth)
+	m.vBuf = a.take(N * ditWidth)
+	m.att = a.take(N * ditWidth)
+	m.out = a.take(N * ditWidth)
+	m.mlp = a.take(mlpChunk * 2 * ditFFN)
+	m.table = a.take(N * ditHeadDim)
+}
+
+// MaxImageTokens and MaxRefTokens are the limits the DiT was opened for.
+func (m *DiT) MaxImageTokens() int { return m.maxImageTokens }
+func (m *DiT) MaxRefTokens() int   { return m.maxRefTokens }
+
 // ArenaBytes returns the size in bytes of the Vulkan arena allocated by K2.
 func (m *DiT) ArenaBytes() int {
 	return m.arenaBytes
@@ -886,11 +929,11 @@ func (m *DiT) SetRefs(slot int, latents [][]float32, shapes [][2]int) error {
 		packed = append(packed, p...)
 		totalRefTokens += sh[0] * sh[1]
 	}
-	if totalRefTokens > MaxRefTokens {
+	if totalRefTokens > m.maxRefTokens {
 		m.refTokens[slot] = 0
 		m.refShapes[slot] = nil
 		m.refIDs[slot] = nil
-		return fmt.Errorf("flux3: %d ref tokens exceeds max %d", totalRefTokens, MaxRefTokens)
+		return fmt.Errorf("flux3: %d ref tokens exceeds the %d this DiT was opened for", totalRefTokens, m.maxRefTokens)
 	}
 
 	refIDs := RefIDs(shapes)
@@ -953,12 +996,6 @@ func (m *DiT) recordBlock(r *vk.Recorder, b *ditBlock, tokens int, xOffset uint3
 		Y: m.vBuf, YStride: uint32(ditWidth),
 		Bias: vk.K2None, Scale: b.v.scale, Mode: vk.K2Store, XHalves: 1,
 	})
-	m.mm(r, b.mlpIn.w, vk.K2MM{
-		Outputs: uint32(2 * ditFFN), Inputs: uint32(ditWidth), Cols: toks,
-		X: nhHalves, XStride: uint32(ditWidth),
-		Y: m.mlp, YStride: uint32(2 * ditFFN),
-		Bias: vk.K2None, Scale: b.mlpIn.scale, Mode: vk.K2Store, XHalves: 1,
-	})
 
 	// 3. QKNorm.
 	m.norm(r, vk.K2Norm{
@@ -1007,22 +1044,30 @@ func (m *DiT) recordBlock(r *vk.Recorder, b *ditBlock, tokens int, xOffset uint3
 		Bias: vk.K2None, Scale: b.attnOut.scale, Mode: vk.K2Store, XHalves: 0,
 	})
 
-	// 7. SwiGLU activation into half (fp16).
-	m.act(r, vk.K2Act{
-		X: m.mlp, XStride: uint32(2 * ditFFN),
-		Y: m.mlp + uint32(ditFFN), YStride: uint32(2 * ditFFN),
-		N: uint32(ditFFN), Rows: toks,
-		Op:  vk.K2SwiGLU,
-		Dst: 2 * m.half, DstStride: uint32(ditFFN), Halves: 1,
-	})
-
-	// 8. MLP Out linear (fp16 operand -> add to m.out).
-	m.mm(r, b.mlpOut.w, vk.K2MM{
-		Outputs: uint32(ditWidth), Inputs: uint32(ditFFN), Cols: toks,
-		X: 2 * m.half, XStride: uint32(ditFFN),
-		Y: m.out, YStride: uint32(ditWidth),
-		Bias: vk.K2None, Scale: b.mlpOut.scale, Mode: vk.K2Add, XHalves: 1,
-	})
+	// 7-8. The MLP from nh, mlpChunk tokens at a time: MLP In, SwiGLU into
+	// half (fp16), MLP Out added to m.out.
+	for c0 := 0; c0 < tokens; c0 += mlpChunk {
+		cols := uint32(min(mlpChunk, tokens-c0))
+		m.mm(r, b.mlpIn.w, vk.K2MM{
+			Outputs: uint32(2 * ditFFN), Inputs: uint32(ditWidth), Cols: cols,
+			X: nhHalves + uint32(c0*ditWidth), XStride: uint32(ditWidth),
+			Y: m.mlp, YStride: uint32(2 * ditFFN),
+			Bias: vk.K2None, Scale: b.mlpIn.scale, Mode: vk.K2Store, XHalves: 1,
+		})
+		m.act(r, vk.K2Act{
+			X: m.mlp, XStride: uint32(2 * ditFFN),
+			Y: m.mlp + uint32(ditFFN), YStride: uint32(2 * ditFFN),
+			N: uint32(ditFFN), Rows: cols,
+			Op:  vk.K2SwiGLU,
+			Dst: 2 * m.half, DstStride: uint32(ditFFN), Halves: 1,
+		})
+		m.mm(r, b.mlpOut.w, vk.K2MM{
+			Outputs: uint32(ditWidth), Inputs: uint32(ditFFN), Cols: cols,
+			X: 2 * m.half, XStride: uint32(ditFFN),
+			Y: m.out + uint32(c0*ditWidth), YStride: uint32(ditWidth),
+			Bias: vk.K2None, Scale: b.mlpOut.scale, Mode: vk.K2Add, XHalves: 1,
+		})
+	}
 
 	// 9. Gated residual add for each span: x += out * gate.
 	for _, sp := range spans {
@@ -1364,15 +1409,17 @@ func (m *DiT) stepPrograms(slot, h, w, refToks, txtToks int) ([]countedProgram, 
 		m.mm(r, m.embImg.w, vk.K2MM{
 			Outputs: uint32(ditWidth), Inputs: uint32(ditInChannels), Cols: uint32(I),
 			X: m.img, XStride: uint32(ditInChannels),
-			Y: m.embImgBuf, YStride: uint32(ditWidth),
+			Y: m.x, YStride: uint32(ditWidth),
 			Bias: vk.K2None, Scale: m.embImg.scale, Mode: vk.K2Store,
 		})
-		m.act(r, vk.K2Act{
-			X: m.x, XStride: uint32(ditWidth),
-			Y: m.embImgBuf, YStride: uint32(ditWidth),
-			N: uint32(ditWidth), Rows: uint32(I),
-			Op: vk.K2Copy,
-		})
+		if I <= MaxImageTokens {
+			m.act(r, vk.K2Act{
+				X: m.embImgBuf, XStride: uint32(ditWidth),
+				Y: m.x, YStride: uint32(ditWidth),
+				N: uint32(ditWidth), Rows: uint32(I),
+				Op: vk.K2Copy,
+			})
+		}
 		spansImg := []span{{start: 0, end: I, modOffset: m.modEarlyImg}}
 		for i := 0; i < m.depth; i++ {
 			m.recordBlock(r, &m.imgEarlyBlocks[i], I, m.x, m.table, spansImg)
@@ -1458,8 +1505,8 @@ func (m *DiT) stepWithWaypoints(slot int, latent []float32, h, w int, sigma, nex
 		return nil, nil, fmt.Errorf("flux3: no text in slot %d", slot)
 	}
 	I := h * w
-	if I > MaxImageTokens {
-		return nil, nil, fmt.Errorf("flux3: %d patches exceeds MaxImageTokens", I)
+	if I > m.maxImageTokens {
+		return nil, nil, fmt.Errorf("flux3: %d patches exceeds the %d image tokens this DiT was opened for", I, m.maxImageTokens)
 	}
 	if len(latent) != I*ditInChannels {
 		return nil, nil, fmt.Errorf("flux3: latent len %d != %d", len(latent), I*ditInChannels)
@@ -1524,8 +1571,10 @@ func (m *DiT) stepWithWaypoints(slot int, latent []float32, h, w int, sigma, nex
 	m.earlyDispatches += progs[0].earlyDispatches
 
 	if recordWps {
-		if emb, err := m.k.Read(int(m.embImgBuf), I*ditWidth); err == nil {
-			wps["wp.emb_img"] = emb
+		if I <= MaxImageTokens {
+			if emb, err := m.k.Read(int(m.embImgBuf), I*ditWidth); err == nil {
+				wps["wp.emb_img"] = emb
+			}
 		}
 		if txtE, err := m.k.Read(int(m.txtStates[slot]), T*ditWidth); err == nil {
 			wps["wp.txt_early"] = txtE

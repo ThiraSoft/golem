@@ -106,6 +106,7 @@ type vaeEncoder struct {
 type vaeDecodeProgram struct {
 	p        *vk.Program
 	out      uint32
+	slices   []int // a band program's: per GroupNorm, its statistics' slices
 	up0, up1 uint32
 	up2, up3 uint32
 }
@@ -133,31 +134,73 @@ type VAE struct {
 	statsBuf        uint32
 	wpBufs          [4]uint32 // up_0, up_1, up_2, up_3 copy buffers (only when recordWaypoints is true)
 
+	// bandPix is the most latent pixels decoded (or encoded) in one go;
+	// a larger latent is decoded in bands, see decodeBanded.
+	bandPix     int
+	trunk       uint32 // the whole latent's level-2 output, 512 x 4h x 4w
+	statsAcc    uint32 // per norm and band, the GroupNorm slice statistics of pass A
+	statsMerged uint32 // per norm, one (n, mean, m2) a group, merged over the bands
+	band        *bandRecording
+
 	decodeProgs map[[2]int]vaeDecodeProgram
 	encodeProgs map[[2]int]vaeEncodeProgram
+	trunkProgs  map[[2]int]vaeDecodeProgram
+	bandProgs   map[bandKey]vaeDecodeProgram
+}
+
+const (
+	// vaeBandLatentPix is the most latent pixels the VAE decodes at once: a
+	// 1 MP picture. Past it, the decode goes in bands of full width.
+	vaeBandLatentPix = 4096
+	// vaeBandOverlap is how many latent rows a band reads past its own on
+	// each side. The band's layers see about 20 pixels around a pixel; two
+	// latent rows are 32.
+	vaeBandOverlap = 2
+	// vaeBandNorms is how many GroupNorms a band runs: six in level 1, six
+	// in level 0, and norm_out.
+	vaeBandNorms = 13
+	// vaeMaxBands bounds the bands of one decode, which statsAcc holds.
+	vaeMaxBands = 64
+	// vaeStatsSlot is what one GroupNorm's slice statistics take: 32 groups,
+	// up to 64 slices, three floats.
+	vaeStatsSlot = 32 * 64 * 3
+)
+
+type bandKey struct {
+	h, w, band, pass int
+}
+
+// bandRecording is the state of a band program while it is recorded: pass 0
+// keeps each norm's own statistics, pass 1 normalises with the merged ones.
+type bandRecording struct {
+	band, pass int
+	norm       int   // the next norm's index
+	slices     []int // per norm, the slices its statistics came in
 }
 
 // OpenVAE opens the VAE from a safetensors file for latents up to maxLatentPix.
 // Waypoint buffers are not allocated on this production path.
 func OpenVAE(d *vk.Device, path string, maxLatentPix int) (*VAE, error) {
-	return openVAE(d, path, maxLatentPix, false)
+	return openVAE(d, path, maxLatentPix, false, vaeBandLatentPix)
 }
 
 // openVAEForTest opens the VAE with waypoint buffers allocated for testing.
 func openVAEForTest(d *vk.Device, path string, maxLatentPix int) (*VAE, error) {
-	return openVAE(d, path, maxLatentPix, true)
+	return openVAE(d, path, maxLatentPix, true, maxLatentPix)
 }
 
-func openVAE(d *vk.Device, path string, maxLatentPix int, waypoints bool) (*VAE, error) {
-	maxAllowedPix := int((1<<32/4 - 1024) / 163840)
-	if maxLatentPix <= 0 || maxLatentPix > maxAllowedPix {
-		return nil, fmt.Errorf("flux3: maxLatentPix %d past arena limit of %d (max resolution %dx%d)", maxLatentPix, maxAllowedPix, int(math.Sqrt(float64(maxAllowedPix)))*16, int(math.Sqrt(float64(maxAllowedPix)))*16)
+// openVAEBands opens the VAE decoding past bandPix latent pixels in bands.
+func openVAEBands(d *vk.Device, path string, maxLatentPix, bandPix int) (*VAE, error) {
+	return openVAE(d, path, maxLatentPix, false, bandPix)
+}
+
+func openVAE(d *vk.Device, path string, maxLatentPix int, waypoints bool, bandPix int) (*VAE, error) {
+	if maxLatentPix <= 0 || bandPix <= 0 {
+		return nil, fmt.Errorf("flux3: a VAE for %d latent pixels, %d at once", maxLatentPix, bandPix)
 	}
-	if waypoints {
-		maxWaypointsPix := int((1<<32/4 - 1024) / (163840 + 139264))
-		if maxLatentPix > maxWaypointsPix {
-			return nil, fmt.Errorf("flux3: maxLatentPix %d past arena limit with waypoints of %d", maxLatentPix, maxWaypointsPix)
-		}
+	bandPix = min(bandPix, maxLatentPix)
+	if n := vaeArenaFloats(maxLatentPix, bandPix, waypoints); uint64(n)*4 >= 1<<32 {
+		return nil, fmt.Errorf("flux3: a VAE arena for %d latent pixels is %d bytes, past the 4 GiB one storage buffer holds", maxLatentPix, uint64(n)*4)
 	}
 
 	tm, err := tensors.Open(path)
@@ -169,8 +212,11 @@ func openVAE(d *vk.Device, path string, maxLatentPix int, waypoints bool) (*VAE,
 		tm:              tm,
 		maxLatentPix:    maxLatentPix,
 		recordWaypoints: waypoints,
+		bandPix:         bandPix,
 		decodeProgs:     make(map[[2]int]vaeDecodeProgram),
 		encodeProgs:     make(map[[2]int]vaeEncodeProgram),
+		trunkProgs:      make(map[[2]int]vaeDecodeProgram),
+		bandProgs:       make(map[bandKey]vaeDecodeProgram),
 	}
 	fail := func(err error) (*VAE, error) {
 		v.Close()
@@ -436,21 +482,8 @@ func openVAE(d *vk.Device, path string, maxLatentPix int, waypoints bool) (*VAE,
 		return fail(err)
 	}
 
-	// Memory layout:
-	// Largest stage is 256 channels at 16× latent pixels: 256 * 256 * maxLatentPix = 65536 * maxLatentPix floats.
-	v.stageFloats = 65536 * maxLatentPix
 	var a arena
-	v.bufs[0] = a.take(65536 * maxLatentPix)
-	v.bufs[1] = a.take(65536 * maxLatentPix)
-	v.bufs[2] = a.take(32768 * maxLatentPix)
-	if waypoints {
-		// Waypoint copy buffers allocated ONLY when test opts in via openVAEForTest.
-		v.wpBufs[3] = a.take(512 * 16 * maxLatentPix)  // up_3: 512 channels at 4x latent
-		v.wpBufs[2] = a.take(512 * 64 * maxLatentPix)  // up_2: 512 channels at 8x latent
-		v.wpBufs[1] = a.take(256 * 256 * maxLatentPix) // up_1: 256 channels at 16x latent
-		v.wpBufs[0] = a.take(128 * 256 * maxLatentPix) // up_0: 128 channels at 16x latent
-	}
-	v.statsBuf = a.take(32 * 64 * 3) // stats buffer for GroupNorm
+	v.layout(&a)
 
 	if v.k, err = vk.NewK2(d, a.n, par.data); err != nil {
 		return fail(err)
@@ -459,6 +492,42 @@ func openVAE(d *vk.Device, path string, maxLatentPix int, waypoints bool) (*VAE,
 		return fail(err)
 	}
 	return v, nil
+}
+
+// vaeArenaFloats is the arena of a VAE for these limits, in floats.
+func vaeArenaFloats(maxLatentPix, bandPix int, waypoints bool) int {
+	v := VAE{maxLatentPix: maxLatentPix, bandPix: bandPix, recordWaypoints: waypoints}
+	var a arena
+	v.layout(&a)
+	return a.n
+}
+
+// layout places the arena's buffers. Largest stage of a decode in one go is
+// 256 channels at 16x the latent: 65536 floats a latent pixel, for bandPix
+// of them. A banded decode also runs the whole latent up to level 2, 512
+// channels at 4x (8192 floats a latent pixel), and keeps its output.
+func (v *VAE) layout(a *arena) {
+	trunk := 0
+	if v.maxLatentPix > v.bandPix {
+		trunk = 8192 * v.maxLatentPix
+	}
+	v.stageFloats = max(65536*v.bandPix, trunk)
+	v.bufs[0] = a.take(v.stageFloats)
+	v.bufs[1] = a.take(v.stageFloats)
+	v.bufs[2] = a.take(max(32768*v.bandPix, trunk))
+	if v.recordWaypoints {
+		// Waypoint copy buffers allocated ONLY when test opts in via openVAEForTest.
+		v.wpBufs[3] = a.take(512 * 16 * v.maxLatentPix)  // up_3: 512 channels at 4x latent
+		v.wpBufs[2] = a.take(512 * 64 * v.maxLatentPix)  // up_2: 512 channels at 8x latent
+		v.wpBufs[1] = a.take(256 * 256 * v.maxLatentPix) // up_1: 256 channels at 16x latent
+		v.wpBufs[0] = a.take(128 * 256 * v.maxLatentPix) // up_0: 128 channels at 16x latent
+	}
+	v.statsBuf = a.take(vaeStatsSlot) // stats buffer for GroupNorm
+	if trunk > 0 {
+		v.trunk = a.take(trunk)
+		v.statsAcc = a.take(vaeBandNorms * vaeMaxBands * vaeStatsSlot)
+		v.statsMerged = a.take(vaeBandNorms * 32 * 3)
+	}
 }
 
 // upload sends all fp16 convolution weights to the GPU.
@@ -638,18 +707,31 @@ func (v *VAE) norm(r *vk.Recorder, src, dst, c, h, w uint32, n vaeNorm, silu boo
 	groupElems := cpg * plane
 	slices := uint32(max(1, min(64, int((groupElems+8191)/8192))))
 	sliceLen := (groupElems + slices - 1) / slices
-	v.k.Flux3GStats(r, vk.K2Flux3GStats{
-		Src:        src,
-		Plane:      plane,
-		CPG:        cpg,
-		GroupElems: groupElems,
-		SliceLen:   sliceLen,
-		Slices:     slices,
-		Stats:      v.statsBuf,
-	})
 	s := uint32(0)
 	if silu {
 		s = 1
+	}
+	stats := v.statsBuf
+	if b := v.band; b != nil && b.pass == 1 {
+		// The whole picture's statistics, merged after pass 0.
+		stats, slices = v.statsMerged+uint32(b.norm*32*3), 1
+		b.norm++
+	} else {
+		v.k.Flux3GStats(r, vk.K2Flux3GStats{
+			Src:        src,
+			Plane:      plane,
+			CPG:        cpg,
+			GroupElems: groupElems,
+			SliceLen:   sliceLen,
+			Slices:     slices,
+			Stats:      v.statsBuf,
+		})
+		if b != nil {
+			at := v.statsAcc + uint32((b.norm*vaeMaxBands+b.band)*vaeStatsSlot)
+			v.k.CopyStrided(r, at, 0, v.statsBuf, 0, 32*slices*3, 1)
+			b.slices = append(b.slices, int(slices))
+			b.norm++
+		}
 	}
 	v.k.Flux3GNorm(r, vk.K2Flux3GNorm{
 		Src:        src,
@@ -658,7 +740,7 @@ func (v *VAE) norm(r *vk.Recorder, src, dst, c, h, w uint32, n vaeNorm, silu boo
 		CPG:        cpg,
 		GroupElems: groupElems,
 		Slices:     slices,
-		Stats:      v.statsBuf,
+		Stats:      stats,
 		Weight:     n.weight,
 		Bias:       n.bias,
 		SiLU:       s,
@@ -879,8 +961,8 @@ func (v *VAE) decodeCore(latent []float32, h, w int, recordWPs bool) ([]float32,
 	if len(latent) != 128*h*w {
 		return nil, nil, fmt.Errorf("flux3: a latent of %d floats for 128 x %d x %d", len(latent), h, w)
 	}
-	if h*w > v.maxLatentPix {
-		return nil, nil, fmt.Errorf("flux3: a latent of %d x %d is past the %d pixels the VAE was opened for", h, w, v.maxLatentPix)
+	if h*w > v.bandPix {
+		return nil, nil, fmt.Errorf("flux3: a latent of %d x %d is past the %d pixels the VAE decodes at once", h, w, v.bandPix)
 	}
 	p, err := v.decodeProgram(h, w, recordWPs)
 	if err != nil {
@@ -943,13 +1025,239 @@ func (v *VAE) decodeCore(latent []float32, h, w int, recordWPs bool) ([]float32,
 }
 
 // Decode turns a 128-ch x16 latent into an RGB image [0, 1] as float32,
-// row by row, three floats per pixel.
+// row by row, three floats per pixel. Past bandPix latent pixels it decodes
+// in bands (decodeBanded).
 func (v *VAE) Decode(latent []float32, h, w int) ([]float32, error) {
-	planes, _, err := v.decodeCore(latent, h, w, false)
+	decode := v.decodeCore
+	if h*w > v.bandPix {
+		decode = v.decodeBanded
+	}
+	planes, _, err := decode(latent, h, w, false)
 	if err != nil {
 		return nil, err
 	}
 	return toRGB(planes, 256*h*w), nil
+}
+
+// vaeBand is one band of a banded decode, in latent rows: it writes rows
+// [y0, y1) of the picture and reads [r0, r1), the overlap clipped to it.
+type vaeBand struct {
+	y0, y1, r0, r1 int
+}
+
+// vaeBands cuts h latent rows of width w into bands of at most bandPix
+// latent pixels, overlap included.
+func vaeBands(h, w, bandPix int) ([]vaeBand, error) {
+	rows := bandPix / w
+	core := rows - 2*vaeBandOverlap
+	if core < 1 {
+		return nil, fmt.Errorf("flux3: a latent %d wide is past the %d the VAE decodes in bands", w, bandPix/(2*vaeBandOverlap+1))
+	}
+	var bands []vaeBand
+	for y0 := 0; y0 < h; y0 += core {
+		y1 := min(h, y0+core)
+		bands = append(bands, vaeBand{y0, y1, max(0, y0-vaeBandOverlap), min(h, y1+vaeBandOverlap)})
+	}
+	if len(bands) > vaeMaxBands {
+		return nil, fmt.Errorf("flux3: a latent of %d x %d takes %d bands, past %d", h, w, len(bands), vaeMaxBands)
+	}
+	return bands, nil
+}
+
+// trunkProgram records the decode of the whole latent up to level 2's
+// resnets, at 4x the latent, into v.trunk. Its one attention, at 2x, sees the
+// whole picture, as do its GroupNorms.
+func (v *VAE) trunkProgram(h, w int) (*vk.Program, error) {
+	key := [2]int{h, w}
+	if p, ok := v.trunkProgs[key]; ok {
+		return p.p, nil
+	}
+	p, err := v.k.Compile(func(r *vk.Recorder) {
+		b := v.bufs
+		H, W := uint32(h), uint32(w)
+		v.k.Flux3VAEUnpatch(r, vk.K2Flux3VAEPatch{Src: b[0], Dst: b[1], H: H, W: W, Mean: v.bnMean, Var: v.bnVar})
+		b = [3]uint32{b[1], b[0], b[2]}
+		H, W = 2*H, 2*W
+		v.conv(r, v.dec.postQuantConv, H, W, b[0], b[1], vk.K2None, convNormal)
+		b = [3]uint32{b[1], b[0], b[2]}
+		v.conv(r, v.dec.convIn, H, W, b[0], b[1], vk.K2None, convNormal)
+		b = [3]uint32{b[1], b[0], b[2]}
+		b = v.residual(r, b, v.dec.mid0, H, W)
+		b = v.attention(r, b, v.dec.midAttn, H, W)
+		b = v.residual(r, b, v.dec.mid1, H, W)
+		for lvl := 3; lvl >= 2; lvl-- {
+			up := v.dec.up[lvl]
+			for bi := 0; bi < 3; bi++ {
+				b = v.residual(r, b, up.blocks[bi], H, W)
+			}
+			if lvl == 3 {
+				H, W = 2*H, 2*W
+				v.conv(r, *up.upsample, H, W, b[0], b[1], vk.K2None, convUpsample)
+				b = [3]uint32{b[1], b[0], b[2]}
+			}
+		}
+		v.k.CopyStrided(r, v.trunk, 0, b[0], 0, 512*H*W, 1)
+	})
+	if err != nil {
+		return nil, err
+	}
+	v.trunkProgs[key] = vaeDecodeProgram{p: p}
+	return p, nil
+}
+
+// bandProgram records one band's decode from the trunk: level 2's upsample,
+// levels 1 and 0, the head. pass 0 normalises with the band's own
+// statistics and keeps them in statsAcc; pass 1 with statsMerged.
+func (v *VAE) bandProgram(h, w, i int, bd vaeBand, pass int) (vaeDecodeProgram, error) {
+	key := bandKey{h, w, i, pass}
+	if p, ok := v.bandProgs[key]; ok {
+		return p, nil
+	}
+	rec := &bandRecording{band: i, pass: pass}
+	v.band = rec
+	defer func() { v.band = nil }()
+	var prog vaeDecodeProgram
+	p, err := v.k.Compile(func(r *vk.Recorder) {
+		b := v.bufs
+		rows := bd.r1 - bd.r0
+		// 512 planes of the trunk, its rows 4*r0 to 4*r1.
+		H, W := uint32(4*rows), uint32(4*w)
+		v.k.CopyStrided(r, b[0], H*W, v.trunk+uint32(16*bd.r0*w), uint32(16*h*w), H*W, 512)
+		H, W = 2*H, 2*W
+		v.conv(r, *v.dec.up[2].upsample, H, W, b[0], b[1], vk.K2None, convUpsample)
+		b = [3]uint32{b[1], b[0], b[2]}
+		for lvl := 1; lvl >= 0; lvl-- {
+			up := v.dec.up[lvl]
+			for bi := 0; bi < 3; bi++ {
+				b = v.residual(r, b, up.blocks[bi], H, W)
+			}
+			if up.upsample != nil {
+				H, W = 2*H, 2*W
+				v.conv(r, *up.upsample, H, W, b[0], b[1], vk.K2None, convUpsample)
+				b = [3]uint32{b[1], b[0], b[2]}
+			}
+		}
+		v.norm(r, b[0], b[1], 128, H, W, v.dec.normOut, true)
+		v.conv(r, v.dec.convOut, H, W, b[1], b[2], vk.K2None, convNormal)
+		prog.out = b[2]
+	})
+	if err != nil {
+		return vaeDecodeProgram{}, err
+	}
+	if rec.norm != vaeBandNorms {
+		p.Close()
+		return vaeDecodeProgram{}, fmt.Errorf("flux3: a VAE band ran %d GroupNorms, want %d", rec.norm, vaeBandNorms)
+	}
+	prog.p, prog.slices = p, rec.slices
+	v.bandProgs[key] = prog
+	return prog, nil
+}
+
+// decodeBanded decodes a latent past bandPix: the trunk on the whole latent,
+// then full-width bands from it. A GroupNorm's statistics are the whole
+// picture's in a full decode, so the bands run twice: pass 0 with their own,
+// whose statistics are merged on the host per norm and group, and pass 1 with
+// the merged ones, which is kept.
+func (v *VAE) decodeBanded(latent []float32, h, w int, recordWPs bool) ([]float32, map[string][]float32, error) {
+	if recordWPs {
+		return nil, nil, fmt.Errorf("flux3: no waypoints from a banded decode")
+	}
+	if len(latent) != 128*h*w {
+		return nil, nil, fmt.Errorf("flux3: a latent of %d floats for 128 x %d x %d", len(latent), h, w)
+	}
+	if h*w > v.maxLatentPix {
+		return nil, nil, fmt.Errorf("flux3: a latent of %d x %d is past the %d pixels the VAE was opened for", h, w, v.maxLatentPix)
+	}
+	bands, err := vaeBands(h, w, v.bandPix)
+	if err != nil {
+		return nil, nil, err
+	}
+	trunk, err := v.trunkProgram(h, w)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := v.k.Write(int(v.bufs[0]), latent); err != nil {
+		return nil, nil, err
+	}
+	if err := trunk.Run(); err != nil {
+		return nil, nil, err
+	}
+
+	// Pass 0: each band's own statistics, kept in statsAcc.
+	slices := make([][]int, len(bands))
+	for i, bd := range bands {
+		p, err := v.bandProgram(h, w, i, bd, 0)
+		if err != nil {
+			return nil, nil, err
+		}
+		slices[i] = p.slices
+		if err := p.p.Run(); err != nil {
+			return nil, nil, err
+		}
+	}
+	merged := make([]float32, vaeBandNorms*32*3)
+	for n := 0; n < vaeBandNorms; n++ {
+		acc, err := v.k.Read(int(v.statsAcc)+n*vaeMaxBands*vaeStatsSlot, len(bands)*vaeStatsSlot)
+		if err != nil {
+			return nil, nil, err
+		}
+		for g := 0; g < 32; g++ {
+			var parts [][3]float64
+			for i := range bands {
+				ns := slices[i][n]
+				for s := 0; s < ns; s++ {
+					o := i*vaeStatsSlot + (g*ns+s)*3
+					parts = append(parts, [3]float64{float64(acc[o]), float64(acc[o+1]), float64(acc[o+2])})
+				}
+			}
+			st := mergeGroupStats(parts)
+			copy(merged[(n*32+g)*3:], []float32{float32(st[0]), float32(st[1]), float32(st[2])})
+		}
+	}
+	if err := v.k.Write(int(v.statsMerged), merged); err != nil {
+		return nil, nil, err
+	}
+
+	// Pass 1: the merged statistics; each band's own rows go to the picture.
+	px := 256 * h * w
+	planes := make([]float32, 3*px)
+	for i, bd := range bands {
+		p, err := v.bandProgram(h, w, i, bd, 1)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := p.p.Run(); err != nil {
+			return nil, nil, err
+		}
+		bandPx := 256 * (bd.r1 - bd.r0) * w
+		from := 256 * (bd.y0 - bd.r0) * w
+		n := 256 * (bd.y1 - bd.y0) * w
+		for c := 0; c < 3; c++ {
+			got, err := v.k.Read(int(p.out)+c*bandPx+from, n)
+			if err != nil {
+				return nil, nil, err
+			}
+			copy(planes[c*px+256*bd.y0*w:], got)
+		}
+	}
+	return planes, nil, nil
+}
+
+// mergeGroupStats combines (n, mean, m2) parts of one group, Chan's
+// parallel formula; parts with n = 0 are skipped.
+func mergeGroupStats(parts [][3]float64) [3]float64 {
+	var n, mean, m2 float64
+	for _, p := range parts {
+		if p[0] <= 0 {
+			continue
+		}
+		nt := n + p[0]
+		d := p[1] - mean
+		mean += d * p[0] / nt
+		m2 += p[2] + d*d*n*p[0]/nt
+		n = nt
+	}
+	return [3]float64{n, mean, m2}
 }
 
 // decodeWithWaypoints turns a 128-ch x16 latent into RGB and returns per-block waypoints.
@@ -977,8 +1285,8 @@ func (v *VAE) Encode(rgb []float32, height, width int) ([]float32, error) {
 
 	hLat := hCrop / downscale
 	wLat := wCrop / downscale
-	if hLat*wLat > v.maxLatentPix {
-		return nil, fmt.Errorf("flux3: a latent of %d x %d is past the %d pixels the VAE was opened for", hLat, wLat, v.maxLatentPix)
+	if hLat*wLat > v.bandPix {
+		return nil, fmt.Errorf("flux3: a latent of %d x %d is past the %d pixels the VAE encodes", hLat, wLat, v.bandPix)
 	}
 
 	// Convert interleaved RGB [0, 1] to planar [-1, 1]
@@ -1019,6 +1327,14 @@ func (v *VAE) Trim() {
 		p.p.Close()
 	}
 	v.encodeProgs = make(map[[2]int]vaeEncodeProgram)
+	for _, p := range v.trunkProgs {
+		p.p.Close()
+	}
+	v.trunkProgs = make(map[[2]int]vaeDecodeProgram)
+	for _, p := range v.bandProgs {
+		p.p.Close()
+	}
+	v.bandProgs = make(map[bandKey]vaeDecodeProgram)
 	v.k.FreeArena()
 }
 
@@ -1037,6 +1353,14 @@ func (v *VAE) Close() {
 		p.p.Close()
 	}
 	v.encodeProgs = nil
+	for _, p := range v.trunkProgs {
+		p.p.Close()
+	}
+	v.trunkProgs = nil
+	for _, p := range v.bandProgs {
+		p.p.Close()
+	}
+	v.bandProgs = nil
 	if v.k != nil {
 		v.k.Close()
 		v.k = nil

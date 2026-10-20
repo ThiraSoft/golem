@@ -17,6 +17,7 @@ package vk
 import (
 	_ "embed"
 	"fmt"
+	"time"
 	"unsafe"
 )
 
@@ -440,9 +441,21 @@ func (k *K2) FreeWeights(handles ...int) {
 }
 
 // Arena makes sure the arena exists, making it again after FreeArena.
+//
+// The arena of another machine freed just before (FLUX 3's DiT before its
+// VAE decodes) goes back to the card some tens of milliseconds later: asked
+// for at once, a large arena lands in system memory, where a decode takes
+// past the kernel's ten seconds and the card is reset. So it waits, a second
+// at most, for the room DeviceLocalFree reports, then asks whatever it got.
 func (k *K2) Arena() error {
 	if k.arena != nil {
 		return nil
+	}
+	want := uint64(k.arenaFloats) * 4
+	for deadline := time.Now().Add(time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if free := k.d.DeviceLocalFree(); free == 0 || free >= want || time.Now().After(deadline) {
+			break
+		}
 	}
 	var err error
 	k.arena, err = k.d.Local(k.arenaFloats*4, bufferUsageStorage|bufferUsageTransferSrc|bufferUsageTransferDst)
@@ -640,6 +653,25 @@ func (k *K2) Flux3VAEUnpatch(r *Recorder, u K2Flux3VAEPatch) {
 func (k *K2) Flux3VAEPatch(r *Recorder, p K2Flux3VAEPatch) {
 	n := 128 * int(p.H*p.W)
 	k.dispatch(r, k2Flux3VAEPatch, -1, groups256(n), unsafe.Pointer(&p))
+}
+
+// CopyStrided records count copies of n floats inside the arena, the i-th
+// from src+i*srcStride to dst+i*dstStride (all in floats), in one transfer,
+// then a barrier. It is how a band of planes is cut out of a picture.
+func (k *K2) CopyStrided(r *Recorder, dst, dstStride, src, srcStride, n, count uint32) {
+	if count == 0 || n == 0 {
+		return
+	}
+	regions := make([]bufferCopy, count)
+	for i := range regions {
+		regions[i] = bufferCopy{
+			srcOffset: 4 * (uint64(src) + uint64(i)*uint64(srcStride)),
+			dstOffset: 4 * (uint64(dst) + uint64(i)*uint64(dstStride)),
+			size:      4 * uint64(n),
+		}
+	}
+	vkCmdCopyBuffer(r.cb, k.arena.handle, k.arena.handle, count, &regions[0])
+	r.Barrier()
 }
 
 // Compile records a program over this machine's buffers.

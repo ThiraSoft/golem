@@ -17,6 +17,19 @@ import (
 	"golang.org/x/image/draw"
 )
 
+const (
+	// DefaultMaxPixels is what a pipeline is opened for when Options say
+	// nothing: the workflows' 4 MP, whose 2:3 size (1680 x 2512, 16485
+	// tokens) is the largest, with room to spare.
+	DefaultMaxPixels = 4456448
+	// MaxSide bounds each side of a picture.
+	MaxSide = 8192
+	// matchMegaPixels is the workflows' ImageScaleToTotalPixels under
+	// match_input_image: 4.0 MP, sides a multiple of 16.
+	matchMegaPixels = 4.0
+	matchSteps      = 16
+)
+
 // Request is one picture, with the fields the mobile front sends.
 type Request struct {
 	Prompt     string        `json:"prompt"`
@@ -29,6 +42,10 @@ type Request struct {
 	Images     []image.Image `json:"images,omitempty"`
 	HidePrompt bool          `json:"hide_prompt,omitempty"`
 	MegaPixels float64       `json:"megapixels,omitempty"`
+	// MatchImage sizes the picture after Images[0] scaled to 4 MP, which
+	// then stands as the first reference, like the workflows'
+	// match_input_image.
+	MatchImage bool `json:"match_image,omitempty"`
 }
 
 // Parameters is the request as a picture's "parameters" text.
@@ -74,10 +91,16 @@ func Open(o Options) (*Pipeline, error) {
 		o.Tokenizer = TokenizerDir()
 	}
 	if o.MaxPixels == 0 {
-		o.MaxPixels = 1024 * 1024
+		o.MaxPixels = DefaultMaxPixels
 	}
-	if o.MaxPixels > MaxImageTokens*256 {
-		return nil, fmt.Errorf("flux3: MaxPixels %d exceeds limit of %d (1 MP DiT limit)", o.MaxPixels, MaxImageTokens*256)
+	if o.MaxPixels < 64*64 || o.MaxPixels > DefaultMaxPixels {
+		return nil, fmt.Errorf("flux3: MaxPixels %d is past the %d this pipeline draws at most", o.MaxPixels, DefaultMaxPixels)
+	}
+	if o.MaxRefs == 0 {
+		o.MaxRefs = MaxRefs
+	}
+	if o.MaxRefs < 1 || o.MaxRefs > MaxRefs {
+		return nil, fmt.Errorf("flux3: MaxRefs %d, from 1 to %d", o.MaxRefs, MaxRefs)
 	}
 	p := &Pipeline{o: o}
 	fail := func(err error) (*Pipeline, error) {
@@ -104,12 +127,80 @@ func Open(o Options) (*Pipeline, error) {
 	return p, nil
 }
 
+// Check says whether the pipeline would draw r, before anything is encoded:
+// under MatchImage, at the size images[0] gives.
+func (p *Pipeline) Check(r Request) error {
+	if err := p.match(&r, false); err != nil {
+		return err
+	}
+	if r.Steps == 0 {
+		r.Steps = Defaults.Steps
+	}
+	if r.CFG == 0 {
+		r.CFG = Defaults.CFG
+	}
+	return p.check(r)
+}
+
+// resolve applies MatchImage: the size of Images[0] scaled to 4 MP, which
+// replaces it (in a copy of the slice) as the first reference.
+func (p *Pipeline) resolve(r *Request) error { return p.match(r, true) }
+
+// match is resolve, which scales the first reference only when scale says
+// so: Check wants the size alone.
+func (p *Pipeline) match(r *Request, scale bool) error {
+	maxRefs := p.o.MaxRefs
+	if maxRefs == 0 {
+		maxRefs = MaxRefs
+	}
+	if len(r.Images) > maxRefs {
+		return fmt.Errorf("flux3: %d reference images, past the %d this pipeline takes", len(r.Images), maxRefs)
+	}
+	if !r.MatchImage {
+		return nil
+	}
+	if len(r.Images) == 0 {
+		return fmt.Errorf("flux3: match_image without a reference image")
+	}
+	b := r.Images[0].Bounds()
+	r.Width, r.Height = scaledSize(b.Dx(), b.Dy(), matchMegaPixels, matchSteps)
+	if scale {
+		scaled := ScaleToTotalPixels(r.Images[0], matchMegaPixels, matchSteps)
+		r.Images = append([]image.Image{scaled}, r.Images[1:]...)
+		r.MatchImage = false
+	}
+	return nil
+}
+
+// scaledSize is the size ScaleToTotalPixels gives a w x h image.
+func scaledSize(w, h int, mp float64, steps int) (int, int) {
+	scale := math.Sqrt(mp * 1024 * 1024 / float64(w*h))
+	rw := max(steps, int(math.RoundToEven(float64(w)*scale/float64(steps)))*steps)
+	rh := max(steps, int(math.RoundToEven(float64(h)*scale/float64(steps)))*steps)
+	return rw, rh
+}
+
+// ScaleToTotalPixels is ComfyUI's ImageScaleToTotalPixels: img scaled to mp
+// megapixels (of 2^20 pixels), each side rounded to a multiple of steps the
+// way Python rounds, with the lanczos filter ReferenceMultiLatent's resize
+// uses. The result is 8 bits a channel, like PIL's.
+func ScaleToTotalPixels(img image.Image, mp float64, steps int) *image.RGBA {
+	b := img.Bounds()
+	rw, rh := scaledSize(b.Dx(), b.Dy(), mp, steps)
+	img = ensureOpaque(img)
+	dst := image.NewRGBA(image.Rect(0, 0, rw, rh))
+	lanczosKernel.Scale(dst, dst.Bounds(), img, img.Bounds(), draw.Src, nil)
+	return dst
+}
+
 func (p *Pipeline) check(r Request) error {
 	switch {
 	case r.Width < 64 || r.Height < 64 || r.Width%16 != 0 || r.Height%16 != 0:
 		return fmt.Errorf("flux3: %d × %d: width and height are multiples of 16, from 64", r.Width, r.Height)
+	case r.Width > MaxSide || r.Height > MaxSide:
+		return fmt.Errorf("flux3: %d × %d: a side is past %d pixels", r.Width, r.Height, MaxSide)
 	case r.Width*r.Height > p.o.MaxPixels:
-		return fmt.Errorf("flux3: %d × %d is past the %d pixels this pipeline was opened for (1 MP DiT limit)", r.Width, r.Height, p.o.MaxPixels)
+		return fmt.Errorf("flux3: %d × %d is past the %d pixels this pipeline was opened for", r.Width, r.Height, p.o.MaxPixels)
 	case r.Steps < 1 || r.Steps > 100:
 		return fmt.Errorf("flux3: %d steps", r.Steps)
 	case r.CFG <= 0:
@@ -212,6 +303,9 @@ func (p *Pipeline) Generate(r Request, progress krea2.Progress) (*image.NRGBA, k
 	if r.CFG == 0 {
 		r.CFG = Defaults.CFG
 	}
+	if err := p.resolve(&r); err != nil {
+		return nil, tm, err
+	}
 	if err := p.check(r); err != nil {
 		return nil, tm, err
 	}
@@ -254,13 +348,13 @@ func (p *Pipeline) Generate(r Request, progress krea2.Progress) (*image.NRGBA, k
 	var refLatents [][]float32
 	var refShapes [][2]int
 	if len(r.Images) > 0 {
-		budget := MaxRefTokens / len(r.Images)
+		// ReferenceMultiLatent's resize: each reference at 1 MP of its own.
 		mp := r.MegaPixels
 		if mp <= 0 {
 			mp = 1.0
 		}
 		for _, img := range r.Images {
-			rgb, rw, rh := ResizeReference(img, mp, budget)
+			rgb, rw, rh := ResizeReference(img, mp, RefTokens)
 			lat, err := p.vae.Encode(rgb, rh, rw)
 			if err != nil {
 				return nil, tm, err
@@ -274,7 +368,7 @@ func (p *Pipeline) Generate(r Request, progress krea2.Progress) (*image.NRGBA, k
 	// 3. Load / ready DiT
 	tLoad := time.Now()
 	if p.dit == nil {
-		p.dit, err = OpenDiT(p.d, p.o.DiT, p.o.Precision)
+		p.dit, err = OpenDiTSized(p.d, p.o.DiT, p.o.Precision, p.o.MaxPixels/256, p.o.MaxRefs*RefTokens)
 		if err != nil {
 			return nil, tm, err
 		}
@@ -387,6 +481,8 @@ func WritePNG(w io.Writer, img image.Image, r Request, model string) error {
 		reqCopy.Prompt, reqCopy.Negative, reqCopy.HidePrompt = "", "", false
 	}
 	reqCopy.Images = nil
+	// Under MatchImage the request's size is the first image's, not its own.
+	reqCopy.Width, reqCopy.Height = img.Bounds().Dx(), img.Bounds().Dy()
 	return krea2.WritePNGWithMetadata(w, img, reqCopy.Parameters(model), reqCopy)
 }
 

@@ -62,6 +62,33 @@ ulimit -c 0; export HSA_ENABLE_COREDUMP=0
     /mnt/data/dev/ComfyUI-flux3 testdata/flux3 [stage ...]
 ```
 
+The 4 MP stages are recorded apart, alone on the card and in a memory scope
+(ComfyUI's i2i alone takes about 21 GB of host memory), with
+`--use-pytorch-cross-attention`: split attention asks for 19 GiB in one call
+at 4 MP with a reference, past the card. The photos they
+read come from the main checkout's `/mnt/data/dev/ComfyUI/input/`:
+
+```sh
+systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=16G /mnt/data/dev/ComfyUI/.venv/bin/python ref/flux3/dump.py /mnt/data/dev/ComfyUI-flux3 testdata/flux3 t2i4 i2i4 mi2i4
+```
+
+- `t2i4/`: the accept prompt at 2048 x 2048, seed 42.
+- `i2i4/`: `input/IMG_20191030_202255.jpg` (4160 x 3120) saved again as
+  `i2i4/ref0.jpg` with EXIF orientation 6, so it reads as a 3120 x 4160
+  portrait; `ImageScaleToTotalPixels` (lanczos, 4.0 MP, steps 16) on the
+  oriented photo gives the size, and the scaled photo is the one reference
+  (`ReferenceMultiLatent` resize, 1.0 MP). Seed 7.
+- `mi2i4/`: the same `ref0.jpg` matched, then `ref1.jpg` (toast), `ref2.png`
+  and `ref3.png` (copied from `input/`), four references at 1.0 MP. Seed 7.
+
+Each records `request.json` (with `ref_shapes`, the references' latent
+`[h, w]`), `noise0`, `sigmas`, the first DiT call (`in.x`, `in.t`, `in.ctx`,
+`in.next`, `out`; no block waypoints), `latent`, `rgb`, the PNG, and
+`timings.json`: seconds per step (the first includes loading the DiT),
+sampling, decode, total, and `decode_mode`, `full` or `tiled` (whether
+ComfyUI fell back to `decode_tiled_`). With references: `ref_rgb0` (the
+first reference as encoded), `ref_latents`, `ref_ids`.
+
 Stages:
 - `tokens/`: three prompts: `p0` (short prompt, 10 unpadded tokens, pads to 80),
   `p1` (exactly 80 unpadded tokens, 0 pads), `p2` (130 unpadded tokens, pads to 160).

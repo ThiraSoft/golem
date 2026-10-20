@@ -221,6 +221,28 @@ func TestK2Norm(t *testing.T) {
 	k2Compare(t, "norm", got, want, 1e-5)
 }
 
+func TestK2CopyStrided(t *testing.T) {
+	x := make([]float32, 64)
+	for i := range x {
+		x[i] = float32(i)
+	}
+	k := newK2(t, 64, nil)
+	k.Write(0, x)
+	run(t, k, func(rec *Recorder) { k.CopyStrided(rec, 40, 5, 1, 10, 3, 3) })
+	got, _ := k.Read(0, 64)
+	want := append([]float32(nil), x...)
+	for i, v := range []float32{1, 2, 3, -1, -1, 11, 12, 13, -1, -1, 21, 22, 23} {
+		if v >= 0 {
+			want[40+i] = v
+		}
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("float %d is %g, want %g", i, got[i], want[i])
+		}
+	}
+}
+
 func TestK2Rope(t *testing.T) {
 	r := rand.New(rand.NewSource(4))
 	tokens, heads, dim := 50, 3, 128

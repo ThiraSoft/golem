@@ -32,8 +32,12 @@ type Options struct {
 	Encoder, DiT, VAE, Tokenizer string
 	// Keep leaves the DiT on the card between pictures.
 	Keep bool
-	// MaxPixels bounds width x height and sizes the VAE; 1024 x 1024 when 0.
+	// MaxPixels bounds width x height and sizes the DiT and the VAE;
+	// DefaultMaxPixels when 0.
 	MaxPixels int
+	// MaxRefs is how many reference images a picture takes, each at 1 MP;
+	// MaxRefs (4) when 0.
+	MaxRefs int
 	// Precision specifies the weight storage precision in DiT (PrecisionFP8 or PrecisionFP16).
 	Precision Precision
 }
