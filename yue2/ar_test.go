@@ -3,6 +3,7 @@ package yue2
 import (
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -487,4 +488,120 @@ func BenchmarkARPrefill(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.Logf("the pass of positions %d to %d, %d wide\n%s", last, len(ids), len(ids)-last, rep)
+}
+
+// BenchmarkARCodes is the codes stage of the Guerreros acceptance run on its
+// own: the 3006-position prompt, then the request's 4870 codes taken one by
+// one through Generate's teacher-forced decode, every distribution computed,
+// on one slot of a cache as long as the song. It then walks the same tokens
+// again a part at a time, the stack's pass, the head, the distribution and a
+// draw, to say where a token's time goes, and profiles the pass at the
+// longest and the shortest context.
+func BenchmarkARCodes(b *testing.B) {
+	heavy.Skip(b, "a measurement of the AR half")
+	fix := loadFixtures(b)
+	raw, err := os.ReadFile(filepath.Join("..", "testdata", "yue2", "bench", "guerreros-replay.json"))
+	if err != nil {
+		b.Skipf("no recorded replay (%v): see ref/yue2/README.md", err)
+	}
+	r, err := ParseRequest(raw)
+	if err != nil {
+		b.Fatal(err)
+	}
+	values, err := ParseCodes(r.SemanticTokens)
+	if err != nil {
+		b.Fatal(err)
+	}
+	codes := make([]int32, len(values))
+	for i, v := range values {
+		codes[i] = v + CodecOffset
+	}
+	prefix := fix.readInt32(b, "ar/prefix")
+	bb, err := OpenBackbone(filepath.Join(weightsDir(), "YuE2-3B-Q8_0.gguf"))
+	if err != nil {
+		b.Skipf("no backbone weights (%v): see ref/yue2/README.md", err)
+	}
+	defer bb.Close()
+	ar, err := NewAR(testDevice(b), bb, len(prefix)+len(codes)+8, 1)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer ar.Close()
+	s := r.SemanticSampling
+	s.MaxTokens = len(codes) + 1
+	s.MinTokens = min(s.MinTokens, len(codes))
+
+	b.ResetTimer()
+	var prefill time.Duration
+	for range b.N {
+		ar.Trim(0, 0)
+		start := time.Now()
+		if _, err := ar.Prefill(0, prefix, PhaseSemantic); err != nil {
+			b.Fatal(err)
+		}
+		prefill += time.Since(start)
+		ar.Trim(0, 0)
+		if _, err := Generate(ar, prefix, nil, 1, s, r.LMSeed, PhaseSemantic, codes, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	stage := b.Elapsed() - prefill
+	b.ReportMetric(float64(stage.Microseconds())/1000/float64(b.N), "ms/stage")
+	b.ReportMetric(float64((stage-prefill).Microseconds())/1000/float64(b.N)/float64(len(codes)+1), "ms/token")
+
+	ar.Trim(0, 0)
+	logits, err := ar.Prefill(0, prefix, PhaseSemantic)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var pass, head, dist, draw time.Duration
+	var candidates []Candidate
+	for step := 0; step <= len(codes); step++ {
+		t := time.Now()
+		candidates = Distribution(logits, s, codes[:min(step, len(codes))], step, PhaseSemantic, candidates)
+		dist += time.Since(t)
+		t = time.Now()
+		_ = Draw(candidates, r.LMSeed, int64(step))
+		draw += time.Since(t)
+		token := int32(MusicEnd)
+		if step < len(codes) {
+			token = codes[step]
+		}
+		t = time.Now()
+		if err := ar.run([]int32{token}, []int{0}); err != nil {
+			b.Fatal(err)
+		}
+		pass += time.Since(t)
+		t = time.Now()
+		outs, err := ar.logits(PhaseSemantic, []int{0}, []int{0})
+		if err != nil {
+			b.Fatal(err)
+		}
+		head += time.Since(t)
+		logits = outs[0]
+	}
+	n := time.Duration(len(codes) + 1)
+	b.Logf("a token, averaged over %d from position %d: stack pass %v, head %v, distribution %v, draw %v",
+		n, len(prefix), pass/n, head/n, dist/n, draw/n)
+
+	tl, err := ar.stack.NewTimeline()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer tl.Close()
+	ar.stack.Profile(tl)
+	defer ar.stack.Profile(nil)
+	for _, at := range []int{len(prefix) + len(codes), len(prefix)} {
+		ar.Trim(0, at)
+		start := time.Now()
+		if err := ar.run([]int32{codes[0]}, []int{0}); err != nil {
+			b.Fatal(err)
+		}
+		rep, err := tl.Report(time.Since(start))
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Logf("the pass at position %d\n%s", at, rep)
+	}
 }
