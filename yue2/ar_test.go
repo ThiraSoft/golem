@@ -40,10 +40,38 @@ func testDevice(t testing.TB) *vk.Device {
 // The AR on the card, two slots, built once for the tests that read it. The
 // backbone stays open behind it: the embedding is read from the mapping.
 var arShared struct {
-	once sync.Once
-	skip string
-	err  error
-	ar   *AR
+	once     sync.Once
+	skip     string
+	err      error
+	ar       *AR
+	backbone *Backbone
+}
+
+// releaseShared gives back what the shared AR, NAR and pipeline hold on the
+// tests' device, so that a test opening a device of its own finds the card's
+// memory for it. Together they hold 14.8 GB of the card's 16, and the
+// tiled decoder's 1.74 GB arena beside them overcommits it: the driver then
+// loses the context mid-decode (TestVAETiled, VkResult -4). A test that
+// asks for one of them afterwards builds it again.
+func releaseShared() {
+	if pipelineShared.p != nil {
+		pipelineShared.p.Close()
+	}
+	pipelineShared.p = nil
+	pipelineShared.once, pipelineShared.skip, pipelineShared.err = sync.Once{}, "", nil
+	if narShared.n != nil {
+		narShared.n.Close()
+	}
+	narShared.n, narShared.got = nil, nil
+	narShared.once, narShared.skip, narShared.err = sync.Once{}, "", nil
+	if arShared.ar != nil {
+		arShared.ar.Close()
+	}
+	if arShared.backbone != nil {
+		arShared.backbone.Close()
+	}
+	arShared.ar, arShared.backbone = nil, nil
+	arShared.once, arShared.skip, arShared.err = sync.Once{}, "", nil
 }
 
 func sharedAR(t testing.TB) *AR {
@@ -56,6 +84,7 @@ func sharedAR(t testing.TB) *AR {
 			s.skip = fmt.Sprintf("no backbone weights (%v): see ref/yue2/README.md", err)
 			return
 		}
+		s.backbone = b
 		s.ar, s.err = NewAR(d, b, arContext, 2)
 	})
 	if s.skip != "" {

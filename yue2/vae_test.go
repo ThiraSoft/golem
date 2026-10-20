@@ -21,8 +21,11 @@ func loadVAEWeights(t testing.TB) *VAEWeights {
 	return w
 }
 
+// openDevice opens a device of the test's own, once the shared AR, NAR and
+// pipeline have given the card back (releaseShared).
 func openDevice(t testing.TB) *vk.Device {
 	t.Helper()
+	releaseShared()
 	d, err := vk.Open()
 	if err != nil {
 		t.Skipf("no Vulkan device: %v", err)
