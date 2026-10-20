@@ -63,10 +63,14 @@ model's 24576, as yue2.cpp's. `-tokens` and `-score` write the codes and
 the score as yue-synth's `--tokens` and `--score` do, and `-compare` takes the
 prefix of a yue-synth run and prints where the score (in tokens) and the
 codes first leave it, and the SNR of the wav16 against its wav when the two
-songs have the same length. The card takes 13.45 GB at that context
-(`cmd/yue2` reads the driver's count before and after loading); the AR's two
-cache slots are 5.6 GB of it, 28 layers of 24576 positions of 1024 fp16 keys
-and as many values each.
+songs have the same length. The card takes 10.64 GB at that context when
+the pipeline opens (`cmd/yue2` reads the driver's count before and after
+loading, and again after the song). The AR opens with one cache slot, 2.8 GB
+of it, 28 layers of 24576 positions of 1024 fp16 keys and as many values.
+The second slot, the unconditional stream's, is allocated on the first
+request whose codes are drawn with guidance (cot off at its 1.01, or any
+`cfg_scale` other than 1) and kept: that request builds the AR again, 0.8 s
+once, and the pipeline holds the 2.8 GB from then on.
 
 ## Accuracy
 
@@ -181,10 +185,13 @@ last pass, positions 2560 to 3006, 54.9% is the attention
 (`vk/shaders/yue2_attn_wide.comp`, 31.4 ms of 57.3), and most of the rest
 is the products, as wide passes of 512 on the matrix cores.
 
-The card holds 13.45 GB for golem's pipeline at the model's whole context
-(the driver's count before and after the open; a run that starts while the
-previous process's memory is still being released reads less, and is not
-the figure).
+The card holds 10.64 GB for golem's pipeline at the model's whole context
+once it is open, 13.10 GB after the Guerreros replay and 15.91 GB after a
+guided request, which brings the second cache slot (the driver's count
+before the open and after each; a run that starts while the previous
+process's memory is still being released reads less, and is not the
+figure). Measured on 2026-10-21. Before the slot was allocated on demand
+the open alone took 13.45 GB, and the replay left 15.91 GB behind it.
 
 ## Same seeds
 

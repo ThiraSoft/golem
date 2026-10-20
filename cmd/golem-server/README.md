@@ -490,8 +490,10 @@ parts: the replay JSON (`application/json`), the rendered WAV audio
 `wav16`, `wav24`, and `wav32` output formats are supported (mp3 returns 400).
 Cancel an in-flight job with `POST /job?id=N&cancel=1`.
 
-YuE2 requires substantial VRAM (approximately 13.45 GB at the default context of
-24576 positions). Because of this memory footprint, `-yue2` cannot be combined
+YuE2 requires substantial VRAM at the default context of 24576 positions:
+10.64 GB once open, 13.10 GB after a replay, and 15.91 GB from the first
+request whose codes are drawn with guidance (`cot` off, or a `cfg_scale`
+other than 1), which allocates the second cache slot and keeps it. Because of this memory footprint, `-yue2` cannot be combined
 with `-model`, `-krea2`, or `-flux3` on the card.
 
 ## Flags

@@ -54,6 +54,9 @@ type Pipeline struct {
 	// context is the cache the chunks are cut for. The tests lower it
 	// below what was allocated to reach two chunks on a short replay.
 	context int
+	// card is the device the stages are on, whoever owns it: guided builds
+	// the AR again on it.
+	card *vk.Device
 }
 
 // Song is one rendered song.
@@ -124,9 +127,12 @@ func openOn(d *vk.Device, o Options) (*Pipeline, error) {
 	if p.tok, err = NewTokenizer(b.file); err != nil {
 		return fail(err)
 	}
-	// Two slots: the unconditional stream decodes beside the conditional one
-	// when the guidance is not one.
-	if p.ar, err = NewAR(d, b, p.context, 2); err != nil {
+	// One slot. The unconditional stream decodes beside the conditional one
+	// in a second slot when the guidance is not one, and that slot's cache is
+	// 2.8 GB at the model's whole context, so it is not allocated until a
+	// request asks for it (guided).
+	p.card = d
+	if p.ar, err = NewAR(d, b, p.context, 1); err != nil {
 		return fail(err)
 	}
 	// A chunk of f frames behind a prefix of n holds n + f + 1 keys and its
@@ -168,6 +174,33 @@ func (p *Pipeline) Close() {
 		p.dev.Close()
 		p.dev = nil
 	}
+}
+
+// guided gives the AR the second slot the unconditional stream decodes in,
+// once, on the first request whose codes are drawn with guidance, and keeps
+// it for the requests after. The stack cuts its cache into slots when it is
+// built, so the AR is built again with two: the weights go up a second time,
+// once in the pipeline's life, rather than every song paying for the cache
+// in VRAM. Nothing in the old AR's cache is needed: a stage prefills its own
+// prompt from position 0. The prefill width is carried over.
+func (p *Pipeline) guided() error {
+	if len(p.ar.pos) >= 2 {
+		return nil
+	}
+	width := p.ar.width
+	p.ar.Close()
+	ar, err := NewAR(p.card, p.backbone, p.context, 2)
+	if err != nil {
+		// The card may not hold the second slot. The pipeline stays usable
+		// for unguided requests with the one it had.
+		if p.ar, _ = NewAR(p.card, p.backbone, p.context, 1); p.ar != nil {
+			p.ar.width = width
+		}
+		return fmt.Errorf("yue2: the unconditional slot for guidance: %w", err)
+	}
+	ar.width = width
+	p.ar = ar
+	return nil
 }
 
 // Context is the cache the chunks are cut for.
@@ -241,6 +274,9 @@ func (p *Pipeline) generate(r Request, forced bool, cancel func() bool) (*Song, 
 	if err := supported(r); err != nil {
 		return nil, err
 	}
+	if p.ar == nil {
+		return nil, fmt.Errorf("yue2: no AR half: building it again for guidance failed and so did the way back")
+	}
 	pl, err := planOf(r)
 	if err != nil {
 		return nil, err
@@ -269,6 +305,18 @@ func (p *Pipeline) generate(r Request, forced bool, cancel func() bool) (*Song, 
 	if forced {
 		pl.planned = pl.hasScore
 		pl.replay = false
+	}
+
+	// A request whose codes are drawn with guidance needs the second slot,
+	// and it is made before the first stage so that a failure costs nothing.
+	guidance := r.CfgScale
+	if guidance < 0 {
+		guidance = DefaultGuidance(pl.cot)
+	}
+	if !pl.replay && guidance != 1 {
+		if err := p.guided(); err != nil {
+			return nil, err
+		}
 	}
 
 	// The score: the request's, the model's or none.
@@ -301,10 +349,6 @@ func (p *Pipeline) generate(r Request, forced bool, cancel func() bool) (*Song, 
 	}
 
 	prefix := BuildPrompt(p.tok, pl.cot, r.Style, r.Lyrics, abc, pl.hasScore)
-	guidance := r.CfgScale
-	if guidance < 0 {
-		guidance = DefaultGuidance(pl.cot)
-	}
 	var negative []int32
 	if guidance != 1 {
 		negative = BuildNegative(p.tok, pl.cot, abc, pl.hasScore)

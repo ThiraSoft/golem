@@ -18,10 +18,11 @@ import (
 // holds it to yue-synth's render of the same request: the normalized wav16
 // against bench/q8-replay.wav, and the replay request against
 // bench/q8-replay.json, field for field. It lives beside the command rather
-// than in yue2 so that it has the card to itself: the pipeline takes 13.45 GB
-// at that context, and yue2's tests keep their own halves resident.
+// than in yue2 so that it has the card to itself: the pipeline takes 10.64 GB
+// at that context when it opens and 13.10 GB once it has rendered this
+// replay, and yue2's tests keep their own halves resident.
 func TestGuerrerosReplay(t *testing.T) {
-	heavy.Skip(t, "a whole song of 4870 frames, 13.45 GB on the card")
+	heavy.Skip(t, "a whole song of 4870 frames, 13.10 GB on the card")
 	bench := filepath.Join("..", "..", "testdata", "yue2", "bench")
 	r, err := yue2.ReadRequest(filepath.Join(bench, "guerreros-replay.json"))
 	if err != nil {

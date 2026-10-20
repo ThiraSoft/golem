@@ -83,6 +83,11 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
+	// What the song left on the card: the open's figure, plus the second
+	// cache slot when the codes were drawn with guidance.
+	if after := vramUsed(); vram >= 0 && after >= 0 {
+		fmt.Fprintf(os.Stderr, "[Card] %.2f GB after the song\n", float64(after-vram)/1e9)
+	}
 	t := time.Now()
 	audio, err := song.Encode(format, r.PeakClip)
 	if err != nil {

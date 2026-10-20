@@ -3,6 +3,7 @@ package yue2
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -77,6 +78,84 @@ func checkSNR(t *testing.T, name string, got, want []float32, bar float64) {
 	t.Logf("%s: SNR %.2f dB, rms error %.4f%%", name, snr, 100*rmsError(got, want))
 	if !(snr >= bar) {
 		t.Errorf("%s: SNR %.2f dB below %.2f dB", name, snr, bar)
+	}
+}
+
+// vramUsed is what the amdgpu driver says the card holds, or -1.
+func vramUsed() int64 {
+	paths, _ := filepath.Glob("/sys/class/drm/card*/device/mem_info_vram_used")
+	for _, path := range paths {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var n int64
+		if _, err := fmt.Sscan(string(b), &n); err == nil && n > 0 {
+			return n
+		}
+	}
+	return -1
+}
+
+// TestPipelineGuidanceSlot holds the spec's rule that the unconditional
+// stream's cache is allocated only when guidance is on: an open pipeline has
+// one slot, a replay leaves it at one, and the first request drawn with
+// guidance gets the second and draws what yue2.cpp drew. That request is the
+// AR recording's guided draw (ar/guided_*), cot off at its 1.01, made a song
+// of four codes through the pipeline: its prompt is the recording's 563
+// tokens and its codes the recording's four.
+func TestPipelineGuidanceSlot(t *testing.T) {
+	fix := loadFixtures(t)
+	p := sharedPipeline(t)
+	if len(p.ar.pos) != 1 {
+		// An earlier test asked for guidance: back to what the open builds.
+		t.Logf("the shared pipeline has %d slots; building its AR again with one", len(p.ar.pos))
+		width := p.ar.width
+		p.ar.Close()
+		ar, err := NewAR(p.card, p.backbone, p.context, 1)
+		if err != nil {
+			p.ar = nil
+			t.Fatal(err)
+		}
+		ar.width, p.ar = width, ar
+	}
+
+	song, err := p.Generate(shortRequest(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(p.ar.pos); n != 1 {
+		t.Errorf("a replay left the AR with %d slots, want 1", n)
+	}
+	checkSNR(t, "replay latents", song.Latents, fix.read(t, "nar/latent"), 30)
+
+	want := fix.readInt32(t, "ar/guided_tokens")
+	r := shortRequest(t)
+	r.Cot, r.ABC, r.SemanticTokens = "off", "", ""
+	// The budget is the recording's four codes: Duration caps it.
+	r.Duration = (float32(len(want)) + 0.5) / FrameRate
+	if prefix := BuildPrompt(p.tok, CotOff, r.Style, r.Lyrics, nil, false); !reflect.DeepEqual(prefix, fix.readInt32(t, "ar/guided_prefix")) {
+		t.Fatalf("the request's prompt of %d tokens is not the recording's", len(prefix))
+	}
+	before := vramUsed()
+	song, err = p.Generate(r, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after := vramUsed(); before > 0 && after > 0 {
+		t.Logf("the second slot at a context of %d: %.3f GB on the card", p.context, float64(after-before)/1e9)
+	}
+	t.Logf("times %v", song.Times)
+	if n := len(p.ar.pos); n != 2 {
+		t.Errorf("a guided request left the AR with %d slots, want 2", n)
+	}
+	if len(song.Codes) != len(want) || !song.Truncated {
+		t.Fatalf("%d codes, truncated %v; want the budget's %d, truncated", len(song.Codes), song.Truncated, len(want))
+	}
+	for i, c := range song.Codes {
+		if c+CodecOffset != want[i] {
+			t.Errorf("guided code %d: %d, the recording's %d", i, c+CodecOffset, want[i])
+		}
 	}
 }
 
