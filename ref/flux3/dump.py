@@ -19,15 +19,23 @@ Stages:
 - i2i: i2i at 256x256 seed 7 with toast reference (ref_latent, ref_states, dit.out0, rgb)
 - mi2i: two references (toast 256x256, great_wave 256x384) (ref_latents, ref_ids, rgb)
 - accept: 1024x1024 t2i, seed 42, steps 16, the PNG
+- t2i4: 2048x2048 t2i, seed 42 (first DiT call, latent, rgb, timings.json)
+- i2i4: a phone photo with EXIF orientation 6, size matched at 4 MP, one
+  reference at 1 MP, seed 7
+- mi2i4: that photo matched plus three more references, 1 MP each, seed 7
+
+The 4 MP stages are not in the default list.
 """
 
 import json
 import math
 import os
+import shutil
+import time
 import sys
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 COMFY = sys.argv[1] if len(sys.argv) > 1 else "/mnt/data/dev/ComfyUI-flux3"
@@ -56,6 +64,7 @@ import comfy.samplers  # noqa: E402
 from comfy_extras.nodes_edit_model import ReferenceMultiLatent  # noqa: E402
 from comfy_extras.nodes_flux import EmptyFlux2LatentImage  # noqa: E402
 from comfy_extras.nodes_model_advanced import ModelSamplingFlux  # noqa: E402
+from comfy_extras.nodes_post_processing import ImageScaleToTotalPixels  # noqa: E402
 
 UNET = "flux3-image-klein-bf16.safetensors"
 CLIP = "qwen3vl_4b_fp8_scaled.safetensors"
@@ -107,6 +116,20 @@ PROMPT_MI2I = "a breakfast table with toast in front of the great wave"
 
 REF_TOAST = os.path.join(ROOT, "ref/flux3/workflows/klein_ref_toast.jpg")
 REF_GREAT_WAVE = os.path.join(ROOT, "ref/flux3/workflows/klein_ref_great_wave.jpg")
+
+# The 4 MP stages: the workflows' ResolutionSelector and ImageScaleToTotalPixels
+# at 4.0 MP, references at ReferenceMultiLatent's 1.0 MP each.
+PROMPT_I2I4 = "turn the photo into a watercolor painting, keep the composition"
+PROMPT_MI2I4 = (
+    "the scene from the first image, with the toast from the second image on a table, "
+    "painted in the colours of the third and fourth images"
+)
+PHONE_PHOTO = os.path.join(COMFY, "input", "IMG_20191030_202255.jpg")
+MI2I4_EXTRA = [
+    (REF_TOAST, "ref1.jpg"),
+    (os.path.join(COMFY, "input", "eyes_renarde.png"), "ref2.png"),
+    (os.path.join(COMFY, "input", "Capture d'écran_20260803_084025.png"), "ref3.png"),
+]
 
 meta = {}
 
@@ -259,7 +282,8 @@ def stage_tokens(clip):
 
 def run_sampling(unet, clip, vae, prompt, width, height, steps, cfg, seed, tag,
                  record_dit=False, extra_conds_fn=None, negative="",
-                 pos=None, neg=None):
+                 pos=None, neg=None, waypoints=True, trajectory=True, dit_prefix="dit",
+                 timings=None):
     print(f"=== Sampling: {tag} ({width}x{height}, seed={seed}, cfg={cfg}, steps={steps}) ===")
     rec = {"steps": []}
     drec = {}
@@ -283,8 +307,12 @@ def run_sampling(unet, clip, vae, prompt, width, height, steps, cfg, seed, tag,
 
     comfy.sample.prepare_noise = prepare
 
+    step_times = []
+
     def cb(step, x0, x, total):
-        rec["steps"].append((step, x.clone(), x0.clone()))
+        step_times.append(time.perf_counter())
+        if trajectory:
+            rec["steps"].append((step, x.clone(), x0.clone()))
 
     hooks = []
     dm = unet.model.diffusion_model
@@ -313,12 +341,13 @@ def run_sampling(unet, clip, vae, prompt, width, height, steps, cfg, seed, tag,
                     drec[name] = (o[0] if isinstance(o, tuple) else o).clone()
             return h
 
-        hooks.append(dm.emb_in["image"].register_forward_hook(grab("wp.emb_img")))
-        hooks.append(dm.txt_mode_blocks[-1].register_forward_hook(grab("wp.txt_early")))
-        hooks.append(dm.content_mode_blocks["image"][-1].register_forward_hook(grab("wp.img_early")))
-        hooks.append(dm.single_blocks[0].register_forward_hook(grab("wp.single_0")))
-        hooks.append(dm.single_blocks[13].register_forward_hook(grab("wp.single_13")))
-        hooks.append(dm.single_blocks[27].register_forward_hook(grab("wp.single_27")))
+        if waypoints:
+            hooks.append(dm.emb_in["image"].register_forward_hook(grab("wp.emb_img")))
+            hooks.append(dm.txt_mode_blocks[-1].register_forward_hook(grab("wp.txt_early")))
+            hooks.append(dm.content_mode_blocks["image"][-1].register_forward_hook(grab("wp.img_early")))
+            hooks.append(dm.single_blocks[0].register_forward_hook(grab("wp.single_0")))
+            hooks.append(dm.single_blocks[13].register_forward_hook(grab("wp.single_13")))
+            hooks.append(dm.single_blocks[27].register_forward_hook(grab("wp.single_27")))
         hooks.append(dm.register_forward_hook(grab("out")))
 
     try:
@@ -329,11 +358,34 @@ def run_sampling(unet, clip, vae, prompt, width, height, steps, cfg, seed, tag,
             return lambda step, x0, x, total: cb(step, x0, x, total)
 
         latent_preview.prepare_callback = prep_cb
+        t_sample = time.perf_counter()
         samples = nodes.common_ksampler(
             patched_unet, seed, steps, cfg, SAMPLER, SCHEDULER, pos, neg, latent, denoise=1.0
         )[0]
         latent_preview.prepare_callback = real_cb
-        decoded = nodes.VAEDecode().decode(vae, samples)[0]
+        # ComfyUI falls back to decode_tiled_ when a full decode does not fit:
+        # record which one ran.
+        tiled = []
+        real_tiled = vae.decode_tiled_
+
+        def decode_tiled_(*a, **kw):
+            tiled.append(True)
+            return real_tiled(*a, **kw)
+
+        vae.decode_tiled_ = decode_tiled_
+        t_decode = time.perf_counter()
+        try:
+            decoded = nodes.VAEDecode().decode(vae, samples)[0]
+        finally:
+            vae.decode_tiled_ = real_tiled
+        t_end = time.perf_counter()
+        if timings is not None:
+            marks = [t_sample] + step_times
+            timings["steps"] = [b - a for a, b in zip(marks, marks[1:])]
+            timings["sample"] = t_decode - t_sample
+            timings["decode"] = t_end - t_decode
+            timings["decode_mode"] = "tiled" if tiled else "full"
+            timings["end"] = t_end
     finally:
         comfy.sample.prepare_noise = real_prepare
         for h in hooks:
@@ -358,7 +410,10 @@ def run_sampling(unet, clip, vae, prompt, width, height, steps, cfg, seed, tag,
     os.makedirs(os.path.join(OUT, tag), exist_ok=True)
     img_pil.save(os.path.join(OUT, tag, f"{tag}.png"))
 
-    if record_dit and "in.x" in drec:
+    if record_dit and "in.x" in drec and not waypoints:
+        for k, v in drec.items():
+            save(f"{dit_prefix}/{k}", v)
+    elif record_dit and "in.x" in drec:
         for k, v in drec.items():
             save(f"dit/{k}", v)
         # Compute pe for dit/
@@ -587,6 +642,98 @@ def stage_accept(unet, clip, vae):
     )
 
 
+def to_tensor(im):
+    return torch.from_numpy(np.array(im.convert("RGB")).astype(np.float32) / 255.0).unsqueeze(0)
+
+
+def write_phone_exif6(path):
+    """The phone photo re-saved with EXIF Orientation 6: oriented, a portrait."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    im = Image.open(PHONE_PHOTO)
+    exif = im.getexif()
+    exif[0x0112] = 6
+    im.save(path, quality=95, exif=exif)
+    oriented = ImageOps.exif_transpose(Image.open(path))
+    assert oriented.size == (3120, 4160), oriented.size
+    return oriented
+
+
+def run_4mp(unet, clip, vae, tag, prompt, seed, images):
+    """One 4 MP stage. images: oriented PIL images, the first one matched."""
+    print(f"=== Stage: {tag} ===")
+    timings = {}
+    t0 = time.perf_counter()
+    width, height = 2048, 2048
+    ref_shapes = []
+    pos = nodes.CLIPTextEncode().encode(clip, prompt)[0]
+    neg = nodes.CLIPTextEncode().encode(clip, "")[0]
+    if images:
+        scaled = ImageScaleToTotalPixels.execute(to_tensor(images[0]), "lanczos", 4.0, 16)[0]
+        height, width = int(scaled.shape[1]), int(scaled.shape[2])
+        refs = {"image1": scaled}
+        for i, im in enumerate(images[1:]):
+            refs[f"image{i + 2}"] = to_tensor(im)
+        saved = []
+        orig_encode = vae.encode
+
+        def hooked_encode(img):
+            saved.append(img)
+            return orig_encode(img)
+
+        vae.encode = hooked_encode
+        try:
+            out = ReferenceMultiLatent.execute(
+                positive=pos,
+                resolution={"resolution": "resize", "megapixels": 1.0},
+                negative=neg,
+                vae=vae,
+                images=refs,
+            )
+            pos, neg = out[0], out[1]
+        finally:
+            vae.encode = orig_encode
+        save(f"{tag}/ref_rgb0", saved[0][0])
+        lats = pos[0][1]["reference_latents"]
+        ref_shapes = [list(lat.shape[-2:]) for lat in lats]
+        save(f"{tag}/ref_latents", torch.cat([lat.flatten(2).transpose(1, 2) for lat in lats], dim=1))
+        dm = unet.model.diffusion_model
+        save(f"{tag}/ref_ids", dm.ref_ids([tuple(s) for s in ref_shapes], "cpu"))
+
+    run_sampling(
+        unet, clip, vae, prompt, width, height, STEPS, CFG, seed, tag,
+        record_dit=True, pos=pos, neg=neg, waypoints=False, trajectory=False,
+        dit_prefix=tag, timings=timings,
+    )
+    timings["total"] = timings.pop("end") - t0
+    with open(os.path.join(OUT, tag, "timings.json"), "w") as f:
+        json.dump(timings, f, indent=2)
+    req_path = os.path.join(OUT, tag, "request.json")
+    with open(req_path) as f:
+        req = json.load(f)
+    req["ref_shapes"] = ref_shapes
+    with open(req_path, "w") as f:
+        json.dump(req, f, indent=2)
+    print(f"{tag}: {width}x{height}, refs {ref_shapes}, timings {timings}")
+
+
+def stage_t2i4(unet, clip, vae):
+    run_4mp(unet, clip, vae, "t2i4", PROMPT_ACCEPT, 42, [])
+
+
+def stage_i2i4(unet, clip, vae):
+    phone = write_phone_exif6(os.path.join(OUT, "i2i4", "ref0.jpg"))
+    run_4mp(unet, clip, vae, "i2i4", PROMPT_I2I4, 7, [phone])
+
+
+def stage_mi2i4(unet, clip, vae):
+    images = [write_phone_exif6(os.path.join(OUT, "mi2i4", "ref0.jpg"))]
+    for src, name in MI2I4_EXTRA:
+        dst = os.path.join(OUT, "mi2i4", name)
+        shutil.copyfile(src, dst)
+        images.append(ImageOps.exif_transpose(Image.open(dst)))
+    run_4mp(unet, clip, vae, "mi2i4", PROMPT_MI2I4, 7, images)
+
+
 def main():
     torch.set_grad_enabled(False)
     unet, clip, vae = load_models()
@@ -604,6 +751,12 @@ def main():
         stage_mi2i(unet, clip, vae)
     if "accept" in STAGES:
         stage_accept(unet, clip, vae)
+    if "t2i4" in STAGES:
+        stage_t2i4(unet, clip, vae)
+    if "i2i4" in STAGES:
+        stage_i2i4(unet, clip, vae)
+    if "mi2i4" in STAGES:
+        stage_mi2i4(unet, clip, vae)
     write_meta()
     print("dump.py complete. meta.json written.")
 
