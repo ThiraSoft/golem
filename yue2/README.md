@@ -104,7 +104,7 @@ from yue-synth's log of the same request on the same card
 | of which the prefill of 7877 positions | 2.59 s | |
 | of which the flow, 32 steps | 18.99 s | 65.9 s |
 | of which the decoder | 0.64 s | |
-| short replay, 100 frames | 2.01 s | |
+| short replay, 100 frames | 2.00 s | |
 
 The prefill takes passes of 512 positions through the tiled Q8_0 product
 on cards with matrix cores (eight a pass without). What is left of it is

@@ -458,6 +458,15 @@ func quantLayout(q nn.Quant, data []byte, rows, cols int) ([]byte, error) {
 	if q != nn.PQ2_0 && q != nn.PTQ1_0 && cols%nn.QuantBlock != 0 {
 		return nil, fmt.Errorf("vk: a quantized row needs a multiple of %d columns, given %d", nn.QuantBlock, cols)
 	}
+	// A Q8_0 row is 34 bytes a block, so with an odd number of blocks every
+	// other row starts two bytes off a word, and so do its magnitudes. Both
+	// kernels read it a word at a time (the mat-vec and the tiled product
+	// alike) and would answer garbage there: measured, the mat-vec gave NaN
+	// at 1056 columns. An even count of blocks keeps every row and every
+	// block's magnitudes on a word.
+	if q == nn.Q8_0 && cols%(2*nn.QuantBlock) != 0 {
+		return nil, fmt.Errorf("vk: a Q8_0 row on the card needs a multiple of %d columns, given %d", 2*nn.QuantBlock, cols)
+	}
 	fileRow, err := quantFileRow(q, cols)
 	if err != nil {
 		return nil, err

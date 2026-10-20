@@ -266,8 +266,21 @@ func TestQ80TiledMatchesCPU(t *testing.T) {
 	if !d.Coopmat() {
 		t.Skip("no cooperative matrices on this device")
 	}
-	const rows, cols = 400, 1024
-	rng := rand.New(rand.NewSource(80))
+	if _, err := quantLayout(nn.Q8_0, make([]byte, 16*33*34), 16, 33*32); err == nil {
+		t.Fatal("a Q8_0 row of 33 blocks was accepted: its odd rows are off a word")
+	}
+	// 1024 is a whole number of every binary's K step. 1088 is 34 blocks,
+	// which leaves the last step of the 32 and 64 column binaries (four blocks
+	// a step) half full, and cut in four it gives slices of unequal length:
+	// 12, 12, 10 and an empty one on those two, 9, 9, 9 and 7 on the others.
+	for _, cols := range []int{1024, 1088} {
+		t.Run(itoa(cols), func(t *testing.T) { q80TiledMatchesCPU(t, d, cols) })
+	}
+}
+
+func q80TiledMatchesCPU(t *testing.T, d *Device, cols int) {
+	const rows = 400
+	rng := rand.New(rand.NewSource(int64(80 + cols)))
 	data := make([]byte, rows*cols/nn.QuantBlock*34)
 	rng.Read(data)
 	m := nn.Matrix{Data: data, Quant: nn.Q8_0, Rows: rows, Cols: cols}
@@ -314,7 +327,7 @@ func TestQ80TiledMatchesCPU(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer set.Close()
-				push := moePush{dim: rows, ffn: cols, used: 1, split: uint32(split)}
+				push := moePush{dim: rows, ffn: uint32(cols), used: 1, split: uint32(split)}
 				groups := coopProductGroups(true, columns, rows) * uint32(split)
 				if err := d.Submit(func(r *Recorder) {
 					r.DispatchWide(set, columns, groups, unsafe.Pointer(&push))

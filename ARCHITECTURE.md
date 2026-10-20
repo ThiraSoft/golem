@@ -126,6 +126,19 @@ opened the whole family.
 Q3_K on the processor was 0.69 tokens a second before it had an integer
 product, because a `Q3_K_S` is that one format for 252 of its tensors.
 
+Q8_0 has had a tiled product too since YuE2, whose 3B is Q8_0 and reads
+prompts of thousands of positions: `shaders/matmul_coop.comp` under `-DQ80`,
+bound on cards with matrix cores. Before it, a Q8_0 projection answered a
+wide pass sixteen columns at a time through the integer mat-vec; now a pass
+of thirty-two columns or more stages the weights in fp16 for the cores, as
+every other tiled format does. So on such a card a Q8_0 checkpoint's prompt
+is no longer bit-identical to what it was, in `QwenPipeline` as in the
+stack, and a token (the mat-vec) is unchanged. A Q8_0 row has to be a
+multiple of sixty-four columns, which keeps its 34-byte blocks on a word.
+`TestQ80TiledMatchesCPU` holds the five widths, unsplit and split in four,
+to the processor; `TestARPrefill` and the yue2 pipeline tests hold the
+engine.
+
 A form with no kernel is an error naming it and never a guess. Eighteen bytes
 to a block of thirty-two is Q4_0 and it is also Q4_K, so a reader that checked
 a length instead of a type would answer fluently out of the wrong bits.

@@ -227,3 +227,25 @@ func candidateIDs(c []Candidate) []int32 {
 	}
 	return ids
 }
+
+// TestDistributionNaN is a head that answered NaN: the cut must still leave a
+// candidate to draw, the best score that is a number.
+func TestDistributionNaN(t *testing.T) {
+	_, rows := PhaseRows(PhaseABC)
+	logits := make([]float32, rows)
+	nan := float32(math.NaN())
+	for i := range logits {
+		logits[i] = nan
+	}
+	logits[7], logits[900] = 1, 2
+	got := Distribution(logits, ABCSampling, nil, 100, PhaseABC, nil)
+	if len(got) == 0 || got[0].ID != 900 {
+		t.Fatalf("NaN window with two numbers: kept %v, want 900 first", candidateIDs(got))
+	}
+	logits[7], logits[900] = nan, nan
+	got = Distribution(logits, ABCSampling, nil, 100, PhaseABC, nil)
+	if len(got) != 1 {
+		t.Fatalf("all-NaN window: kept %d candidates, want 1", len(got))
+	}
+	_ = Draw(got, 1, 0)
+}

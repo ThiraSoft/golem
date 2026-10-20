@@ -177,6 +177,20 @@ func Distribution(logits []float32, s Sampling, history []int32, step int, p Pha
 			kept++
 		}
 	}
+	if kept == 0 {
+		// Only a NaN can do this: it compares false with everything, so a NaN
+		// threshold keeps nothing. Drawing from nothing would fail downstream,
+		// so the best score that is a number is taken alone, and the first
+		// candidate when none is.
+		best := 0
+		for i := range out {
+			if !isNaN32(out[i].Score) && (isNaN32(out[best].Score) || out[i].Score > out[best].Score) {
+				best = i
+			}
+		}
+		winner := out[best]
+		return append(out[:0], winner)
+	}
 	out = out[:kept]
 	// Equal scores go by id so the order, and with it the nucleus cut and the
 	// draw, never depends on how the sort happens to break ties.
@@ -213,6 +227,8 @@ func Distribution(logits []float32, s Sampling, history []int32, step int, p Pha
 
 	return out
 }
+
+func isNaN32(x float32) bool { return x != x }
 
 // kthLargest returns the k-th largest score of c, counting equal scores
 // separately, as out[k-1] of a descending sort would. It keeps the k largest
