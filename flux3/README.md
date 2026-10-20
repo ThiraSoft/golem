@@ -38,39 +38,35 @@ stays in system memory and the card reads it across the bus, 325 ms a prompt.
 
 Measured on one RX 9070 XT (16 GB VRAM), every figure from a run in this
 repository, compared to ComfyUI (worktree at origin/master with
-`--use-split-cross-attention`) on the same card for the same picture.
-Each row compares the same work under the same conditions (warm page cache
-for DiT loads; positive prompt only for text encoding; minimum over repeated
-warm runs for VAE decodes):
+`--use-split-cross-attention`) on the same card for the same picture:
 
 | component | ComfyUI | golem FP16 (default) | golem FP8 |
 |---|---:|---:|---:|
-| text encoder (warm, positive prompt) | 408 ms | 325 ms | 325 ms |
-| text encoder (cold first run) | 2350 ms | 335 ms | 335 ms |
-| DiT load to VRAM (warm page cache) | 9.54 s | 3.37 s | 6.07 s |
-| VAE decode 1024 x 1024 (warm min) | 405 ms | 581 ms | 581 ms |
-| VAE decode 768 x 1024 (warm min) | 303 ms | 435 ms | 435 ms |
-| DiT step 1024 x 1024 | 0.998 s | 0.756 s | 0.584 s |
-| DiT step 768 x 1024 | 0.818 s | 0.561 s | 0.419 s |
+| text encoder (warm, positive prompt) | 410 ms | 325 ms | 325 ms |
+| text encoder (cold, includes CLIP upload to VRAM) | 2504 ms | 335 ms | 335 ms |
+| DiT load to VRAM (warm page cache) | 15.31 s | 3.37 s | 6.07 s |
+| VAE decode 1024 x 1024 (warm min) | 429 ms | 581 ms | 581 ms |
+| VAE decode 768 x 1024 (warm min) | 268 ms | 435 ms | 435 ms |
+| DiT step 1024 x 1024 (steady state, no swap) | 0.902 s | 0.756 s | 0.584 s |
+| DiT step 768 x 1024 (steady state, no swap) | 0.644 s | 0.561 s | 0.419 s |
 
 Total picture generation time (prompt to decoded image, DiT kept):
 
-| size | steps | ComfyUI | golem FP16 (default) | golem FP8 |
-|---|---|---:|---:|---:|
-| 1024 x 1024 | 16 | 21.26 s | 13.25 s | 10.41 s |
-| 1024 x 1024 | 8 | 11.27 s | 7.10 s | 5.68 s |
-| 768 x 1024 | 16 | 15.77 s | 9.86 s | 7.57 s |
-| 768 x 1024 | 8 | 9.42 s | 5.33 s | 4.18 s |
+| size | steps | ComfyUI (prompt changed, swaps) | ComfyUI (prompt cached, no swap) | golem FP16 (default) | golem FP8 |
+|---|---|---:|---:|---:|---:|
+| 1024 x 1024 | 16 | 19.42 s | 16.90 s | 13.25 s | 10.41 s |
+| 1024 x 1024 | 8 | 11.18 s | 9.18 s | 7.10 s | 5.68 s |
+| 768 x 1024 | 16 | 15.44 s | 11.96 s | 9.86 s | 7.57 s |
+| 768 x 1024 | 8 | 8.94 s | 6.39 s | 5.33 s | 4.18 s |
+
+golem keeps its encoder in host memory and never swaps.
 
 Without Keep (loading the DiT on every picture):
 
-| size | steps | ComfyUI | golem FP16 (default) | golem FP8 |
-|---|---|---:|---:|---:|
-| 1024 x 1024 | 16 | N/A | 16.71 s | 16.62 s |
-| 768 x 1024 | 16 | N/A | 13.40 s | 13.79 s |
-
-(ComfyUI retains loaded model weights across workflow executions, so a cold
-per-generation DiT reload is not directly comparable.)
+| size | steps | golem FP16 (default) | golem FP8 |
+|---|---|---:|---:|
+| 1024 x 1024 | 16 | 16.71 s | 16.62 s |
+| 768 x 1024 | 16 | 13.40 s | 13.79 s |
 
 VRAM footprint:
 - FP16: weights 10.34 GB, arena 1.84 GB, total 12.17 GB

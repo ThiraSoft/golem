@@ -8,10 +8,13 @@ Run via:
         /mnt/data/dev/ComfyUI/.venv/bin/python ref/flux3/bench_comfy.py
 """
 
+import logging
 import math
 import os
 import sys
 import time
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 COMFY = "/mnt/data/dev/ComfyUI-flux3"
 sys.path.insert(0, COMFY)
@@ -96,8 +99,8 @@ def main():
     t0 = time.perf_counter()
     pos = nodes.CLIPTextEncode().encode(clip, PROMPT)[0]
     sync()
-    t_enc_first = time.perf_counter() - t0
-    print(f"Text encode (first/cold): {t_enc_first:.3f} s")
+    t_enc_cold = time.perf_counter() - t0
+    print(f"Text encode (cold, includes CLIP upload to VRAM): {t_enc_cold:.3f} s")
 
     enc_times = []
     for _ in range(4):
@@ -159,11 +162,11 @@ def main():
     h1 = dm.register_forward_pre_hook(pre_h, with_kwargs=True)
     h2 = dm.register_forward_hook(post_h, with_kwargs=True)
 
-    # Helper for full end-to-end generation window: prompt text -> text encode -> DiT sample -> VAE decode
-    def run_e2e(w, h, steps):
+    # Case (a): prompt changed each picture (text encode inside window; CLIP & DiT swap on 16 GB card)
+    def run_e2e_changed(w, h, steps, prompt_text):
         sync()
         t0 = time.perf_counter()
-        p = nodes.CLIPTextEncode().encode(clip, PROMPT)[0]
+        p = nodes.CLIPTextEncode().encode(clip, prompt_text)[0]
         p_unet = ModelSamplingFlux().patch(unet, SHIFT, SHIFT, w, h)[0]
         lat = EmptyFlux2LatentImage.execute(w, h, 1)[0]
         t_samp0 = time.perf_counter()
@@ -178,44 +181,104 @@ def main():
         t_total = time.perf_counter() - t0
         return t_total, t_sample, t_dec
 
-    # 4. Benchmark runs
-    # 1024x1024, 16 steps (Warm run: DiT already on card)
-    print("\n--- 4. Generation 1024x1024 (16 steps) ---")
-    step_times.clear()
-    t_warm_1024, t_samp_warm_1024, _ = run_e2e(1024, 1024, 16)
-    step_1024_warm = min(step_times) if step_times else (t_samp_warm_1024 / 16)
-    print(f"1024x1024 (16 steps, warm): total {t_warm_1024:.3f} s (sample {t_samp_warm_1024:.3f} s, best step {step_1024_warm:.3f} s)")
+    # Case (b): prompt unchanged (encode precomputed/cached, DiT stays on GPU without swapping)
+    def run_e2e_cached(w, h, steps, cond):
+        sync()
+        t0 = time.perf_counter()
+        p_unet = ModelSamplingFlux().patch(unet, SHIFT, SHIFT, w, h)[0]
+        lat = EmptyFlux2LatentImage.execute(w, h, 1)[0]
+        t_samp0 = time.perf_counter()
+        samples = nodes.common_ksampler(p_unet, 42, steps, CFG, SAMPLER, SCHEDULER, cond, neg, lat, denoise=1.0)[0]
+        sync()
+        t_sample = time.perf_counter() - t_samp0
 
-    # 1024x1024, 8 steps (Warm run)
-    step_times.clear()
-    t_8_1024, t_samp_8_1024, _ = run_e2e(1024, 1024, 8)
-    print(f"1024x1024 (8 steps, warm): total {t_8_1024:.3f} s (sample {t_samp_8_1024:.3f} s)")
+        t_dec0 = time.perf_counter()
+        _ = nodes.VAEDecode().decode(vae, samples)[0]
+        sync()
+        t_dec = time.perf_counter() - t_dec0
+        t_total = time.perf_counter() - t0
+        return t_total, t_sample, t_dec
 
-    # 768x1024, 16 steps (Warm run)
+    # 4. Benchmark runs at 1024x1024
+    print("\n--- 4. Generation 1024x1024 ---")
+    # Untimed warmup run per size (matching golem)
+    print("Warmup 1024x1024 (untimed)...")
+    _ = run_e2e_changed(1024, 1024, 16, PROMPT)
+
+    # Case (a): prompt changed each picture (CLIP and DiT swap on 16 GB)
+    print("\nMeasuring Case (a): prompt changed each picture (swapping)...")
+    step_times.clear()
+    t_a_1024_16, t_samp_a_1024_16, _ = run_e2e_changed(1024, 1024, 16, PROMPT + " variation 1")
+    print(f"Case (a) 1024x1024 (16 steps, prompt changed): total {t_a_1024_16:.3f} s (sample {t_samp_a_1024_16:.3f} s)")
+
+    step_times.clear()
+    t_a_1024_8, t_samp_a_1024_8, _ = run_e2e_changed(1024, 1024, 8, PROMPT + " variation 2")
+    print(f"Case (a) 1024x1024 (8 steps, prompt changed): total {t_a_1024_8:.3f} s (sample {t_samp_a_1024_8:.3f} s)")
+
+    # Case (b): prompt unchanged (encode cached by ComfyUI, no swap)
+    print("\nMeasuring Case (b): prompt unchanged (steady state, no swap)...")
+    comfy.model_management.load_models_gpu([unet])
+    sync()
+
+    step_times.clear()
+    t_b_1024_16, t_samp_b_1024_16, _ = run_e2e_cached(1024, 1024, 16, pos)
+    step_1024_steady = min(step_times) if step_times else (t_samp_b_1024_16 / 16)
+    print(f"Case (b) 1024x1024 (16 steps, prompt cached): total {t_b_1024_16:.3f} s (sample {t_samp_b_1024_16:.3f} s, best step {step_1024_steady:.3f} s)")
+
+    step_times.clear()
+    t_b_1024_8, t_samp_b_1024_8, _ = run_e2e_cached(1024, 1024, 8, pos)
+    print(f"Case (b) 1024x1024 (8 steps, prompt cached): total {t_b_1024_8:.3f} s (sample {t_samp_b_1024_8:.3f} s)")
+
+    # 5. Benchmark runs at 768x1024
     print("\n--- 5. Generation 768x1024 ---")
-    step_times.clear()
-    t_warm_768, t_samp_768, _ = run_e2e(768, 1024, 16)
-    step_768 = min(step_times) if step_times else (t_samp_768 / 16)
-    print(f"768x1024 (16 steps, warm): total {t_warm_768:.3f} s (sample {t_samp_768:.3f} s, best step {step_768:.3f} s)")
+    # Untimed warmup run per size (matching golem)
+    print("Warmup 768x1024 (untimed)...")
+    _ = run_e2e_changed(768, 1024, 16, PROMPT)
 
-    # 768x1024, 8 steps (Warm run)
+    # Case (a): prompt changed each picture (CLIP and DiT swap on 16 GB)
+    print("\nMeasuring Case (a): prompt changed each picture (swapping)...")
     step_times.clear()
-    t_8_768, t_samp_8_768, _ = run_e2e(768, 1024, 8)
-    print(f"768x1024 (8 steps, warm): total {t_8_768:.3f} s (sample {t_samp_8_768:.3f} s)")
+    t_a_768_16, t_samp_a_768_16, _ = run_e2e_changed(768, 1024, 16, PROMPT + " variation 3")
+    print(f"Case (a) 768x1024 (16 steps, prompt changed): total {t_a_768_16:.3f} s (sample {t_samp_a_768_16:.3f} s)")
+
+    step_times.clear()
+    t_a_768_8, t_samp_a_768_8, _ = run_e2e_changed(768, 1024, 8, PROMPT + " variation 4")
+    print(f"Case (a) 768x1024 (8 steps, prompt changed): total {t_a_768_8:.3f} s (sample {t_samp_a_768_8:.3f} s)")
+
+    # Case (b): prompt unchanged (encode cached by ComfyUI, no swap)
+    print("\nMeasuring Case (b): prompt unchanged (steady state, no swap)...")
+    comfy.model_management.load_models_gpu([unet])
+    sync()
+
+    step_times.clear()
+    t_b_768_16, t_samp_b_768_16, _ = run_e2e_cached(768, 1024, 16, pos)
+    step_768_steady = min(step_times) if step_times else (t_samp_b_768_16 / 16)
+    print(f"Case (b) 768x1024 (16 steps, prompt cached): total {t_b_768_16:.3f} s (sample {t_samp_b_768_16:.3f} s, best step {step_768_steady:.3f} s)")
+
+    step_times.clear()
+    t_b_768_8, t_samp_b_768_8, _ = run_e2e_cached(768, 1024, 8, pos)
+    print(f"Case (b) 768x1024 (8 steps, prompt cached): total {t_b_768_8:.3f} s (sample {t_samp_b_768_8:.3f} s)")
 
     h1.remove()
     h2.remove()
 
     print("\n=== SUMMARY TABLE ===")
-    print(f"Text Encoder (warm, positive): {t_enc_warm*1000:.1f} ms (cold {t_enc_first*1000:.1f} ms)")
+    print(f"Text Encoder (warm, positive): {t_enc_warm*1000:.1f} ms")
+    print(f"Text Encoder (cold, includes CLIP upload to VRAM): {t_enc_cold*1000:.1f} ms")
     print(f"DiT Load (host + VRAM): {t_unet_load_total:.2f} s (host: {t_unet_host:.2f} s, vram upload: {t_unet_vram_upload:.2f} s)")
     print(f"VAE Decode: 1024x1024 (warm min): {t_dec_1024_warm*1000:.1f} ms, 768x1024 (warm min): {t_dec_768_warm*1000:.1f} ms")
-    print(f"DiT Step (1024x1024): {step_1024_warm:.3f} s")
-    print(f"DiT Step (768x1024): {step_768:.3f} s")
-    print(f"1024x1024 (16 steps, Keep): {t_warm_1024:.2f} s")
-    print(f"1024x1024 (8 steps, Keep): {t_8_1024:.2f} s")
-    print(f"768x1024 (16 steps, Keep): {t_warm_768:.2f} s")
-    print(f"768x1024 (8 steps, Keep): {t_8_768:.2f} s")
+    print(f"DiT Step (1024x1024, steady state without swap): {step_1024_steady:.3f} s")
+    print(f"DiT Step (768x1024, steady state without swap): {step_768_steady:.3f} s")
+    print("Case (a): prompt changed each picture (CLIP and DiT swap on 16 GB):")
+    print(f"  1024x1024 (16 steps): {t_a_1024_16:.2f} s")
+    print(f"  1024x1024 (8 steps):  {t_a_1024_8:.2f} s")
+    print(f"  768x1024 (16 steps):  {t_a_768_16:.2f} s")
+    print(f"  768x1024 (8 steps):   {t_a_768_8:.2f} s")
+    print("Case (b): prompt unchanged (encode cached by ComfyUI, no swap):")
+    print(f"  1024x1024 (16 steps): {t_b_1024_16:.2f} s")
+    print(f"  1024x1024 (8 steps):  {t_b_1024_8:.2f} s")
+    print(f"  768x1024 (16 steps):  {t_b_768_16:.2f} s")
+    print(f"  768x1024 (8 steps):   {t_b_768_8:.2f} s")
 
 
 if __name__ == "__main__":
