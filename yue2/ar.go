@@ -27,6 +27,8 @@ package yue2
 //   - A token reads its keys through the split attention of vk/yue2_ar.go
 //     (UseSplitDecode): attn_one's workgroup a head walked the three thousand
 //     keys of the prompt on sixteen workgroups, 12.4 of a token's 15.4 ms.
+//     A pass of a prompt reads them through yue2_attn_wide.comp, the same
+//     call's, with its mix on the matrix cores (BenchmarkARPrefill).
 
 import (
 	"encoding/binary"
