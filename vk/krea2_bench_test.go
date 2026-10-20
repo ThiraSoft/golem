@@ -67,6 +67,11 @@ func TestK2AttnThroughput(t *testing.T) {
 		n := c.n
 		k := newK2(t, n*(2*qs+2*ks), nil)
 		k.ReserveAttention(n, c.heads/c.group)
+		// Random, not the zeros of a new arena: the card runs zeros at a
+		// higher clock than anything a picture gives it.
+		if err := k.Write(0, randomFloats(rand.New(rand.NewSource(1)), n*(2*qs+2*ks), 1)); err != nil {
+			t.Fatal(err)
+		}
 		a := K2Attn{Q: 0, QStride: uint32(qs), K: uint32(n * qs), KStride: uint32(ks), V: uint32(n*qs + n*ks), VStride: uint32(ks),
 			O: uint32(n*qs + 2*n*ks), OStride: uint32(qs), Queries: uint32(n), Keys: uint32(n), Group: uint32(c.group),
 			Scale: float32(1 / math.Sqrt(128)), Heads: c.heads, Seqs: 1, HeadDim: 128}

@@ -26,6 +26,7 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DFP8 -DXH shaders/krea2_mm.comp -o shaders/krea2_mm8h.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DXH shaders/krea2_mm.comp -o shaders/krea2_mm16h.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DFP8 -DXH -DBM=256 -DBN=256 shaders/krea2_mm.comp -o shaders/krea2_mm8hb.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DXH -DBM=256 -DBN=256 shaders/krea2_mm.comp -o shaders/krea2_mm16hb.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_norm.comp -o shaders/krea2_norm.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_rope.comp -o shaders/krea2_rope.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_act.comp -o shaders/krea2_act.spv
@@ -58,6 +59,9 @@ var krea2MM16HSPIRV []byte
 
 //go:embed shaders/krea2_mm8hb.spv
 var krea2MM8HBSPIRV []byte
+
+//go:embed shaders/krea2_mm16hb.spv
+var krea2MM16HBSPIRV []byte
 
 //go:embed shaders/krea2_norm.spv
 var krea2NormSPIRV []byte
@@ -118,6 +122,7 @@ const (
 	k2MM8H
 	k2MM16H
 	k2MM8HB
+	k2MM16HB
 	k2Norm
 	k2Rope
 	k2Act
@@ -341,6 +346,7 @@ var k2Specs = [k2Kernels]struct {
 	k2MM8H:            {&krea2MM8HSPIRV, unsafe.Sizeof(K2MM{})},
 	k2MM16H:           {&krea2MM16HSPIRV, unsafe.Sizeof(K2MM{})},
 	k2MM8HB:           {&krea2MM8HBSPIRV, unsafe.Sizeof(K2MM{})},
+	k2MM16HB:          {&krea2MM16HBSPIRV, unsafe.Sizeof(K2MM{})},
 	k2Norm:            {&krea2NormSPIRV, unsafe.Sizeof(K2Norm{})},
 	k2Rope:            {&krea2RopeSPIRV, unsafe.Sizeof(K2Rope{})},
 	k2Act:             {&krea2ActSPIRV, unsafe.Sizeof(K2Act{})},
@@ -595,7 +601,7 @@ func (k k2Kernel) tile() uint32 {
 	switch k {
 	case k2MM8, k2MM16, k2MM8H, k2MM16H:
 		return 128
-	case k2MM8HB:
+	case k2MM8HB, k2MM16HB:
 		return 256
 	}
 	return 0
@@ -605,6 +611,12 @@ func (k k2Kernel) tile() uint32 {
 // them: fewer leave the card's 64 compute units half idle, and the tiles of
 // 128 are quicker there (the DiT's k and v, 1536 rows).
 const k2BigTiles = 128
+
+// k2BigTiles16 is the same for fp16 weights, whose tiles of 128 lose less
+// to their reads: FLUX 3's MLP output over 4096 tokens (192 big tiles) is
+// quicker in tiles of 128, its input (1152) and its 3072-square products
+// at 4 MP (780) in tiles of 256.
+const k2BigTiles16 = 512
 
 // MM records a product whose weights are fp8 (fp8 true) or fp16.
 func (k *K2) MM(r *Recorder, w int, fp8 bool, m K2MM) {
@@ -619,8 +631,12 @@ func (k *K2) MM(r *Recorder, w int, fp8 bool, m K2MM) {
 		kern += k2MM8H - k2MM8
 		// A tile of 256 × 256 reads half the bytes a product of 128 does,
 		// which is what these products wait on.
-		if kern == k2MM8H && ((m.Outputs+255)/256)*((m.Cols+255)/256) >= k2BigTiles {
+		big := ((m.Outputs + 255) / 256) * ((m.Cols + 255) / 256)
+		if kern == k2MM8H && big >= k2BigTiles {
 			kern = k2MM8HB
+		}
+		if kern == k2MM16H && big >= k2BigTiles16 {
+			kern = k2MM16HB
 		}
 	}
 	b := kern.tile()
