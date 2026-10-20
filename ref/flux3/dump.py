@@ -124,11 +124,13 @@ PROMPT_MI2I4 = (
     "the scene from the first image, with the toast from the second image on a table, "
     "painted in the colours of the third and fourth images"
 )
-PHONE_PHOTO = os.path.join(COMFY, "input", "IMG_20191030_202255.jpg")
+# The photos sit in the main ComfyUI checkout, whatever COMFY the nodes come from.
+INPUTS = "/mnt/data/dev/ComfyUI/input"
+PHONE_PHOTO = os.path.join(INPUTS, "IMG_20191030_202255.jpg")
 MI2I4_EXTRA = [
     (REF_TOAST, "ref1.jpg"),
-    (os.path.join(COMFY, "input", "eyes_renarde.png"), "ref2.png"),
-    (os.path.join(COMFY, "input", "Capture d'écran_20260803_084025.png"), "ref3.png"),
+    (os.path.join(INPUTS, "eyes_renarde.png"), "ref2.png"),
+    (os.path.join(INPUTS, "Capture d'écran_20260803_084025.png"), "ref3.png"),
 ]
 
 meta = {}

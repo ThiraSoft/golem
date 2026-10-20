@@ -63,11 +63,11 @@ ulimit -c 0; export HSA_ENABLE_COREDUMP=0
 ```
 
 The 4 MP stages are recorded apart, alone on the card and in a memory scope
-(ComfyUI's i2i alone takes about 21 GB of host memory), from the main
-ComfyUI directory whose `input/` holds the photos they read:
+(ComfyUI's i2i alone takes about 21 GB of host memory). The photos they
+read come from the main checkout's `/mnt/data/dev/ComfyUI/input/`:
 
 ```sh
-systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=16G /mnt/data/dev/ComfyUI/.venv/bin/python ref/flux3/dump.py /mnt/data/dev/ComfyUI testdata/flux3 t2i4 i2i4 mi2i4
+systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=16G /mnt/data/dev/ComfyUI/.venv/bin/python ref/flux3/dump.py /mnt/data/dev/ComfyUI-flux3 testdata/flux3 t2i4 i2i4 mi2i4
 ```
 
 - `t2i4/`: the accept prompt at 2048 x 2048, seed 42.
