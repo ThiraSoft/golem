@@ -101,14 +101,14 @@ The distances to the default recordings are logged beside the asserted ones.
 | flow, layers 0 to 27 | `TestNARLayers` | 0.0147% to 0.0537% (1%) | 0.23% to 1.22% |
 | flow, first velocity | `TestNARVelocity` | 0.0380% (2%) | 0.94% (2%) |
 | flow, 32 midpoint steps on 100 frames | `TestNARSolve` | | latents 42.41 dB (30 dB) |
-| AR prefill, hidden after layers 0, 13, 27 | `TestARPrefill` | 0.12%, 0.37%, 0.80% (logged) | 0.055%, 0.25%, 0.76% (1%) |
-| AR prefill, hidden after the final norm | `TestARPrefill` | 0.94% (logged) | 0.91% (1%) |
-| AR prefill, logits on the score and code rows | `TestARPrefill` | 0.10%, 1.19% (logged) | 0.085%, 1.21% a column at a time, codes 1.36% from the wide prefill (2%) |
-| AR, eight decoded codes | `TestARDecode` | | 0.67% to 1.09% (2%), 8 of 8 tokens drawn as recorded |
-| AR, guidance, four steps of two branches | `TestARGuided` | | 0.75% to 1.17% (2%), 4 of 4 tokens drawn as recorded |
-| short replay, 100 frames | `TestPipelineShortReplay` | latents 43.98 dB, audio 37.27 dB (30 dB) | latents 40.47 dB, audio 29.37 dB (28.5 dB) |
-| two chunks, `--max-seq 3150` | `TestPipelineChunks` | | latents 40.04 dB, audio 40.61 dB (30 dB) |
-| Guerreros replay, 4870 frames, normalized wav16 | `TestGuerrerosReplay` | | 34.52 dB (30 dB) against `bench/q8-replay.wav` |
+| AR prefill, hidden after layers 0, 13, 27 | `TestARPrefill` | 0.12%, 0.34%, 0.80% (logged) | 0.055%, 0.26%, 0.78% (1%) |
+| AR prefill, hidden after the final norm | `TestARPrefill` | 0.95% (logged) | 0.93% (1%) |
+| AR prefill, logits on the score and code rows | `TestARPrefill` | 0.078%, 1.28% (logged) | 0.092%, 1.05% a column at a time, codes 1.19% from the wide prefill (2%) |
+| AR, eight decoded codes | `TestARDecode` | | 0.70% to 1.19% (2%), 8 of 8 tokens drawn as recorded |
+| AR, guidance, four steps of two branches | `TestARGuided` | | 0.75% to 1.39% (2%), 4 of 4 tokens drawn as recorded |
+| short replay, 100 frames | `TestPipelineShortReplay` | latents 41.22 dB, audio 32.57 dB (30 dB) | latents 41.72 dB, audio 28.97 dB (28.5 dB) |
+| two chunks, `--max-seq 3150` | `TestPipelineChunks` | | latents 38.54 dB, audio 38.60 dB (30 dB) |
+| Guerreros replay, 4870 frames, normalized wav16 | `TestGuerrerosReplay` | | 34.55 dB (30 dB) against `bench/q8-replay.wav` |
 
 The AR is the one half held to yue2.cpp's default recording: its
 logits feed a sampler, and the tokens it draws are the check that matters.
@@ -119,11 +119,11 @@ logits, which is why their bar is 2% (the exact recording is logged).
 the Guerreros request (`bench/`): its full run and its replay of the same
 codes differ by 34.8 dB on the wav16 (cache written by the decode against
 cache written by a prefill), and its Q8_0 and BF16 replays differ by
-25.8 dB. golem's replay lands at 34.52 dB from yue2.cpp's replay, at the
+25.8 dB. golem's replay lands at 34.55 dB from yue2.cpp's replay, at the
 first floor; golem's teacher-forced run, whose cache the decode writes as
-in yue2.cpp's full run, lands at 32.78 dB from `bench/q8-full.wav`
-(`cmd/yue2 -forced -compare bench/q8-full`, a third forced run of the
-sitting). `TestGuerrerosReplay` asserts 30 dB, above
+in yue2.cpp's full run, lands at 35.53 dB from `bench/q8-full.wav`
+(`cmd/yue2 -forced -compare bench/q8-full`, both forced runs of the
+sitting below). `TestGuerrerosReplay` asserts 30 dB, above
 the 25.8 dB floor.
 
 `TestPipelineSeal` holds a generated song's sealed first chunk to the
@@ -134,13 +134,16 @@ bytes, and `TestGuerrerosReplay` the replay request to
 ## Speed
 
 Measured on 2026-10-20 on the RX 9070 XT (i7-9700K, 31 GB), in one sitting:
-card idle (0.47 GB on it, the desktop's, when checked before the first
-run and again before the free runs; no other GPU process), DPM
-`auto`, power profile `performance`, golem at `6937fb6` (the engine of
-`0f9c595`, with the bench flags of `cmd/yue2`), yue2.cpp at `8af0174`. Each run was made twice; the
-table is the second, the page cache warm for both engines, and the first
-is within 0.2 s of it everywhere. The commands are in `ref/yue2/README.md`
-(`bench_yue2cpp.sh`, `bench_golem.sh`).
+card idle (0.79 GB on it, the desktop's and Steam's, when checked before
+the first run and once the last had released its memory; no other GPU
+process), DPM `auto`, power
+profile `performance`, golem at `962be51`, yue2.cpp at `8af0174`. Each run
+was made twice; the table is the second, the page cache warm for both
+engines, and the first is within 0.2 s of it everywhere but yue2.cpp's
+first full run, whose LM load took 1.53 s against 0.80 (109.56 s on the
+wall clock). The commands are in
+`ref/yue2/README.md` (`bench_yue2cpp.sh`, `bench_golem.sh`), the outputs in
+`bench/t11b/`.
 
 The Guerreros song, 2433 score tokens, 4870 codes, 194.8 s of audio. The
 acceptance run is the first column: golem teacher-forced, the score and
@@ -150,36 +153,38 @@ tokens from the same seeds.
 
 | stage | golem `-forced` | yue2.cpp full | golem replay | yue2.cpp replay |
 |---|---:|---:|---:|---:|
-| model open | 4.6 s | 1.8 s (0.78 + 0.53 + 0.49, a stage at a time) | 4.7 s | 1.8 s |
-| score, 2433 tokens, prompt prefill included | **12.96 s** | 13.5 s | | |
-| codes, 4870 tokens, prefill of 3006 included | 26.92 s | **26.1 s** | | |
-| prefill of the 7877 positions | | | 2.59 s | not logged |
-| flow, 32 steps on 4870 frames | **19.10 s** | 65.55 s | **19.13 s** | 65.64 s |
-| decoder | **0.64 s** | 1.45 s | **0.64 s** | 1.46 s |
-| wav16 | 0.19 s | not logged | 0.21 s | not logged |
-| one request, golem's open apart, yue2.cpp's loads in | 59.81 s | 108.2 s | 22.58 s | 69.9 s |
-| the process, wall clock | **64.54 s** | 108.48 s | **27.38 s** | 70.18 s |
+| model open | **1.5 s** | 1.8 s (0.80 + 0.51 + 0.47, a stage at a time) | **1.6 s** | 1.8 s |
+| score, 2433 tokens, prompt prefill included | **12.92 s** | 13.6 s | | |
+| codes, 4870 tokens, prefill of 3006 included | **25.07 s** | 26.1 s | | |
+| prefill of the 7877 positions | | | 1.21 s | not logged |
+| flow, 32 steps on 4870 frames | **19.08 s** | 65.68 s | **19.15 s** | 65.72 s |
+| decoder | **0.64 s** | 1.46 s | **0.64 s** | 1.45 s |
+| wav16 | 0.17 s | not logged | 0.17 s | not logged |
+| one request, golem's open apart, yue2.cpp's loads in | 57.89 s | 108.3 s | 21.18 s | 70.0 s |
+| the process, wall clock | **59.68 s** | 108.64 s | **23.07 s** | 70.26 s |
 
 The acceptance holds on the wall clock of the whole process, both sides
-loading their models: 64.54 s against 108.48 s. The request row is not a
-like-for-like pair: golem's leaves its 4.6 s open out, yue2.cpp's
+loading their models: 59.68 s against 108.64 s. The request row is not a
+like-for-like pair: golem's leaves its 1.5 s open out, yue2.cpp's
 `[Pipeline] Done` keeps its 1.8 s of loads in, since it loads each stage
 when it reaches it. yue2.cpp's stage lines leave its prefills apart
-(72 ms and 215 ms) and round to 0.1 s; the prefills are added in here.
-Two stages golem loses: the codes, about 0.8 s behind over 4870 tokens
-(5.53 ms a token against 5.36, prefills included), and the model open,
-2.8 s behind, which is paid once a process and is in the wall clock. The
-flow is 3.4 times faster, and it is most of yue2.cpp's time.
+(74 ms and 217 ms) and round to 0.1 s; the prefills are added in here.
+Every stage of the request is golem's now: the codes take 5.15 ms a token
+against 5.36 (prefills included), the score 5.31 against 5.58, and the
+open 1.5 s against 1.8. The flow is 3.4 times faster, and it is most of
+yue2.cpp's time.
 
-The prefill loses too: `BenchmarkARPrefill` takes 436.6 ms for the
-3006-position Guerreros prompt, against the 215 ms yue2.cpp logs for the
-same prompt, 2.0 times as long. Of its last pass, positions 2560 to 3006,
-79.4% is the attention's scores kernel.
+One loss is left, the prompt's prefill: `BenchmarkARPrefill` takes
+234.1 ms for the 3006-position Guerreros prompt, measured the same
+evening, against the 217 ms yue2.cpp logs for it in this sitting. Of its
+last pass, positions 2560 to 3006, 54.9% is the attention
+(`vk/shaders/yue2_attn_wide.comp`, 31.4 ms of 57.3), and most of the rest
+is the products, as wide passes of 512 on the matrix cores.
 
 The card holds 13.45 GB for golem's pipeline at the model's whole context
 (the driver's count before and after the open; a run that starts while the
-previous process's memory is still being released reads less, 8.1 GB to
-8.2 GB, and is not the figure).
+previous process's memory is still being released reads less, and is not
+the figure).
 
 ## Same seeds
 
@@ -189,16 +194,18 @@ times:
 
 | | golem | yue2.cpp |
 |---|---:|---:|
-| score | 2671 tokens, 14.33 s | 2433 tokens, 13.5 s |
-| codes | 5074 tokens, 28.60 s | 4870 tokens, 26.1 s |
-| flow, 32 steps | 20.03 s (5074 frames) | 65.55 s (4870 frames) |
-| decoder | 0.66 s | 1.45 s |
-| one request, golem's open apart, yue2.cpp's loads in | 63.81 s | 108.2 s |
-| the process, wall clock | 68.65 s | 108.48 s |
+| score | 2883 tokens, 15.42 s | 2433 tokens, 13.6 s |
+| codes | 5405 tokens, 28.70 s | 4870 tokens, 26.1 s |
+| flow, 32 steps | 22.38 s (5405 frames) | 65.68 s (4870 frames) |
+| decoder | 0.71 s | 1.46 s |
+| one request, golem's open apart, yue2.cpp's loads in | 67.40 s | 108.3 s |
+| the process, wall clock | 69.16 s | 108.64 s |
 
-golem's score leaves yue2.cpp's at its token 873; the codes, written after
-a different score, differ from the first. yue2.cpp's own Q8_0 and BF16 runs
-with the same seeds also write different scores (2433 and 2883 tokens) and
+golem's score leaves yue2.cpp's Q8_0 one at its token 873, and is byte for
+byte the score yue2.cpp's BF16 run writes from the same seeds
+(`bench/bf16-full.abc`, 2883 tokens); its codes follow that run's for 30
+codes and then leave them. yue2.cpp's own Q8_0 and BF16 runs with the same
+seeds also write different scores (2433 and 2883 tokens) and
 different codes.
 The two songs differ in length, so the free run is not the acceptance
 figure; the teacher-forced run above does the same work as yue2.cpp's.

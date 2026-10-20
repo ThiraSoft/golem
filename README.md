@@ -39,7 +39,7 @@ On one RX 9070 XT, every figure a benchmark in this repository:
 - **A Krea 2 picture in 8.9 seconds**, the same picture ComfyUI draws for the same seed, at half its time a step.
 - **A FLUX 3 Image Klein picture in 8.0 seconds**, 16 steps (6.0 s at 768 × 1024, 4.4 s at 8 steps), the same picture ComfyUI draws for the same seed (34.1 dB); at the workflows' 4 MP, 2048 × 2048, in 47.9 s against ComfyUI's 74.5 s (2.46 s a step against 3.69), and with four references in 120 s against 191.
 - **A Laya decision in 7.8 ms**, two and a half times faster than the checkpoint's own PyTorch.
-- **A 195-second YuE2 song in 64.5 seconds**, the 7303 score and code tokens yue2.cpp draws in 108.5 s taken a decode step each, then the flow and the decoder; replaying the codes, 27.4 s against 70.2.
+- **A 195-second YuE2 song in 59.7 seconds**, the 7303 score and code tokens yue2.cpp draws in 108.6 s taken a decode step each, then the flow and the decoder; replaying the codes, 23.1 s against 70.3.
 
 <p align="center">
   <img src="assets/krea2-golem.jpg" alt="A clay golem reading a book at a desk beside an old computer terminal, drawn by golem's Krea 2 engine" width="720"><br>
@@ -238,7 +238,7 @@ Against the reference each model was written from, same card, 2026-09-28:
 | Krea 2, one DiT step at 768 × 1024 | **1.02 s** | 1.89 s (ComfyUI) |
 | Laya, one question | **7.8 ms** | 19.9 ms (PyTorch) |
 | Laya, 32 questions | **51 ms** | 56 ms (PyTorch) |
-| YuE2, a 195 s song, 7303 tokens forced, 2026-10-20 | **64.5 s** | 108.5 s (yue2.cpp) |
+| YuE2, a 195 s song, 7303 tokens forced, 2026-10-20 | **59.7 s** | 108.6 s (yue2.cpp) |
 
 On an i7-9700K with eight threads and Q4_0 weights, Gemma E2B draws 22.6 tokens a second and reads 204, the 26B A4B does 13.1 and 51, Qwen3 4B does 14.6 and 110: a tie with llama.cpp on generation, and between ×1.06 and ×1.33 reading a prompt.
 
