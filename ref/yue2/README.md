@@ -226,6 +226,37 @@ Facts these runs establish:
   **25.8 dB**. These bracket what "the same audio" can mean between two
   engines; golem's replay SNR is reported against them.
 
+## The acceptance bench (2026-10-20)
+
+Both engines on the Guerreros request in one sitting, each run twice, the
+second kept (page cache warm for both). Before it: unload the musicbench
+worker (`curl -X POST localhost:8005/api/unload`), check that nothing else
+holds the card (`rocm-smi --showmemuse`,
+`pgrep -af "yue-server|golem|krea2|ComfyUI|python"`), and record the DPM
+level (`/sys/class/drm/card1/device/power_dpm_force_performance_level`,
+`auto`) and `powerprofilesctl get`. Each script prints the wall clock of
+the whole process, models loaded included, and its stage lines.
+
+```sh
+Y=/mnt/data/dev/musicbench/yue2 B=/mnt/data/golem-testdata/yue2/bench O=$B/t10
+scope() { systemd-run --user --scope -q -p MemoryMax=14G -p MemorySwapMax=2G "$@"; }
+go build -o /tmp/yue2 ./cmd/yue2
+# yue2.cpp: the free run (its tokens must equal bench/q8-full.tokens.csv) and the replay
+scope ref/yue2/bench_yue2cpp.sh $Y Q8_0 $B/guerreros-full.json $O/cpp-full-2
+scope ref/yue2/bench_yue2cpp.sh $Y Q8_0 $B/guerreros-replay.json $O/cpp-replay-2
+# golem: teacher-forced (the acceptance run), replay, free run from the seeds
+scope ref/yue2/bench_golem.sh /tmp/yue2 $B/guerreros-replay.json $O/golem-forced-2 -forced -compare $B/q8-full
+scope ref/yue2/bench_golem.sh /tmp/yue2 $B/guerreros-replay.json $O/golem-replay-2 -compare $B/q8-replay
+scope ref/yue2/bench_golem.sh /tmp/yue2 $B/guerreros-full.json $O/golem-full-2 -compare $B/q8-full
+```
+
+`-compare` prints where golem's score and codes first leave yue2.cpp's run,
+and the wav16's SNR against its wav when the lengths agree. The results
+are in `yue2/README.md` ("Speed", "Same seeds"). On 2026-10-20 yue2.cpp
+reproduced `bench/q8-full.tokens.csv` and `bench/q8-full.abc` byte for byte
+on both of its free runs, and its stage times were within 0.4 s of the
+table above.
+
 ## Fixture Recording (`yue-synth` and `dump_audio`)
 
 The whole pipeline is recorded with yue2.cpp's own CLI, no dumper of its own:

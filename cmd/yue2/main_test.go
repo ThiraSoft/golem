@@ -83,3 +83,22 @@ func TestGuerrerosReplay(t *testing.T) {
 		t.Errorf("the replay request differs from yue-synth's:\n%s", song.Replay(r).JSON())
 	}
 }
+
+// TestFirstDifference pins the same-seeds line of the benchmark: the index
+// is the first token that differs, and a stream that stops early differs
+// where it stops.
+func TestFirstDifference(t *testing.T) {
+	for _, c := range []struct {
+		a, b []int32
+		want string
+	}{
+		{[]int32{1, 2, 3}, []int32{1, 2, 3}, "identical"},
+		{[]int32{1, 2, 3}, []int32{1, 5, 3}, "first difference at index 1"},
+		{[]int32{1, 2}, []int32{1, 2, 3}, "identical over the first 2, then one ends"},
+		{[]int32{9}, []int32{1}, "first difference at index 0"},
+	} {
+		if got := firstDifference(c.a, c.b); got != c.want {
+			t.Errorf("firstDifference(%v, %v) = %q, want %q", c.a, c.b, got, c.want)
+		}
+	}
+}

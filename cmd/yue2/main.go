@@ -9,17 +9,28 @@
 // computing its distribution and then taking the given token, which costs
 // what drawing them would: the benchmark's mode. Beside the audio goes
 // <out>.replay.json, the request that renders the same song again.
+//
+// -tokens and -score write the codes and the score as yue-synth's --tokens
+// and --score do. -compare takes the prefix of a yue-synth run (the one
+// ref/yue2/bench_yue2cpp.sh writes) and says where this song first leaves
+// its <prefix>.abc and <prefix>.tokens.csv: the benchmark's same-seeds line.
+// When the two songs have the same length it also gives the SNR of this
+// audio against <prefix>.wav.
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/ThiraSoft/golem/audio/wav"
 	"github.com/ThiraSoft/golem/yue2"
 )
 
@@ -31,6 +42,9 @@ func main() {
 	out := flag.String("out", "song.wav", "where to write the audio")
 	forced := flag.Bool("forced", false, "decode the request's score and codes token by token rather than replay them")
 	context := flag.Int("context", 0, "the cache in positions, yue2.cpp's --max-seq; 0 is the model's whole context")
+	tokens := flag.String("tokens", "", "also write the semantic codes as CSV, yue-synth's --tokens")
+	score := flag.String("score", "", "also write the score, yue-synth's --score")
+	compare := flag.String("compare", "", "the prefix of a yue-synth run: report where the score and codes first differ from <prefix>.abc and <prefix>.tokens.csv")
 	flag.Parse()
 
 	if *request == "" {
@@ -83,6 +97,17 @@ func main() {
 		fail(err)
 	}
 
+	if *tokens != "" {
+		if err := os.WriteFile(*tokens, []byte(yue2.FormatCodes(song.Codes)+"\n"), 0o644); err != nil {
+			fail(err)
+		}
+	}
+	if *score != "" {
+		if err := os.WriteFile(*score, []byte(song.Score), 0o644); err != nil {
+			fail(err)
+		}
+	}
+
 	seconds := float64(song.Samples) / yue2.SampleRate
 	for _, stage := range []string{"score", "semantic", "prefill", "nar", "vae"} {
 		if d, ok := song.Times[stage]; ok {
@@ -98,6 +123,88 @@ func main() {
 		trunc = ", truncated"
 	}
 	fmt.Fprintf(os.Stderr, "[Done] %d frames%s, seeds %d and %d -> %s, %s\n", song.Frames, trunc, song.LMSeed, song.Seed, *out, replay)
+
+	if *compare != "" {
+		if err := compareRun(p.Tokenizer(), song, audio, *compare); err != nil {
+			fail(err)
+		}
+	}
+}
+
+// compareRun reports where song first leaves a yue-synth run's score and
+// codes. The score is compared in tokens, both texts through the backbone's
+// tokenizer, because a token is what the sampler draws.
+func compareRun(tok *yue2.Tokenizer, song *yue2.Song, audio []byte, prefix string) error {
+	abc, err := os.ReadFile(prefix + ".abc")
+	if err != nil {
+		return err
+	}
+	csv, err := os.ReadFile(prefix + ".tokens.csv")
+	if err != nil {
+		return err
+	}
+	codes, err := yue2.ParseCodes(string(csv))
+	if err != nil {
+		return err
+	}
+	got, want := tok.Encode(song.Score), tok.Encode(string(abc))
+	fmt.Fprintf(os.Stderr, "[Compare] score: %d tokens against %d, text %s, %s\n",
+		len(got), len(want), equalWord(song.Score == string(abc)), firstDifference(got, want))
+	fmt.Fprintf(os.Stderr, "[Compare] codes: %d against %d, %s\n", len(song.Codes), len(codes), firstDifference(song.Codes, codes))
+
+	f, err := os.Open(prefix + ".wav")
+	if err != nil {
+		return err
+	}
+	ref, _, _, err := wav.ReadChannels(f)
+	f.Close()
+	if err != nil {
+		return err
+	}
+	ours, _, _, err := wav.ReadChannels(bytes.NewReader(audio))
+	if err != nil {
+		return err
+	}
+	if len(ours) != len(ref) {
+		fmt.Fprintf(os.Stderr, "[Compare] audio: %d samples against %d, no SNR\n", len(ours), len(ref))
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "[Compare] audio: SNR %.2f dB against %s.wav\n", snr(ours, ref), prefix)
+	return nil
+}
+
+// snr is the signal to noise ratio of got against ref in decibels, as
+// TestGuerrerosReplay measures it.
+func snr(got, ref []float32) float64 {
+	var num, den float64
+	for i := range ref {
+		d := float64(got[i] - ref[i])
+		num += d * d
+		den += float64(ref[i]) * float64(ref[i])
+	}
+	return 10 * math.Log10(den/num)
+}
+
+func equalWord(same bool) string {
+	if same {
+		return "equal"
+	}
+	return "different"
+}
+
+// firstDifference names the first index where a and b disagree, counting
+// the end of the shorter one as a disagreement.
+func firstDifference(a, b []int32) string {
+	if slices.Equal(a, b) {
+		return "identical"
+	}
+	n := min(len(a), len(b))
+	for i := range n {
+		if a[i] != b[i] {
+			return fmt.Sprintf("first difference at index %d", i)
+		}
+	}
+	return fmt.Sprintf("identical over the first %d, then one ends", n)
 }
 
 // vramUsed is what the amdgpu driver says the card holds, or -1.

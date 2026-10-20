@@ -173,6 +173,9 @@ func (p *Pipeline) Close() {
 // Context is the cache the chunks are cut for.
 func (p *Pipeline) Context() int { return p.context }
 
+// Tokenizer is the backbone's BPE, the one the score is written in.
+func (p *Pipeline) Tokenizer() *Tokenizer { return p.tok }
+
 // plan is what a request asks of the stages: the cot it renders with (a
 // supplied stream with no score renders without one, whatever the mode: a
 // score planned now is not the one the codes follow), whether a score goes
