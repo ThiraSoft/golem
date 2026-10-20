@@ -26,15 +26,20 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DFP8 -DXH shaders/krea2_mm.comp -o shaders/krea2_mm8h.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DXH shaders/krea2_mm.comp -o shaders/krea2_mm16h.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DFP8 -DXH -DBM=256 -DBN=256 shaders/krea2_mm.comp -o shaders/krea2_mm8hb.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DXH -DBM=256 -DBN=256 shaders/krea2_mm.comp -o shaders/krea2_mm16hb.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_norm.comp -o shaders/krea2_norm.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_rope.comp -o shaders/krea2_rope.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_act.comp -o shaders/krea2_act.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_attn.comp -o shaders/krea2_attn128.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DHD=384 -DBC=16 shaders/krea2_attn.comp -o shaders/krea2_attn384.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DHD=512 -DBC=16 shaders/krea2_attn.comp -o shaders/krea2_attn512.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_flash.comp -o shaders/krea2_flash128.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DGLOBAL shaders/krea2_flash.comp -o shaders/krea2_flashg128.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_kvhalf.comp -o shaders/krea2_kvhalf.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_conv.comp -o shaders/krea2_conv.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_pix.comp -o shaders/krea2_pix.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_norm.comp -o shaders/flux3_norm.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_qkrope.comp -o shaders/flux3_qkrope.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_gate.comp -o shaders/flux3_gate.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_gstats.comp -o shaders/flux3_gstats.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_gnorm.comp -o shaders/flux3_gnorm.spv
@@ -56,6 +61,9 @@ var krea2MM16HSPIRV []byte
 //go:embed shaders/krea2_mm8hb.spv
 var krea2MM8HBSPIRV []byte
 
+//go:embed shaders/krea2_mm16hb.spv
+var krea2MM16HBSPIRV []byte
+
 //go:embed shaders/krea2_norm.spv
 var krea2NormSPIRV []byte
 
@@ -74,6 +82,15 @@ var krea2Attn384SPIRV []byte
 //go:embed shaders/krea2_attn512.spv
 var krea2Attn512SPIRV []byte
 
+//go:embed shaders/krea2_flash128.spv
+var krea2Flash128SPIRV []byte
+
+//go:embed shaders/krea2_flashg128.spv
+var krea2FlashG128SPIRV []byte
+
+//go:embed shaders/krea2_kvhalf.spv
+var krea2KVHalfSPIRV []byte
+
 //go:embed shaders/krea2_conv.spv
 var krea2ConvSPIRV []byte
 
@@ -82,6 +99,9 @@ var krea2PixSPIRV []byte
 
 //go:embed shaders/flux3_norm.spv
 var flux3NormSPIRV []byte
+
+//go:embed shaders/flux3_qkrope.spv
+var flux3QKRopeSPIRV []byte
 
 //go:embed shaders/flux3_gate.spv
 var flux3GateSPIRV []byte
@@ -106,16 +126,21 @@ const (
 	k2MM8H
 	k2MM16H
 	k2MM8HB
+	k2MM16HB
 	k2Norm
 	k2Rope
 	k2Act
 	k2Attn128
 	k2Attn384
 	k2Attn512
+	k2Flash128
+	k2FlashG128
+	k2KVHalf
 	k2Conv
 	k2Pix
 	k2Flux3Norm
 	k2Flux3Gate
+	k2Flux3QKRope
 	k2Flux3GStats
 	k2Flux3GNorm
 	k2Flux3VAEUnpatch
@@ -149,7 +174,21 @@ const (
 	K2Store    = 0
 	K2Add      = 1
 	K2GatedAdd = 2
+	// K2SwiGLUHalves writes silu(gate)·up as fp16, Outputs/2 a column, Y and
+	// YStride counting halves, from weights whose rows go in runs of 32 of
+	// the gate's then 32 of the up's (SwiGLURows).
+	K2SwiGLUHalves = 3
 )
+
+// SwiGLURow is where row r of a SwiGLU's stacked weight, the gate's n rows
+// then the up's, goes for K2SwiGLUHalves: runs of 32 of each in turn.
+func SwiGLURow(r, n int) int {
+	up := 0
+	if r >= n {
+		r, up = r-n, 32
+	}
+	return r/32*64 + up + r%32
+}
 
 // K2None is the offset that says a kernel has no such input.
 const K2None = ^uint32(0)
@@ -273,6 +312,17 @@ type K2Flux3Gate struct {
 	N, Rows        uint32
 }
 
+// K2Flux3QKRope is the RMS norm of every head of 128 of the queries and the
+// keys, times their weights, then their rotary position from a table of a
+// token's 64 cosines then 64 sines, in place. See shaders/flux3_qkrope.comp.
+type K2Flux3QKRope struct {
+	Q, K, Stride     uint32
+	Heads, Tokens    uint32
+	Table            uint32
+	QWeight, KWeight uint32
+	Eps              float32
+}
+
 // K2Flux3GStats is pass 1 of GroupNorm with 32 groups.
 type K2Flux3GStats struct {
 	Src, Plane, CPG, GroupElems uint32
@@ -306,6 +356,10 @@ type K2 struct {
 	readback    *Buffer
 	weights     []*Buffer
 	lora        int // the weights the products' fourth buffer is; -1 for none
+	// The fp16 keys and values of the attention, which lives and dies with
+	// the arena; ReserveAttention sizes it.
+	kv      *Buffer
+	kvBytes int
 }
 
 type k2SetKey struct {
@@ -322,16 +376,21 @@ var k2Specs = [k2Kernels]struct {
 	k2MM8H:            {&krea2MM8HSPIRV, unsafe.Sizeof(K2MM{})},
 	k2MM16H:           {&krea2MM16HSPIRV, unsafe.Sizeof(K2MM{})},
 	k2MM8HB:           {&krea2MM8HBSPIRV, unsafe.Sizeof(K2MM{})},
+	k2MM16HB:          {&krea2MM16HBSPIRV, unsafe.Sizeof(K2MM{})},
 	k2Norm:            {&krea2NormSPIRV, unsafe.Sizeof(K2Norm{})},
 	k2Rope:            {&krea2RopeSPIRV, unsafe.Sizeof(K2Rope{})},
 	k2Act:             {&krea2ActSPIRV, unsafe.Sizeof(K2Act{})},
 	k2Attn128:         {&krea2Attn128SPIRV, 18 * 4},
 	k2Attn384:         {&krea2Attn384SPIRV, 18 * 4},
 	k2Attn512:         {&krea2Attn512SPIRV, 18 * 4},
+	k2Flash128:        {&krea2Flash128SPIRV, 18 * 4},
+	k2FlashG128:       {&krea2FlashG128SPIRV, 18 * 4},
+	k2KVHalf:          {&krea2KVHalfSPIRV, 8 * 4},
 	k2Conv:            {&krea2ConvSPIRV, unsafe.Sizeof(K2Conv{})},
 	k2Pix:             {&krea2PixSPIRV, unsafe.Sizeof(K2Pix{})},
 	k2Flux3Norm:       {&flux3NormSPIRV, unsafe.Sizeof(K2Flux3Norm{})},
 	k2Flux3Gate:       {&flux3GateSPIRV, unsafe.Sizeof(K2Flux3Gate{})},
+	k2Flux3QKRope:     {&flux3QKRopeSPIRV, unsafe.Sizeof(K2Flux3QKRope{})},
 	k2Flux3GStats:     {&flux3GStatsSPIRV, unsafe.Sizeof(K2Flux3GStats{})},
 	k2Flux3GNorm:      {&flux3GNormSPIRV, unsafe.Sizeof(K2Flux3GNorm{})},
 	k2Flux3VAEUnpatch: {&flux3VAEUnpatchSPIRV, unsafe.Sizeof(K2Flux3VAEPatch{})},
@@ -366,7 +425,12 @@ func NewK2(d *Device, arenaFloats int, params []float32) (*K2, error) {
 		if k2Kernel(i).product() {
 			bindings = 4
 		}
-		if k.pipes[i], err = d.newPipeline(*spec.spirv, bindings, uint32(spec.push), coopmatWave, nil); err != nil {
+		wave := uint32(coopmatWave)
+		if k2Kernel(i) == k2Flash128 || k2Kernel(i) == k2FlashG128 {
+			// Written for the matrix cores' own width; see the shader.
+			wave = 32
+		}
+		if k.pipes[i], err = d.newPipeline(*spec.spirv, bindings, uint32(spec.push), wave, nil); err != nil {
 			return fail(fmt.Errorf("vk: Krea 2 kernel %d: %w", i, err))
 		}
 	}
@@ -458,9 +522,33 @@ func (k *K2) Arena() error {
 		}
 	}
 	var err error
-	k.arena, err = k.d.Local(k.arenaFloats*4, bufferUsageStorage|bufferUsageTransferSrc|bufferUsageTransferDst)
-	return err
+	if k.arena, err = k.d.Local(k.arenaFloats*4, bufferUsageStorage|bufferUsageTransferSrc|bufferUsageTransferDst); err != nil {
+		return err
+	}
+	if k.kvBytes > 0 {
+		if k.kv, err = k.d.Local(k.kvBytes, bufferUsageStorage); err != nil {
+			k.arena.Close()
+			k.arena = nil
+			return err
+		}
+	}
+	return nil
 }
+
+// kvRows is the keys a head of the fp16 copy holds: the keys rounded up to a
+// tile of every attention kernel.
+func kvRows(keys uint32) uint32 { return (keys + 63) / 64 * 64 }
+
+// ReserveAttention makes room, beside the arena, for an fp16 copy of the
+// keys and values of attentions of up to keys keys over kvHeads heads of 128,
+// which the long attentions read instead of the arena (see Attn). It takes
+// effect with the next Arena; without it, or past it, Attn reads the arena.
+func (k *K2) ReserveAttention(keys, kvHeads int) {
+	k.kvBytes = 2 * 2 * kvHeads * 128 * int(kvRows(uint32(keys)))
+}
+
+// KVBytes is what ReserveAttention keeps on the card while the arena is.
+func (k *K2) KVBytes() int { return k.kvBytes }
 
 // FreeArena gives the arena's memory back to the card. Every program
 // recorded before it is dead: close them first, and record again after
@@ -473,6 +561,10 @@ func (k *K2) FreeArena() {
 	if k.arena != nil {
 		k.arena.Close()
 		k.arena = nil
+	}
+	if k.kv != nil {
+		k.kv.Close()
+		k.kv = nil
 	}
 }
 
@@ -495,6 +587,9 @@ func (k *K2) set(kern k2Kernel, w int) *Set {
 	first := k.params
 	if w >= 0 {
 		first = k.weights[w]
+	}
+	if kern == k2KVHalf || kern == k2FlashG128 {
+		first = k.kv
 	}
 	bufs := []*Buffer{first, k.arena, k.params}
 	if kern.product() {
@@ -537,7 +632,7 @@ func (k k2Kernel) tile() uint32 {
 	switch k {
 	case k2MM8, k2MM16, k2MM8H, k2MM16H:
 		return 128
-	case k2MM8HB:
+	case k2MM8HB, k2MM16HB:
 		return 256
 	}
 	return 0
@@ -547,6 +642,12 @@ func (k k2Kernel) tile() uint32 {
 // them: fewer leave the card's 64 compute units half idle, and the tiles of
 // 128 are quicker there (the DiT's k and v, 1536 rows).
 const k2BigTiles = 128
+
+// k2BigTiles16 is the same for fp16 weights, whose tiles of 128 lose less
+// to their reads: FLUX 3's MLP output over 4096 tokens (192 big tiles) is
+// quicker in tiles of 128, its input (1152) and its 3072-square products
+// at 4 MP (780) in tiles of 256.
+const k2BigTiles16 = 512
 
 // MM records a product whose weights are fp8 (fp8 true) or fp16.
 func (k *K2) MM(r *Recorder, w int, fp8 bool, m K2MM) {
@@ -561,8 +662,12 @@ func (k *K2) MM(r *Recorder, w int, fp8 bool, m K2MM) {
 		kern += k2MM8H - k2MM8
 		// A tile of 256 × 256 reads half the bytes a product of 128 does,
 		// which is what these products wait on.
-		if kern == k2MM8H && ((m.Outputs+255)/256)*((m.Cols+255)/256) >= k2BigTiles {
+		big := ((m.Outputs + 255) / 256) * ((m.Cols + 255) / 256)
+		if kern == k2MM8H && big >= k2BigTiles {
 			kern = k2MM8HB
+		}
+		if kern == k2MM16H && big >= k2BigTiles16 {
+			kern = k2MM16HB
 		}
 	}
 	b := kern.tile()
@@ -584,6 +689,17 @@ func (k *K2) Act(r *Recorder, a K2Act) {
 	k.dispatch(r, k2Act, -1, groups256(n), unsafe.Pointer(&a))
 }
 
+// k2FlashRows is the queries a workgroup of shaders/krea2_flash.comp takes.
+const k2FlashRows = 128
+
+// flash says whether shaders/krea2_flash.comp takes this attention: no mask,
+// heads of 128, enough queries to fill its workgroups, and keys and values
+// it can read four floats at a time.
+func (a K2Attn) flash() bool {
+	return a.HeadDim == 128 && a.Causal == 0 && a.Queries >= 512 &&
+		(a.K|a.KStride|a.KSeq|a.V|a.VStride|a.VSeq)%4 == 0
+}
+
 // Attn records attention; HeadDim is 128, 384 or 512.
 func (k *K2) Attn(r *Recorder, a K2Attn) {
 	kern := k2Attn128
@@ -594,12 +710,37 @@ func (k *K2) Attn(r *Recorder, a K2Attn) {
 	} else if a.HeadDim != 128 {
 		panic(fmt.Sprintf("vk: Krea 2 attention has no kernel for heads of %d", a.HeadDim))
 	}
-	a.Tiles = (a.Queries + 63) / 64
+	rows := uint32(64)
+	if a.flash() {
+		kern, rows = k2Flash128, k2FlashRows
+		if a.Seqs == 1 && k.kv != nil && 2*2*(a.Heads/int(a.Group))*128*int(kvRows(a.Keys)) <= k.kvBytes {
+			k.attnFromHalves(r, a)
+			return
+		}
+	}
+	a.Tiles = (a.Queries + rows - 1) / rows
 	groups := int(a.Tiles) * a.Seqs
 	if groups > 65535 || a.Heads > 65535 {
 		panic(fmt.Sprintf("vk: Krea 2 attention of %d×%d workgroups", groups, a.Heads))
 	}
 	r.DispatchColumns(k.set(kern, -1), uint32(groups), uint32(a.Heads), a.push())
+	r.Barrier()
+}
+
+// attnFromHalves records the long attention in two: the keys and values to
+// fp16 in k.kv, the values transposed, then shaders/krea2_flash.comp reading
+// them there.
+func (k *K2) attnFromHalves(r *Recorder, a K2Attn) {
+	kvHeads := uint32(a.Heads) / a.Group
+	np := kvRows(a.Keys)
+	half := struct{ k, kStride, v, vStride, tokens, np, kh, vt uint32 }{
+		a.K, a.KStride, a.V, a.VStride, a.Keys, np, 0, kvHeads * 128 * np}
+	r.DispatchColumns(k.set(k2KVHalf, -1), np/64, kvHeads, unsafe.Pointer(&half))
+	r.Barrier()
+	a.K, a.KSeq = half.kh, 0
+	a.V, a.VStride, a.VSeq = half.vt, np, 0
+	a.Tiles = (a.Queries + k2FlashRows - 1) / k2FlashRows
+	r.DispatchColumns(k.set(k2FlashG128, -1), a.Tiles, uint32(a.Heads), a.push())
 	r.Barrier()
 }
 
@@ -622,6 +763,10 @@ func (k *K2) Pix(r *Recorder, p K2Pix) {
 
 func (k *K2) Flux3Norm(r *Recorder, n K2Flux3Norm) {
 	k.dispatch(r, k2Flux3Norm, -1, int(n.Rows), unsafe.Pointer(&n))
+}
+
+func (k *K2) Flux3QKRope(r *Recorder, q K2Flux3QKRope) {
+	k.dispatch(r, k2Flux3QKRope, -1, int((2*q.Tokens*q.Heads+3)/4), unsafe.Pointer(&q))
 }
 
 func (k *K2) Flux3Gate(r *Recorder, g K2Flux3Gate) {

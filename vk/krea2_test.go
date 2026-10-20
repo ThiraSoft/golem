@@ -9,6 +9,7 @@ package vk
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
 	"math/rand"
 	"testing"
@@ -187,6 +188,118 @@ func TestK2ProductFP16(t *testing.T) {
 	k2Compare(t, "mm16", got, want, 1e-5)
 }
 
+// TestK2ProductSwiGLU: a SwiGLU's stacked weight in runs (SwiGLURow), X in
+// fp16, silu(gate)·up out as fp16; with fp16 weights in tiles of 128 and of
+// 256, and fp8 ones.
+func TestK2ProductSwiGLU(t *testing.T) {
+	r := rand.New(rand.NewSource(9))
+	for _, c := range []struct {
+		n, ins, cols int
+		fp8          bool
+	}{{352, 96, 200, false}, {9216, 32, 2000, false}, {352, 96, 200, true}} {
+		outs := 2 * c.n
+		wf := randomFloats(r, outs*c.ins, 0.1)
+		wq := make([]float32, len(wf)) // what the card sees of each weight
+		var w []byte
+		if c.fp8 {
+			w8 := randomFP8(r, outs*c.ins)
+			for i := range wq {
+				wq[i] = e4m3(w8[i])
+			}
+			w = make([]byte, len(w8))
+			for o := 0; o < outs; o++ {
+				copy(w[SwiGLURow(o, c.n)*c.ins:], w8[o*c.ins:(o+1)*c.ins])
+			}
+		} else {
+			w = make([]byte, 2*len(wf))
+			for o := 0; o < outs; o++ {
+				at := SwiGLURow(o, c.n) * c.ins
+				for i := 0; i < c.ins; i++ {
+					h := f32ToF16(wf[o*c.ins+i])
+					wq[o*c.ins+i] = f16ToF32(h)
+					binary.LittleEndian.PutUint16(w[2*(at+i):], h)
+				}
+			}
+		}
+		x := randomFloats(r, c.cols*c.ins, 1)
+		xh := make([]float32, len(x)/2) // x as fp16, two to a float
+		for i := 0; i < len(x); i += 2 {
+			lo, hi := uint32(f32ToF16(x[i])), uint32(f32ToF16(x[i+1]))
+			xh[i/2] = math.Float32frombits(lo | hi<<16)
+		}
+		const scale = 0.8
+		yAt := len(xh)
+		k := newK2(t, yAt+c.cols*c.n/2, []float32{0})
+		wb, _ := k.AddWeights(w)
+		k.Write(0, xh)
+		run(t, k, func(rec *Recorder) {
+			k.MM(rec, wb, c.fp8, K2MM{Outputs: uint32(outs), Inputs: uint32(c.ins), Cols: uint32(c.cols),
+				XStride: uint32(c.ins), Y: uint32(2 * yAt), YStride: uint32(c.n), Bias: K2None, Scale: scale,
+				Mode: K2SwiGLUHalves, XHalves: 1})
+		})
+		raw, _ := k.Read(yAt, c.cols*c.n/2)
+		got := make([]float32, c.cols*c.n)
+		for i, v := range raw {
+			b := math.Float32bits(v)
+			got[2*i], got[2*i+1] = f16ToF32(uint16(b)), f16ToF32(uint16(b>>16))
+		}
+		want := make([]float32, c.cols*c.n)
+		for col := 0; col < c.cols; col++ {
+			for g := 0; g < c.n; g++ {
+				var a, u float64
+				for i := 0; i < c.ins; i++ {
+					xi := float64(f16ToF32(f32ToF16(x[col*c.ins+i])))
+					a += float64(wq[g*c.ins+i]) * xi
+					u += float64(wq[(c.n+g)*c.ins+i]) * xi
+				}
+				a, u = a*scale, u*scale
+				want[col*c.n+g] = f16ToF32(f32ToF16(float32(a / (1 + math.Exp(-a)) * u)))
+			}
+		}
+		k2Compare(t, fmt.Sprintf("swiglu %d x %d x %d, fp8 %v", outs, c.ins, c.cols, c.fp8), got, want, 1e-2) // an fp16 step of the largest either side
+	}
+}
+
+func TestK2Flux3QKRope(t *testing.T) {
+	r := rand.New(rand.NewSource(10))
+	const heads, tokens, stride = 3, 37, 3*128 + 32
+	q := randomFloats(r, tokens*stride, 2)
+	kk := randomFloats(r, tokens*stride, 2)
+	table := randomFloats(r, tokens*128, 1)
+	qw := randomFloats(r, 128, 0.5)
+	kw := randomFloats(r, 128, 0.5)
+	k := newK2(t, 2*tokens*stride+tokens*128, append(append([]float32{}, qw...), kw...))
+	k.Write(0, q)
+	k.Write(tokens*stride, kk)
+	k.Write(2*tokens*stride, table)
+	run(t, k, func(rec *Recorder) {
+		k.Flux3QKRope(rec, K2Flux3QKRope{Q: 0, K: tokens * stride, Stride: stride, Heads: heads, Tokens: tokens,
+			Table: 2 * tokens * stride, QWeight: 0, KWeight: 128, Eps: 1e-6})
+	})
+	got, _ := k.Read(0, 2*tokens*stride)
+	want := append(append([]float32{}, q...), kk...)
+	for which, w := range [][]float32{qw, kw} {
+		x := want[which*tokens*stride:]
+		for tok := 0; tok < tokens; tok++ {
+			for h := 0; h < heads; h++ {
+				v := x[tok*stride+h*128:][:128]
+				var ss float64
+				for _, e := range v {
+					ss += float64(e) * float64(e)
+				}
+				inv := 1 / math.Sqrt(ss/128+1e-6)
+				for i := 0; i < 64; i++ {
+					x0 := float64(v[2*i]) * inv * float64(w[2*i])
+					x1 := float64(v[2*i+1]) * inv * float64(w[2*i+1])
+					c, s := float64(table[tok*128+i]), float64(table[tok*128+64+i])
+					v[2*i], v[2*i+1] = float32(c*x0-s*x1), float32(s*x0+c*x1)
+				}
+			}
+		}
+	}
+	k2Compare(t, "qkrope", got, want, 1e-5)
+}
+
 func TestK2Norm(t *testing.T) {
 	r := rand.New(rand.NewSource(3))
 	rows, n := 37, 6144
@@ -363,30 +476,51 @@ func TestK2Attention(t *testing.T) {
 		name                         string
 		heads, group, hd, seqs, len_ int
 		causal                       uint32
+		amp                          float32
 	}{
-		{"dit", 8, 4, 128, 1, 263, 0},
-		{"encoder", 8, 4, 128, 1, 41, 1},
-		{"fusion", 4, 1, 128, 20, 12, 0},
-		{"vae", 1, 1, 384, 1, 150, 0},
+		{"dit", 8, 4, 128, 1, 263, 0, 1},
+		{"encoder", 8, 4, 128, 1, 41, 1, 1},
+		{"fusion", 4, 1, 128, 20, 12, 0, 1},
+		{"vae", 1, 1, 384, 1, 150, 0, 1},
+		// What shaders/krea2_flash.comp takes: long, with and without
+		// groups, two sequences, ragged ends, and peaked scores, which fp16
+		// keys round to 1.39% of the scale whichever kernel runs.
+		{"long", 4, 1, 128, 1, 2100, 0, 1},
+		{"long gqa", 8, 4, 128, 1, 1100, 0, 1},
+		{"long seqs", 2, 1, 128, 2, 700, 0, 1},
+		{"long peaked", 2, 1, 128, 1, 1500, 0, 3},
 	}
 	for _, c := range cases {
 		qs := c.heads * c.hd
 		ks := c.heads / c.group * c.hd
 		n := c.len_ * c.seqs
 		q, kAt, vAt, oAt := 0, n*qs, n*qs+n*ks, n*qs+2*n*ks
-		mem := randomFloats(r, oAt+n*qs, 1)
+		mem := randomFloats(r, oAt+n*qs, c.amp)
 		a := K2Attn{Q: uint32(q), QStride: uint32(qs), QSeq: uint32(c.len_ * qs),
 			K: uint32(kAt), KStride: uint32(ks), KSeq: uint32(c.len_ * ks),
 			V: uint32(vAt), VStride: uint32(ks), VSeq: uint32(c.len_ * ks),
 			O: uint32(oAt), OStride: uint32(qs), OSeq: uint32(c.len_ * qs),
 			Queries: uint32(c.len_), Keys: uint32(c.len_), Group: uint32(c.group), Causal: c.causal,
 			Scale: float32(1 / math.Sqrt(float64(c.hd))), Heads: c.heads, Seqs: c.seqs, HeadDim: c.hd}
-		k := newK2(t, len(mem), nil)
-		k.Write(0, mem)
-		run(t, k, func(rec *Recorder) { k.Attn(rec, a) })
-		got, _ := k.Read(oAt, n*qs)
 		want := attention(a, mem)[oAt:]
-		k2Compare(t, c.name, got, want, 5e-3)
+		tol := 5e-3
+		if c.amp > 1 {
+			tol = 2e-2
+		}
+		// Reading the arena, and reading the fp16 copy ReserveAttention
+		// makes room for.
+		for _, reserve := range []bool{false, true} {
+			k := newK2(t, len(mem), nil)
+			name := c.name
+			if reserve {
+				k.ReserveAttention(c.len_, c.heads/c.group)
+				name += ", fp16 copy"
+			}
+			k.Write(0, mem)
+			run(t, k, func(rec *Recorder) { k.Attn(rec, a) })
+			got, _ := k.Read(oAt, n*qs)
+			k2Compare(t, name, got, want, tol)
+		}
 	}
 }
 

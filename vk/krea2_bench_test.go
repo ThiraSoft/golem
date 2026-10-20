@@ -1,6 +1,7 @@
 package vk
 
 import (
+	"encoding/binary"
 	"math"
 	"math/rand"
 	"testing"
@@ -46,4 +47,89 @@ func TestK2Throughput(t *testing.T) {
 		Queries: N, Keys: N, Group: 4, Scale: float32(1 / math.Sqrt(128)), Heads: 48, Seqs: 1, HeadDim: 128}
 	d := time1(k, 3, func(rec *Recorder) { k.Attn(rec, a) })
 	t.Logf("attention %d tokens, 48 heads: %v, %.1f TFLOPS (three products counted)", N, d, 48*float64(N)*float64(N)*128*2*3/d.Seconds()/1e12)
+}
+
+// What the attention does at the DiTs' sizes, in TFLOPS: FLUX 3's 24 heads
+// at 1, 4 and 4 MP with four references, Krea 2's 48 over twelve at
+// 768 × 1024. A measurement, not a check.
+func TestK2AttnThroughput(t *testing.T) {
+	heavy.Skip(t, "a measurement")
+	for _, c := range []struct {
+		name            string
+		heads, group, n int
+	}{
+		{"flux3 1 MP", 24, 1, 4176},
+		{"flux3 4 MP", 24, 1, 16544},
+		{"flux3 4 MP + 4 refs", 24, 1, 32755},
+		{"krea2 768x1024", 48, 4, 3098},
+	} {
+		qs, ks := c.heads*128, c.heads/c.group*128
+		n := c.n
+		k := newK2(t, n*(2*qs+2*ks), nil)
+		k.ReserveAttention(n, c.heads/c.group)
+		// Random, not the zeros of a new arena: the card runs zeros at a
+		// higher clock than anything a picture gives it.
+		if err := k.Write(0, randomFloats(rand.New(rand.NewSource(1)), n*(2*qs+2*ks), 1)); err != nil {
+			t.Fatal(err)
+		}
+		a := K2Attn{Q: 0, QStride: uint32(qs), K: uint32(n * qs), KStride: uint32(ks), V: uint32(n*qs + n*ks), VStride: uint32(ks),
+			O: uint32(n*qs + 2*n*ks), OStride: uint32(qs), Queries: uint32(n), Keys: uint32(n), Group: uint32(c.group),
+			Scale: float32(1 / math.Sqrt(128)), Heads: c.heads, Seqs: 1, HeadDim: 128}
+		p, err := k.Compile(func(r *Recorder) { k.Attn(r, a) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A second of it first: the card's clock climbs over the first
+		// hundreds of milliseconds, and the first shape would pay for it.
+		for start := time.Now(); time.Since(start) < time.Second; {
+			p.Run()
+		}
+		best := time.Hour
+		for i := 0; i < 5; i++ {
+			start := time.Now()
+			if err := p.Run(); err != nil {
+				t.Fatal(err)
+			}
+			best = min(best, time.Since(start))
+		}
+		p.Close()
+		t.Logf("%s, %d tokens, %d heads: %v, %.1f TFLOPS", c.name, n, c.heads, best, 4*float64(c.heads)*float64(n)*float64(n)*128/best.Seconds()/1e12)
+	}
+}
+
+// What FLUX 3's fp16 products do at 4 MP, in TFLOPS: the MLP's two over a
+// chunk of 4096 tokens, and a 3072-square one over a 2048² picture's
+// tokens. A measurement, not a check.
+func TestK2Flux3MMThroughput(t *testing.T) {
+	heavy.Skip(t, "a measurement")
+	r := rand.New(rand.NewSource(1))
+	for _, s := range [][3]int{{18432, 3072, 4096}, {3072, 9216, 4096}, {3072, 3072, 16544}} {
+		outs, ins, n := s[0], s[1], s[2]
+		k := newK2(t, n*ins/2+n*outs, nil)
+		wb := make([]byte, 2*outs*ins)
+		for i := 0; i < outs*ins; i++ {
+			binary.LittleEndian.PutUint16(wb[2*i:], f32ToF16(float32(r.NormFloat64())*0.02))
+		}
+		w, _ := k.AddWeights(wb)
+		p, err := k.Compile(func(rec *Recorder) {
+			k.MM(rec, w, false, K2MM{Outputs: uint32(outs), Inputs: uint32(ins), Cols: uint32(n), XStride: uint32(ins),
+				Y: uint32(n * ins / 2), YStride: uint32(outs), Bias: K2None, Scale: 1, XHalves: 1})
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for start := time.Now(); time.Since(start) < time.Second; {
+			p.Run()
+		}
+		best := time.Hour
+		for i := 0; i < 5; i++ {
+			start := time.Now()
+			if err := p.Run(); err != nil {
+				t.Fatal(err)
+			}
+			best = min(best, time.Since(start))
+		}
+		p.Close()
+		t.Logf("mm %d×%d×%d: %v, %.1f TFLOPS", outs, ins, n, best, 2*float64(outs*ins*n)/best.Seconds()/1e12)
+	}
 }

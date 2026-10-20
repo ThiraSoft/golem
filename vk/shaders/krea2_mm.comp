@@ -30,7 +30,11 @@
 //
 // MODE, in the push constants: 0 writes Y, 1 adds to Y, 2 adds to Y times a
 // gate vector read from the arena (ga) plus one read from the parameters (gb),
-// which is the DiT's gated residual.
+// which is the DiT's gated residual. 3 is SwiGLU on the way out, for weights
+// whose rows go in runs of 32, a run of the gate's then the same of the
+// up's: every wave holds both, sixteen-square for sixteen-square, and writes
+// silu(gate)·up as fp16, clamped to fp16's range, outputs/2 a column, y and
+// yStride counting halves.
 //
 // A LoRA on the product (loraRank above 0) goes on after the weights, in the
 // same sums: its B, fp16 rows of loraRank in the fourth buffer at byte
@@ -45,6 +49,9 @@
 #ifndef BN
 #define BN 128
 #endif
+#ifndef GROUP
+#define GROUP 8
+#endif
 #define WM (BM / 64) // waves down the rows
 #define THREADS (64 * WM * (BN / 64))
 #define BK 32
@@ -57,6 +64,7 @@ layout(std430, binding = 0) readonly buffer W { uvec4 w[]; };
 layout(std430, binding = 0) readonly buffer W2 { uvec2 w2[]; };
 layout(std430, binding = 1) buffer A { float a[]; };
 layout(std430, binding = 1) readonly buffer AH { uvec4 ah[]; };
+layout(std430, binding = 1) buffer AY { float16_t ay[]; };
 layout(std430, binding = 2) readonly buffer P { float par[]; };
 layout(std430, binding = 3) readonly buffer L { uvec4 l[]; };
 
@@ -237,12 +245,22 @@ void stash(uint t, uvec4 wn[PER(WS)], XN xn[PER(XS)]) {
 void main() {
     uint t = gl_LocalInvocationID.x;
     // The tiles run down the rows first, so that neighbouring workgroups read
-    // the same columns of X; the grid may have a second axis when there are
-    // more tiles than one axis holds.
+    // the same columns of X, but GROUP row tiles at most: a band of rows goes
+    // over every column before the next, so that its weights stay in the
+    // cache. A weight past the card's cache (the MLP's 18432 x 3072 in fp16,
+    // 113 MB) was otherwise read from memory again for every column tile.
+    // The grid may have a second axis when there are more tiles than one
+    // axis holds.
     uint tiles = (p.outputs + uint(BM) - 1u) / uint(BM);
+    uint colTiles = (p.cols + uint(BN) - 1u) / uint(BN);
     uint tile = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
-    uint row0 = (tile % tiles) * uint(BM);
-    uint col0 = (tile / tiles) * uint(BN);
+    uint band = tile / (uint(GROUP) * colTiles);
+    uint first = band * uint(GROUP);
+    if (first >= tiles) return;
+    uint rows = min(uint(GROUP), tiles - first);
+    uint inBand = tile - first * colTiles;
+    uint row0 = (first + inBand % rows) * uint(BM);
+    uint col0 = (inBand / rows) * uint(BN);
     if (col0 >= p.cols) return;
     uint wave = gl_SubgroupID;
     uint lane = gl_SubgroupInvocationID;
@@ -286,6 +304,30 @@ void main() {
     }
 
     uint mine = wave * 16u * uint(ST);
+    if (p.mode == 3u) {
+        [[unroll]] for (uint i = 0u; i < 2u; i++) {
+            [[unroll]] for (uint j = 0u; j < 4u; j++) {
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> g = acc[i][j];
+                for (int e = 0; e < g.length(); e++) {
+                    float x = g[e] * p.scale, u = acc[i + 2u][j][e] * p.scale;
+                    g[e] = clamp(x / (1.0 + exp(-x)) * u, -65504.0, 65504.0);
+                }
+                coopMatStore(g, stage, mine, uint(ST), gl_CooperativeMatrixLayoutRowMajor);
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
+                [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                    uint r = lane & 15u, c = (lane >> 4) + u * 4u;
+                    uint row = (row0 + wr) / 2u + i * 16u + r;
+                    uint col = col0 + wc + j * 16u + c;
+                    if (row < p.outputs / 2u && col < p.cols) {
+                        ay[p.y + col * p.yStride + row] = float16_t(stage[mine + r * uint(ST) + c]);
+                    }
+                }
+                subgroupBarrier();
+            }
+        }
+        return;
+    }
     [[unroll]] for (uint i = 0u; i < 4u; i++) {
         [[unroll]] for (uint j = 0u; j < 4u; j++) {
             coopMatStore(acc[i][j], stage, mine, uint(ST), gl_CooperativeMatrixLayoutRowMajor);

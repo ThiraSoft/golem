@@ -47,8 +47,8 @@ const (
 	RefTokens = 4096
 	MaxRefs   = 4
 	// mlpChunk is how many tokens one pass of a block's MLP covers: its
-	// 2 x 9216 wide input is the largest buffer a token needs, so the arena
-	// holds it for these tokens only.
+	// 9216 wide hidden layer, in fp16, is held for these tokens only. The
+	// products are as quick over 4096 tokens as over 8192.
 	mlpChunk = 4096
 )
 
@@ -215,6 +215,9 @@ type DiT struct {
 
 	recordDispatch  func()
 	earlyDispatches int
+	// timeline, when set, gets a stamp after every dispatch, named for the
+	// kernel's family: what the profile tests read.
+	timeline *vk.Timeline
 
 	embImg       linearWeight
 	embRef       linearWeight
@@ -257,7 +260,9 @@ type DiT struct {
 	embImgBuf uint32
 	imgOut    uint32
 
-	x, nh, q, kBuf, vBuf, att, out, mlp, half, table uint32
+	x, nh, q, kBuf, vBuf, att, half, table uint32
+	// zeroPar is ditWidth zeros in the parameters: the gated adds' second gate.
+	zeroPar uint32
 
 	ctxTokens [2]int
 	refTokens [2]int
@@ -407,6 +412,7 @@ func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens
 	}
 
 	var par parBuffer
+	m.zeroPar = par.add(make([]float32, ditWidth))
 	vec := func(name string, n int) (uint32, error) {
 		t, err := tm.Get(name)
 		if err != nil {
@@ -465,13 +471,28 @@ func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens
 		}
 	}
 
-	m.arenaBytes = a.n * 4
 	if m.k, err = vk.NewK2(d, a.n, par.data); err != nil {
 		return fail(err)
 	}
+	// The attention's fp16 keys and values, beside the arena.
+	m.k.ReserveAttention(maxImageTokens+maxRefTokens+MaxTextTokens, ditHeads)
+	m.arenaBytes = a.n*4 + m.k.KVBytes()
 
 	var f8Buf []byte
 	var f16Buf []byte
+	// runs, when set, is the stacked SwiGLU weight up is reading: its rows go
+	// to the card in runs of 32 of the gate's and the up's in turn
+	// (vk.SwiGLURow), which the MLP input's product wants. The conversions
+	// write each element where its run goes: shift is how far, for element
+	// i, and the first element past i's run.
+	runs := false
+	shift := func(i, rows, cols int) (by, end int) {
+		if !runs {
+			return 0, rows * cols
+		}
+		run := i / (32 * cols)
+		return (vk.SwiGLURow(run*32, rows/2) - run*32) * cols, (run + 1) * 32 * cols
+	}
 	var lut [65536]byte
 	lastInvScale := float32(-1)
 	up := func(name string, rows, cols int) (linearWeight, error) {
@@ -495,13 +516,16 @@ func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens
 			var overflows int64
 			parallelChunks(n, func(w, s, e int) {
 				var ov int64
-				for i := s; i < e; i++ {
-					u := binary.LittleEndian.Uint16(raw[i*2:])
-					h := bf16ToHalfLUT[u]
-					if (h & 0x7c00) == 0x7c00 {
-						ov++
+				for i := s; i < e; {
+					by, end := shift(i, rows, cols)
+					for ; i < min(end, e); i++ {
+						u := binary.LittleEndian.Uint16(raw[i*2:])
+						h := bf16ToHalfLUT[u]
+						if (h & 0x7c00) == 0x7c00 {
+							ov++
+						}
+						binary.LittleEndian.PutUint16(f16Buf[(i+by)*2:], h)
 					}
-					binary.LittleEndian.PutUint16(f16Buf[i*2:], h)
 				}
 				if ov > 0 {
 					atomic.AddInt64(&overflows, ov)
@@ -560,9 +584,11 @@ func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens
 			f8Buf = f8Buf[:n]
 		}
 		parallelChunks(n, func(w, s, e int) {
-			for i := s; i < e; i++ {
-				u := binary.LittleEndian.Uint16(raw[i*2:])
-				f8Buf[i] = lut[u]
+			for i := s; i < e; {
+				by, end := shift(i, rows, cols)
+				for ; i < min(end, e); i++ {
+					f8Buf[i+by] = lut[binary.LittleEndian.Uint16(raw[i*2:])]
+				}
 			}
 		})
 		madviseDontNeed(raw)
@@ -587,7 +613,10 @@ func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens
 		if b.attnOut, err = up(prefix+"attn_out.weight", ditWidth, ditWidth); err != nil {
 			return err
 		}
-		if b.mlpIn, err = up(prefix+"mlp_in.weight", 2*ditFFN, ditWidth); err != nil {
+		runs = true
+		b.mlpIn, err = up(prefix+"mlp_in.weight", 2*ditFFN, ditWidth)
+		runs = false
+		if err != nil {
 			return err
 		}
 		b.mlpOut, err = up(prefix+"mlp_out.weight", ditWidth, ditFFN)
@@ -722,8 +751,6 @@ func (m *DiT) layout(a *arena) {
 	m.kBuf = a.take(N * ditWidth)
 	m.vBuf = a.take(N * ditWidth)
 	m.att = a.take(N * ditWidth)
-	m.out = a.take(N * ditWidth)
-	m.mlp = a.take(mlpChunk * 2 * ditFFN)
 	m.table = a.take(N * ditHeadDim)
 }
 
@@ -745,36 +772,38 @@ func (m *DiT) dispatch() {
 func (m *DiT) mm(r *vk.Recorder, w int, mm vk.K2MM) {
 	m.dispatch()
 	m.k.MM(r, w, m.precision == PrecisionFP8, mm)
-}
-
-func (m *DiT) norm(r *vk.Recorder, n vk.K2Norm) {
-	m.dispatch()
-	m.k.Norm(r, n)
+	label := "mm"
+	switch {
+	case mm.Outputs == 2*ditFFN:
+		label = "mm mlp in"
+	case mm.Inputs == ditFFN:
+		label = "mm mlp out"
+	}
+	m.timeline.Stamp(r, label)
 }
 
 func (m *DiT) flux3Norm(r *vk.Recorder, n vk.K2Flux3Norm) {
 	m.dispatch()
 	m.k.Flux3Norm(r, n)
+	m.timeline.Stamp(r, "norm")
 }
 
-func (m *DiT) flux3Gate(r *vk.Recorder, g vk.K2Flux3Gate) {
+func (m *DiT) qkrope(r *vk.Recorder, q vk.K2Flux3QKRope) {
 	m.dispatch()
-	m.k.Flux3Gate(r, g)
-}
-
-func (m *DiT) rope(r *vk.Recorder, p vk.K2Rope) {
-	m.dispatch()
-	m.k.Rope(r, p)
+	m.k.Flux3QKRope(r, q)
+	m.timeline.Stamp(r, "qkrope")
 }
 
 func (m *DiT) act(r *vk.Recorder, a vk.K2Act) {
 	m.dispatch()
 	m.k.Act(r, a)
+	m.timeline.Stamp(r, "act")
 }
 
 func (m *DiT) attn(r *vk.Recorder, a vk.K2Attn) {
 	m.dispatch()
 	m.k.Attn(r, a)
+	m.timeline.Stamp(r, "attn")
 }
 
 func (m *DiT) forget() {
@@ -997,32 +1026,11 @@ func (m *DiT) recordBlock(r *vk.Recorder, b *ditBlock, tokens int, xOffset uint3
 		Bias: vk.K2None, Scale: b.v.scale, Mode: vk.K2Store, XHalves: 1,
 	})
 
-	// 3. QKNorm.
-	m.norm(r, vk.K2Norm{
-		Src: m.q, SrcStride: uint32(ditHeadDim),
-		Dst: m.q, DstStride: uint32(ditHeadDim),
-		N: uint32(ditHeadDim), Rows: toks * uint32(ditHeads),
-		Weight: b.qNorm, OnePlus: 0, Eps: ditEps,
-		ScaleA: vk.K2None,
-	})
-	m.norm(r, vk.K2Norm{
-		Src: m.kBuf, SrcStride: uint32(ditHeadDim),
-		Dst: m.kBuf, DstStride: uint32(ditHeadDim),
-		N: uint32(ditHeadDim), Rows: toks * uint32(ditHeads),
-		Weight: b.kNorm, OnePlus: 0, Eps: ditEps,
-		ScaleA: vk.K2None,
-	})
-
-	// 4. Rope.
-	m.rope(r, vk.K2Rope{
-		X: m.q, Stride: uint32(ditWidth),
-		Heads: uint32(ditHeads), Dim: uint32(ditHeadDim),
-		Tokens: toks, Table: ropeOffset,
-	})
-	m.rope(r, vk.K2Rope{
-		X: m.kBuf, Stride: uint32(ditWidth),
-		Heads: uint32(ditHeads), Dim: uint32(ditHeadDim),
-		Tokens: toks, Table: ropeOffset,
+	// 3-4. QKNorm and RoPE, one pass over both.
+	m.qkrope(r, vk.K2Flux3QKRope{
+		Q: m.q, K: m.kBuf, Stride: uint32(ditWidth),
+		Heads: uint32(ditHeads), Tokens: toks, Table: ropeOffset,
+		QWeight: b.qNorm, KWeight: b.kNorm, Eps: ditEps,
 	})
 
 	// 5. Attention.
@@ -1036,51 +1044,35 @@ func (m *DiT) recordBlock(r *vk.Recorder, b *ditBlock, tokens int, xOffset uint3
 		Heads: ditHeads, Seqs: 1, HeadDim: ditHeadDim,
 	})
 
-	// 6. Attention Out linear (float32 operand -> m.out, Mode: Store).
-	m.mm(r, b.attnOut.w, vk.K2MM{
-		Outputs: uint32(ditWidth), Inputs: uint32(ditWidth), Cols: toks,
-		X: m.att, XStride: uint32(ditWidth),
-		Y: m.out, YStride: uint32(ditWidth),
-		Bias: vk.K2None, Scale: b.attnOut.scale, Mode: vk.K2Store, XHalves: 0,
-	})
-
-	// 7-8. The MLP from nh, mlpChunk tokens at a time: MLP In, SwiGLU into
-	// half (fp16), MLP Out added to m.out.
-	for c0 := 0; c0 < tokens; c0 += mlpChunk {
-		cols := uint32(min(mlpChunk, tokens-c0))
-		m.mm(r, b.mlpIn.w, vk.K2MM{
-			Outputs: uint32(2 * ditFFN), Inputs: uint32(ditWidth), Cols: cols,
-			X: nhHalves + uint32(c0*ditWidth), XStride: uint32(ditWidth),
-			Y: m.mlp, YStride: uint32(2 * ditFFN),
-			Bias: vk.K2None, Scale: b.mlpIn.scale, Mode: vk.K2Store, XHalves: 1,
-		})
-		m.act(r, vk.K2Act{
-			X: m.mlp, XStride: uint32(2 * ditFFN),
-			Y: m.mlp + uint32(ditFFN), YStride: uint32(2 * ditFFN),
-			N: uint32(ditFFN), Rows: cols,
-			Op:  vk.K2SwiGLU,
-			Dst: 2 * m.half, DstStride: uint32(ditFFN), Halves: 1,
-		})
-		m.mm(r, b.mlpOut.w, vk.K2MM{
-			Outputs: uint32(ditWidth), Inputs: uint32(ditFFN), Cols: cols,
-			X: 2 * m.half, XStride: uint32(ditFFN),
-			Y: m.out + uint32(c0*ditWidth), YStride: uint32(ditWidth),
-			Bias: vk.K2None, Scale: b.mlpOut.scale, Mode: vk.K2Add, XHalves: 1,
-		})
-	}
-
-	// 9. Gated residual add for each span: x += out * gate.
+	// 6-9. Attention Out, then the MLP from nh mlpChunk tokens at a time
+	// (MLP In with its SwiGLU into half as fp16, MLP Out), each added to x times its
+	// span's gate: x += g·(attn + mlp) as two gated adds, with no buffer
+	// between. Neither reads x, which the norm above was the last to read.
 	for _, sp := range spans {
-		rows := uint32(sp.end - sp.start)
-		xDst := xOffset + uint32(sp.start*ditWidth)
-		outSrc := m.out + uint32(sp.start*ditWidth)
 		gate := sp.modOffset + uint32(2*ditWidth)
-		m.flux3Gate(r, vk.K2Flux3Gate{
-			X: xDst, XStride: uint32(ditWidth),
-			Out: outSrc, OutStride: uint32(ditWidth),
-			Gate: gate,
-			N:    uint32(ditWidth), Rows: rows,
+		m.mm(r, b.attnOut.w, vk.K2MM{
+			Outputs: uint32(ditWidth), Inputs: uint32(ditWidth), Cols: uint32(sp.end - sp.start),
+			X: m.att + uint32(sp.start*ditWidth), XStride: uint32(ditWidth),
+			Y: xOffset + uint32(sp.start*ditWidth), YStride: uint32(ditWidth),
+			Bias: vk.K2None, Scale: b.attnOut.scale, Mode: vk.K2GatedAdd,
+			GateA: gate, GateB: m.zeroPar,
 		})
+		for c0 := sp.start; c0 < sp.end; c0 += mlpChunk {
+			cols := uint32(min(mlpChunk, sp.end-c0))
+			m.mm(r, b.mlpIn.w, vk.K2MM{
+				Outputs: uint32(2 * ditFFN), Inputs: uint32(ditWidth), Cols: cols,
+				X: nhHalves + uint32(c0*ditWidth), XStride: uint32(ditWidth),
+				Y: 2 * m.half, YStride: uint32(ditFFN),
+				Bias: vk.K2None, Scale: b.mlpIn.scale, Mode: vk.K2SwiGLUHalves, XHalves: 1,
+			})
+			m.mm(r, b.mlpOut.w, vk.K2MM{
+				Outputs: uint32(ditWidth), Inputs: uint32(ditFFN), Cols: cols,
+				X: 2 * m.half, XStride: uint32(ditFFN),
+				Y: xOffset + uint32(c0*ditWidth), YStride: uint32(ditWidth),
+				Bias: vk.K2None, Scale: b.mlpOut.scale, Mode: vk.K2GatedAdd, XHalves: 1,
+				GateA: gate, GateB: m.zeroPar,
+			})
+		}
 	}
 }
 

@@ -1,0 +1,42 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// FLUX 3's queries and keys between their products and the attention, in
+// place and in one pass: each head's RMS norm times its weight, then the
+// rotary position of krea2_rope.comp (pairs 2i, 2i + 1, the table holding a
+// token's D/2 cosines then D/2 sines). One wave of sixty-four a head of a
+// token, a pair a thread; the queries' heads first, then the keys'.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint q, k, stride;      // a token's stride, both
+    uint heads, tokens;
+    uint table;
+    uint qWeight, kWeight;  // in the parameters
+    float eps;
+} p;
+
+void main() {
+    uint row = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 4u + gl_SubgroupID;
+    uint rows = p.tokens * p.heads;
+    if (row >= 2u * rows) return;
+    bool isK = row >= rows;
+    if (isK) row -= rows;
+    uint tok = row / p.heads, head = row % p.heads;
+    uint pair = gl_SubgroupInvocationID;
+    uint at = (isK ? p.k : p.q) + tok * p.stride + head * 128u + 2u * pair;
+    float x0 = a[at], x1 = a[at + 1u];
+    float inv = inversesqrt(subgroupAdd(x0 * x0 + x1 * x1) / 128.0 + p.eps);
+    uint wt = isK ? p.kWeight : p.qWeight;
+    x0 *= inv * par[wt + 2u * pair];
+    x1 *= inv * par[wt + 2u * pair + 1u];
+    float c = a[p.table + tok * 128u + pair];
+    float s = a[p.table + tok * 128u + 64u + pair];
+    a[at] = c * x0 - s * x1;
+    a[at + 1u] = s * x0 + c * x1;
+}

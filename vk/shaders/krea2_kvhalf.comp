@@ -1,0 +1,58 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// The keys and values of an attention as shaders/krea2_flash.comp reads them
+// when it reads them from the arena rather than through shared memory: fp16,
+// the keys a head at a time token by token, the values transposed, a head's
+// dimension at a time over every token, the rows padded to np with zeros.
+// A workgroup is sixty-four tokens of one head; the values go through shared
+// memory to come out in rows.
+
+layout(local_size_x = 256) in;
+
+
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer A4 { vec4 a4[]; };
+layout(std430, binding = 0) buffer AH { f16vec4 ah[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint k, kStride;
+    uint v, vStride;
+    uint tokens, np;
+    uint kh, vt;      // in halves, multiples of four
+} p;
+
+shared float16_t sv[128 * 68];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.y;
+    uint tok0 = gl_WorkGroupID.x * 64u;
+    for (uint e = t; e < 64u * 32u; e += 256u) {
+        uint r = e / 32u, d = (e % 32u) * 4u;
+        uint tok = tok0 + r;
+        vec4 x = vec4(0.0), y = vec4(0.0);
+        if (tok < p.tokens) {
+            x = a4[(p.k + tok * p.kStride + head * 128u + d) >> 2];
+            y = a4[(p.v + tok * p.vStride + head * 128u + d) >> 2];
+        }
+        if (tok < p.np) {
+            ah[(p.kh + (head * p.np + tok) * 128u + d) >> 2] = f16vec4(clamp(x, vec4(-65504.0), vec4(65504.0)));
+        }
+        y = clamp(y, vec4(-65504.0), vec4(65504.0));
+        sv[d * 68u + r] = float16_t(y.x);
+        sv[(d + 1u) * 68u + r] = float16_t(y.y);
+        sv[(d + 2u) * 68u + r] = float16_t(y.z);
+        sv[(d + 3u) * 68u + r] = float16_t(y.w);
+    }
+    barrier();
+    for (uint e = t; e < 128u * 16u; e += 256u) {
+        uint d = e / 16u, r = (e % 16u) * 4u;
+        if (tok0 + r < p.np) {
+            uint s = d * 68u + r;
+            ah[(p.vt + (head * 128u + d) * p.np + tok0 + r) >> 2] = f16vec4(sv[s], sv[s + 1u], sv[s + 2u], sv[s + 3u]);
+        }
+    }
+}
