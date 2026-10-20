@@ -58,6 +58,7 @@ func sharedNAR(t *testing.T) (*NAR, map[string][]float32) {
 	arLen := len(fix.readInt32(t, "nar/ar_ids"))
 	kAll, vAll := fix.readF16(t, "nar/kv_all_k.f16"), fix.readF16(t, "nar/kv_all_v.f16")
 	noise := fix.read(t, "nar/noise")
+	d := testDevice(t)
 	s := &narShared
 	s.once.Do(func() {
 		b, err := OpenBackbone(filepath.Join(weightsDir(), "YuE2-3B-Q8_0.gguf"))
@@ -66,11 +67,6 @@ func sharedNAR(t *testing.T) (*NAR, map[string][]float32) {
 			return
 		}
 		defer b.Close()
-		d, err := vk.Open()
-		if err != nil {
-			s.skip = fmt.Sprintf("no Vulkan device: %v", err)
-			return
-		}
 		if !d.Coopmat() {
 			s.skip = "the NAR wants cooperative matrices"
 			return

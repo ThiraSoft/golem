@@ -151,6 +151,56 @@ Outputs are written under `testdata/yue2/{tokens,prompt,philox,sample}/` with sh
    - `sample/penalty_window_*`: repetition penalty with synthetic history longer than the window.
    - `sample/with_end_token_*`: score sampling at step >= min_tokens where `ABC_END` is eligible.
 
+## Fixture Recording (`dump_ar`)
+
+The AR half on the Guerreros request (`bench/guerreros-replay.json`), Vulkan0,
+a cache of 4096 positions and two sets:
+
+```sh
+systemd-run --user --scope -q -p MemoryMax=14G -p MemorySwapMax=2G \
+    /mnt/data/golem-testdata/yue2/build-ref/dump_ar \
+    /mnt/data/LLMs_models/Serveurperso/YuE2-GGUF/YuE2-3B-Q8_0.gguf \
+    /mnt/data/golem-testdata/yue2/bench/guerreros-replay.json \
+    /mnt/data/golem-testdata/yue2
+```
+
+### Recorded Stages
+
+1. Prefill of the full prompt with the replay's score (`qw3lm_forward`'s graph
+   copied into the dumper, outputs set on the probes):
+   - `ar/prefix`: `[3006]` int32, the prompt (equal to `prompt/guerreros_full_with_abc`).
+   - `ar/prefill_hidden_l{0,13,27}`: `[4, 2048]` the hidden state after those layers, last four positions.
+   - `ar/prefill_normed`: `[4, 2048]` after the final norm, last four positions.
+   - `ar/prefill_logits_abc`: `[151849]` the last position's logits on the score rows [0, 151849).
+   - `ar/prefill_logits_semantic`: `[32769]` on the code rows [151852, 184621).
+2. Eight semantic decode steps (`qw3lm_forward_batch`), drawn as `yue2_generate`
+   draws them (lm_seed 1497252302528095116, draw index = step):
+   - `ar/decode_tokens`: `[8]` int32, the drawn tokens (the replay's first eight codes).
+   - `ar/decode_logits`: `[8, 32769]` the logits after feeding each of them.
+3. Cot off, guidance 1.01, four steps, the two branches in sets 0 and 1:
+   - `ar/guided_prefix`: `[563]`, `ar/guided_negative`: `[12]` int32.
+   - `ar/guided_cond_logits`, `ar/guided_uncond_logits`: `[4, 32769]` each step's logits before mixing.
+   - `ar/guided_tokens`: `[4]` int32.
+4. The prefill probes again with no product quantizing its activation
+   (`dump_ar ... exact`: integer dot products and cooperative matrices off,
+   every `MUL_MAT` of the probe graph at `GGML_PREC_F32`, as `dump_nar ... exact`):
+   - `ar_exact/prefill_hidden_l{0,13,27}`, `ar_exact/prefill_normed`,
+     `ar_exact/prefill_logits_{abc,semantic}`: same shapes.
+   - Default against exact: 0.14% after layer 0, 0.38% after 13, 0.80% after 27,
+     0.95% after the final norm, 1.45% on the code logits, 0.04% on the score
+     logits. This is how far yue2.cpp moves under a change of arithmetic alone.
+   - The head is a mat-vec on the float32 hidden state: a float64 sum of the
+     Q8_0 rows over `ar/prefill_normed` lands 0.0000% from `ar/prefill_logits_*`,
+     and 0.46% on the codes once the hidden state is quantized to Q8_0.
+
+```sh
+systemd-run --user --scope -q -p MemoryMax=14G -p MemorySwapMax=2G \
+    /mnt/data/golem-testdata/yue2/build-ref/dump_ar \
+    /mnt/data/LLMs_models/Serveurperso/YuE2-GGUF/YuE2-3B-Q8_0.gguf \
+    /mnt/data/golem-testdata/yue2/bench/guerreros-replay.json \
+    /mnt/data/golem-testdata/yue2 exact
+```
+
 ## Reference measured 2026-10-20 (yue-synth, Vulkan0, DPM auto, card idle)
 
 `ref/yue2/bench_yue2cpp.sh`, Guerreros request (style, lyrics, lm_seed,

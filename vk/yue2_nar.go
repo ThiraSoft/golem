@@ -70,6 +70,9 @@ type K2Yue2Cache struct {
 	buf   *Buffer
 	np    uint32
 	heads uint32 // the keys' and values' heads
+
+	// stackPipe copies the AR half's stack cache in; see yue2_ar.go.
+	stackPipe *Pipeline
 }
 
 // The cache's sets are kept among the machine's, under a weight handle no
@@ -175,6 +178,10 @@ func (c *K2Yue2Cache) Close() {
 			s.Close()
 			delete(c.k.sets, key)
 		}
+	}
+	if c.stackPipe != nil {
+		c.stackPipe.Close()
+		c.stackPipe = nil
 	}
 	if c.buf != nil {
 		c.buf.Close()

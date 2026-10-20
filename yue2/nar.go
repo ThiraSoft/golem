@@ -309,6 +309,38 @@ func (n *NAR) SetPrefix(k, v [][]uint16, arLen int) error {
 	return nil
 }
 
+// SetPrefixFromStack is SetPrefix from the AR half's own cache: the first
+// arLen positions of ar's slot, every layer, copied on the card. ar and n
+// must share a device. It holds until the next SetPrefix.
+func (n *NAR) SetPrefixFromStack(ar *AR, slot, arLen int) error {
+	c := n.cfg
+	if arLen < 1 || arLen > n.maxPrefix {
+		return fmt.Errorf("yue2: a prefix of %d keys, past the %d the cache holds", arLen, n.maxPrefix)
+	}
+	if slot < 0 || slot >= len(ar.pos) || arLen > ar.Pos(slot) {
+		return fmt.Errorf("yue2: a prefix of %d keys from slot %d of the AR", arLen, slot)
+	}
+	if ar.cfg.KVHeads != c.KVHeads || ar.cfg.HeadDim != 128 || ar.cfg.Layers != c.Layers {
+		return fmt.Errorf("yue2: an AR of %d layers of %d heads of %d for a NAR of %d layers of %d heads",
+			ar.cfg.Layers, ar.cfg.KVHeads, ar.cfg.HeadDim, c.Layers, c.KVHeads)
+	}
+	ks, vs := make([]*vk.Buffer, c.Layers), make([]*vk.Buffer, c.Layers)
+	var capacity int
+	for l := range ks {
+		ks[l], vs[l], capacity = ar.Cache(l)
+	}
+	// A slot's ring starts at slot·capacity positions, and the context never
+	// wraps: Prefill and Step refuse a position past it.
+	if err := n.cache.ImportStack(ks, vs, slot*capacity, arLen); err != nil {
+		return err
+	}
+	if arLen != n.arLen {
+		n.forget()
+		n.arLen = arLen
+	}
+	return nil
+}
+
 // forget drops the programs and tables of the previous prefix length.
 func (n *NAR) forget() {
 	for f, p := range n.progs {

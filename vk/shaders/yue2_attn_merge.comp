@@ -1,0 +1,112 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+// The stretches yue2_attn_split.comp left, folded: each rescaled from its own
+// maximum to the largest, the sums and the mixes added, the mix divided by
+// the sum. Then the Q8_0 form the output projection reads, block by block,
+// exactly as attn_one.comp writes it. A workgroup to a head.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer PT { float part[]; };
+layout(std430, binding = 1) writeonly buffer AQ { uint  aq[];   };
+layout(std430, binding = 2) writeonly buffer AS { float as_[];  };
+
+layout(push_constant) uniform Push {
+    uint heads;
+    uint kvHeads;
+    uint headDim;
+    uint perKV;
+    uint block;
+    uint capacity;
+    uint mask;
+    uint columns;
+    float scale;
+    uint col0;
+    uint splits;
+} p;
+
+const uint MAXD = 512u;
+const uint DPT  = MAXD / 256u;
+
+uint floatToHalf(float f) {
+    uint bits     = floatBitsToUint(f);
+    uint sign     = (bits >> 16) & 0x8000u;
+    int  exponent = int((bits >> 23) & 0xFFu) - 127 + 15;
+    uint mantissa = bits & 0x7FFFFFu;
+
+    if ((bits & 0x7FFFFFFFu) == 0u) return sign;
+    if (exponent >= 0x1F) {
+        if ((bits & 0x7F800000u) == 0x7F800000u && mantissa != 0u) return sign | 0x7E00u;
+        return sign | 0x7C00u;
+    }
+    if (exponent <= 0) {
+        if (exponent < -10) return sign;
+        mantissa |= 0x800000u;
+        uint shift = uint(14 - exponent);
+        uint value = mantissa >> shift;
+        uint rest  = mantissa & ((1u << shift) - 1u);
+        uint mid   = 1u << (shift - 1u);
+        if (rest > mid || (rest == mid && (value & 1u) == 1u)) value++;
+        return sign | value;
+    }
+    uint value = (uint(exponent) << 10) | (mantissa >> 13);
+    uint rest  = mantissa & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (value & 1u) == 1u)) value++;
+    return sign | value;
+}
+
+int nearestInt(float f) {
+    return (floatBitsToInt(f + 12582912.0) & 0x007fffff) - 0x00400000;
+}
+
+void main() {
+    uint h    = gl_WorkGroupID.x;
+    uint t    = gl_LocalInvocationID.x;
+    uint hd   = p.headDim;
+    uint base = p.col0;
+    uint rows = (base * p.heads + h) * p.splits;
+    uint w    = hd + 2u;
+
+    float inf = 1.0 / 0.0;
+    float top = -inf;
+    for (uint s = 0u; s < p.splits; s++) top = max(top, part[(rows + s) * w + hd]);
+
+    uint blocks = (p.heads * hd) >> 5;
+    for (uint u = 0u; u < DPT; u++) {
+        uint dim = t + u * 256u;
+        if (dim >= hd) break;
+        float sum = 0.0, mix = 0.0;
+        for (uint s = 0u; s < p.splits; s++) {
+            uint r = (rows + s) * w;
+            float m = part[r + hd];
+            float f = isinf(m) ? 0.0 : exp(m - top);
+            sum += part[r + hd + 1u] * f;
+            mix += part[r + dim] * f;
+        }
+        float value = (sum > 0.0) ? mix * (1.0 / sum) : 0.0;
+
+        uint slot = ((h * hd) >> 5) + (dim >> 5);
+        float peak = subgroupClusteredMax(abs(value), 32u);
+        float scale = 0.0;
+        int   q = 0;
+        if (peak > 0.0) {
+            scale = unpackHalf2x16(floatToHalf(peak * (1.0 / 127.0))).x;
+            precise float scaled = value * (127.0 / peak);
+            q = clamp(nearestInt(scaled), -128, 127);
+        }
+        int count = subgroupClusteredAdd(q, 32u);
+
+        uint word = subgroupClusteredOr(uint(q & 0xFF) << ((dim & 3u) * 8u), 4u);
+        uint dest = ((base * p.heads * hd + h * hd) >> 2) + (dim >> 2);
+        if ((dim & 3u) == 0u) aq[dest] = word;
+
+        if ((dim & 31u) == 0u) {
+            uint cbase = base * 2u * blocks;
+            as_[cbase + slot]          = scale;
+            as_[cbase + blocks + slot] = 8.0 * scale * float(count);
+        }
+    }
+}
