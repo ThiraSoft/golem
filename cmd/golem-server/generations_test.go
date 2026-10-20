@@ -276,8 +276,8 @@ func TestGenerationsCapsImagesCount(t *testing.T) {
 }
 
 func TestGenerationsRefusesOversizedImageDimensions(t *testing.T) {
-	// Create an image with dimension > 4096 (e.g. 4097 x 1)
-	big := image.NewNRGBA(image.Rect(0, 0, 4097, 1))
+	// Create an image with a side past 8192 (8193 x 1)
+	big := image.NewNRGBA(image.Rect(0, 0, 8193, 1))
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, big); err != nil {
 		t.Fatal(err)
@@ -289,7 +289,7 @@ func TestGenerationsRefusesOversizedImageDimensions(t *testing.T) {
 	if rec.Code != 400 {
 		t.Fatalf("status %d, want 400", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "limit") && !strings.Contains(rec.Body.String(), "4096") {
+	if !strings.Contains(rec.Body.String(), "limit") && !strings.Contains(rec.Body.String(), "8192") {
 		t.Errorf("error %s does not name limit", rec.Body.String())
 	}
 }
@@ -363,5 +363,26 @@ func TestFlux3SizePastLimitIs400(t *testing.T) {
 	}
 	if f.drew {
 		t.Error("the imager drew a picture its Check refused")
+	}
+}
+
+// TestFlux3TakesAPhonePhoto: a 13 MP phone photo (4160 x 3120) is what
+// match_image is for; it reaches the imager.
+func TestFlux3TakesAPhonePhoto(t *testing.T) {
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewNRGBA(image.Rect(0, 0, 4160, 3120))); err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeImager{size: "2048x2048", steps: 1, disallowLoRA: true}
+	s := NewServer(nil, nil, "flux3", nil, sample.Params{})
+	s.SetImager(f)
+	rec := httptest.NewRecorder()
+	body := fmt.Sprintf(`{"prompt":"a cat","match_image":true,"images":["%s"]}`, base64.StdEncoding.EncodeToString(buf.Bytes()))
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/images/generations", strings.NewReader(body)))
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if b := f.got.Images[0].Bounds(); b.Dx() != 4160 || b.Dy() != 3120 {
+		t.Errorf("the imager got %v", b)
 	}
 }

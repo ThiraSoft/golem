@@ -315,7 +315,9 @@ func decodeImageBase64(s string) (image.Image, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode image config: %w", err)
 	}
-	const maxDim = 4096
+	// A phone's photo, 4160 x 3120 and more, is what match_image takes;
+	// everything is scaled down after.
+	const maxDim = flux3.MaxSide
 	if cfg.Width > maxDim || cfg.Height > maxDim {
 		return nil, fmt.Errorf("image dimension %dx%d exceeds %dx%d limit", cfg.Width, cfg.Height, maxDim, maxDim)
 	}
