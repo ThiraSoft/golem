@@ -1,6 +1,7 @@
 package vk
 
 import (
+	"encoding/binary"
 	"math"
 	"math/rand"
 	"testing"
@@ -88,5 +89,42 @@ func TestK2AttnThroughput(t *testing.T) {
 		}
 		p.Close()
 		t.Logf("%s, %d tokens, %d heads: %v, %.1f TFLOPS", c.name, n, c.heads, best, 4*float64(c.heads)*float64(n)*float64(n)*128/best.Seconds()/1e12)
+	}
+}
+
+// What FLUX 3's fp16 products do at 4 MP, in TFLOPS: the MLP's two over a
+// chunk of 4096 tokens, and a 3072-square one over a 2048² picture's
+// tokens. A measurement, not a check.
+func TestK2Flux3MMThroughput(t *testing.T) {
+	heavy.Skip(t, "a measurement")
+	r := rand.New(rand.NewSource(1))
+	for _, s := range [][3]int{{18432, 3072, 4096}, {3072, 9216, 4096}, {3072, 3072, 16544}} {
+		outs, ins, n := s[0], s[1], s[2]
+		k := newK2(t, n*ins/2+n*outs, nil)
+		wb := make([]byte, 2*outs*ins)
+		for i := 0; i < outs*ins; i++ {
+			binary.LittleEndian.PutUint16(wb[2*i:], f32ToF16(float32(r.NormFloat64())*0.02))
+		}
+		w, _ := k.AddWeights(wb)
+		p, err := k.Compile(func(rec *Recorder) {
+			k.MM(rec, w, false, K2MM{Outputs: uint32(outs), Inputs: uint32(ins), Cols: uint32(n), XStride: uint32(ins),
+				Y: uint32(n * ins / 2), YStride: uint32(outs), Bias: K2None, Scale: 1, XHalves: 1})
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for start := time.Now(); time.Since(start) < time.Second; {
+			p.Run()
+		}
+		best := time.Hour
+		for i := 0; i < 5; i++ {
+			start := time.Now()
+			if err := p.Run(); err != nil {
+				t.Fatal(err)
+			}
+			best = min(best, time.Since(start))
+		}
+		p.Close()
+		t.Logf("mm %d×%d×%d: %v, %.1f TFLOPS", outs, ins, n, best, 2*float64(outs*ins*n)/best.Seconds()/1e12)
 	}
 }

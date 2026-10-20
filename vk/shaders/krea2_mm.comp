@@ -45,6 +45,9 @@
 #ifndef BN
 #define BN 128
 #endif
+#ifndef GROUP
+#define GROUP 8
+#endif
 #define WM (BM / 64) // waves down the rows
 #define THREADS (64 * WM * (BN / 64))
 #define BK 32
@@ -237,12 +240,22 @@ void stash(uint t, uvec4 wn[PER(WS)], XN xn[PER(XS)]) {
 void main() {
     uint t = gl_LocalInvocationID.x;
     // The tiles run down the rows first, so that neighbouring workgroups read
-    // the same columns of X; the grid may have a second axis when there are
-    // more tiles than one axis holds.
+    // the same columns of X, but GROUP row tiles at most: a band of rows goes
+    // over every column before the next, so that its weights stay in the
+    // cache. A weight past the card's cache (the MLP's 18432 x 3072 in fp16,
+    // 113 MB) was otherwise read from memory again for every column tile.
+    // The grid may have a second axis when there are more tiles than one
+    // axis holds.
     uint tiles = (p.outputs + uint(BM) - 1u) / uint(BM);
+    uint colTiles = (p.cols + uint(BN) - 1u) / uint(BN);
     uint tile = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
-    uint row0 = (tile % tiles) * uint(BM);
-    uint col0 = (tile / tiles) * uint(BN);
+    uint band = tile / (uint(GROUP) * colTiles);
+    uint first = band * uint(GROUP);
+    if (first >= tiles) return;
+    uint rows = min(uint(GROUP), tiles - first);
+    uint inBand = tile - first * colTiles;
+    uint row0 = (first + inBand % rows) * uint(BM);
+    uint col0 = (inBand / rows) * uint(BN);
     if (col0 >= p.cols) return;
     uint wave = gl_SubgroupID;
     uint lane = gl_SubgroupInvocationID;
