@@ -1,0 +1,595 @@
+package yue2
+
+// The flow matching half on the card: the NAR weight set of the 28 blocks,
+// which reads the AR half's keys and values and predicts the velocity of 64
+// latent channels a frame. It runs on the Krea 2 machine the way flux3's DiT
+// does: one float32 arena, token-major, one row of 2048 a token; the weights
+// fp16 one buffer per tensor, dequantized on the host at load; one program
+// recorded per shape and replayed for every evaluation of the ODE.
+//
+// yue2.cpp's src/nar.h is the specification. The block is [zero row, the
+// frames, zero row], N = frames + 2 tokens at positions arLen .. arLen + N - 1,
+// which continue the AR prefix's; every query sees the arLen prefix keys and
+// the N fresh ones, unmasked. The prefix lives in a cache beside the arena
+// (vk.K2Yue2Cache) in the layout the attention reads, written once by
+// SetPrefix; each evaluation writes the block's own keys behind it.
+
+import (
+	"encoding/binary"
+	"fmt"
+	"math"
+	"runtime"
+	"sync"
+	"unsafe"
+
+	"github.com/ThiraSoft/golem/nn"
+	"github.com/ThiraSoft/golem/vk"
+)
+
+// narTimeDim is the width of the timestep's sinusoidal features.
+const narTimeDim = 256
+
+type narLayer struct {
+	qkv, o, gateUp, down int
+	attnNorm, ffnNorm    uint32
+	qNorm, kNorm         uint32
+}
+
+// NAR is the flow matching half on one device.
+type NAR struct {
+	cfg    Config
+	k      *vk.K2
+	cache  *vk.K2Yue2Cache
+	layers []narLayer
+
+	vae2llm, llm2vae, time0, time1 int
+	vae2llmB, llm2vaeB             uint32
+	time0B, time1B, norm           uint32
+
+	maxFrames, maxPrefix int
+	arLen                int
+
+	// The arena, in floats: the latent block, the timestep's features and
+	// its embedding, the frame embedding and the rotation table of the
+	// current shape, the stream x, the norms' fp16 answer, the fused q|k|v
+	// product, the attention's answer, the MLP's fp16 inner activation, the
+	// velocity.
+	xin, feats, tA, temb uint32
+	pos, table           uint32
+	x, nh, qkv, att, ffn uint32
+	out                  uint32
+	floats               int
+
+	progs map[int]*vk.Program
+	// tables is the frame count the frame embedding and the rotation table
+	// in the arena were written for; 0 for none.
+	tables int
+
+	// timeline, when set, gets a stamp after every dispatch: what the
+	// benchmark reads.
+	timeline *vk.Timeline
+}
+
+// NewNAR puts b's NAR half on d, with an arena for up to maxFrames frames and
+// a cache for a prefix of up to maxPrefix keys.
+func NewNAR(d *vk.Device, b *Backbone, maxFrames, maxPrefix int) (*NAR, error) {
+	cfg := b.Cfg
+	if cfg.HeadDim != 128 || cfg.Heads*cfg.HeadDim != cfg.Dim || cfg.Heads%cfg.KVHeads != 0 {
+		return nil, fmt.Errorf("yue2: NAR of %d heads of %d over %d, which the attention does not take", cfg.Heads, cfg.HeadDim, cfg.Dim)
+	}
+	if maxFrames < 1 || maxPrefix < 1 {
+		return nil, fmt.Errorf("yue2: NAR of %d frames over %d keys", maxFrames, maxPrefix)
+	}
+	n := &NAR{cfg: cfg, maxFrames: maxFrames, maxPrefix: maxPrefix, progs: map[int]*vk.Program{},
+		layers: make([]narLayer, cfg.Layers)}
+
+	maxN := maxFrames + 2
+	dim, kvDim, ffn := cfg.Dim, cfg.KVHeads*cfg.HeadDim, cfg.FFN
+	at := 0
+	room := func(floats int) uint32 {
+		o := at
+		at += (floats + 63) / 64 * 64
+		return uint32(o)
+	}
+	n.xin = room(cfg.LatentDim * maxN)
+	n.feats = room(narTimeDim)
+	n.tA = room(dim)
+	n.temb = room(dim)
+	n.pos = room(dim * maxN)
+	n.table = room(cfg.HeadDim * maxN)
+	n.x = room(dim * maxN)
+	n.nh = room(dim * maxN / 2)
+	n.qkv = room((dim + 2*kvDim) * maxN)
+	n.att = room(dim * maxN)
+	n.ffn = room(ffn * maxN / 2)
+	n.out = room(cfg.LatentDim * maxN)
+	n.floats = at
+
+	var params []float32
+	param := func(p []float32) uint32 {
+		o := uint32(len(params))
+		params = append(params, p...)
+		return o
+	}
+	for l := range n.layers {
+		bl, nl := &b.NAR[l], &n.layers[l]
+		nl.attnNorm, nl.ffnNorm = param(bl.AttnNorm), param(bl.FFNNorm)
+		nl.qNorm, nl.kNorm = param(bl.QNorm), param(bl.KNorm)
+	}
+	n.norm = param(b.Norm)
+	n.vae2llmB, n.llm2vaeB = param(b.Vae2LLMBias), param(b.LLM2VaeBias)
+	n.time0B, n.time1B = param(b.Time0Bias), param(b.Time1Bias)
+
+	k, err := vk.NewK2(d, n.floats, params)
+	if err != nil {
+		return nil, err
+	}
+	n.k = k
+	fail := func(err error) (*NAR, error) {
+		n.Close()
+		return nil, fmt.Errorf("yue2: NAR weights: %w", err)
+	}
+	upload := func(h *int, rows []uint16) error {
+		var err error
+		*h, err = k.AddWeights(unsafe.Slice((*byte)(unsafe.Pointer(&rows[0])), 2*len(rows)))
+		return err
+	}
+	single := func(h *int, m Matrix) error {
+		rows, err := halves(m)
+		if err != nil {
+			return err
+		}
+		return upload(h, rows)
+	}
+	for _, w := range []struct {
+		h *int
+		m Matrix
+	}{{&n.vae2llm, b.Vae2LLM}, {&n.llm2vae, b.LLM2Vae}, {&n.time0, b.Time0}, {&n.time1, b.Time1}} {
+		if err := single(w.h, w.m); err != nil {
+			return fail(err)
+		}
+	}
+	for l := range n.layers {
+		bl, nl := &b.NAR[l], &n.layers[l]
+		// q, k and v in one product, their rows stacked.
+		var qkv []uint16
+		for _, m := range []Matrix{bl.Q, bl.K, bl.V} {
+			rows, err := halves(m)
+			if err != nil {
+				return fail(err)
+			}
+			qkv = append(qkv, rows...)
+		}
+		if err := upload(&nl.qkv, qkv); err != nil {
+			return fail(err)
+		}
+		if err := single(&nl.o, bl.O); err != nil {
+			return fail(err)
+		}
+		// The gate's rows then the up's, in the runs of 32 the SwiGLU
+		// epilogue wants.
+		gate, err := halves(bl.Gate)
+		if err != nil {
+			return fail(err)
+		}
+		up, err := halves(bl.Up)
+		if err != nil {
+			return fail(err)
+		}
+		gu := make([]uint16, len(gate)+len(up))
+		for r := range 2 * ffn {
+			var src []uint16
+			if r < ffn {
+				src = gate[r*dim:]
+			} else {
+				src = up[(r-ffn)*dim:]
+			}
+			copy(gu[vk.SwiGLURow(r, ffn)*dim:], src[:dim])
+		}
+		if err := upload(&nl.gateUp, gu); err != nil {
+			return fail(err)
+		}
+		if err := single(&nl.down, bl.Down); err != nil {
+			return fail(err)
+		}
+	}
+	if n.cache, err = k.NewYue2Cache(cfg.Layers, cfg.KVHeads, maxPrefix+maxN); err != nil {
+		return fail(err)
+	}
+	return n, nil
+}
+
+// halves widens or narrows a weight matrix to fp16, row-major.
+func halves(m Matrix) ([]uint16, error) {
+	n := m.Rows * m.Cols
+	out := make([]uint16, n)
+	var rowBytes int
+	switch m.Quant {
+	case nn.Q8_0:
+		if m.Cols%32 != 0 {
+			return nil, fmt.Errorf("a Q8_0 matrix of %d columns", m.Cols)
+		}
+		rowBytes = m.Cols / 32 * 34
+	case nn.BF16, nn.F16:
+		rowBytes = 2 * m.Cols
+	case nn.F32:
+		rowBytes = 4 * m.Cols
+	default:
+		return nil, fmt.Errorf("weights in %v", m.Quant)
+	}
+	if len(m.Data) < rowBytes*m.Rows {
+		return nil, fmt.Errorf("%d bytes for %d rows of %d", len(m.Data), m.Rows, m.Cols)
+	}
+	row := func(r int) {
+		src, dst := m.Data[r*rowBytes:(r+1)*rowBytes], out[r*m.Cols:(r+1)*m.Cols]
+		switch m.Quant {
+		case nn.Q8_0:
+			for b := 0; b < m.Cols/32; b++ {
+				blk := src[34*b:]
+				d := nn.Widen(binary.LittleEndian.Uint16(blk))
+				for i := range 32 {
+					dst[32*b+i] = nn.Half(float32(int8(blk[2+i])) * d)
+				}
+			}
+		case nn.BF16:
+			for i := range dst {
+				dst[i] = nn.Half(math.Float32frombits(uint32(binary.LittleEndian.Uint16(src[2*i:])) << 16))
+			}
+		case nn.F16:
+			for i := range dst {
+				dst[i] = binary.LittleEndian.Uint16(src[2*i:])
+			}
+		case nn.F32:
+			for i := range dst {
+				dst[i] = nn.Half(math.Float32frombits(binary.LittleEndian.Uint32(src[4*i:])))
+			}
+		}
+	}
+	workers := runtime.GOMAXPROCS(0)
+	var wg sync.WaitGroup
+	for w := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for r := w; r < m.Rows; r += workers {
+				row(r)
+			}
+		}()
+	}
+	wg.Wait()
+	return out, nil
+}
+
+// WeightBytes is what the weights hold on the card; CacheBytes the prefix
+// cache; ArenaBytes the arena.
+func (n *NAR) WeightBytes() int { return n.k.WeightBytes() }
+func (n *NAR) CacheBytes() int  { return n.cache.Bytes() }
+func (n *NAR) ArenaBytes() int  { return 4 * n.floats }
+
+// SetPrefix puts the AR half's keys and values on the card, every layer's
+// arLen rows of [KV heads][128] fp16, as the AR cache holds them: k[l] and
+// v[l] are layer l's, position-major. It holds until the next SetPrefix.
+func (n *NAR) SetPrefix(k, v [][]uint16, arLen int) error {
+	c := n.cfg
+	if arLen < 1 || arLen > n.maxPrefix {
+		return fmt.Errorf("yue2: a prefix of %d keys, past the %d the cache holds", arLen, n.maxPrefix)
+	}
+	if len(k) != c.Layers || len(v) != c.Layers {
+		return fmt.Errorf("yue2: a prefix of %d and %d layers for %d", len(k), len(v), c.Layers)
+	}
+	width := c.KVHeads * c.HeadDim
+	np := n.cache.Rows()
+	blk := make([]uint16, 2*width*np)
+	for l := range c.Layers {
+		if len(k[l]) < arLen*width || len(v[l]) < arLen*width {
+			return fmt.Errorf("yue2: layer %d's prefix is %d and %d halves, not %d", l, len(k[l]), len(v[l]), arLen*width)
+		}
+		// The keys [head][np][128], the values [head][128][np], the rows
+		// past the prefix zero until an evaluation writes the block there.
+		clear(blk)
+		vt := blk[width*np:]
+		for t := range arLen {
+			for h := range c.KVHeads {
+				src := t*width + h*c.HeadDim
+				copy(blk[(h*np+t)*c.HeadDim:], k[l][src:src+c.HeadDim])
+				for d := range c.HeadDim {
+					vt[(h*c.HeadDim+d)*np+t] = v[l][src+d]
+				}
+			}
+		}
+		if err := n.cache.WriteLayer(l, blk); err != nil {
+			return err
+		}
+	}
+	if arLen != n.arLen {
+		n.forget()
+		n.arLen = arLen
+	}
+	return nil
+}
+
+// forget drops the programs and tables of the previous prefix length.
+func (n *NAR) forget() {
+	for f, p := range n.progs {
+		p.Close()
+		delete(n.progs, f)
+	}
+	n.tables = 0
+}
+
+// shiftT is the timestep of a raw one: its sigmoid, through the release's
+// shift curve. Float32 step by step, as nar_shift_t.
+func (n *NAR) shiftT(raw float32) float32 {
+	s := n.cfg.TimestepShift
+	sig := 1 / (1 + float32(math.Exp(float64(-raw))))
+	return s * sig / (1 + (s-1)*sig)
+}
+
+// timeFeatures is nar_time_features: the cosines first, then the sines,
+// frequencies exp(-ln(1e4)·i/128), in float32 the way the C++ computes them.
+func timeFeatures(t float32) []float32 {
+	out := make([]float32, narTimeDim)
+	half := narTimeDim / 2
+	ln := float32(math.Log(10000))
+	for i := range half {
+		freq := float32(math.Exp(float64(-ln * float32(i) / float32(half))))
+		arg := t * freq
+		out[i] = float32(math.Cos(float64(arg)))
+		out[half+i] = float32(math.Sin(float64(arg)))
+	}
+	return out
+}
+
+// frameEmbedding is nar_pos_features: over the block's own frame index
+// 0 .. tokens - 1, sin and cos interleaved over dim, in float32 as the C++.
+func frameEmbedding(tokens, dim int) []float32 {
+	out := make([]float32, tokens*dim)
+	step := -float32(math.Log(10000)) / float32(dim)
+	for i := 0; 2*i < dim; i++ {
+		div := float32(math.Exp(float64(float32(2*i) * step)))
+		for p := range tokens {
+			arg := float32(p) * div
+			out[p*dim+2*i] = float32(math.Sin(float64(arg)))
+			out[p*dim+2*i+1] = float32(math.Cos(float64(arg)))
+		}
+	}
+	return out
+}
+
+// ropeTable is a token's 64 cosines then 64 sines for positions first ..
+// first + tokens - 1: ggml's angle pos·θ^i with θ = base^(-2/128), the power
+// in float32 as its shader takes it.
+func ropeTable(first, tokens int, base float64) []float32 {
+	out := make([]float32, 128*tokens)
+	scale := float32(math.Pow(base, -2.0/128))
+	for t := range tokens {
+		pos := float32(first + t)
+		for i := range 64 {
+			theta := pos * float32(math.Pow(float64(scale), float64(i)))
+			out[128*t+i] = float32(math.Cos(float64(theta)))
+			out[128*t+64+i] = float32(math.Sin(float64(theta)))
+		}
+	}
+	return out
+}
+
+func (n *NAR) mm(r *vk.Recorder, w int, label string, m vk.K2MM) {
+	m.Scale = 1
+	n.k.MM(r, w, false, m)
+	n.timeline.Stamp(r, label)
+}
+
+func (n *NAR) rmsNorm(r *vk.Recorder, src, weight uint32, tokens int) {
+	d := uint32(n.cfg.Dim)
+	n.k.Norm(r, vk.K2Norm{Src: src, SrcStride: d, Dst: 2 * n.nh, DstStride: d, N: d, Rows: uint32(tokens),
+		Weight: weight, Eps: n.cfg.Eps, ScaleA: vk.K2None, ScaleB: vk.K2None, ShiftA: vk.K2None, ShiftB: vk.K2None,
+		Halves: 1})
+	n.timeline.Stamp(r, "norm")
+}
+
+func (n *NAR) act(r *vk.Recorder, a vk.K2Act) {
+	n.k.Act(r, a)
+	n.timeline.Stamp(r, "act")
+}
+
+// recordInput is the block's first hidden state: vae2llm of the latents,
+// plus the timestep's embedding, plus the frame embedding.
+func (n *NAR) recordInput(r *vk.Recorder, tokens int) {
+	d, toks := uint32(n.cfg.Dim), uint32(tokens)
+	n.mm(r, n.time0, "time", vk.K2MM{Outputs: d, Inputs: narTimeDim, Cols: 1, X: n.feats, XStride: narTimeDim,
+		Y: n.tA, YStride: d, Bias: n.time0B, Mode: vk.K2Store})
+	n.act(r, vk.K2Act{X: n.tA, XStride: d, N: d, Rows: 1, Op: vk.K2SiLU})
+	n.mm(r, n.time1, "time", vk.K2MM{Outputs: d, Inputs: d, Cols: 1, X: n.tA, XStride: d,
+		Y: n.temb, YStride: d, Bias: n.time1B, Mode: vk.K2Store})
+	lat := uint32(n.cfg.LatentDim)
+	n.mm(r, n.vae2llm, "input", vk.K2MM{Outputs: d, Inputs: lat, Cols: toks, X: n.xin, XStride: lat,
+		Y: n.x, YStride: d, Bias: n.vae2llmB, Mode: vk.K2Store})
+	n.act(r, vk.K2Act{X: n.x, XStride: d, Y: n.temb, YStride: 0, N: d, Rows: toks, Op: vk.K2Sum})
+	n.act(r, vk.K2Act{X: n.x, XStride: d, Y: n.pos, YStride: d, N: d, Rows: toks, Op: vk.K2Sum})
+}
+
+// recordLayer is block l over the latent block. With sa set, the attention's
+// output projection goes to the q|k|v room, which it has finished with, and
+// is added to x after: the same sum, kept for the waypoint.
+func (n *NAR) recordLayer(r *vk.Recorder, l, tokens int, sa bool) {
+	c, bl := n.cfg, &n.layers[l]
+	d, toks := uint32(c.Dim), uint32(tokens)
+	kvDim := uint32(c.KVHeads * c.HeadDim)
+	stride := d + 2*kvDim
+	n.rmsNorm(r, n.x, bl.attnNorm, tokens)
+	n.mm(r, bl.qkv, "mm qkv", vk.K2MM{Outputs: stride, Inputs: d, Cols: toks, X: 2 * n.nh, XStride: d,
+		Y: n.qkv, YStride: stride, Bias: vk.K2None, Mode: vk.K2Store, XHalves: 1})
+	n.k.Yue2QKRope(r, vk.K2Yue2QKRope{Q: n.qkv, K: n.qkv + d, Stride: stride,
+		QHeads: uint32(c.Heads), KHeads: uint32(c.KVHeads), Tokens: toks, Table: n.table,
+		QWeight: bl.qNorm, KWeight: bl.kNorm, Eps: c.Eps})
+	n.timeline.Stamp(r, "qkrope")
+	n.cache.Import(r, l, n.qkv+d, n.qkv+d+kvDim, stride, toks, uint32(n.arLen))
+	n.timeline.Stamp(r, "kv import")
+	n.cache.Attn(r, l, vk.K2Attn{Q: n.qkv, QStride: stride, O: n.att, OStride: d,
+		Queries: toks, Keys: uint32(n.arLen) + toks, Group: uint32(c.Heads / c.KVHeads),
+		Scale: float32(1 / math.Sqrt(float64(c.HeadDim))), Heads: c.Heads, Seqs: 1, HeadDim: c.HeadDim})
+	n.timeline.Stamp(r, "attn")
+	if sa {
+		n.mm(r, bl.o, "mm o", vk.K2MM{Outputs: d, Inputs: d, Cols: toks, X: n.att, XStride: d,
+			Y: n.qkv, YStride: d, Bias: vk.K2None, Mode: vk.K2Store})
+		n.act(r, vk.K2Act{X: n.x, XStride: d, Y: n.qkv, YStride: d, N: d, Rows: toks, Op: vk.K2Sum})
+	} else {
+		n.mm(r, bl.o, "mm o", vk.K2MM{Outputs: d, Inputs: d, Cols: toks, X: n.att, XStride: d,
+			Y: n.x, YStride: d, Bias: vk.K2None, Mode: vk.K2Add})
+	}
+	ffn := uint32(c.FFN)
+	n.rmsNorm(r, n.x, bl.ffnNorm, tokens)
+	n.mm(r, bl.gateUp, "mm ffn in", vk.K2MM{Outputs: 2 * ffn, Inputs: d, Cols: toks, X: 2 * n.nh, XStride: d,
+		Y: 2 * n.ffn, YStride: ffn, Bias: vk.K2None, Mode: vk.K2SwiGLUHalves, XHalves: 1})
+	n.mm(r, bl.down, "mm ffn out", vk.K2MM{Outputs: d, Inputs: ffn, Cols: toks, X: 2 * n.ffn, XStride: ffn,
+		Y: n.x, YStride: d, Bias: vk.K2None, Mode: vk.K2Add, XHalves: 1})
+}
+
+// recordHead is the final norm and llm2vae, every token's velocity.
+func (n *NAR) recordHead(r *vk.Recorder, tokens int) {
+	d, lat := uint32(n.cfg.Dim), uint32(n.cfg.LatentDim)
+	n.rmsNorm(r, n.x, n.norm, tokens)
+	n.mm(r, n.llm2vae, "head", vk.K2MM{Outputs: lat, Inputs: d, Cols: uint32(tokens), X: 2 * n.nh, XStride: d,
+		Y: n.out, YStride: lat, Bias: n.llm2vaeB, Mode: vk.K2Store, XHalves: 1})
+}
+
+// prepare writes the latent block, the timestep's features and, on a new
+// shape, the frame embedding and the rotation table.
+func (n *NAR) prepare(x []float32, frames int, rawT float32) error {
+	if n.arLen == 0 {
+		return fmt.Errorf("yue2: a velocity before SetPrefix")
+	}
+	if frames < 1 || frames > n.maxFrames {
+		return fmt.Errorf("yue2: %d frames, past the %d the arena holds", frames, n.maxFrames)
+	}
+	lat := n.cfg.LatentDim
+	if len(x) < lat*frames {
+		return fmt.Errorf("yue2: %d latents for %d frames", len(x), frames)
+	}
+	tokens := frames + 2
+	if n.tables != frames {
+		if err := n.k.Write(int(n.pos), frameEmbedding(tokens, n.cfg.Dim)); err != nil {
+			return err
+		}
+		if err := n.k.Write(int(n.table), ropeTable(n.arLen, tokens, n.cfg.RoPEBase)); err != nil {
+			return err
+		}
+		n.tables = frames
+	}
+	// LATENT_START and LATENT_END are zero rows around the frames.
+	in := make([]float32, lat*tokens)
+	copy(in[lat:], x[:lat*frames])
+	if err := n.k.Write(int(n.xin), in); err != nil {
+		return err
+	}
+	return n.k.Write(int(n.feats), timeFeatures(n.shiftT(rawT)))
+}
+
+// Velocity is one evaluation of the network: the velocity of frames frames of
+// latents x, [t][64], at raw timestep rawT (the logit of t, saturated at
+// ±20), over the prefix SetPrefix put on the card. It comes back as x is.
+func (n *NAR) Velocity(x []float32, frames int, rawT float32) ([]float32, error) {
+	if err := n.prepare(x, frames, rawT); err != nil {
+		return nil, err
+	}
+	p, err := n.program(frames)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.Run(); err != nil {
+		return nil, err
+	}
+	lat := n.cfg.LatentDim
+	return n.k.Read(int(n.out)+lat, lat*frames)
+}
+
+// program is the whole evaluation for frames frames, recorded once.
+func (n *NAR) program(frames int) (*vk.Program, error) {
+	if p, ok := n.progs[frames]; ok {
+		return p, nil
+	}
+	tokens := frames + 2
+	p, err := n.k.Compile(func(r *vk.Recorder) {
+		n.recordInput(r, tokens)
+		for l := range n.layers {
+			n.recordLayer(r, l, tokens, false)
+		}
+		n.recordHead(r, tokens)
+	})
+	if err != nil {
+		return nil, err
+	}
+	n.progs[frames] = p
+	return p, nil
+}
+
+// waypoints is one evaluation in pieces, a program each, reading back what
+// yue2.cpp's dumper records of its first evaluation: temb_t, and token-major
+// [N][2048] hidden_after_input, layer0_sa_output and hidden_after_layer
+// {0, 7, 14, 21, 27}, and the velocity.
+func (n *NAR) waypoints(x []float32, frames int, rawT float32) (map[string][]float32, error) {
+	if err := n.prepare(x, frames, rawT); err != nil {
+		return nil, err
+	}
+	tokens := frames + 2
+	d := n.cfg.Dim
+	got := map[string][]float32{}
+	run := func(record func(r *vk.Recorder)) error {
+		p, err := n.k.Compile(record)
+		if err != nil {
+			return err
+		}
+		defer p.Close()
+		return p.Run()
+	}
+	read := func(name string, at uint32, count int) error {
+		v, err := n.k.Read(int(at), count)
+		got[name] = v
+		return err
+	}
+	if err := run(func(r *vk.Recorder) { n.recordInput(r, tokens) }); err != nil {
+		return nil, err
+	}
+	if err := read("temb_t", n.temb, d); err != nil {
+		return nil, err
+	}
+	if err := read("hidden_after_input", n.x, d*tokens); err != nil {
+		return nil, err
+	}
+	for l := range n.layers {
+		if err := run(func(r *vk.Recorder) { n.recordLayer(r, l, tokens, l == 0) }); err != nil {
+			return nil, err
+		}
+		if l == 0 {
+			if err := read("layer0_sa_output", n.qkv, d*tokens); err != nil {
+				return nil, err
+			}
+		}
+		if l%7 == 0 || l == len(n.layers)-1 {
+			if err := read(fmt.Sprintf("hidden_after_layer%d", l), n.x, d*tokens); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := run(func(r *vk.Recorder) { n.recordHead(r, tokens) }); err != nil {
+		return nil, err
+	}
+	lat := n.cfg.LatentDim
+	if err := read("velocity", n.out+uint32(lat), lat*frames); err != nil {
+		return nil, err
+	}
+	return got, nil
+}
+
+// Close releases the card's memory.
+func (n *NAR) Close() {
+	n.forget()
+	if n.cache != nil {
+		n.cache.Close()
+		n.cache = nil
+	}
+	if n.k != nil {
+		n.k.Close()
+		n.k = nil
+	}
+}

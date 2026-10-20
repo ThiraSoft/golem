@@ -36,7 +36,170 @@ static bool parse_tokens(const std::string & csv, std::vector<int> * out) {
     return !out->empty();
 }
 
+
+// read_raw reads a whole fixture file written by an earlier run.
+static bool read_raw(const std::string & path, void * dst, size_t bytes) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        fprintf(stderr, "FATAL: cannot open %s\n", path.c_str());
+        return false;
+    }
+    size_t got = fread(dst, 1, bytes, f);
+    bool   ok  = got == bytes && fgetc(f) == EOF;
+    fclose(f);
+    if (!ok) {
+        fprintf(stderr, "FATAL: %s is not %zu bytes\n", path.c_str(), bytes);
+    }
+    return ok;
+}
+
+// record_exact replays the first velocity evaluation of the default run with
+// the products summing in float32 over fp16 operands, and writes its probes
+// under nar_exact/.
+//
+// At its default settings ggml-vulkan quantizes the activations of every
+// product against Q8_0 weights to Q8_1 (an fp16 scale and an int8 a value,
+// blocks of 32), because this card has integer dot products; that alone puts
+// the default run's hidden_after_input 0.34% away from the exact sum of its
+// fp16 noise and Q8_0 weights. The process is started with integer dot
+// products and cooperative matrices disabled (the int8 matrix cores are the
+// other route to Q8_1), and every MUL_MAT is set to GGML_PREC_F32, so the
+// products take the weights dequantized to fp16 and the activations rounded
+// to fp16, and sum them in float32.
+//
+// The AR cache is not prefilled again under these settings: the default
+// run's kv_all_{k,v}.f16 are loaded into it, so that both recordings share
+// the prefix golem is given.
+static int record_exact(const std::string & model_path, const std::string & out_dir) {
+    Yue2NAR nar;
+    if (!nar_load(&nar, model_path.c_str(), {})) {
+        fprintf(stderr, "FATAL: failed to load NAR from %s\n", model_path.c_str());
+        return 1;
+    }
+
+    // The default run's prefix length, noise and cache rows.
+    std::string dir = out_dir + "/nar/";
+    FILE *      f   = fopen((dir + "ar_ids").c_str(), "rb");
+    if (!f) {
+        fprintf(stderr, "FATAL: no %sar_ids: run the default recording first\n", dir.c_str());
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    int ar_len = (int) (ftell(f) / 4);
+    fclose(f);
+
+    int T_lat = 100;
+    int M     = 1;
+    std::vector<float> state((size_t) nar.latent_dim * T_lat * M);
+    if (!read_raw(dir + "noise", state.data(), state.size() * sizeof(float))) {
+        return 1;
+    }
+
+    Qw3lmKvCache  kv;
+    Qwen3LMConfig kv_cfg = nar.cfg;
+    kv_cfg.max_seq_len   = 4096;
+    qw3lm_kv_init(&kv, kv_cfg, nar.backend);
+    if (!qw3lm_kv_sets(&kv, 1)) {
+        fprintf(stderr, "FATAL: failed to allocate KV cache sets\n");
+        return 1;
+    }
+    int D   = kv_cfg.head_dim;
+    int S   = kv_cfg.max_seq_len;
+    int Nkv = kv_cfg.n_kv_heads;
+    int L   = kv_cfg.n_layers;
+    std::vector<uint16_t> all_k((size_t) L * ar_len * Nkv * D), all_v(all_k.size());
+    if (!read_raw(dir + "kv_all_k.f16", all_k.data(), all_k.size() * 2) ||
+        !read_raw(dir + "kv_all_v.f16", all_v.data(), all_v.size() * 2)) {
+        return 1;
+    }
+    std::vector<uint16_t> k_raw((size_t) D * S * Nkv, 0), v_raw(k_raw.size(), 0);
+    for (int l = 0; l < L; l++) {
+        for (int pos = 0; pos < ar_len; pos++) {
+            for (int head = 0; head < Nkv; head++) {
+                for (int d = 0; d < D; d++) {
+                    size_t dst = (size_t) head * S * D + (size_t) pos * D + d;
+                    size_t src = (size_t) l * ar_len * Nkv * D + (size_t) pos * Nkv * D + (size_t) head * D + d;
+                    k_raw[dst] = all_k[src];
+                    v_raw[dst] = all_v[src];
+                }
+            }
+        }
+        ggml_backend_tensor_set(kv.k4[l], k_raw.data(), 0, k_raw.size() * 2);
+        ggml_backend_tensor_set(kv.v4[l], v_raw.data(), 0, v_raw.size() * 2);
+    }
+    kv.pos[0] = ar_len;
+
+    // nar_velocity, with the products set to float32 between the graph's
+    // build and its allocation.
+    float raw_t = nar_logit_clamped(1.0f);
+    if (!nar_build_graph(&nar, &kv, T_lat, M, ar_len, 0)) {
+        return 1;
+    }
+    int f32 = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(nar.graph); i++) {
+        struct ggml_tensor * n = ggml_graph_node(nar.graph, i);
+        if (n->op == GGML_OP_MUL_MAT) {
+            ggml_mul_mat_set_prec(n, GGML_PREC_F32);
+            f32++;
+        }
+    }
+    fprintf(stderr, "[Dump-NAR] %d products at GGML_PREC_F32\n", f32);
+    ggml_backend_sched_reset(nar.sched);
+    if (!ggml_backend_sched_alloc_graph(nar.sched, nar.graph)) {
+        fprintf(stderr, "FATAL: graph alloc failed\n");
+        return 1;
+    }
+    int                N = T_lat + 2;
+    std::vector<float> x((size_t) nar.latent_dim * N, 0.0f);
+    memcpy(x.data() + nar.latent_dim, state.data(), state.size() * sizeof(float));
+    ggml_backend_tensor_set(nar.in_x, x.data(), 0, x.size() * sizeof(float));
+    float feats[YUE2_TIME_EMBED_DIM];
+    nar_time_features(nar_shift_t(&nar, raw_t), feats);
+    ggml_backend_tensor_set(nar.in_time, feats, 0, sizeof(feats));
+    ggml_backend_sched_graph_compute(nar.sched, nar.graph);
+    std::vector<float> first(state.size());
+    ggml_backend_tensor_get(nar.out_v, first.data(), 0, first.size() * sizeof(float));
+
+    Fixtures fixtures(out_dir);
+    const int                probes[] = YUE2_NAR_PROBE_LAYERS;
+    const char *             fixed[]  = { "temb_t", "hidden_after_input", "layer0_sa_output" };
+    std::vector<std::string> names(fixed, fixed + 3);
+    for (int probe : probes) {
+        names.push_back("hidden_after_layer" + std::to_string(probe));
+    }
+    for (const std::string & name : names) {
+        struct ggml_tensor * t = ggml_graph_get_tensor(nar.graph, name.c_str());
+        if (!t) {
+            fprintf(stderr, "FATAL: probe tensor %s not found in graph\n", name.c_str());
+            return 1;
+        }
+        int64_t            n0 = t->ne[0];
+        int64_t            n1 = t->ne[1];
+        std::vector<float> buf((size_t) n0 * n1);
+        ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
+        if (n1 <= 1) {
+            fixtures.write("nar_exact/" + name, buf.data(), { (int) n0 });
+        } else {
+            fixtures.write("nar_exact/" + name, buf.data(), { (int) n1, (int) n0 });
+        }
+    }
+    fixtures.write("nar_exact/v_first_0", first.data(), { T_lat, nar.latent_dim });
+
+    nar_free(&nar);
+    qw3lm_kv_free(&kv);
+    fprintf(stderr, "[Dump-NAR] Exact recording done.\n");
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    // "exact" as the fourth argument records nar_exact/ (see record_exact);
+    // the switches must be set before ggml-vulkan looks at the device.
+    bool exact = argc > 4 && strcmp(argv[4], "exact") == 0;
+    if (exact) {
+        setenv("GGML_VK_DISABLE_INTEGER_DOT_PRODUCT", "1", 1);
+        setenv("GGML_VK_DISABLE_COOPMAT", "1", 1);
+    }
+
     // Force Vulkan0 backend device as required by the reference harness
     if (!backend_set_device("Vulkan0")) {
         fprintf(stderr, "FATAL: Vulkan0 backend device not found\n");
@@ -59,6 +222,10 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "[Dump-NAR] Model:   %s\n", model_path.c_str());
     fprintf(stderr, "[Dump-NAR] Request: %s\n", request_path.c_str());
     fprintf(stderr, "[Dump-NAR] OutDir:  %s\n", out_dir.c_str());
+
+    if (exact) {
+        return record_exact(model_path, out_dir);
+    }
 
     // Parse the JSON request
     Yue2Request req;

@@ -1,0 +1,45 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// YuE2's queries and keys between their product and the attention, in place
+// and in one pass: each head's RMS norm times its weight, then the NeoX
+// rotation ggml's rope mode 2 applies, which turns element i with element
+// i + 64 (flux3_qkrope.comp turns 2i with 2i + 1). The table holds a token's
+// 64 cosines then 64 sines. The queries and the keys share a row stride, the
+// product's, and differ in their head counts (16 and 8). One wave of sixty-four
+// a head of a token, a pair a thread; the queries' heads first, then the keys'.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint q, k, stride;      // a token's stride, both
+    uint qHeads, kHeads, tokens;
+    uint table;
+    uint qWeight, kWeight;  // in the parameters
+    float eps;
+} p;
+
+void main() {
+    uint row = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 4u + gl_SubgroupID;
+    uint qRows = p.tokens * p.qHeads;
+    if (row >= qRows + p.tokens * p.kHeads) return;
+    bool isK = row >= qRows;
+    if (isK) row -= qRows;
+    uint heads = isK ? p.kHeads : p.qHeads;
+    uint tok = row / heads, head = row % heads;
+    uint i = gl_SubgroupInvocationID;
+    uint at = (isK ? p.k : p.q) + tok * p.stride + head * 128u + i;
+    float x0 = a[at], x1 = a[at + 64u];
+    float inv = inversesqrt(subgroupAdd(x0 * x0 + x1 * x1) / 128.0 + p.eps);
+    uint wt = isK ? p.kWeight : p.qWeight;
+    x0 *= inv * par[wt + i];
+    x1 *= inv * par[wt + 64u + i];
+    float c = a[p.table + tok * 128u + i];
+    float s = a[p.table + tok * 128u + 64u + i];
+    a[at] = c * x0 - s * x1;
+    a[at + 64u] = s * x0 + c * x1;
+}

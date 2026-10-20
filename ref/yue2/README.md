@@ -82,7 +82,33 @@ Outputs are written under `testdata/yue2/nar/` and `testdata/yue2/rng/` with sha
    - `nar/v_first_0`, `nar/v_second_0`: `[100, 64]` first and second (midpoint) velocity evaluations of step 0.
    - `nar/xt_{0,1,7,31}`: `[100, 64]` ODE state after step k.
    - `nar/latent`: `[100, 64]` final latents after 32 midpoint steps.
-3. Standalone CPU RNG validation:
+3. The first velocity evaluation again, with yue2.cpp's products in float32
+   (`dump_nar ... exact`, a second run after the default one, which it reads):
+   - `nar_exact/temb_t`, `nar_exact/hidden_after_input`, `nar_exact/layer0_sa_output`,
+     `nar_exact/hidden_after_layer{0,7,14,21,27}`, `nar_exact/v_first_0`: the probes
+     above, same shapes, same noise, same prefix (`kv_all_{k,v}.f16` are loaded into
+     the cache rather than prefilled again).
+   - At its default settings ggml-vulkan quantizes the activations of every product
+     against Q8_0 weights to Q8_1 (an fp16 scale and an int8 a value, blocks of 32),
+     because this card has integer dot products. That alone puts the default
+     `nar/hidden_after_input` 0.34% away from the exact sum of its noise and its
+     Q8_0 weights. The exact run starts with `GGML_VK_DISABLE_INTEGER_DOT_PRODUCT`
+     and `GGML_VK_DISABLE_COOPMAT` set (the int8 matrix cores are the other route to
+     Q8_1) and every `MUL_MAT` at `GGML_PREC_F32`. Its products then take fp16
+     operands (the Q8_0 weights dequantized to fp16, the activations rounded to
+     fp16) and sum in float32: a float64 sum over those operands lands 0.0000% from
+     `nar_exact/hidden_after_input`, and 0.0133% with the noise left in float32.
+     This is the recording an engine with fp16 operands and float32 sums is held to.
+
+```sh
+systemd-run --user --scope -q -p MemoryMax=14G -p MemorySwapMax=2G \
+    /mnt/data/golem-testdata/yue2/build-ref/dump_nar \
+    /mnt/data/LLMs_models/Serveurperso/YuE2-GGUF/YuE2-3B-Q8_0.gguf \
+    ref/yue2/requests/nar-short.json \
+    /mnt/data/golem-testdata/yue2 exact
+```
+
+4. Standalone CPU RNG validation:
    - `rng/normal_37`: `[37]` values from torch_cpu_randn(seed, 37).
    - `rng/normal_6400`: `[6400]` values from torch_cpu_randn(seed, 6400), matching flattened `nar/noise`.
 
