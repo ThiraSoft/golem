@@ -188,3 +188,68 @@ func (c *K2Yue2Cache) Close() {
 		c.buf = nil
 	}
 }
+
+// AddWeightRows is AddWeights for a tensor of rows rows of rowBytes the
+// caller writes itself: fill(dst, first, n) writes rows first .. first+n-1
+// into dst, which is a staging buffer on its way to the card. It returns the
+// tensor's handle.
+//
+// It is for weights converted on the way, YuE2's NAR half widened from Q8_0
+// to fp16: written into a slice and then uploaded, the conversion and the
+// transfer ran one after the other, and the slices, two and a half
+// gigabytes of them, were memory the process faulted in once for nothing.
+// Here fill writes the next chunk while the card reads the last one, through
+// the device's staging pair and the handshake CopyInto uses.
+func (k *K2) AddWeightRows(rows, rowBytes int, fill func(dst []byte, first, n int)) (int, error) {
+	if rows < 1 || rowBytes < 1 || rowBytes > stageChunk-16 {
+		return 0, fmt.Errorf("vk: %d rows of %d bytes", rows, rowBytes)
+	}
+	d := k.d
+	stage, err := d.staging()
+	if err != nil {
+		return 0, err
+	}
+	// The products read sixteen bytes at a time, as addWeights pads for.
+	size := (rows*rowBytes + 15) / 16 * 16
+	dst, err := d.newBuffer(uint64(size), bufferUsageStorage|bufferUsageTransferDst, memoryDeviceLocal)
+	if err != nil {
+		return 0, err
+	}
+	// A chunk leaves room for the last one's padding.
+	per := (stageChunk - 16) / rowBytes
+	free := make(chan int, len(stage))
+	for i := range stage {
+		free <- i
+	}
+	type ready struct{ slot, first, bytes int }
+	filled := make(chan ready, 1)
+	go func() {
+		for first := 0; first < rows; first += per {
+			slot := <-free
+			n := min(per, rows-first)
+			bytes := n * rowBytes
+			buf := stage[slot].Bytes()
+			fill(buf[:bytes], first, n)
+			if first+n == rows {
+				// The padding is zeros, as addWeights's copy leaves it.
+				clear(buf[bytes : size-first*rowBytes])
+				bytes = size - first*rowBytes
+			}
+			filled <- ready{slot, first, bytes}
+		}
+		close(filled)
+	}()
+	var failed error
+	for r := range filled {
+		if failed == nil {
+			failed = d.copyBuffer(stage[r.slot], dst, uint64(r.first*rowBytes), uint64(r.bytes))
+		}
+		free <- r.slot
+	}
+	if failed != nil {
+		dst.Close()
+		return 0, failed
+	}
+	k.weights = append(k.weights, dst)
+	return len(k.weights) - 1, nil
+}

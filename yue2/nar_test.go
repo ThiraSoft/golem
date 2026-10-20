@@ -1,10 +1,13 @@
 package yue2
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
 	"math/rand"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -236,4 +239,75 @@ func BenchmarkNARVelocity(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.Logf("one evaluation\n%s", rep)
+}
+
+// TestNarrowMatchesNN holds narrow to nn.FloatToHalf, bit for bit, on every
+// product a Q8_0 weight can be (each int8 times each fp16 scale, infinities
+// and NaNs included) and on a few million float32 bit patterns besides, for
+// the BF16 and F32 weights it narrows too; GOLEM_FULL_TEST checks all 2^32.
+func TestNarrowMatchesNN(t *testing.T) {
+	bad := 0
+	check := func(f float32) {
+		if got, want := narrow(f), nn.FloatToHalf(f); got != want && bad < 10 {
+			bad++
+			t.Errorf("narrow(%g = %#08x) = %#04x, nn.FloatToHalf %#04x", f, math.Float32bits(f), got, want)
+		}
+	}
+	for s := range 1 << 16 {
+		d := nn.Widen(uint16(s))
+		for q := -128; q < 128; q++ {
+			check(float32(q) * d)
+		}
+	}
+	rng := rand.New(rand.NewSource(3))
+	for range 4 << 20 {
+		check(math.Float32frombits(rng.Uint32()))
+	}
+	if !heavy.On() || testing.Short() {
+		return
+	}
+	// Every float32, over the cores, under GOLEM_FULL_TEST.
+	var wrong atomic.Int64
+	spread(1<<16, func(lo, hi int) {
+		for top := lo; top < hi; top++ {
+			for low := range 1 << 16 {
+				f := math.Float32frombits(uint32(top)<<16 | uint32(low))
+				if narrow(f) != nn.FloatToHalf(f) {
+					wrong.Add(1)
+				}
+			}
+		}
+	})
+	if n := wrong.Load(); n != 0 {
+		t.Errorf("%d of the 2^32 float32 patterns narrow differently", n)
+	}
+}
+
+// TestQ80RowsMatchNarrow holds narrowRow's Q8_0 rows, read through the
+// q80Halves table, to narrow itself: a row of eight blocks for every scale,
+// both signs and the infinities and NaNs included, whose bytes run through
+// all 256 values.
+func TestQ80RowsMatchNarrow(t *testing.T) {
+	q80 := q80Halves()
+	const cols = 256
+	data := make([]byte, cols/32*34)
+	m := Matrix{Quant: nn.Q8_0, Data: data, Rows: 1, Cols: cols}
+	out := make([]uint16, cols)
+	bad := 0
+	for s := range 1 << 16 {
+		for b := range cols / 32 {
+			binary.LittleEndian.PutUint16(data[34*b:], uint16(s))
+			for i := range 32 {
+				data[34*b+2+i] = byte(32*b + i)
+			}
+		}
+		narrowRow(&m, 0, out, q80)
+		d := nn.Widen(uint16(s))
+		for q := range cols {
+			if want := narrow(float32(int8(q)) * d); out[q] != want && bad < 10 {
+				bad++
+				t.Errorf("scale %#04x, byte %d: %#04x, narrow %#04x", s, q, out[q], want)
+			}
+		}
+	}
 }

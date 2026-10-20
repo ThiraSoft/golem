@@ -137,67 +137,81 @@ func newNAR(d *vk.Device, b *Backbone, maxFrames, maxPrefix, keys int) (*NAR, er
 		n.Close()
 		return nil, fmt.Errorf("yue2: NAR weights: %w", err)
 	}
-	upload := func(h *int, rows []uint16) error {
+	// Every weight goes to the card as fp16 rows, each widened from a row of
+	// one of the file's matrices on its way (vk.K2.AddWeightRows): row r of
+	// the tensor is row of src(r).
+	q80 := q80Halves()
+	upload := func(h *int, rows, cols int, src func(r int) (*Matrix, int)) error {
 		var err error
-		*h, err = k.AddWeights(unsafe.Slice((*byte)(unsafe.Pointer(&rows[0])), 2*len(rows)))
+		*h, err = k.AddWeightRows(rows, 2*cols, func(dst []byte, first, count int) {
+			out := unsafe.Slice((*uint16)(unsafe.Pointer(&dst[0])), len(dst)/2)
+			spread(count, func(lo, hi int) {
+				for i := lo; i < hi; i++ {
+					m, row := src(first + i)
+					narrowRow(m, row, out[i*cols:(i+1)*cols], q80)
+				}
+			})
+		})
 		return err
 	}
-	single := func(h *int, m Matrix) error {
-		rows, err := halves(m)
-		if err != nil {
+	single := func(h *int, m *Matrix) error {
+		if err := widenable(*m, m.Cols); err != nil {
 			return err
 		}
-		return upload(h, rows)
+		return upload(h, m.Rows, m.Cols, func(r int) (*Matrix, int) { return m, r })
 	}
 	for _, w := range []struct {
 		h *int
-		m Matrix
-	}{{&n.vae2llm, b.Vae2LLM}, {&n.llm2vae, b.LLM2Vae}, {&n.time0, b.Time0}, {&n.time1, b.Time1}} {
+		m *Matrix
+	}{{&n.vae2llm, &b.Vae2LLM}, {&n.llm2vae, &b.LLM2Vae}, {&n.time0, &b.Time0}, {&n.time1, &b.Time1}} {
 		if err := single(w.h, w.m); err != nil {
 			return fail(err)
 		}
 	}
+	// The gate's rows then the up's, in the runs of 32 the SwiGLU epilogue
+	// wants: the card's row c is the source row swiGLU[c].
+	swiGLU := make([]int, 2*ffn)
+	for r := range swiGLU {
+		swiGLU[vk.SwiGLURow(r, ffn)] = r
+	}
 	for l := range n.layers {
 		bl, nl := &b.NAR[l], &n.layers[l]
-		// q, k and v in one product, their rows stacked.
-		var qkv []uint16
-		for _, m := range []Matrix{bl.Q, bl.K, bl.V} {
-			rows, err := halves(m)
-			if err != nil {
+		for _, m := range []Matrix{bl.Q, bl.K, bl.V, bl.Gate, bl.Up} {
+			if err := widenable(m, dim); err != nil {
 				return fail(err)
 			}
-			qkv = append(qkv, rows...)
 		}
-		if err := upload(&nl.qkv, qkv); err != nil {
-			return fail(err)
+		if bl.Q.Rows != dim || bl.K.Rows != kvDim || bl.V.Rows != kvDim || bl.Gate.Rows != ffn || bl.Up.Rows != ffn {
+			return fail(fmt.Errorf("block %d: q, k, v of %d, %d, %d rows and a gate and up of %d, %d", l,
+				bl.Q.Rows, bl.K.Rows, bl.V.Rows, bl.Gate.Rows, bl.Up.Rows))
 		}
-		if err := single(&nl.o, bl.O); err != nil {
-			return fail(err)
-		}
-		// The gate's rows then the up's, in the runs of 32 the SwiGLU
-		// epilogue wants.
-		gate, err := halves(bl.Gate)
-		if err != nil {
-			return fail(err)
-		}
-		up, err := halves(bl.Up)
-		if err != nil {
-			return fail(err)
-		}
-		gu := make([]uint16, len(gate)+len(up))
-		for r := range 2 * ffn {
-			var src []uint16
-			if r < ffn {
-				src = gate[r*dim:]
-			} else {
-				src = up[(r-ffn)*dim:]
+		// q, k and v in one product, their rows stacked.
+		err := upload(&nl.qkv, dim+2*kvDim, dim, func(r int) (*Matrix, int) {
+			switch {
+			case r < dim:
+				return &bl.Q, r
+			case r < dim+kvDim:
+				return &bl.K, r - dim
 			}
-			copy(gu[vk.SwiGLURow(r, ffn)*dim:], src[:dim])
-		}
-		if err := upload(&nl.gateUp, gu); err != nil {
+			return &bl.V, r - dim - kvDim
+		})
+		if err != nil {
 			return fail(err)
 		}
-		if err := single(&nl.down, bl.Down); err != nil {
+		if err := single(&nl.o, &bl.O); err != nil {
+			return fail(err)
+		}
+		err = upload(&nl.gateUp, 2*ffn, dim, func(c int) (*Matrix, int) {
+			r := swiGLU[c]
+			if r < ffn {
+				return &bl.Gate, r
+			}
+			return &bl.Up, r - ffn
+		})
+		if err != nil {
+			return fail(err)
+		}
+		if err := single(&nl.down, &bl.Down); err != nil {
 			return fail(err)
 		}
 	}
@@ -207,15 +221,13 @@ func newNAR(d *vk.Device, b *Backbone, maxFrames, maxPrefix, keys int) (*NAR, er
 	return n, nil
 }
 
-// halves widens or narrows a weight matrix to fp16, row-major.
-func halves(m Matrix) ([]uint16, error) {
-	n := m.Rows * m.Cols
-	out := make([]uint16, n)
+// widenable says whether m is a matrix of cols columns narrowRow reads.
+func widenable(m Matrix, cols int) error {
 	var rowBytes int
 	switch m.Quant {
 	case nn.Q8_0:
 		if m.Cols%32 != 0 {
-			return nil, fmt.Errorf("a Q8_0 matrix of %d columns", m.Cols)
+			return fmt.Errorf("a Q8_0 matrix of %d columns", m.Cols)
 		}
 		rowBytes = m.Cols / 32 * 34
 	case nn.BF16, nn.F16:
@@ -223,49 +235,134 @@ func halves(m Matrix) ([]uint16, error) {
 	case nn.F32:
 		rowBytes = 4 * m.Cols
 	default:
-		return nil, fmt.Errorf("weights in %v", m.Quant)
+		return fmt.Errorf("weights in %v", m.Quant)
+	}
+	if m.Cols != cols {
+		return fmt.Errorf("a matrix of %d columns where %d are read", m.Cols, cols)
 	}
 	if len(m.Data) < rowBytes*m.Rows {
-		return nil, fmt.Errorf("%d bytes for %d rows of %d", len(m.Data), m.Rows, m.Cols)
+		return fmt.Errorf("%d bytes for %d rows of %d", len(m.Data), m.Rows, m.Cols)
 	}
-	row := func(r int) {
-		src, dst := m.Data[r*rowBytes:(r+1)*rowBytes], out[r*m.Cols:(r+1)*m.Cols]
-		switch m.Quant {
-		case nn.Q8_0:
-			for b := 0; b < m.Cols/32; b++ {
-				blk := src[34*b:]
-				d := nn.Widen(binary.LittleEndian.Uint16(blk))
-				for i := range 32 {
-					dst[32*b+i] = nn.Half(float32(int8(blk[2+i])) * d)
-				}
-			}
-		case nn.BF16:
-			for i := range dst {
-				dst[i] = nn.Half(math.Float32frombits(uint32(binary.LittleEndian.Uint16(src[2*i:])) << 16))
-			}
-		case nn.F16:
-			for i := range dst {
-				dst[i] = binary.LittleEndian.Uint16(src[2*i:])
-			}
-		case nn.F32:
-			for i := range dst {
-				dst[i] = nn.Half(math.Float32frombits(binary.LittleEndian.Uint32(src[4*i:])))
+	return nil
+}
+
+// q80Halves is narrow(float32(q) * d) for every q of a Q8_0 block and every
+// fp16 scale d of sign zero: entry s<<8 | byte(q) for the scale of bits s.
+// Narrowing commutes with the sign, so a negative scale's entry is its
+// magnitude's with the sign bit flipped, zeros included (q = 0 against a
+// negative scale is minus zero in float32, and narrows to 0x8000), for every
+// finite scale. Sixteen
+// megabytes, built in a few milliseconds over the cores, against 1.4 billion
+// products to narrow for the NAR half: a lookup and an exclusive or in place
+// of the rounding. TestQ80RowsMatchNarrow holds narrowRow to narrow on
+// every scale and byte.
+func q80Halves() []uint16 {
+	t := make([]uint16, 1<<15<<8)
+	spread(1<<15, func(lo, hi int) {
+		for s := lo; s < hi; s++ {
+			d := nn.Widen(uint16(s))
+			for q := range 256 {
+				t[s<<8|q] = narrow(float32(int8(q)) * d)
 			}
 		}
-	}
-	workers := runtime.GOMAXPROCS(0)
-	var wg sync.WaitGroup
-	for w := range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for r := w; r < m.Rows; r += workers {
-				row(r)
+	})
+	return t
+}
+
+// narrowRow writes row r of m into dst in fp16: a Q8_0 row as each int8
+// times its block's scale, rounded once (looked up in q80, q80Halves), the
+// others rounded from their own precision. widenable has checked m.
+func narrowRow(m *Matrix, r int, dst []uint16, q80 []uint16) {
+	switch m.Quant {
+	case nn.Q8_0:
+		rowBytes := m.Cols / 32 * 34
+		src := m.Data[r*rowBytes : (r+1)*rowBytes]
+		for b := 0; b < m.Cols/32; b++ {
+			blk := src[34*b : 34*b+34]
+			s := binary.LittleEndian.Uint16(blk)
+			q := blk[2:34]
+			out := dst[32*b : 32*b+32]
+			if s&0x7c00 == 0x7c00 {
+				// An infinite or NaN scale, which no quantizer writes: zero
+				// times infinity is a NaN whose sign the table's flip would
+				// get wrong, so these round as they are.
+				d := nn.Widen(s)
+				for i := range out {
+					out[i] = narrow(float32(int8(q[i])) * d)
+				}
+				continue
 			}
-		}()
+			table := q80[int(s&0x7fff)<<8:][:256]
+			sign := s & 0x8000
+			for i := range out {
+				out[i] = table[q[i]] ^ sign
+			}
+		}
+	case nn.BF16:
+		src := m.Data[r*2*m.Cols : (r+1)*2*m.Cols]
+		for i := range dst {
+			dst[i] = narrow(math.Float32frombits(uint32(binary.LittleEndian.Uint16(src[2*i:])) << 16))
+		}
+	case nn.F16:
+		src := m.Data[r*2*m.Cols : (r+1)*2*m.Cols]
+		for i := range dst {
+			dst[i] = binary.LittleEndian.Uint16(src[2*i:])
+		}
+	case nn.F32:
+		src := m.Data[r*4*m.Cols : (r+1)*4*m.Cols]
+		for i := range dst {
+			dst[i] = narrow(math.Float32frombits(binary.LittleEndian.Uint32(src[4*i:])))
+		}
+	}
+}
+
+// narrow is nn.FloatToHalf, rounding to the nearest fp16 with ties to even,
+// in the form of Fabian Giesen's float_to_half_fast3_rtne: the exponent
+// rebiased by an integer add and the rounding carried into it, with the
+// subnormals rounded by the float adder. nn's version branches on every
+// case, and widening the NAR half calls it 1.4 billion times.
+// TestNarrowMatchesNN holds the two to the same bits on every product of an
+// int8 and an fp16 scale.
+func narrow(f float32) uint16 {
+	u := math.Float32bits(f)
+	sign := u & 0x80000000
+	u ^= sign
+	var o uint32
+	switch {
+	case u >= (127+16)<<23: // past fp16's range: infinity, or NaN kept quiet
+		o = 0x7c00
+		if u > 0x7f800000 {
+			o = 0x7e00
+		}
+	case u < 113<<23: // an fp16 subnormal or zero, rounded by the adder
+		const magic = ((127 - 15) + (23 - 10) + 1) << 23
+		o = math.Float32bits(math.Float32frombits(u)+math.Float32frombits(magic)) - magic
+	default:
+		odd := u >> 13 & 1
+		u -= (127 - 15) << 23
+		u += 0xfff + odd
+		o = u >> 13
+	}
+	return uint16(o | sign>>16)
+}
+
+// spread runs work over [0, n) cut into one contiguous range a core.
+func spread(n int, work func(lo, hi int)) {
+	workers := min(runtime.GOMAXPROCS(0), n)
+	if workers <= 1 {
+		work(0, n)
+		return
+	}
+	var wg sync.WaitGroup
+	per := (n + workers - 1) / workers
+	for lo := 0; lo < n; lo += per {
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			work(lo, hi)
+		}(lo, min(lo+per, n))
 	}
 	wg.Wait()
-	return out, nil
 }
 
 // WeightBytes is what the weights hold on the card; CacheBytes the prefix
