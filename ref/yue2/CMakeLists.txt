@@ -40,3 +40,34 @@ set_target_properties(dump_vae PROPERTIES
     BUILD_RPATH "${YUE2_ROOT}/build"
     INSTALL_RPATH "${YUE2_ROOT}/build"
 )
+
+add_executable(dump_nar dump_nar.cpp ${YUE2_ROOT}/src/request.cpp)
+
+target_include_directories(dump_nar PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${YUE2_ROOT}/src
+    ${YUE2_ROOT}
+    ${YUE2_ROOT}/vendor/yyjson
+)
+target_include_directories(dump_nar SYSTEM PRIVATE
+    ${YUE2_ROOT}/ggml/include
+)
+
+target_link_directories(dump_nar PRIVATE
+    ${YUE2_ROOT}/build
+    ${YUE2_ROOT}/build/ggml/src
+)
+
+target_link_libraries(dump_nar PRIVATE
+    yyjson
+    ggml
+    ggml-base
+    ggml-cpu
+    ggml-vulkan
+    Threads::Threads
+)
+
+set_target_properties(dump_nar PROPERTIES
+    BUILD_RPATH "${YUE2_ROOT}/build"
+    INSTALL_RPATH "${YUE2_ROOT}/build"
+)

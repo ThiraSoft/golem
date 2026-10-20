@@ -66,6 +66,29 @@ struct Fixtures {
         fprintf(stderr, "Fixtures: wrote %s (%zu int32s)\n", name.c_str(), n);
     }
 
+    void write_f16(const std::string & name, const uint16_t * data, std::vector<int> shape) {
+        fs::path p = fs::path(dir) / name;
+        fs::create_directories(p.parent_path());
+
+        size_t n = 1;
+        for (int dim : shape) {
+            n *= (size_t) dim;
+        }
+
+        std::ofstream f(p, std::ios::binary);
+        if (!f.is_open()) {
+            fprintf(stderr, "Fixtures: cannot write %s\n", p.string().c_str());
+            exit(1);
+        }
+        f.write(reinterpret_cast<const char *>(data), (std::streamsize) (n * sizeof(uint16_t)));
+        if (!f) {
+            fprintf(stderr, "Fixtures: error writing %s\n", p.string().c_str());
+            exit(1);
+        }
+        shapes[name] = std::move(shape);
+        fprintf(stderr, "Fixtures: wrote %s (%zu f16s)\n", name.c_str(), n);
+    }
+
     ~Fixtures() {
         fs::path meta_path = fs::path(dir) / "meta.json";
         std::map<std::string, std::vector<int>> merged;

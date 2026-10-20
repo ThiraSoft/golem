@@ -53,6 +53,39 @@ Outputs are written to `testdata/yue2/` with shapes indexed in `testdata/yue2/me
    - `vae_tiled/latent`: `[600, 64]` time-major float32 input
    - `vae_tiled/audio`: `[2, 1151936]` planar stereo float32 waveform decoded by `vae_ggml_decode_tiled` with core 512, halo 16 (1920 * 600 - 64 samples per channel)
 
+## Fixture Recording (`dump_nar`)
+
+The NAR flow matching dumper runs on a short replay (first 100 semantic tokens of Guerreros):
+
+```sh
+systemd-run --user --scope -q -p MemoryMax=14G -p MemorySwapMax=2G \
+    /mnt/data/golem-testdata/yue2/build-ref/dump_nar \
+    /mnt/data/LLMs_models/Serveurperso/YuE2-GGUF/YuE2-3B-Q8_0.gguf \
+    ref/yue2/requests/nar-short.json \
+    /mnt/data/golem-testdata/yue2
+```
+
+Outputs are written under `testdata/yue2/nar/` and `testdata/yue2/rng/` with shapes in `testdata/yue2/meta.json`.
+
+### Recorded Stages
+
+1. AR sequence prefill into KV cache (3107 tokens: prefix 3006, 100 codes + offset 151853, music end 151852):
+   - `nar/ar_ids`: `[3107]` int32 token sequence.
+   - `nar/kv_k_l{0,13,27}`, `nar/kv_v_l{0,13,27}`: float32 `[3107, 8, 128]` position-major key/value cache rows (position, KV head, head dimension).
+   - `nar/kv_all_k.f16`, `nar/kv_all_v.f16`: raw little-endian IEEE 754 binary16 (2 bytes per element), shape `[28, 3107, 8, 128]` (layer, position, KV head, head dimension).
+2. Flow matching ODE midpoint solver (32 steps on 100 frames):
+   - `nar/noise`: `[100, 64]` initial standard normal noise (seed 9207606299741175932).
+   - `nar/temb_t`: `[2048]` timestep embedding of the first velocity call.
+   - `nar/hidden_after_input`: `[102, 2048]` row-major hidden state after input projection, timestep embedding, and position embedding.
+   - `nar/layer0_sa_output`: `[102, 2048]` self-attention output of layer 0.
+   - `nar/hidden_after_layer{0,7,14,21,27}`: `[102, 2048]` hidden states after the corresponding layers.
+   - `nar/v_first_0`, `nar/v_second_0`: `[100, 64]` first and second (midpoint) velocity evaluations of step 0.
+   - `nar/xt_{0,1,7,31}`: `[100, 64]` ODE state after step k.
+   - `nar/latent`: `[100, 64]` final latents after 32 midpoint steps.
+3. Standalone CPU RNG validation:
+   - `rng/normal_37`: `[37]` values from torch_cpu_randn(seed, 37).
+   - `rng/normal_6400`: `[6400]` values from torch_cpu_randn(seed, 6400), matching flattened `nar/noise`.
+
 ## Reference measured 2026-10-20 (yue-synth, Vulkan0, DPM auto, card idle)
 
 `ref/yue2/bench_yue2cpp.sh`, Guerreros request (style, lyrics, lm_seed,

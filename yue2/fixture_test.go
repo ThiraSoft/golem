@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -66,6 +67,20 @@ func (f *fixtures) readInt32(t testing.TB, name string) []int32 {
 	out := make([]int32, len(b)/4)
 	for i := range out {
 		out[i] = int32(binary.LittleEndian.Uint32(b[i*4:]))
+	}
+	return out
+}
+
+func (f *fixtures) readF16(t testing.TB, name string) []uint16 {
+	t.Helper()
+	f.shape(t, name)
+	b, err := os.ReadFile(filepath.Join(f.dir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make([]uint16, len(b)/2)
+	for i := range out {
+		out[i] = binary.LittleEndian.Uint16(b[i*2:])
 	}
 	return out
 }
@@ -139,20 +154,71 @@ func TestFixturesPresent(t *testing.T) {
 		"vae_f32acc/audio",
 		"vae_tiled/latent",
 		"vae_tiled/audio",
+		"nar/ar_ids",
+		"nar/kv_k_l0",
+		"nar/kv_k_l13",
+		"nar/kv_k_l27",
+		"nar/kv_v_l0",
+		"nar/kv_v_l13",
+		"nar/kv_v_l27",
+		"nar/kv_all_k.f16",
+		"nar/kv_all_v.f16",
+		"nar/noise",
+		"nar/temb_t",
+		"nar/hidden_after_input",
+		"nar/layer0_sa_output",
+		"nar/hidden_after_layer0",
+		"nar/hidden_after_layer7",
+		"nar/hidden_after_layer14",
+		"nar/hidden_after_layer21",
+		"nar/hidden_after_layer27",
+		"nar/v_first_0",
+		"nar/v_second_0",
+		"nar/xt_0",
+		"nar/xt_1",
+		"nar/xt_7",
+		"nar/xt_31",
+		"nar/latent",
+		"rng/normal_37",
+		"rng/normal_6400",
 	}
 	for _, req := range required {
 		if !f.has(req) {
 			t.Errorf("missing fixture: %s", req)
 			continue
 		}
-		data := f.read(t, req)
 		shape := f.shape(t, req)
 		expectedLen := 1
 		for _, dim := range shape {
 			expectedLen *= dim
 		}
-		if len(data) != expectedLen {
-			t.Errorf("%s: length %d != expected %d from shape %v", req, len(data), expectedLen, shape)
+		var gotLen int
+		if req == "nar/ar_ids" {
+			gotLen = len(f.readInt32(t, req))
+		} else if strings.HasSuffix(req, ".f16") {
+			gotLen = len(f.readF16(t, req))
+		} else {
+			gotLen = len(f.read(t, req))
+		}
+		if gotLen != expectedLen {
+			t.Errorf("%s: length %d != expected %d from shape %v", req, gotLen, expectedLen, shape)
+		}
+	}
+}
+
+func TestRNGFixtures(t *testing.T) {
+	f := loadFixtures(t)
+	if !f.has("rng/normal_6400") || !f.has("nar/noise") {
+		t.Skip("rng fixtures not present")
+	}
+	normal6400 := f.read(t, "rng/normal_6400")
+	noise := f.read(t, "nar/noise")
+	if len(normal6400) != len(noise) {
+		t.Fatalf("length mismatch: %d vs %d", len(normal6400), len(noise))
+	}
+	for i := range normal6400 {
+		if normal6400[i] != noise[i] {
+			t.Fatalf("mismatch at %d: %v vs %v", i, normal6400[i], noise[i])
 		}
 	}
 }
