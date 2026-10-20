@@ -63,7 +63,9 @@ ulimit -c 0; export HSA_ENABLE_COREDUMP=0
 ```
 
 The 4 MP stages are recorded apart, alone on the card and in a memory scope
-(ComfyUI's i2i alone takes about 21 GB of host memory). The photos they
+(ComfyUI's i2i alone takes about 21 GB of host memory), with
+`--use-pytorch-cross-attention`: split attention asks for 19 GiB in one call
+at 4 MP with a reference, past the card. The photos they
 read come from the main checkout's `/mnt/data/dev/ComfyUI/input/`:
 
 ```sh

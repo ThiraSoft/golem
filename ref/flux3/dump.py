@@ -44,9 +44,15 @@ STAGES = sys.argv[3:] or ["tokens", "sample", "sample_cfg", "vae", "i2i", "mi2i"
 
 sys.path.insert(0, COMFY)
 os.chdir(COMFY)
+# Split attention wants 19 GiB for one call at 4 MP with a reference, past
+# the card: the 4 MP stages use PyTorch's (scaled dot product) attention.
+FOUR_MP = {"t2i4", "i2i4", "mi2i4"}
+ATTENTION = "--use-pytorch-cross-attention" if FOUR_MP & set(STAGES) else "--use-split-cross-attention"
+if FOUR_MP & set(STAGES) and not set(STAGES) <= FOUR_MP:
+    sys.exit("dump.py: record the 4 MP stages apart from the others")
 sys.argv = [
     sys.argv[0],
-    "--use-split-cross-attention",
+    ATTENTION,
     "--fp16-text-enc",
     "--fp16-vae",
     "--disable-mmap",
