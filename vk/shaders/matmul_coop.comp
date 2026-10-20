@@ -427,6 +427,13 @@ uint  pwh2[WPT];
 // on eight.
 float pwm[WPT];
 #endif
+#ifdef Q80
+// Q8_0's thirty-two magnitudes are a byte each, twice what a Q4_0 block's
+// nibbles take, so the second sixteen ride in a register of their own. That
+// is the whole cost of the format here: no minimum, no high bits, and the
+// staging is a sign extension where the others unpack.
+uvec4 pw2[WPT];
+#endif
 uvec4 plo[APT], phi[APT];
 float pas[APT];
 
@@ -462,6 +469,9 @@ void prefetch(uint kb) {
 #endif
 #ifdef Q6K
             pwh2[i] = 0u;
+#endif
+#ifdef Q80
+            pw2[i] = uvec4(0u);
 #endif
 #if defined(Q5K) || defined(Q4K) || defined(Q6K) || defined(Q41) || defined(Q3K) || defined(Q2K)
             pwm[i] = 0.0;
@@ -592,6 +602,14 @@ void prefetch(uint kb) {
                 }
                 pws[i] = dm.x * float(sc);
                 pwm[i] = dm.y * float(mn);
+#elif defined(Q80)
+                // vk/mixture.go's splitQ8_0: Q4_0's layout with thirty-two
+                // bytes of magnitudes to a block instead of sixteen, the fp16
+                // scales first, so two dwordx4 and the same scale read.
+                uint at4  = (base + 2u * nb + 32u * b) >> 2;
+                pw[i]  = uvec4(w[at4], w[at4 + 1u], w[at4 + 2u], w[at4 + 3u]);
+                pw2[i] = uvec4(w[at4 + 4u], w[at4 + 5u], w[at4 + 6u], w[at4 + 7u]);
+                pws[i] = unpackHalf2x16(w[(base + 2u * b) >> 2])[b & 1u];
 #else
                 uint at4  = (base + 2u * nb + 16u * b) >> 2;
                 pw[i]  = uvec4(w[at4], w[at4 + 1u], w[at4 + 2u], w[at4 + 3u]);
@@ -689,7 +707,7 @@ void stageTile() {
         uint  wh2 = pwh2[i];
 #endif
         [[unroll]] for (uint u = 0u; u < 4u; u++) {
-#if !defined(Q3K) && !defined(Q2K) && !defined(PQ20) && !defined(PTQ10)
+#if !defined(Q3K) && !defined(Q2K) && !defined(PQ20) && !defined(PTQ10) && !defined(Q80)
             uint w0 = pw[i][u] & 0x0F0F0F0Fu;
             uint w1 = (pw[i][u] >> 4u) & 0x0F0F0F0Fu;
 #endif
@@ -772,6 +790,16 @@ void stageTile() {
             // format: a Q4_1 weight is q times its scale *plus* its minimum.
             vec4 v0 = unpackUnorm4x8(w0) * 255.0 * ws + wm;
             vec4 v1 = unpackUnorm4x8(w1) * 255.0 * ws + wm;
+#elif defined(Q80)
+            // Signed bytes, extended as the activation's are below. Weights
+            // u*4 to u*4+3 are word u of the first register and the sixteen
+            // after them word u of the second, which is where the nibble
+            // formats' low and high halves land too.
+            int x0 = int(pw[i][u]), x1 = int(pw2[i][u]);
+            vec4 v0 = vec4(bitfieldExtract(x0, 0, 8), bitfieldExtract(x0, 8, 8),
+                           bitfieldExtract(x0, 16, 8), bitfieldExtract(x0, 24, 8)) * ws;
+            vec4 v1 = vec4(bitfieldExtract(x1, 0, 8), bitfieldExtract(x1, 8, 8),
+                           bitfieldExtract(x1, 16, 8), bitfieldExtract(x1, 24, 8)) * ws;
 #else
             vec4 v0 = (unpackUnorm4x8(w0) * 255.0 - 8.0) * ws;
             vec4 v1 = (unpackUnorm4x8(w1) * 255.0 - 8.0) * ws;
@@ -865,6 +893,8 @@ void main() {
     rowBytes  = ((nb >> 3) * 114u + 3u) & ~3u;
 #elif defined(Q2K)
     rowBytes  = (nb >> 3) * 84u;
+#elif defined(Q80)
+    rowBytes  = nb * 34u;
 #else
     rowBytes  = nb * 18u;
 #endif

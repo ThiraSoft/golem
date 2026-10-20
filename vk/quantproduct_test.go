@@ -249,3 +249,102 @@ func quantProductOnCard(tb testing.TB, d *Device, m nn.Matrix, q []uint32, scale
 	copy(out, y.Floats()[:m.Rows])
 	return out
 }
+
+// TestQ80TiledMatchesCPU is the Q8_0 member of the tiled family through the
+// door a stack uses (newQuantProducts), at every width it is built for and
+// with the shared dimension cut in one and in four, which is what attention's
+// output and the feed forward's down projection take on a row-poor matrix.
+//
+// Random bytes are enough for this format, unlike the K-quants: a Q8_0 block
+// is one fp16 scale and thirty-two signed bytes, with no packed scales or
+// minima a quantizer's narrow range could hide a misreading of. The row count
+// is a multiple of sixteen and not of the hundred and twenty-eight a
+// workgroup writes, so the last tile of rows is a partial one.
+func TestQ80TiledMatchesCPU(t *testing.T) {
+	d := open(t)
+	defer d.Close()
+	if !d.Coopmat() {
+		t.Skip("no cooperative matrices on this device")
+	}
+	const rows, cols = 400, 1024
+	rng := rand.New(rand.NewSource(80))
+	data := make([]byte, rows*cols/nn.QuantBlock*34)
+	rng.Read(data)
+	m := nn.Matrix{Data: data, Quant: nn.Q8_0, Rows: rows, Cols: cols}
+	sane(t, m, rng)
+	layout, err := quantLayout(m.Quant, m.Data, m.Rows, m.Cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	products := newQuantProducts(d, true)
+	defer products.Close()
+	pipe, err := products.get(nn.Q8_0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := d.Upload(layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	for _, columns := range []int{32, 64, 128, 256, 512} {
+		for _, split := range []int{1, 4} {
+			t.Run(itoa(columns)+"/split"+itoa(split), func(t *testing.T) {
+				batch := columnsOf(m.Cols, columns)
+				want := kQuantAgainstQ8_0(m, batch, columns)
+				q, scales := q80Batch(batch, m.Cols, columns)
+				aq, err := d.Upload(unsafe.Slice((*byte)(unsafe.Pointer(&q[0])), len(q)*4))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer aq.Close()
+				as, err := d.Upload(asBytes(scales))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer as.Close()
+				y, err := d.Readback(split*columns*rows*4, bufferUsageStorage)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer y.Close()
+				set, err := pipe.NewSet([]*Buffer{w, aq, as, y})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer set.Close()
+				push := moePush{dim: rows, ffn: cols, used: 1, split: uint32(split)}
+				groups := coopProductGroups(true, columns, rows) * uint32(split)
+				if err := d.Submit(func(r *Recorder) {
+					r.DispatchWide(set, columns, groups, unsafe.Pointer(&push))
+				}); err != nil {
+					t.Fatal(err)
+				}
+				// The slices of a split product are as wide as the binary,
+				// one after another; the stack folds them on the card.
+				floats := y.Floats()
+				var worst, scale float64
+				var atCol, atRow int
+				for c := 0; c < columns; c++ {
+					for i := 0; i < rows; i++ {
+						var got float32
+						for k := 0; k < split; k++ {
+							got += floats[(k*columns+c)*rows+i]
+						}
+						scale = math.Max(scale, math.Abs(float64(want[c][i])))
+						if gap := math.Abs(float64(got - want[c][i])); gap > worst {
+							worst, atCol, atRow = gap, c, i
+						}
+					}
+				}
+				// The K-quants' tiled bar: the mat-vec's tenth of a per cent,
+				// doubled for the fp16 a weight is staged as.
+				if worst > 2e-3*scale {
+					t.Fatalf("column %d row %d: %g of a peak of %g", atCol, atRow, worst, scale)
+				}
+				t.Logf("%d rows by %d columns, worst gap %g of a peak of %g", rows, columns, worst, scale)
+			})
+		}
+	}
+}
