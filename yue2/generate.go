@@ -12,8 +12,10 @@ type Generation struct {
 	Truncated bool
 }
 
-// errCancelled is what Generate returns when cancel says so.
-var errCancelled = errors.New("yue2: generation cancelled")
+// ErrCancelled is what a stage returns, wrapped or as it is, when its cancel
+// function says so: Generate between tokens, NAR.Solve between steps, the
+// VAE between tiles and Pipeline.Generate between stages.
+var ErrCancelled = errors.New("yue2: cancelled")
 
 // Generate is yue2.cpp's yue2_generate (src/generate.h) for one song: prefill
 // prefix into slot 0 (and negative into slot 1 when guidance is not one),
@@ -77,7 +79,7 @@ func Generate(ar *AR, prefix, negative []int32, guidance float32, s Sampling, se
 	var candidates []Candidate
 	for step := 0; ; step++ {
 		if cancel != nil && cancel() {
-			return g, errCancelled
+			return g, ErrCancelled
 		}
 		var token int32
 		if owed < 0 {

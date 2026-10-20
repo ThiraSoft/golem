@@ -73,6 +73,13 @@ type NAR struct {
 // NewNAR puts b's NAR half on d, with an arena for up to maxFrames frames and
 // a cache for a prefix of up to maxPrefix keys.
 func NewNAR(d *vk.Device, b *Backbone, maxFrames, maxPrefix int) (*NAR, error) {
+	return newNAR(d, b, maxFrames, maxPrefix, maxPrefix+maxFrames+2)
+}
+
+// newNAR is NewNAR with a cache of keys rows, which a prefix and the block
+// behind it share: the pipeline's chunks are long prefixes with short blocks
+// or the other way round, never both, and the context bounds their sum.
+func newNAR(d *vk.Device, b *Backbone, maxFrames, maxPrefix, keys int) (*NAR, error) {
 	cfg := b.Cfg
 	if cfg.HeadDim != 128 || cfg.Heads*cfg.HeadDim != cfg.Dim || cfg.Heads%cfg.KVHeads != 0 {
 		return nil, fmt.Errorf("yue2: NAR of %d heads of %d over %d, which the attention does not take", cfg.Heads, cfg.HeadDim, cfg.Dim)
@@ -194,7 +201,7 @@ func NewNAR(d *vk.Device, b *Backbone, maxFrames, maxPrefix int) (*NAR, error) {
 			return fail(err)
 		}
 	}
-	if n.cache, err = k.NewYue2Cache(cfg.Layers, cfg.KVHeads, maxPrefix+maxN); err != nil {
+	if n.cache, err = k.NewYue2Cache(cfg.Layers, cfg.KVHeads, keys); err != nil {
 		return fail(err)
 	}
 	return n, nil
@@ -512,6 +519,9 @@ func (n *NAR) prepareTables(frames int) error {
 	if frames < 1 || frames > n.maxFrames {
 		return fmt.Errorf("yue2: %d frames, past the %d the arena holds", frames, n.maxFrames)
 	}
+	if n.arLen+frames+2 > n.cache.Rows() {
+		return fmt.Errorf("yue2: %d frames behind a prefix of %d, past the %d keys the cache holds", frames, n.arLen, n.cache.Rows())
+	}
 	tokens := frames + 2
 	if n.tables != frames {
 		if err := n.k.Write(int(n.pos), frameEmbedding(tokens, n.cfg.Dim)); err != nil {
@@ -653,7 +663,7 @@ func (n *NAR) solveWithHook(noise []float32, frames, steps int, cancel func() bo
 
 	for step := range steps {
 		if cancel != nil && cancel() {
-			return nil, fmt.Errorf("yue2: solve cancelled at step %d", step)
+			return nil, fmt.Errorf("%w: the flow at step %d of %d", ErrCancelled, step, steps)
 		}
 		t := float32(1.0) - float32(step)*dt
 		rawT := logitClamped(t)

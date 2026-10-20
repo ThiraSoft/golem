@@ -225,3 +225,55 @@ Facts these runs establish:
   by **34.8 dB** on the wav16; Q8_0 replay against BF16 replay is
   **25.8 dB**. These bracket what "the same audio" can mean between two
   engines; golem's replay SNR is reported against them.
+
+## Fixture Recording (`yue-synth` and `dump_audio`)
+
+The whole pipeline is recorded with yue2.cpp's own CLI, no dumper of its own:
+`ref/yue2/requests/pipeline-short.json` is `nar-short.json` (the first 100
+codes of the Guerreros replay, its score, its seeds) with `output_format`
+`wav32`, the decoder's float audio written as it is, without normalization.
+
+```sh
+Y=/mnt/data/dev/musicbench/yue2 M=/mnt/data/LLMs_models/Serveurperso/YuE2-GGUF O=/mnt/data/golem-testdata/yue2/pipeline
+synth() { systemd-run --user --scope -q -p MemoryMax=14G -p MemorySwapMax=2G \
+    $Y/build/yue-synth --device Vulkan0 --model $M/YuE2-3B-Q8_0.gguf --vae $M/YuE2-Vae-F32.gguf \
+    --request ref/yue2/requests/pipeline-short.json "$@"; }
+synth --out $O/short.wav --latent $O/short.vae --tokens $O/short.tokens.csv
+synth --max-seq 3150 --out $O/chunks.wav --latent $O/chunks.vae
+GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1 GGML_VK_DISABLE_COOPMAT=1 \
+    synth --out $O/short_exact.wav --latent $O/short_exact.vae
+```
+
+`dump_audio` (no ggml: `audio-io.h` is header-only) turns each render into
+fixtures, and with `normalize` records yue2.cpp's output stage on the short
+render's audio:
+
+```sh
+D=/mnt/data/golem-testdata/yue2/build-ref/dump_audio F=/mnt/data/golem-testdata/yue2
+$D $F short $O/short.wav $O/short.vae normalize
+$D $F chunks $O/chunks.wav $O/chunks.vae
+$D $F short_exact $O/short_exact.wav $O/short_exact.vae
+```
+
+### Recorded Stages
+
+1. `pipeline/{short,chunks,short_exact}/audio`: `[2, 191936]` planar stereo float32,
+   the decoder's output (1920 * 100 - 64 samples a channel), and
+   `pipeline/{short,chunks,short_exact}/latent`: `[100, 64]` time-major latents.
+   - `short` is yue-synth at its whole context: one chunk of 100 frames. Its
+     latents are `nar/latent` byte for byte.
+   - `chunks` is `--max-seq 3150`: the prefix of 3006 leaves chunks of
+     (3150 - 3006 - 3) / 2 = 70 frames, so the song takes two, 70 and 30, the
+     second prefilling its 30 codes and the end token behind the prefix.
+   - `short_exact` is `short` with the integer dot products and the matrix cores
+     off. At its defaults ggml-vulkan rounds every activation entering a Q8_0
+     product to Q8_1 (see `nar_exact/` above); with both off, the products take
+     fp16 operands and sum in float32, as golem's do. The two yue2.cpp renders
+     are 39.33 dB apart on the latents and 28.53 dB on the audio: that is
+     yue2.cpp's own arithmetic noise on this replay, and the reason the
+     pipeline's 30 dB audio bar is held against `short_exact`.
+2. `normalize/out_{0,10,999}`: `[2, 191936]`, `pipeline/short/audio` through
+   `audio_normalize` at those `peak_clip` values.
+3. `normalize/wav16`, `normalize/wav24`: the raw bytes of `audio_encode_wav` over
+   `normalize/out_10` (the shape is the byte count); `normalize/wav32`: over the
+   unnormalized audio, which is `pipeline/short.wav` byte for byte.

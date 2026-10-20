@@ -134,3 +134,16 @@ set_target_properties(dump_ar PROPERTIES
     BUILD_RPATH "${YUE2_ROOT}/build"
     INSTALL_RPATH "${YUE2_ROOT}/build"
 )
+
+# The output stage needs no ggml: audio-io.h is header-only.
+add_executable(dump_audio dump_audio.cpp)
+
+target_include_directories(dump_audio PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${YUE2_ROOT}/src
+    ${YUE2_ROOT}
+)
+
+target_link_libraries(dump_audio PRIVATE
+    Threads::Threads
+)

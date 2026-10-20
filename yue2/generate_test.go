@@ -1,6 +1,7 @@
 package yue2
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 )
@@ -47,7 +48,7 @@ func TestGenerateForced(t *testing.T) {
 	}
 	stop := 0
 	_, err = Generate(ar, prefix, nil, 1, s, arSeed, PhaseSemantic, forced, func() bool { stop++; return stop > 2 })
-	if err == nil {
-		t.Error("a cancelled generation came back without an error")
+	if !errors.Is(err, ErrCancelled) {
+		t.Errorf("a cancelled generation returned %v, want ErrCancelled", err)
 	}
 }

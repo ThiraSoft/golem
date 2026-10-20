@@ -301,6 +301,11 @@ func (v *VAE) Decode(latents []float32, frames int) ([]float32, error) {
 // DecodeTiled is Decode with tiles of core frames plus halo either side. At
 // core frames or fewer it decodes the whole in one.
 func (v *VAE) DecodeTiled(latents []float32, frames, core, halo int) ([]float32, error) {
+	return v.decodeTiled(latents, frames, core, halo, nil)
+}
+
+// decodeTiled is DecodeTiled asking cancel, when not nil, before every tile.
+func (v *VAE) decodeTiled(latents []float32, frames, core, halo int, cancel func() bool) ([]float32, error) {
 	if len(latents) < 64*frames {
 		return nil, fmt.Errorf("yue2: %d latents for %d frames", len(latents), frames)
 	}
@@ -310,6 +315,9 @@ func (v *VAE) DecodeTiled(latents []float32, frames, core, halo int) ([]float32,
 		core, halo = frames, 0
 	}
 	for start := 0; start < frames; start += core {
+		if cancel != nil && cancel() {
+			return nil, fmt.Errorf("%w: the decoder at frame %d of %d", ErrCancelled, start, frames)
+		}
 		end := min(start+core, frames)
 		left, right := max(start-halo, 0), min(end+halo, frames)
 		audio, err := v.tile(latents[64*left:], right-left)
