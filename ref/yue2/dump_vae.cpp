@@ -8,6 +8,144 @@
 #include <string>
 #include <vector>
 
+// record_untiled decodes the 64 frames of latent_64 in one graph and writes
+// its waypoints under dir, every product at GGML_PREC_F32 when f32acc is set.
+static bool record_untiled(VAEGGML & vae, Fixtures & fixtures, const std::vector<float> & latent_64,
+                           const std::string & dir, bool f32acc) {
+    int T_short = (int) latent_64.size() / 64;
+    // Build graph manually to mark waypoints as outputs
+    size_t ctx_size = ggml_tensor_overhead() * 1024 + ggml_graph_overhead_custom(8192, false);
+    uint8_t * graph_buf = (uint8_t *) malloc(ctx_size);
+    struct ggml_init_params p = { ctx_size, graph_buf, true };
+    struct ggml_context * ctx = ggml_init(p);
+
+    struct ggml_tensor * graph_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_short, 64);
+    ggml_set_name(graph_input, "vae_input");
+    ggml_set_input(graph_input);
+
+    // conv1: [T, 64] -> [T, 2048]
+    struct ggml_tensor * conv1_out = vae_conv1d(ctx, vae.c1w, vae.c1b, graph_input, 1, 3, 1);
+    ggml_set_name(conv1_out, "vae_conv1");
+    ggml_set_output(conv1_out);
+
+    struct ggml_tensor * x = conv1_out;
+    struct ggml_tensor * block_outs[6];
+    struct ggml_tensor * b0_ct = nullptr;
+    struct ggml_tensor * b0_ru[3] = {};
+
+    for (int i = 0; i < 6; i++) {
+        VAEBlock & b = vae.blk[i];
+        x = vae_snake(ctx, x, b.sa, b.sb);
+        int pad = (b.stride + 1) / 2;
+        x = vae_conv_t1d(ctx, b.ctw, b.ctb, x, b.stride, pad, b.out_ch);
+        if (i == 0) {
+            b0_ct = x;
+            ggml_set_name(b0_ct, "vae_b0_ct");
+            ggml_set_output(b0_ct);
+        }
+        for (int r = 0; r < 3; r++) {
+            x = vae_res_unit(ctx, &b.ru[r], x);
+            if (i == 0) {
+                b0_ru[r] = x;
+                std::string runame = "vae_b0_ru" + std::to_string(r);
+                ggml_set_name(x, runame.c_str());
+                ggml_set_output(x);
+            }
+        }
+        std::string bname = "vae_block_" + std::to_string(i);
+        ggml_set_name(x, bname.c_str());
+        ggml_set_output(x);
+        block_outs[i] = x;
+    }
+
+    x = vae_snake(ctx, x, vae.sa, vae.sb);
+    struct ggml_tensor * audio_out = vae_conv1d(ctx, vae.c2w, NULL, x, 1, 3, 1);
+    ggml_set_name(audio_out, "vae_audio");
+    ggml_set_output(audio_out);
+
+    struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8192, false);
+    for (int i = 0; i < 6; i++) {
+        ggml_build_forward_expand(graph, block_outs[i]);
+    }
+    ggml_build_forward_expand(graph, conv1_out);
+    ggml_build_forward_expand(graph, audio_out);
+    if (b0_ct) ggml_build_forward_expand(graph, b0_ct);
+    for (int r = 0; r < 3; r++) {
+        if (b0_ru[r]) ggml_build_forward_expand(graph, b0_ru[r]);
+    }
+
+    if (f32acc) {
+        for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+            struct ggml_tensor * n = ggml_graph_node(graph, i);
+            if (n->op == GGML_OP_MUL_MAT) ggml_mul_mat_set_prec(n, GGML_PREC_F32);
+        }
+    }
+
+    if (!ggml_backend_sched_alloc_graph(vae.sched, graph)) {
+        fprintf(stderr, "FATAL: graph alloc failed for T=64\n");
+        return false;
+    }
+
+    // Set input transposed to channel-major [T, 64]
+    std::vector<float> scratch_in((size_t) T_short * 64);
+    for (int c = 0; c < 64; c++) {
+        for (int t = 0; t < T_short; t++) {
+            scratch_in[c * T_short + t] = latent_64[t * 64 + c];
+        }
+    }
+    ggml_backend_tensor_set(graph_input, scratch_in.data(), 0, scratch_in.size() * sizeof(float));
+
+    // Compute graph
+    ggml_backend_sched_graph_compute(vae.sched, graph);
+
+    // Read back conv1
+    int conv1_oc = (int) conv1_out->ne[1]; // 2048
+    int conv1_ol = (int) conv1_out->ne[0]; // 64
+    std::vector<float> conv1_data((size_t) conv1_oc * conv1_ol);
+    ggml_backend_tensor_get(conv1_out, conv1_data.data(), 0, conv1_data.size() * sizeof(float));
+    fixtures.write(dir + "/conv1", conv1_data.data(), {conv1_oc, conv1_ol});
+
+    // Read back blocks 0..5
+    for (int i = 0; i < 6; i++) {
+        int oc = (int) block_outs[i]->ne[1];
+        int ol = (int) block_outs[i]->ne[0];
+        std::vector<float> blk_data((size_t) oc * ol);
+        ggml_backend_tensor_get(block_outs[i], blk_data.data(), 0, blk_data.size() * sizeof(float));
+        fixtures.write(dir + "/block_" + std::to_string(i), blk_data.data(), {oc, ol});
+    }
+
+    // Read back audio
+    int audio_oc = (int) audio_out->ne[1]; // 2
+    int audio_ol = (int) audio_out->ne[0]; // 122816
+    std::vector<float> audio_data((size_t) audio_oc * audio_ol);
+    ggml_backend_tensor_get(audio_out, audio_data.data(), 0, audio_data.size() * sizeof(float));
+    fixtures.write(dir + "/audio", audio_data.data(), {audio_oc, audio_ol});
+
+    if (b0_ct) {
+        int oc = (int) b0_ct->ne[1];
+        int ol = (int) b0_ct->ne[0];
+        std::vector<float> d((size_t) oc * ol);
+        ggml_backend_tensor_get(b0_ct, d.data(), 0, d.size() * sizeof(float));
+        fixtures.write(dir + "/b0_ct", d.data(), {oc, ol});
+    }
+    for (int r = 0; r < 3; r++) {
+        if (b0_ru[r]) {
+            int oc = (int) b0_ru[r]->ne[1];
+            int ol = (int) b0_ru[r]->ne[0];
+            std::vector<float> d((size_t) oc * ol);
+            ggml_backend_tensor_get(b0_ru[r], d.data(), 0, d.size() * sizeof(float));
+            fixtures.write(dir + "/b0_ru" + std::to_string(r), d.data(), {oc, ol});
+        }
+    }
+
+    // Clean up short graph
+    ggml_backend_sched_reset(vae.sched);
+    ggml_free(ctx);
+    free(graph_buf);
+
+    return true;
+}
+
 int main(int argc, char ** argv) {
     // Force Vulkan0 backend device as required by the reference harness
     if (!backend_set_device("Vulkan0")) {
@@ -72,94 +210,12 @@ int main(int argc, char ** argv) {
     memcpy(latent_64.data(), full_latent.data() + 1000 * 64, latent_64.size() * sizeof(float));
     fixtures.write("vae/latent", latent_64.data(), {T_short, 64});
 
-    // Build graph manually to mark waypoints as outputs
-    size_t ctx_size = ggml_tensor_overhead() * 1024 + ggml_graph_overhead_custom(8192, false);
-    uint8_t * graph_buf = (uint8_t *) malloc(ctx_size);
-    struct ggml_init_params p = { ctx_size, graph_buf, true };
-    struct ggml_context * ctx = ggml_init(p);
-
-    struct ggml_tensor * graph_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_short, 64);
-    ggml_set_name(graph_input, "vae_input");
-    ggml_set_input(graph_input);
-
-    // conv1: [T, 64] -> [T, 2048]
-    struct ggml_tensor * conv1_out = vae_conv1d(ctx, vae.c1w, vae.c1b, graph_input, 1, 3, 1);
-    ggml_set_name(conv1_out, "vae_conv1");
-    ggml_set_output(conv1_out);
-
-    struct ggml_tensor * x = conv1_out;
-    struct ggml_tensor * block_outs[6];
-
-    for (int i = 0; i < 6; i++) {
-        VAEBlock & b = vae.blk[i];
-        x = vae_snake(ctx, x, b.sa, b.sb);
-        int pad = (b.stride + 1) / 2;
-        x = vae_conv_t1d(ctx, b.ctw, b.ctb, x, b.stride, pad, b.out_ch);
-        for (int r = 0; r < 3; r++) {
-            x = vae_res_unit(ctx, &b.ru[r], x);
-        }
-        std::string bname = "vae_block_" + std::to_string(i);
-        ggml_set_name(x, bname.c_str());
-        ggml_set_output(x);
-        block_outs[i] = x;
-    }
-
-    x = vae_snake(ctx, x, vae.sa, vae.sb);
-    struct ggml_tensor * audio_out = vae_conv1d(ctx, vae.c2w, NULL, x, 1, 3, 1);
-    ggml_set_name(audio_out, "vae_audio");
-    ggml_set_output(audio_out);
-
-    struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8192, false);
-    for (int i = 0; i < 6; i++) {
-        ggml_build_forward_expand(graph, block_outs[i]);
-    }
-    ggml_build_forward_expand(graph, conv1_out);
-    ggml_build_forward_expand(graph, audio_out);
-
-    if (!ggml_backend_sched_alloc_graph(vae.sched, graph)) {
-        fprintf(stderr, "FATAL: graph alloc failed for T=64\n");
-        return 1;
-    }
-
-    // Set input transposed to channel-major [T, 64]
-    std::vector<float> scratch_in((size_t) T_short * 64);
-    for (int c = 0; c < 64; c++) {
-        for (int t = 0; t < T_short; t++) {
-            scratch_in[c * T_short + t] = latent_64[t * 64 + c];
-        }
-    }
-    ggml_backend_tensor_set(graph_input, scratch_in.data(), 0, scratch_in.size() * sizeof(float));
-
-    // Compute graph
-    ggml_backend_sched_graph_compute(vae.sched, graph);
-
-    // Read back conv1
-    int conv1_oc = (int) conv1_out->ne[1]; // 2048
-    int conv1_ol = (int) conv1_out->ne[0]; // 64
-    std::vector<float> conv1_data((size_t) conv1_oc * conv1_ol);
-    ggml_backend_tensor_get(conv1_out, conv1_data.data(), 0, conv1_data.size() * sizeof(float));
-    fixtures.write("vae/conv1", conv1_data.data(), {conv1_oc, conv1_ol});
-
-    // Read back blocks 0..5
-    for (int i = 0; i < 6; i++) {
-        int oc = (int) block_outs[i]->ne[1];
-        int ol = (int) block_outs[i]->ne[0];
-        std::vector<float> blk_data((size_t) oc * ol);
-        ggml_backend_tensor_get(block_outs[i], blk_data.data(), 0, blk_data.size() * sizeof(float));
-        fixtures.write("vae/block_" + std::to_string(i), blk_data.data(), {oc, ol});
-    }
-
-    // Read back audio
-    int audio_oc = (int) audio_out->ne[1]; // 2
-    int audio_ol = (int) audio_out->ne[0]; // 122816
-    std::vector<float> audio_data((size_t) audio_oc * audio_ol);
-    ggml_backend_tensor_get(audio_out, audio_data.data(), 0, audio_data.size() * sizeof(float));
-    fixtures.write("vae/audio", audio_data.data(), {audio_oc, audio_ol});
-
-    // Clean up short graph
-    ggml_backend_sched_reset(vae.sched);
-    ggml_free(ctx);
-    free(graph_buf);
+    // ggml-vulkan accumulates fp16 products in fp16 at the default precision
+    // on a card whose matrix cores offer it, which is yue2.cpp's arithmetic;
+    // the same graph with every product at GGML_PREC_F32 is the one that
+    // separates an engine's error from the reference's own.
+    if (!record_untiled(vae, fixtures, latent_64, "vae", false)) return 1;
+    if (!record_untiled(vae, fixtures, latent_64, "vae_f32acc", true)) return 1;
 
     // -------------------------------------------------------------
     // Stage 2: Tiled decode of frames 2000..2599 (T = 600)

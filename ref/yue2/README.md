@@ -40,6 +40,14 @@ Outputs are written to `testdata/yue2/` with shapes indexed in `testdata/yue2/me
    - `vae/block_4`: `[64, 61408]` channel-major float32 output of decoder block 4
    - `vae/block_5`: `[64, 122816]` channel-major float32 output of decoder block 5
    - `vae/audio`: `[2, 122816]` planar stereo float32 waveform (1920 * 64 - 64 samples per channel)
+   - `vae/b0_ct`: `[1024, 384]` block 0's transposed convolution, before its residual units
+   - `vae/b0_ru0`, `vae/b0_ru1`, `vae/b0_ru2`: `[1024, 384]` block 0 after each residual unit (`b0_ru2` is `block_0`)
+   - `vae_f32acc/...`: the same waypoints (`conv1`, `b0_ct`, `b0_ru0..2`, `block_0..5`, `audio`)
+     from the same graph with every `MUL_MAT` set to `GGML_PREC_F32`. At its default
+     precision ggml-vulkan accumulates fp16 products in fp16 on this card (the device
+     has fp16 accumulators on its matrix cores), which leaves yue2.cpp's own `conv1`
+     0.15% away from the exact sum of its fp16 operands; this recording is the one an
+     engine summing in float32 is held to. The operands stay fp16 (`im2col` to F16).
 
 2. Tiled VAE decode on a 600-frame window (frames 2000..2599 of `bench/q8-replay.vae`):
    - `vae_tiled/latent`: `[600, 64]` time-major float32 input

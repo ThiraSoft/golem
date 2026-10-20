@@ -1,0 +1,44 @@
+#version 450
+
+// The second half of YuE2's transposed convolution, ggml's col2im_1d: the
+// product wrote col[tIn][oc*K + k] = sum over ic of W[ic][oc][k] x[ic][tIn],
+// every input sample's contribution to the K outputs it reaches, and an
+// output sample t gathers those of every (tIn, k) with tIn*stride + k - pad
+// == t, then its bias. Both sides are time-major: out[t][oc] at dst + t*oc.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint col;    // floats, [tIn][oc*k]
+    uint dst;    // floats, [tOut][oc]
+    uint tIn;
+    uint tOut;
+    uint oc;
+    uint k;
+    uint stride;
+    uint pad;
+    uint bias;   // in the parameters; ~0 for none
+} p;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u;
+    if (idx >= p.tOut * p.oc) return;
+    uint c = idx % p.oc;
+    int t = int(idx / p.oc) + int(p.pad);
+    int s = int(p.stride);
+    // ceil((t - K + 1) / s), which the division would truncate towards zero
+    // for a negative numerator, but then the bound is zero anyway.
+    int first = max((t - int(p.k) + s) / s, 0);
+    int last = min(t / s, int(p.tIn) - 1);
+    uint koc = p.oc * p.k;
+    float sum = 0.0;
+    for (int i = first; i <= last; i++) {
+        sum += a[p.col + uint(i) * koc + c * p.k + uint(t - i * s)];
+    }
+    if (p.bias != ~0u) sum += par[p.bias + c];
+    a[p.dst + idx] = sum;
+}

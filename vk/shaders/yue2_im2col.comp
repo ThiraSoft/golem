@@ -1,0 +1,66 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// The operand of YuE2's convolutions, for krea2_mm.comp: X[t][ic*K + k] =
+// f(in[t + k*dil - pad][ic]), zero outside the signal, where f is SnakeBeta,
+// x + sin(ea*x)^2 * ieb with ea = exp(alpha) and ieb = 1/exp(beta) per
+// channel from the parameters, or nothing when snakeA is ~0. With K of one it
+// is the snake alone, which is what the transposed convolutions read.
+//
+// The activation is time-major, in[t][ic] at src + t*ic, which is how the
+// products write it. A thread takes one input sample, so that its snake is
+// worked out once, and writes it to the K places it lands in; the threads
+// span pad samples either side of the signal so that every padded place gets
+// its zero, the operand's room being shared by every product.
+//
+// With halves set, X is fp16 and dst and dstStride count halves, clamped to
+// fp16's range as krea2_norm.comp does; ggml's conv_1d im2cols to fp16 too.
+// Without, X is float32, which the tests read.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) buffer A { float a[]; };
+layout(std430, binding = 1) buffer AY { float16_t ay[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint src;       // in, floats, [t][ic]
+    uint dst;       // X, halves or floats
+    uint dstStride; // a row of X, halves or floats
+    uint tLen;
+    uint ic;
+    uint k;
+    uint dil;
+    uint pad;
+    uint snakeA;    // exp(alpha) in the parameters; ~0 for no snake
+    uint snakeB;    // 1/exp(beta) in the parameters
+    uint halves;
+} p;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u;
+    if (idx >= (p.tLen + 2u * p.pad) * p.ic) return;
+    uint c = idx % p.ic;
+    int ts = int(idx / p.ic) - int(p.pad);
+
+    float v = 0.0;
+    if (ts >= 0 && ts < int(p.tLen)) {
+        v = a[p.src + uint(ts) * p.ic + c];
+        if (p.snakeA != ~0u) {
+            float s = sin(par[p.snakeA + c] * v);
+            v += s * s * par[p.snakeB + c];
+        }
+    }
+    float16_t h = float16_t(clamp(v, -65504.0, 65504.0));
+    for (uint k = 0u; k < p.k; k++) {
+        int t = ts - int(k * p.dil) + int(p.pad);
+        if (t < 0 || t >= int(p.tLen)) continue;
+        uint at = p.dst + uint(t) * p.dstStride + c * p.k + k;
+        if (p.halves != 0u) {
+            ay[at] = h;
+        } else {
+            a[at] = v;
+        }
+    }
+}
