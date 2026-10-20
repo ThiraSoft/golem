@@ -260,7 +260,9 @@ type DiT struct {
 	embImgBuf uint32
 	imgOut    uint32
 
-	x, nh, q, kBuf, vBuf, att, out, mlp, half, table uint32
+	x, nh, q, kBuf, vBuf, att, mlp, half, table uint32
+	// zeroPar is ditWidth zeros in the parameters: the gated adds' second gate.
+	zeroPar uint32
 
 	ctxTokens [2]int
 	refTokens [2]int
@@ -410,6 +412,7 @@ func OpenDiTSized(d *vk.Device, path string, precision Precision, maxImageTokens
 	}
 
 	var par parBuffer
+	m.zeroPar = par.add(make([]float32, ditWidth))
 	vec := func(name string, n int) (uint32, error) {
 		t, err := tm.Get(name)
 		if err != nil {
@@ -727,7 +730,6 @@ func (m *DiT) layout(a *arena) {
 	m.kBuf = a.take(N * ditWidth)
 	m.vBuf = a.take(N * ditWidth)
 	m.att = a.take(N * ditWidth)
-	m.out = a.take(N * ditWidth)
 	m.mlp = a.take(mlpChunk * 2 * ditFFN)
 	m.table = a.take(N * ditHeadDim)
 }
@@ -1055,51 +1057,42 @@ func (m *DiT) recordBlock(r *vk.Recorder, b *ditBlock, tokens int, xOffset uint3
 		Heads: ditHeads, Seqs: 1, HeadDim: ditHeadDim,
 	})
 
-	// 6. Attention Out linear (float32 operand -> m.out, Mode: Store).
-	m.mm(r, b.attnOut.w, vk.K2MM{
-		Outputs: uint32(ditWidth), Inputs: uint32(ditWidth), Cols: toks,
-		X: m.att, XStride: uint32(ditWidth),
-		Y: m.out, YStride: uint32(ditWidth),
-		Bias: vk.K2None, Scale: b.attnOut.scale, Mode: vk.K2Store, XHalves: 0,
-	})
-
-	// 7-8. The MLP from nh, mlpChunk tokens at a time: MLP In, SwiGLU into
-	// half (fp16), MLP Out added to m.out.
-	for c0 := 0; c0 < tokens; c0 += mlpChunk {
-		cols := uint32(min(mlpChunk, tokens-c0))
-		m.mm(r, b.mlpIn.w, vk.K2MM{
-			Outputs: uint32(2 * ditFFN), Inputs: uint32(ditWidth), Cols: cols,
-			X: nhHalves + uint32(c0*ditWidth), XStride: uint32(ditWidth),
-			Y: m.mlp, YStride: uint32(2 * ditFFN),
-			Bias: vk.K2None, Scale: b.mlpIn.scale, Mode: vk.K2Store, XHalves: 1,
-		})
-		m.act(r, vk.K2Act{
-			X: m.mlp, XStride: uint32(2 * ditFFN),
-			Y: m.mlp + uint32(ditFFN), YStride: uint32(2 * ditFFN),
-			N: uint32(ditFFN), Rows: cols,
-			Op:  vk.K2SwiGLU,
-			Dst: 2 * m.half, DstStride: uint32(ditFFN), Halves: 1,
-		})
-		m.mm(r, b.mlpOut.w, vk.K2MM{
-			Outputs: uint32(ditWidth), Inputs: uint32(ditFFN), Cols: cols,
-			X: 2 * m.half, XStride: uint32(ditFFN),
-			Y: m.out + uint32(c0*ditWidth), YStride: uint32(ditWidth),
-			Bias: vk.K2None, Scale: b.mlpOut.scale, Mode: vk.K2Add, XHalves: 1,
-		})
-	}
-
-	// 9. Gated residual add for each span: x += out * gate.
+	// 6-9. Attention Out, then the MLP from nh mlpChunk tokens at a time
+	// (MLP In, SwiGLU into half as fp16, MLP Out), each added to x times its
+	// span's gate: x += g·(attn + mlp) as two gated adds, with no buffer
+	// between. Neither reads x, which the norm above was the last to read.
 	for _, sp := range spans {
-		rows := uint32(sp.end - sp.start)
-		xDst := xOffset + uint32(sp.start*ditWidth)
-		outSrc := m.out + uint32(sp.start*ditWidth)
 		gate := sp.modOffset + uint32(2*ditWidth)
-		m.flux3Gate(r, vk.K2Flux3Gate{
-			X: xDst, XStride: uint32(ditWidth),
-			Out: outSrc, OutStride: uint32(ditWidth),
-			Gate: gate,
-			N:    uint32(ditWidth), Rows: rows,
+		m.mm(r, b.attnOut.w, vk.K2MM{
+			Outputs: uint32(ditWidth), Inputs: uint32(ditWidth), Cols: uint32(sp.end - sp.start),
+			X: m.att + uint32(sp.start*ditWidth), XStride: uint32(ditWidth),
+			Y: xOffset + uint32(sp.start*ditWidth), YStride: uint32(ditWidth),
+			Bias: vk.K2None, Scale: b.attnOut.scale, Mode: vk.K2GatedAdd,
+			GateA: gate, GateB: m.zeroPar,
 		})
+		for c0 := sp.start; c0 < sp.end; c0 += mlpChunk {
+			cols := uint32(min(mlpChunk, sp.end-c0))
+			m.mm(r, b.mlpIn.w, vk.K2MM{
+				Outputs: uint32(2 * ditFFN), Inputs: uint32(ditWidth), Cols: cols,
+				X: nhHalves + uint32(c0*ditWidth), XStride: uint32(ditWidth),
+				Y: m.mlp, YStride: uint32(2 * ditFFN),
+				Bias: vk.K2None, Scale: b.mlpIn.scale, Mode: vk.K2Store, XHalves: 1,
+			})
+			m.act(r, vk.K2Act{
+				X: m.mlp, XStride: uint32(2 * ditFFN),
+				Y: m.mlp + uint32(ditFFN), YStride: uint32(2 * ditFFN),
+				N: uint32(ditFFN), Rows: cols,
+				Op:  vk.K2SwiGLU,
+				Dst: 2 * m.half, DstStride: uint32(ditFFN), Halves: 1,
+			})
+			m.mm(r, b.mlpOut.w, vk.K2MM{
+				Outputs: uint32(ditWidth), Inputs: uint32(ditFFN), Cols: cols,
+				X: 2 * m.half, XStride: uint32(ditFFN),
+				Y: xOffset + uint32(c0*ditWidth), YStride: uint32(ditWidth),
+				Bias: vk.K2None, Scale: b.mlpOut.scale, Mode: vk.K2GatedAdd, XHalves: 1,
+				GateA: gate, GateB: m.zeroPar,
+			})
+		}
 	}
 }
 
