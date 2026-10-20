@@ -112,6 +112,45 @@ systemd-run --user --scope -q -p MemoryMax=14G -p MemorySwapMax=2G \
    - `rng/normal_37`: `[37]` values from torch_cpu_randn(seed, 37).
    - `rng/normal_6400`: `[6400]` values from torch_cpu_randn(seed, 6400), matching flattened `nar/noise`.
 
+## Fixture Recording (`dump_tokens`)
+
+The token, prompt, Philox, and sampler dumper runs against the Q8_0 backbone and records
+tokenizer token IDs, assembled prompt sequences, Philox test cases, and sampled token draws:
+
+```sh
+systemd-run --user --scope -q -p MemoryMax=14G -p MemorySwapMax=2G \
+    /mnt/data/golem-testdata/yue2/build-ref/dump_tokens \
+    /mnt/data/LLMs_models/Serveurperso/YuE2-GGUF/YuE2-3B-Q8_0.gguf \
+    /mnt/data/golem-testdata/yue2/bench/guerreros-replay.json \
+    /mnt/data/dev/musicbench/yue2/tests/bpe-text.txt \
+    /mnt/data/golem-testdata/yue2
+```
+
+Outputs are written under `testdata/yue2/{tokens,prompt,philox,sample}/` with shapes in `testdata/yue2/meta.json`.
+
+### Recorded Stages
+
+1. BPE Tokenizer:
+   - `tokens/guerreros_request`: `[569]` int32 token IDs of the full Guerreros request conditioning text.
+   - `tokens/bpe_text`: `[254]` int32 token IDs of `tests/bpe-text.txt` covering contractions, decomposed/precomposed accents, and ABC notation.
+   - `tokens/guerreros_lyrics_nfd`: `[490]` int32 token IDs of the Guerreros lyrics decomposed to NFD.
+   - `tokens/guerreros_abc`: `[2433]` int32 token IDs of the replay ABC score.
+2. Prompt Sequences:
+   - `prompt/guerreros_full_with_abc`: `[3006]` int32 token sequence for full chain-of-thought with ABC.
+   - `prompt/guerreros_melody_no_abc`: `[572]` int32 token sequence for melody mode stopping at `ABC_START`.
+   - `prompt/guerreros_off`: `[563]` int32 token sequence for chain-of-thought off mode.
+   - `prompt/negative_off`: `[12]` int32 token sequence for unconditional stream with cot off.
+   - `prompt/negative_full_with_abc`: `[2457]` int32 token sequence for unconditional stream with full ABC score.
+3. Philox PRNG:
+   - `philox/counters`: `[8, 4]` int32 counters.
+   - `philox/seeds`: `[8, 2]` int32 key seeds.
+   - `philox/words`: `[8, 4]` int32 output words from `philox4x32_10`.
+4. Sampler:
+   - `sample/score_{0,1,2}_*`: score phase (3 steps) logits, history, candidates (IDs and scores), step index, and drawn token.
+   - `sample/semantic_{0,1,2}_*`: semantic phase (3 steps) logits, history, candidates, step index, and drawn token.
+   - `sample/penalty_window_*`: repetition penalty with synthetic history longer than the window.
+   - `sample/with_end_token_*`: score sampling at step >= min_tokens where `ABC_END` is eligible.
+
 ## Reference measured 2026-10-20 (yue-synth, Vulkan0, DPM auto, card idle)
 
 `ref/yue2/bench_yue2cpp.sh`, Guerreros request (style, lyrics, lm_seed,

@@ -53,8 +53,29 @@ type Vocab struct {
 	split func(string) []string
 }
 
+// Option configures how Load reads a tokenizer from a GGUF.
+type Option func(*loadConfig)
+
+type loadConfig struct {
+	defaultPre string
+}
+
+// WithDefaultPre provides a fallback pre-tokenizer name when the GGUF does not
+// specify tokenizer.ggml.pre, and defaults all token types to Normal if
+// tokenizer.ggml.token_type is absent.
+func WithDefaultPre(pre string) Option {
+	return func(c *loadConfig) {
+		c.defaultPre = pre
+	}
+}
+
 // Load reads the tokenizer from an already-open GGUF.
-func Load(g *tensors.GGUF) (*Vocab, error) {
+func Load(g *tensors.GGUF, opts ...Option) (*Vocab, error) {
+	var cfg loadConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	model, err := g.String("tokenizer.ggml.model")
 	if err != nil {
 		return nil, err
@@ -64,7 +85,11 @@ func Load(g *tensors.GGUF) (*Vocab, error) {
 	}
 	pre, err := g.String("tokenizer.ggml.pre")
 	if err != nil {
-		return nil, err
+		if cfg.defaultPre != "" {
+			pre = cfg.defaultPre
+		} else {
+			return nil, err
+		}
 	}
 	if !knownPre(pre) {
 		return nil, fmt.Errorf("pre-tokenizer %q is not one this package implements", pre)
@@ -76,7 +101,14 @@ func Load(g *tensors.GGUF) (*Vocab, error) {
 	}
 	rawKinds, err := g.Uint32Slice("tokenizer.ggml.token_type")
 	if err != nil {
-		return nil, err
+		if cfg.defaultPre != "" {
+			rawKinds = make([]uint32, len(texts))
+			for i := range rawKinds {
+				rawKinds[i] = uint32(Normal)
+			}
+		} else {
+			return nil, err
+		}
 	}
 	if len(rawKinds) != len(texts) {
 		return nil, fmt.Errorf("%d tokens but %d types", len(texts), len(rawKinds))

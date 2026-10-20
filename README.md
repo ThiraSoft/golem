@@ -247,7 +247,7 @@ If you ship Go and you need a model to run **on the machine your software alread
 
 That covers on-premise deployments, edge and embedded boxes, air-gapped machines, CI, and any product where "please install Python 3.11 first" is not a sentence to put in front of a customer. If you run models on your own workstation and a package manager is fine, [Ollama](https://ollama.com) is friendlier.
 
-**Why not bind to llama.cpp?** Because a cgo binding is no longer a static binary. It brings back the C toolchain and a build that breaks differently on every distribution. The price of leaving it out was a full set of kernels: AVX2 and NEON in Go assembly, Vulkan compute bound through `purego` at runtime rather than linked. Four dependencies in all, and `CGO_ENABLED=0 go build ./...` passes.
+**Why not bind to llama.cpp?** Because a cgo binding is no longer a static binary. It brings back the C toolchain and a build that breaks differently on every distribution. The price of leaving it out was a full set of kernels: AVX2 and NEON in Go assembly, Vulkan compute bound through `purego` at runtime rather than linked. Five dependencies in all, and `CGO_ENABLED=0 go build ./...` passes.
 
 ## How it is known to be right
 
