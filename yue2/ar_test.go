@@ -416,3 +416,46 @@ func BenchmarkARToken(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkARPrefill reads the 3006 positions of the Guerreros prompt, the
+// prompt TestARPrefill holds, against yue2.cpp's 216 ms; then where the last
+// pass's time goes, the widest and deepest one.
+func BenchmarkARPrefill(b *testing.B) {
+	heavy.Skip(b, "a measurement of the AR half")
+	fix := loadFixtures(b)
+	ar := sharedAR(b)
+	ids := fix.readInt32(b, "ar/prefix")
+	ar.Trim(0, 0)
+	if _, err := ar.Prefill(0, ids, PhaseSemantic); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for range b.N {
+		ar.Trim(0, 0)
+		if _, err := ar.Prefill(0, ids, PhaseSemantic); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.Elapsed().Microseconds())/1000/float64(b.N), "ms/prefill")
+
+	last := (len(ids) - 1) / ar.width * ar.width
+	ar.Trim(0, last)
+	tl, err := ar.stack.NewTimeline()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer tl.Close()
+	ar.stack.Profile(tl)
+	defer ar.stack.Profile(nil)
+	slots := make([]int, len(ids)-last)
+	start := time.Now()
+	if err := ar.run(ids[last:], slots); err != nil {
+		b.Fatal(err)
+	}
+	rep, err := tl.Report(time.Since(start))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Logf("the pass of positions %d to %d, %d wide\n%s", last, len(ids), len(ids)-last, rep)
+}

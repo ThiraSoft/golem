@@ -37,11 +37,12 @@ import (
 	"github.com/ThiraSoft/golem/vk"
 )
 
-// arPassColumns is the widest pass a prefill takes. The Q8_0 products have
-// no tiled form (vk/quantproduct.go), and a pass wider than eight columns
-// takes the tiled ladder (vk/attention.go passWidth), so a prompt is read
-// eight positions a pass.
-const arPassColumns = 8
+// arNarrowColumns is the widest pass a prefill takes on a card without
+// matrix cores. There the Q8_0 products have no tiled form
+// (vk/quantproduct.go), and a pass wider than eight columns takes the tiled
+// ladder (vk/attention.go passWidth), so a prompt is read eight positions a
+// pass. With matrix cores a pass is as wide as the stack carries.
+const arNarrowColumns = 8
 
 // AR is the autoregressive half on one device.
 type AR struct {
@@ -51,6 +52,8 @@ type AR struct {
 	embed   Matrix
 	context int
 	pos     []int
+	// width is the widest pass a prefill takes.
+	width int
 
 	// outs are the logits, one buffer a slot, which Prefill and Step hand
 	// back and overwrite.
@@ -87,7 +90,8 @@ func NewAR(d *vk.Device, b *Backbone, context, slots int) (*AR, error) {
 		return nil, fmt.Errorf("yue2: an embedding of %d and a head of %d over a stream of %d", b.Embed.Cols, b.Head.Cols, cfg.Dim)
 	}
 
-	a := &AR{cfg: cfg, embed: b.Embed, context: context, pos: make([]int, slots), outs: make([][]float32, slots)}
+	a := &AR{cfg: cfg, embed: b.Embed, context: context, pos: make([]int, slots), outs: make([][]float32, slots),
+		width: arNarrowColumns}
 	fail := func(err error) (*AR, error) {
 		a.Close()
 		return nil, err
@@ -140,6 +144,9 @@ func NewAR(d *vk.Device, b *Backbone, context, slots int) (*AR, error) {
 	}
 	if err := a.stack.Ready(); err != nil {
 		return fail(err)
+	}
+	if d.Coopmat() {
+		a.width = a.stack.Columns()
 	}
 
 	rowBytes := cfg.Dim / nn.QuantBlock * 34
@@ -290,7 +297,7 @@ func (a *AR) Prefill(slot int, ids []int32, p Phase) ([]float32, error) {
 	if a.pos[slot]+len(ids) > a.context {
 		return nil, fmt.Errorf("yue2: %d positions behind %d in a cache of %d", len(ids), a.pos[slot], a.context)
 	}
-	width := min(a.stack.Columns(), arPassColumns)
+	width := a.width
 	slots := make([]int, min(width, len(ids)))
 	for i := range slots {
 		slots[i] = slot

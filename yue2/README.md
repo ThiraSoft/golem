@@ -100,12 +100,15 @@ from yue-synth's log of the same request on the same card
 
 | | golem | yue2.cpp |
 |---|---|---|
-| Guerreros replay, 4870 frames (194.8 s of audio), one chunk | 29.2 s | 70.1 s, loads included |
-| of which the prefill of 7877 positions | 9.59 s | |
+| Guerreros replay, 4870 frames (194.8 s of audio), one chunk | 22.2 s | 70.1 s, loads included |
+| of which the prefill of 7877 positions | 2.59 s | |
 | of which the flow, 32 steps | 18.99 s | 65.9 s |
 | of which the decoder | 0.64 s | |
-| short replay, 100 frames | 3.88 s | |
+| short replay, 100 frames | 2.01 s | |
 
-The prefill reads eight positions a pass (no tiled Q8_0 product yet). A
-planned score is slow: the sampler sorts every candidate of the score
-window at every step, where yue2.cpp partially sorts the top k.
+The prefill takes passes of 512 positions through the tiled Q8_0 product
+on cards with matrix cores (eight a pass without). What is left of it is
+the attention: 80% of the last pass of a 3006-position prompt is the
+scores kernel (`BenchmarkARPrefill`, 0.42 s for that prompt against
+yue2.cpp's 216 ms). The sampler selects the top k of the score window with
+a heap rather than sorting it, 0.40 ms a step (`BenchmarkDistribution`).

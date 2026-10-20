@@ -154,13 +154,23 @@ func TestPipelineChunks(t *testing.T) {
 // TestPipelineChunks, and the render is held to the replay of the same
 // request, whose first chunk is prefilled whole: the same keys by another
 // road, so only the order of the sums may differ.
+//
+// That holds when the prefill takes the products a token takes, the integer
+// mat-vec, so the replay prefills eight positions a pass here. At 512 a pass
+// the prefill stages its weights in fp16 for the matrix cores (the tiled Q8_0
+// product), which is other arithmetic and not another order: the first
+// chunk's latents then land 38.3 dB from the sealed ones, the audio 52.6 dB.
+// yue2.cpp has the same split, coopmat fp16 for a prompt and integer dots
+// for a token.
 func TestPipelineSeal(t *testing.T) {
 	p := sharedPipeline(t)
 	r := shortRequest(t)
 	r.ABC = ""
 	prefix := BuildPrompt(p.tok, CotOff, r.Style, r.Lyrics, nil, false)
 	p.context = len(prefix) + 3 + 2*70
-	defer func() { p.context = pipelineContext }()
+	width := p.ar.width
+	p.ar.width = arNarrowColumns
+	defer func() { p.context, p.ar.width = pipelineContext, width }()
 	replay, err := p.Generate(r, nil)
 	if err != nil {
 		t.Fatal(err)
