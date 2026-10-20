@@ -786,28 +786,16 @@ func (m *DiT) mm(r *vk.Recorder, w int, mm vk.K2MM) {
 	m.timeline.Stamp(r, label)
 }
 
-func (m *DiT) norm(r *vk.Recorder, n vk.K2Norm) {
-	m.dispatch()
-	m.k.Norm(r, n)
-	m.timeline.Stamp(r, "qknorm")
-}
-
 func (m *DiT) flux3Norm(r *vk.Recorder, n vk.K2Flux3Norm) {
 	m.dispatch()
 	m.k.Flux3Norm(r, n)
 	m.timeline.Stamp(r, "norm")
 }
 
-func (m *DiT) flux3Gate(r *vk.Recorder, g vk.K2Flux3Gate) {
+func (m *DiT) qkrope(r *vk.Recorder, q vk.K2Flux3QKRope) {
 	m.dispatch()
-	m.k.Flux3Gate(r, g)
-	m.timeline.Stamp(r, "gate")
-}
-
-func (m *DiT) rope(r *vk.Recorder, p vk.K2Rope) {
-	m.dispatch()
-	m.k.Rope(r, p)
-	m.timeline.Stamp(r, "rope")
+	m.k.Flux3QKRope(r, q)
+	m.timeline.Stamp(r, "qkrope")
 }
 
 func (m *DiT) act(r *vk.Recorder, a vk.K2Act) {
@@ -1042,32 +1030,11 @@ func (m *DiT) recordBlock(r *vk.Recorder, b *ditBlock, tokens int, xOffset uint3
 		Bias: vk.K2None, Scale: b.v.scale, Mode: vk.K2Store, XHalves: 1,
 	})
 
-	// 3. QKNorm.
-	m.norm(r, vk.K2Norm{
-		Src: m.q, SrcStride: uint32(ditHeadDim),
-		Dst: m.q, DstStride: uint32(ditHeadDim),
-		N: uint32(ditHeadDim), Rows: toks * uint32(ditHeads),
-		Weight: b.qNorm, OnePlus: 0, Eps: ditEps,
-		ScaleA: vk.K2None,
-	})
-	m.norm(r, vk.K2Norm{
-		Src: m.kBuf, SrcStride: uint32(ditHeadDim),
-		Dst: m.kBuf, DstStride: uint32(ditHeadDim),
-		N: uint32(ditHeadDim), Rows: toks * uint32(ditHeads),
-		Weight: b.kNorm, OnePlus: 0, Eps: ditEps,
-		ScaleA: vk.K2None,
-	})
-
-	// 4. Rope.
-	m.rope(r, vk.K2Rope{
-		X: m.q, Stride: uint32(ditWidth),
-		Heads: uint32(ditHeads), Dim: uint32(ditHeadDim),
-		Tokens: toks, Table: ropeOffset,
-	})
-	m.rope(r, vk.K2Rope{
-		X: m.kBuf, Stride: uint32(ditWidth),
-		Heads: uint32(ditHeads), Dim: uint32(ditHeadDim),
-		Tokens: toks, Table: ropeOffset,
+	// 3-4. QKNorm and RoPE, one pass over both.
+	m.qkrope(r, vk.K2Flux3QKRope{
+		Q: m.q, K: m.kBuf, Stride: uint32(ditWidth),
+		Heads: uint32(ditHeads), Tokens: toks, Table: ropeOffset,
+		QWeight: b.qNorm, KWeight: b.kNorm, Eps: ditEps,
 	})
 
 	// 5. Attention.

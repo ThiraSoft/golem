@@ -39,6 +39,7 @@ import (
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_conv.comp -o shaders/krea2_conv.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/krea2_pix.comp -o shaders/krea2_pix.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_norm.comp -o shaders/flux3_norm.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_qkrope.comp -o shaders/flux3_qkrope.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_gate.comp -o shaders/flux3_gate.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_gstats.comp -o shaders/flux3_gstats.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/flux3_gnorm.comp -o shaders/flux3_gnorm.spv
@@ -99,6 +100,9 @@ var krea2PixSPIRV []byte
 //go:embed shaders/flux3_norm.spv
 var flux3NormSPIRV []byte
 
+//go:embed shaders/flux3_qkrope.spv
+var flux3QKRopeSPIRV []byte
+
 //go:embed shaders/flux3_gate.spv
 var flux3GateSPIRV []byte
 
@@ -136,6 +140,7 @@ const (
 	k2Pix
 	k2Flux3Norm
 	k2Flux3Gate
+	k2Flux3QKRope
 	k2Flux3GStats
 	k2Flux3GNorm
 	k2Flux3VAEUnpatch
@@ -307,6 +312,17 @@ type K2Flux3Gate struct {
 	N, Rows        uint32
 }
 
+// K2Flux3QKRope is the RMS norm of every head of 128 of the queries and the
+// keys, times their weights, then their rotary position from a table of a
+// token's 64 cosines then 64 sines, in place. See shaders/flux3_qkrope.comp.
+type K2Flux3QKRope struct {
+	Q, K, Stride     uint32
+	Heads, Tokens    uint32
+	Table            uint32
+	QWeight, KWeight uint32
+	Eps              float32
+}
+
 // K2Flux3GStats is pass 1 of GroupNorm with 32 groups.
 type K2Flux3GStats struct {
 	Src, Plane, CPG, GroupElems uint32
@@ -374,6 +390,7 @@ var k2Specs = [k2Kernels]struct {
 	k2Pix:             {&krea2PixSPIRV, unsafe.Sizeof(K2Pix{})},
 	k2Flux3Norm:       {&flux3NormSPIRV, unsafe.Sizeof(K2Flux3Norm{})},
 	k2Flux3Gate:       {&flux3GateSPIRV, unsafe.Sizeof(K2Flux3Gate{})},
+	k2Flux3QKRope:     {&flux3QKRopeSPIRV, unsafe.Sizeof(K2Flux3QKRope{})},
 	k2Flux3GStats:     {&flux3GStatsSPIRV, unsafe.Sizeof(K2Flux3GStats{})},
 	k2Flux3GNorm:      {&flux3GNormSPIRV, unsafe.Sizeof(K2Flux3GNorm{})},
 	k2Flux3VAEUnpatch: {&flux3VAEUnpatchSPIRV, unsafe.Sizeof(K2Flux3VAEPatch{})},
@@ -746,6 +763,10 @@ func (k *K2) Pix(r *Recorder, p K2Pix) {
 
 func (k *K2) Flux3Norm(r *Recorder, n K2Flux3Norm) {
 	k.dispatch(r, k2Flux3Norm, -1, int(n.Rows), unsafe.Pointer(&n))
+}
+
+func (k *K2) Flux3QKRope(r *Recorder, q K2Flux3QKRope) {
+	k.dispatch(r, k2Flux3QKRope, -1, int((2*q.Tokens*q.Heads+3)/4), unsafe.Pointer(&q))
 }
 
 func (k *K2) Flux3Gate(r *Recorder, g K2Flux3Gate) {

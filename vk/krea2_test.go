@@ -260,6 +260,46 @@ func TestK2ProductSwiGLU(t *testing.T) {
 	}
 }
 
+func TestK2Flux3QKRope(t *testing.T) {
+	r := rand.New(rand.NewSource(10))
+	const heads, tokens, stride = 3, 37, 3*128 + 32
+	q := randomFloats(r, tokens*stride, 2)
+	kk := randomFloats(r, tokens*stride, 2)
+	table := randomFloats(r, tokens*128, 1)
+	qw := randomFloats(r, 128, 0.5)
+	kw := randomFloats(r, 128, 0.5)
+	k := newK2(t, 2*tokens*stride+tokens*128, append(append([]float32{}, qw...), kw...))
+	k.Write(0, q)
+	k.Write(tokens*stride, kk)
+	k.Write(2*tokens*stride, table)
+	run(t, k, func(rec *Recorder) {
+		k.Flux3QKRope(rec, K2Flux3QKRope{Q: 0, K: tokens * stride, Stride: stride, Heads: heads, Tokens: tokens,
+			Table: 2 * tokens * stride, QWeight: 0, KWeight: 128, Eps: 1e-6})
+	})
+	got, _ := k.Read(0, 2*tokens*stride)
+	want := append(append([]float32{}, q...), kk...)
+	for which, w := range [][]float32{qw, kw} {
+		x := want[which*tokens*stride:]
+		for tok := 0; tok < tokens; tok++ {
+			for h := 0; h < heads; h++ {
+				v := x[tok*stride+h*128:][:128]
+				var ss float64
+				for _, e := range v {
+					ss += float64(e) * float64(e)
+				}
+				inv := 1 / math.Sqrt(ss/128+1e-6)
+				for i := 0; i < 64; i++ {
+					x0 := float64(v[2*i]) * inv * float64(w[2*i])
+					x1 := float64(v[2*i+1]) * inv * float64(w[2*i+1])
+					c, s := float64(table[tok*128+i]), float64(table[tok*128+64+i])
+					v[2*i], v[2*i+1] = float32(c*x0-s*x1), float32(s*x0+c*x1)
+				}
+			}
+		}
+	}
+	k2Compare(t, "qkrope", got, want, 1e-5)
+}
+
 func TestK2Norm(t *testing.T) {
 	r := rand.New(rand.NewSource(3))
 	rows, n := 37, 6144
