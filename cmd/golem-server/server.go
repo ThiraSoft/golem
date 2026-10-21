@@ -5,7 +5,7 @@ package main
 //
 // One model means one request at a time: a slot is held for the whole of an
 // answer and a second request waits for one. What several slots buy is the
-// cache, not the throughput — slots.go says how one is chosen, and there is
+// cache, not the throughput: slots.go says how one is chosen, and there is
 // still no batching between requests.
 
 import (
@@ -41,6 +41,7 @@ type Server struct {
 	embed    Embedder
 	imager   Imager
 	decider  Decider
+	yue2     *yue2Queue
 	// tokens is what a grammar reads the vocabulary through. It is built on
 	// the first request that asks for one and shared by every request after:
 	// a quarter of a million pieces is not something to decode twice, nor to
@@ -143,7 +144,21 @@ func (s *Server) Handler() http.Handler {
 	if s.decider != nil {
 		mux.HandleFunc("POST /v1/systemone", s.systemone)
 	}
+	if s.yue2 != nil {
+		mux.HandleFunc("POST /synth", s.yue2.synth)
+		mux.HandleFunc("GET /job", s.yue2.getJob)
+		mux.HandleFunc("POST /job", s.yue2.postJob)
+		mux.HandleFunc("GET /health", s.yue2.health)
+		mux.HandleFunc("GET /props", s.yue2.props)
+	}
 	return mux
+}
+
+// Close stops background workers the server owns.
+func (s *Server) Close() {
+	if s.yue2 != nil {
+		s.yue2.Close()
+	}
 }
 
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {

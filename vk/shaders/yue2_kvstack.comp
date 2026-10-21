@@ -1,0 +1,53 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// The AR half's keys and values of one layer, copied from the stack's cache
+// (vk/attention.go: a slot's ring of positions, a position [heads][128],
+// fp16) into the NAR's prefix cache in the layout krea2_flash.comp reads
+// with GLOBAL: the keys [head][np][128], the values transposed,
+// [head][128][np]. Rows 0 .. tokens - 1; the rows behind them are the
+// latent block's and are left alone.
+//
+// A workgroup is sixty-four positions of one head, as in yue2_kvimport.comp:
+// the keys go straight across, the values through shared memory so that the
+// transpose writes along its rows.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer AH { float16_t ah[]; };
+layout(std430, binding = 1) readonly buffer CK { float16_t ck[]; };
+layout(std430, binding = 2) readonly buffer CV { float16_t cv[]; };
+
+layout(push_constant) uniform Push {
+    uint src;           // the slot's first position in the stack's cache, halves
+    uint heads, tokens;
+    uint np;
+    uint kh, vt;        // the layer's keys and values in the prefix cache, halves
+} p;
+
+shared float16_t sv[128 * 65];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.y;
+    uint tok0 = gl_WorkGroupID.x * 64u;
+    for (uint e = t; e < 64u * 128u; e += 256u) {
+        uint r = e / 128u, d = e % 128u;
+        uint tok = tok0 + r;
+        float16_t y = float16_t(0.0);
+        if (tok < p.tokens) {
+            uint at = p.src + (tok * p.heads + head) * 128u + d;
+            ah[p.kh + (head * p.np + tok) * 128u + d] = ck[at];
+            y = cv[at];
+        }
+        sv[d * 65u + r] = y;
+    }
+    barrier();
+    for (uint e = t; e < 128u * 64u; e += 256u) {
+        uint d = e / 64u, r = e % 64u;
+        if (tok0 + r < p.tokens) {
+            ah[p.vt + (head * 128u + d) * p.np + tok0 + r] = sv[d * 65u + r];
+        }
+    }
+}

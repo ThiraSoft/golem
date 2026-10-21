@@ -190,6 +190,10 @@ type Attention struct {
 	aq, as      *Buffer
 
 	blocks []*attentionBlock
+
+	// split is the split attention of a token's keys, nil unless
+	// UseSplitDecode asked for it (vk/yue2_ar.go).
+	split *yue2Split
 }
 
 // An attentionBlock is one block's matrices, norms and cache.
@@ -785,6 +789,11 @@ func (a *Attention) Record(r *Recorder, block, columns int, runs []span) {
 		// are short ranges, and a tile of thirty-two spends its shape on the
 		// columns that are not there — measured, the scores of a pass of two
 		// cost 1.74 of a pass of one that way.
+		// YuE2's columns read thousands of keys each; see UseSplitDecode.
+		// Nothing else turns it on.
+		if a.split != nil && a.recordSplitRun(r, block, run, score) {
+			continue
+		}
 		if run.count <= 4 {
 			for c := 0; c < run.count; c++ {
 				score.col0 = uint32(run.first + c)
@@ -846,6 +855,8 @@ func (a *Attention) productGroups(width, outputs int) uint32 {
 }
 
 func (a *Attention) Close() {
+	a.split.close()
+	a.split = nil
 	for _, b := range a.blocks {
 		b.close()
 	}

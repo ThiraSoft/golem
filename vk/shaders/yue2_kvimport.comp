@@ -1,0 +1,62 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// The fresh keys and values of YuE2's flow matching block, written behind the
+// prefix the AR half left in the cache, in the layout krea2_flash.comp reads
+// with GLOBAL: fp16, the keys a head at a time token by token, the values
+// transposed, a head's dimension at a time over every token, rows of np. The
+// prefix stays where SetPrefix put it, rows 0 .. row0 - 1; this writes rows
+// row0 .. row0 + tokens - 1 and nothing else, which krea2_kvhalf.comp cannot
+// do: it pads every head to np with zeros and writes four halves at a time,
+// from row 0.
+//
+// A workgroup is sixty-four tokens of one head, as there; the values go
+// through shared memory to come out along the rows of the transpose, one
+// half a thread since row0 can be anything.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer AH { float16_t ah[]; };
+layout(std430, binding = 1) readonly buffer A4 { vec4 a4[]; };
+layout(std430, binding = 2) readonly buffer P { float par[]; };
+
+layout(push_constant) uniform Push {
+    uint k, v, stride;  // the fresh rows in the arena, floats, multiples of four
+    uint heads, tokens;
+    uint row0, np;
+    uint kh, vt;        // the layer's keys and values in the cache, halves
+} p;
+
+shared float16_t sv[128 * 65];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.y;
+    uint tok0 = gl_WorkGroupID.x * 64u;
+    for (uint e = t; e < 64u * 32u; e += 256u) {
+        uint r = e / 32u, d = (e % 32u) * 4u;
+        uint tok = tok0 + r;
+        vec4 y = vec4(0.0);
+        if (tok < p.tokens) {
+            vec4 x = clamp(a4[(p.k + tok * p.stride + head * 128u + d) >> 2], vec4(-65504.0), vec4(65504.0));
+            uint at = p.kh + (head * p.np + p.row0 + tok) * 128u + d;
+            ah[at] = float16_t(x.x);
+            ah[at + 1u] = float16_t(x.y);
+            ah[at + 2u] = float16_t(x.z);
+            ah[at + 3u] = float16_t(x.w);
+            y = clamp(a4[(p.v + tok * p.stride + head * 128u + d) >> 2], vec4(-65504.0), vec4(65504.0));
+        }
+        sv[d * 65u + r] = float16_t(y.x);
+        sv[(d + 1u) * 65u + r] = float16_t(y.y);
+        sv[(d + 2u) * 65u + r] = float16_t(y.z);
+        sv[(d + 3u) * 65u + r] = float16_t(y.w);
+    }
+    barrier();
+    for (uint e = t; e < 128u * 64u; e += 256u) {
+        uint d = e / 64u, r = e % 64u;
+        if (tok0 + r < p.tokens) {
+            ah[p.vt + (head * 128u + d) * p.np + p.row0 + tok0 + r] = sv[d * 65u + r];
+        }
+    }
+}

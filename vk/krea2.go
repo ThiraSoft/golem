@@ -145,6 +145,11 @@ const (
 	k2Flux3GNorm
 	k2Flux3VAEUnpatch
 	k2Flux3VAEPatch
+	k2Yue2Im2Col
+	k2Yue2Col2Im
+	k2Yue2QKRope
+	k2Yue2KVImport
+	k2Yue2Axpy
 	k2Kernels
 )
 
@@ -395,6 +400,11 @@ var k2Specs = [k2Kernels]struct {
 	k2Flux3GNorm:      {&flux3GNormSPIRV, unsafe.Sizeof(K2Flux3GNorm{})},
 	k2Flux3VAEUnpatch: {&flux3VAEUnpatchSPIRV, unsafe.Sizeof(K2Flux3VAEPatch{})},
 	k2Flux3VAEPatch:   {&flux3VAEPatchSPIRV, unsafe.Sizeof(K2Flux3VAEPatch{})},
+	k2Yue2Im2Col:      {&yue2Im2ColSPIRV, unsafe.Sizeof(K2Yue2Im2Col{})},
+	k2Yue2Col2Im:      {&yue2Col2ImSPIRV, unsafe.Sizeof(K2Yue2Col2Im{})},
+	k2Yue2QKRope:      {&yue2QKRopeSPIRV, unsafe.Sizeof(K2Yue2QKRope{})},
+	k2Yue2KVImport:    {&yue2KVImportSPIRV, unsafe.Sizeof(k2Yue2KVImportPush{})},
+	k2Yue2Axpy:        {&yue2AxpySPIRV, unsafe.Sizeof(K2Yue2Axpy{})},
 }
 
 // NewK2 makes the pipelines, an arena of arenaFloats and a parameter buffer

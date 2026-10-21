@@ -136,11 +136,18 @@ import (
 // branch and its attention come through this door as well, and refusing them
 // would refuse the model the routed kernels were widened for.
 //
-// No tiled form. A card without matrix cores answers a wide pass sixteen
-// columns at a time for every format but Q4_0 already, and that is the path
-// this takes on every card — a Q8_0 checkpoint is read for its size, not for
-// its prompt speed.
+// And the tiled form on matrix cores, at the geometry Q4_1's binaries use.
+// It was missing because a Q8_0 checkpoint used to be read for its size and
+// not its prompt speed, until YuE2's 3B, which is Q8_0 and reads prompts of
+// several thousand positions: eight columns a pass put 2.5 seconds on a
+// prompt of 3006. A card without matrix cores still answers a wide pass
+// sixteen columns at a time, as it does for every format but Q4_0.
 //
+//go:generate glslc -O -DQ80 -DCOLUMNS=32 -DBN=32 -DBM=64 -DBK=128 -DWAVE_M=4 -DWAVE_N=1 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q80_32.spv
+//go:generate glslc -O -DQ80 -DCOLUMNS=64 -DBN=64 -DBM=128 -DBK=128 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q80_64.spv
+//go:generate glslc -O -DQ80 -DCOLUMNS=128 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q80_128.spv
+//go:generate glslc -O -DQ80 -DCOLUMNS=256 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q80_256.spv
+//go:generate glslc -O -DQ80 -DCOLUMNS=512 -DBN=128 -DBM=128 -DBK=32 -DWAVE_M=2 -DWAVE_N=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matmul_coop.comp -o shaders/matmul_coop_q80_512.spv
 //go:generate glslc -O -DQ80 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q80w.spv
 //go:generate glslc -O -DQ80 -DCOLUMNS=2 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q80w2.spv
 //go:generate glslc -O -DQ80 -DCOLUMNS=4 --target-env=vulkan1.1 -fshader-stage=compute shaders/matvec.comp -o shaders/matvec_q80w4.spv
@@ -160,6 +167,21 @@ var matvecQ80W8SPIRV []byte
 
 //go:embed shaders/matvec_q80w16.spv
 var matvecQ80W16SPIRV []byte
+
+//go:embed shaders/matmul_coop_q80_32.spv
+var matmulCoopQ80_32SPIRV []byte
+
+//go:embed shaders/matmul_coop_q80_64.spv
+var matmulCoopQ80_64SPIRV []byte
+
+//go:embed shaders/matmul_coop_q80_128.spv
+var matmulCoopQ80_128SPIRV []byte
+
+//go:embed shaders/matmul_coop_q80_256.spv
+var matmulCoopQ80_256SPIRV []byte
+
+//go:embed shaders/matmul_coop_q80_512.spv
+var matmulCoopQ80_512SPIRV []byte
 
 //go:embed shaders/matvec_q41q8.spv
 var matvecQ41Q8SPIRV []byte
@@ -436,6 +458,15 @@ func quantLayout(q nn.Quant, data []byte, rows, cols int) ([]byte, error) {
 	if q != nn.PQ2_0 && q != nn.PTQ1_0 && cols%nn.QuantBlock != 0 {
 		return nil, fmt.Errorf("vk: a quantized row needs a multiple of %d columns, given %d", nn.QuantBlock, cols)
 	}
+	// A Q8_0 row is 34 bytes a block, so with an odd number of blocks every
+	// other row starts two bytes off a word, and so do its magnitudes. Both
+	// kernels read it a word at a time (the mat-vec and the tiled product
+	// alike) and would answer garbage there: measured, the mat-vec gave NaN
+	// at 1056 columns. An even count of blocks keeps every row and every
+	// block's magnitudes on a word.
+	if q == nn.Q8_0 && cols%(2*nn.QuantBlock) != 0 {
+		return nil, fmt.Errorf("vk: a Q8_0 row on the card needs a multiple of %d columns, given %d", 2*nn.QuantBlock, cols)
+	}
 	fileRow, err := quantFileRow(q, cols)
 	if err != nil {
 		return nil, err
@@ -675,6 +706,14 @@ func newQuantProduct(d *Device, q nn.Quant, coop bool) (*Pipeline, error) {
 			}{
 				{tiledColumns, matmulCoopQ41_32SPIRV}, {64, matmulCoopQ41_64SPIRV},
 				{128, matmulCoopQ41_128SPIRV}, {256, matmulCoopQ41_256SPIRV}, {wideColumns, matmulCoopQ41_512SPIRV},
+			}
+		case nn.Q8_0:
+			tiled = []struct {
+				columns int
+				spirv   []byte
+			}{
+				{tiledColumns, matmulCoopQ80_32SPIRV}, {64, matmulCoopQ80_64SPIRV},
+				{128, matmulCoopQ80_128SPIRV}, {256, matmulCoopQ80_256SPIRV}, {wideColumns, matmulCoopQ80_512SPIRV},
 			}
 		case nn.PQ2_0:
 			tiled = []struct {

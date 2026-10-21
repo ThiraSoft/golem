@@ -1,0 +1,295 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+
+// attn_scores.comp's matrix-core form, for YuE2's prompts alone: heads of
+// 128, read a pass of hundreds of positions at a time behind thousands of
+// keys. attn_scores is written for heads up to 512 (Gemma 4's), and two
+// things of that cost YuE2 most of its prefill (79% of the last pass of the
+// Guerreros prompt was that kernel):
+//
+//   - The mix gives a thread a dimension. At heads of 128 that is half of
+//     the 256 threads, and the other half wait through the phase that costs
+//     the most, each of the working ones carrying thirty-two rows.
+//   - Its shared memory holds a query tile of heads of 512, some fifty
+//     kilobytes, so a compute unit runs one workgroup at a time.
+//
+// Here the mix runs on the cores as well: the tile's probabilities in fp16,
+// as ggml's flash attention hands them to its cores, times the tile's
+// values, into the output's rows, which live in shared memory in float32 so
+// that the online softmax can rescale them a row at a time (the cores'
+// accumulators cannot be, without leaning on how the driver lays them out).
+// The tiles are sized for heads of 128, twenty-five kilobytes less than
+// attn_scores's. The scores, the mask, the online softmax and the Q8_0 form
+// written at the end are attn_scores's, line for line.
+//
+// Measured on the Guerreros prompt (BenchmarkARPrefill, 3006 positions):
+// attn_scores 425 ms; the same arithmetic with both halves of the workgroup
+// mixing, sixteen rows each, 295 ms; this, 235 ms. Against a float64
+// attention of the same operands it lands where attn_scores does, the Q8_0
+// rounding being the whole of either's distance (TestYue2AttnWide).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer QH { float qh[];     };
+layout(std430, binding = 1) readonly  buffer CK { uint  ck[];     };
+layout(std430, binding = 2) readonly  buffer CV { uint  cv[];     };
+layout(std430, binding = 3) buffer          SC { float scores[];  };  // unused, bound as attn_scores binds it
+layout(std430, binding = 4) writeonly buffer AQ { uint  aq[];     };
+layout(std430, binding = 5) writeonly buffer AS { float as_[];    };
+layout(std430, binding = 6) readonly  buffer WH { uvec4 where_[]; };
+
+layout(push_constant) uniform Push {
+    uint heads;
+    uint kvHeads;
+    uint headDim;   // 128, which vk/yue2_ar.go checks
+    uint perKV;
+    uint block;
+    uint capacity;
+    uint mask;
+    uint columns;
+    float scale;
+    uint col0;
+} p;
+
+const uint WHERE_COLUMNS = 512u;
+
+const uint BR = 32u;
+const uint BC = 32u;
+const uint HD = 128u;
+const uint QW = HD / 8u;
+const uint HALF = BR / 2u;   // the rows each half of the workgroup writes out
+
+// A key row of the head, then eight halves of slack; a query row the same.
+const uint KST = HD + 8u;
+const uint QST = HD + 8u;
+
+// ks holds a tile's values once its keys are scored.
+shared float16_t ks[BC * KST];
+shared float16_t qs[BR * QST];
+shared float pr[BR * BC];
+// The probabilities in fp16 for the cores, and the output's rows in
+// float32, where the softmax rescales them.
+const uint PST = BC + 8u;
+const uint OST = HD + 4u;
+shared float16_t ps[BR * PST];
+shared float os[BR * OST];
+shared float corr[BR];
+shared float sums[BR];
+
+uint floatToHalf(float f) {
+    uint bits     = floatBitsToUint(f);
+    uint sign     = (bits >> 16) & 0x8000u;
+    int  exponent = int((bits >> 23) & 0xFFu) - 127 + 15;
+    uint mantissa = bits & 0x7FFFFFu;
+
+    if ((bits & 0x7FFFFFFFu) == 0u) return sign;
+    if (exponent >= 0x1F) {
+        if ((bits & 0x7F800000u) == 0x7F800000u && mantissa != 0u) return sign | 0x7E00u;
+        return sign | 0x7C00u;
+    }
+    if (exponent <= 0) {
+        if (exponent < -10) return sign;
+        mantissa |= 0x800000u;
+        uint shift = uint(14 - exponent);
+        uint value = mantissa >> shift;
+        uint rest  = mantissa & ((1u << shift) - 1u);
+        uint mid   = 1u << (shift - 1u);
+        if (rest > mid || (rest == mid && (value & 1u) == 1u)) value++;
+        return sign | value;
+    }
+    uint value = (uint(exponent) << 10) | (mantissa >> 13);
+    uint rest  = mantissa & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (value & 1u) == 1u)) value++;
+    return sign | value;
+}
+
+int nearestInt(float f) {
+    return (floatBitsToInt(f + 12582912.0) & 0x007fffff) - 0x00400000;
+}
+
+uint slotBase;
+
+uint entry(uint pos, uint head) {
+    uint at = (p.mask != 0u) ? (pos & p.mask) : (pos % p.capacity);
+    return ((slotBase + at) * p.kvHeads + head) * HD;
+}
+
+void main() {
+    uint h    = gl_WorkGroupID.x;
+    uint t    = gl_LocalInvocationID.x;
+    uint kv   = h / p.perKV;
+    uint base = p.col0 + gl_WorkGroupID.y * BR;
+    slotBase  = where_[p.block * WHERE_COLUMNS + base].w * p.capacity;
+
+    uint rows = min(BR, p.columns - base);
+    uint lo = 0xFFFFFFFFu, hi = 0u;
+    for (uint r = 0u; r < rows; r++) {
+        uvec4 w = where_[p.block * WHERE_COLUMNS + base + r];
+        lo = min(lo, w.y);
+        hi = max(hi, w.z);
+    }
+    uint total = hi - lo + 1u;
+
+    // The score geometry, attn_scores's: eight lanes to a row.
+    uint r0 = t >> 3, cl = t & 7u;
+    uvec4 mine = where_[p.block * WHERE_COLUMNS + base + min(r0, rows - 1u)];
+    bool live = r0 < rows;
+
+    // The output's geometry: a dimension, and which sixteen rows.
+    uint d  = t & (HD - 1u);
+    uint rh = (t >> 7) * HALF;
+
+    for (uint idx = t; idx < rows * QW; idx += 256u) {
+        uint r = idx / QW, j = idx % QW;
+        uint qb = (base + r) * p.heads * HD + h * HD + (j << 3);
+        uint qat = r * QST + (j << 3);
+        [[unroll]] for (uint u = 0u; u < 8u; u++) qs[qat + u] = float16_t(qh[qb + u]);
+    }
+
+    for (uint e = t; e < BR * OST; e += 256u) os[e] = 0.0;
+    float rowMax = -1.0 / 0.0, rowSum = 0.0;
+
+    uint wave = gl_SubgroupID;
+    uint wtr  = wave & 1u, wtc = wave >> 1;
+
+    for (uint start = 0u; start < total; start += BC) {
+        uint got = min(BC, total - start);
+
+        // The whole head of a tile of keys at once: attn_scores's chunk is
+        // the whole head when the head is 128, so the products run in the
+        // same order.
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> S =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        barrier();
+        for (uint idx = t; idx < got * QW; idx += 256u) {
+            uint c = idx / QW, j = idx % QW;
+            uint o = (entry(lo + start + c, kv) >> 1) + (j << 2);
+            uvec4 raw = uvec4(ck[o], ck[o + 1u], ck[o + 2u], ck[o + 3u]);
+            uint at = c * KST + (j << 3);
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                vec2 hv = unpackHalf2x16(raw[u]);
+                ks[at + (u << 1)]      = float16_t(hv.x);
+                ks[at + (u << 1) + 1u] = float16_t(hv.y);
+            }
+        }
+        barrier();
+        for (uint kk = 0u; kk < HD / 16u; kk++) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+            coopMatLoad(A, qs, (wtr << 4) * QST + (kk << 4), QST,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(B, ks, (wtc << 4) * KST + (kk << 4), KST,
+                        gl_CooperativeMatrixLayoutColumnMajor);
+            S = coopMatMulAdd(A, B, S);
+        }
+
+        barrier();
+        coopMatStore(S, pr, (wtr << 4) * BC + (wtc << 4), BC,
+                     gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+
+        float sv[4];
+        float peak = -1.0 / 0.0;
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            uint c   = cl + (i << 3);
+            uint pos = lo + start + c;
+            float v  = (live && c < got && pos >= mine.y && pos <= mine.z)
+                        ? pr[r0 * BC + c] * p.scale : -1.0 / 0.0;
+            sv[i] = v;
+            peak  = max(peak, v);
+        }
+        float newMax = max(rowMax, subgroupClusteredMax(peak, 8u));
+        float mine_  = 0.0;
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            float pv = isinf(newMax) ? 0.0 : exp(sv[i] - newMax);
+            ps[r0 * PST + cl + (i << 3)] = float16_t(pv);
+            mine_ += pv;
+        }
+        float tileSum = subgroupClusteredAdd(mine_, 8u);
+        float rescale = (rowMax == newMax) ? 1.0 : exp(rowMax - newMax);
+        if (cl == 0u) corr[r0] = rescale;
+        rowSum = rowSum * rescale + tileSum;
+        rowMax = newMax;
+        barrier();
+
+        // The tile's values into ks, rows past the tile zero: their
+        // probabilities are, and a zero times whatever the cache holds there
+        // could still be a NaN.
+        for (uint idx = t; idx < BC * QW; idx += 256u) {
+            uint c = idx / QW, j = idx % QW;
+            uvec4 raw = uvec4(0u);
+            if (c < got) {
+                uint o = (entry(lo + start + c, kv) >> 1) + (j << 2);
+                raw = uvec4(cv[o], cv[o + 1u], cv[o + 2u], cv[o + 3u]);
+            }
+            uint at = c * KST + (j << 3);
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                vec2 hv = unpackHalf2x16(raw[u]);
+                ks[at + (u << 1)]      = float16_t(hv.x);
+                ks[at + (u << 1) + 1u] = float16_t(hv.y);
+            }
+        }
+        for (uint e = t; e < BR * HD; e += 256u) {
+            uint r = e / HD;
+            os[r * OST + (e % HD)] *= corr[r];
+        }
+        barrier();
+        // O += P·V on the cores: a wave owns sixteen rows and sixty-four
+        // dimensions of the output, four tiles.
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            uint d0 = ((wtc & 1u) * 4u + i) << 4;
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> O;
+            coopMatLoad(O, os, (wtr << 4) * OST + d0, OST, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint kk = 0u; kk < BC / 16u; kk++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                coopMatLoad(A, ps, (wtr << 4) * PST + (kk << 4), PST, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B, ks, (kk << 4) * KST + d0, KST, gl_CooperativeMatrixLayoutRowMajor);
+                O = coopMatMulAdd(A, B, O);
+            }
+            coopMatStore(O, os, (wtr << 4) * OST + d0, OST, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+
+    barrier();
+    if (cl == 0u && live) sums[r0] = rowSum;
+    barrier();
+
+    // The Q8_0 form, attn_scores's, a block of thirty-two to thirty-two
+    // threads of one half: a cluster never spans the two halves, so whether
+    // a row is live is uniform across it.
+    uint blocks = (p.heads * HD) >> 5;
+    uint slot = ((h * HD) >> 5) + (d >> 5);
+    for (uint i = 0u; i < HALF; i++) {
+        uint r = rh + i;
+        if (r >= rows) break;
+        float invSum = (sums[r] > 0.0) ? (1.0 / sums[r]) : 0.0;
+        float value = os[r * OST + d] * invSum;
+
+        float peak = subgroupClusteredMax(abs(value), 32u);
+        float scale = 0.0;
+        int   q = 0;
+        if (peak > 0.0) {
+            scale = unpackHalf2x16(floatToHalf(peak * (1.0 / 127.0))).x;
+            precise float scaled = value * (127.0 / peak);
+            q = clamp(nearestInt(scaled), -128, 127);
+        }
+        int count = subgroupClusteredAdd(q, 32u);
+
+        uint word = subgroupClusteredOr(uint(q & 0xFF) << ((d & 3u) * 8u), 4u);
+        uint dest = (((base + r) * p.heads * HD + h * HD) >> 2) + (d >> 2);
+        if ((d & 3u) == 0u) aq[dest] = word;
+
+        if ((d & 31u) == 0u) {
+            uint cbase = (base + r) * 2u * blocks;
+            as_[cbase + slot]          = scale;
+            as_[cbase + blocks + slot] = 8.0 * scale * float(count);
+        }
+    }
+}

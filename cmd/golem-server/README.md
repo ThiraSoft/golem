@@ -24,6 +24,11 @@ The endpoints:
 | `POST /v1/embeddings` | OpenAI's embeddings, float or base64 (requires `-embed`) |
 | `POST /api/embed`, `POST /api/embeddings` | ollama's two embedding endpoints, so a client pointed at ollama needs only the port changed (requires `-embed`) |
 | `POST /v1/systemone` | typed questions about a state, answered by Laya in Jev's shape, so a Jev or laya-serve client needs only its base URL changed (requires `-laya`) |
+| `POST /synth` | song synthesis with YuE2, returning a job ID (requires `-yue2`) |
+| `GET /job` | poll job status or fetch multipart audio, replay JSON and latents (requires `-yue2`) |
+| `POST /job` | cancel a synthesis job (requires `-yue2`) |
+| `GET /health` | server health check (requires `-yue2`) |
+| `GET /props` | server capabilities, model context and request defaults (requires `-yue2`) |
 | `GET /v1/models` | the loaded models, for clients that probe at startup |
 
 ## Tools
@@ -468,11 +473,36 @@ them: the server carries one checkpoint. Requests take turns on the model,
 and on an RX 9070 XT a request of three questions and 225 positions is
 answered in 14 ms over HTTP once the first has been.
 
+## Songs
+
+With `-yue2 <dir>` (or `GOLEM_YUE2`), a directory holding YuE2's GGUF files, it answers
+song synthesis requests compatible with yue2.cpp's `yue-server`:
+
+```bash
+./golem-server -yue2 /mnt/data/LLMs_models/Serveurperso/YuE2-GGUF -addr 127.0.0.1:8188
+```
+
+Jobs run sequentially through a single FIFO worker. Submit with `POST /synth`,
+poll status with `GET /job?id=N`, and fetch the multipart result with
+`GET /job?id=N&result=1`. The result boundary is `yue2-batch-boundary` with three
+parts: the replay JSON (`application/json`), the rendered WAV audio
+(`audio/wav`), and the raw float32 latents (`application/octet-stream`). Only
+`wav16`, `wav24`, and `wav32` output formats are supported (mp3 returns 400).
+Cancel an in-flight job with `POST /job?id=N&cancel=1`.
+
+YuE2 requires substantial VRAM at the default context of 24576 positions:
+10.64 GB once open, 13.10 GB after a replay, and 15.91 GB from the first
+request whose codes are drawn with guidance (`cot` off, or a `cfg_scale`
+other than 1), which allocates the second cache slot and keeps it. Because of this memory footprint, `-yue2` cannot be combined
+with `-model`, `-krea2`, or `-flux3` on the card.
+
 ## Flags
 
 | | |
 |---|---|
-| `-model` | the GGUF, or `GOLEM_MODEL`; not required when `-stt`, `-embed`, `-krea2` or `-laya` is given |
+| `-model` | the GGUF, or `GOLEM_MODEL`; not required when `-stt`, `-embed`, `-krea2`, `-laya` or `-yue2` is given |
+| `-yue2` | directory holding YuE2 GGUF files (YuE2-3B-Q8_0.gguf, YuE2-Vae-F32.gguf), or `GOLEM_YUE2` |
+| `-yue2-context` | positions to keep in YuE2's KV cache; 24576 by default |
 | `-stt` | directory holding the Kyutai STT model, or `GOLEM_STT`; a server may carry it alone, and then answers `/v1/models` and `/v1/audio/transcriptions` and nothing else |
 | `-embed` | a nomic-embed-text-v2-moe GGUF, or `GOLEM_EMBED`, for the embedding endpoints; a server may carry it alone |
 | `-laya` | a Laya checkpoint directory, or `GOLEM_LAYA`, for `/v1/systemone`; a server may carry it alone |
