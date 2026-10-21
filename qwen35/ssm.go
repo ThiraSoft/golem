@@ -24,10 +24,8 @@ func ForwardSSMToken(
 	// alpha = bw.SSMAlpha * x -> [48]
 	// beta = bw.SSMBeta * x -> [48]
 	qkv := scratch.qkv[:10240]
-	bw.QKV.MatVec(scratch.batchX, qkv)
-
 	gateZ := scratch.gate[:bc.SSMInnerSize]
-	bw.AttnGate.MatVec(scratch.batchX, gateZ)
+	nn.MatVecs([]nn.Matrix{bw.QKV, bw.AttnGate}, scratch.batchX, [][]float32{qkv, gateZ})
 
 	alpha := scratch.alpha[:bc.SSMTimeStepRank]
 	beta := scratch.beta[:bc.SSMTimeStepRank]
@@ -62,13 +60,12 @@ func ForwardSSMToken(
 	// Indexing it the other way round mixes every channel's taps together.
 	for c := 0; c < convDim; c++ {
 		w := bw.Conv1D[c*kernel : (c+1)*kernel]
-		sum := w[0]*cache.ConvState[0*convDim+c] +
+		convOut[c] = w[0]*cache.ConvState[0*convDim+c] +
 			w[1]*cache.ConvState[1*convDim+c] +
 			w[2]*cache.ConvState[2*convDim+c] +
 			w[3]*qkv[c]
-		// SiLU activation
-		convOut[c] = sum / (1.0 + float32(math.Exp(float64(-sum))))
 	}
+	nn.SiLUGGMLRange(convOut, 0, convDim)
 
 	// Shift circular buffer
 	copy(cache.ConvState[0*convDim:1*convDim], cache.ConvState[1*convDim:2*convDim])
@@ -108,53 +105,36 @@ func ForwardSSMToken(
 		}
 	}
 
-	// 6. Gated Delta Net recurrence for each of the 48 heads:
+	// 6. Gated Delta Net recurrence for each of the 48 heads.
+	//
+	// A row's delta reads that row alone, so the decay, the delta, the update
+	// and the output are one pass over it rather than two over the head: the
+	// state is three megabytes a layer and it is read once. The heads are
+	// independent and go to the cores; on the processor this loop was the
+	// largest thing a token did on one of them.
 	numVHeads := bc.SSMTimeStepRank // 48
 	ySSM := scratch.ySSM[:bc.SSMInnerSize]
 	scale := float32(1.0 / math.Sqrt(float64(stateSize))) // 1 / sqrt(128)
-	delta := make([]float32, stateSize)
 
-	for h := 0; h < numVHeads; h++ {
-		// Map head h to Q and K head (h % 16)
-		kHeadIdx := h % numKHeads
-		qHead := qChannels[kHeadIdx*stateSize : (kHeadIdx+1)*stateSize]
-		kHead := kChannels[kHeadIdx*stateSize : (kHeadIdx+1)*stateSize]
-		vHead := vChannels[h*stateSize : (h+1)*stateSize]
-		yHead := ySSM[h*stateSize : (h+1)*stateSize]
+	nn.InParallel(numVHeads, numVHeads*stateSize*stateSize, func(first, last int) {
+		for h := first; h < last; h++ {
+			// Map head h to Q and K head (h % 16)
+			kHeadIdx := h % numKHeads
+			qHead := qChannels[kHeadIdx*stateSize : (kHeadIdx+1)*stateSize]
+			kHead := kChannels[kHeadIdx*stateSize : (kHeadIdx+1)*stateSize]
+			vHead := vChannels[h*stateSize : (h+1)*stateSize]
+			yHead := ySSM[h*stateSize : (h+1)*stateSize]
 
-		sBase := h * stateSize * stateSize
-		dVal := decay[h]
-		bVal := beta[h]
+			sBase := h * stateSize * stateSize
+			dVal := decay[h]
+			bVal := beta[h]
 
-		// For each row j (0..127):
-		for j := 0; j < stateSize; j++ {
-			row := cache.SSMState[sBase+j*stateSize : sBase+(j+1)*stateSize]
-
-			// 1. Decay state
-			var sumK float32
-			for i := 0; i < stateSize; i++ {
-				hVal := row[i] * dVal
-				row[i] = hVal
-				sumK += hVal * kHead[i]
+			for j := 0; j < stateSize; j++ {
+				row := cache.SSMState[sBase+j*stateSize : sBase+(j+1)*stateSize]
+				yHead[j] = gdnRow(row, kHead, qHead, dVal, bVal, vHead[j]) * scale
 			}
-
-			// 2. Compute delta
-			delta[j] = (vHead[j] - sumK) * bVal
 		}
-
-		// 3. Update state with outer product and compute output with Q
-		for j := 0; j < stateSize; j++ {
-			row := cache.SSMState[sBase+j*stateSize : sBase+(j+1)*stateSize]
-			d := delta[j]
-			var sumQ float32
-			for i := 0; i < stateSize; i++ {
-				hVal := row[i] + d*kHead[i]
-				row[i] = hVal
-				sumQ += hVal * qHead[i]
-			}
-			yHead[j] = sumQ * scale
-		}
-	}
+	})
 
 	// 7. Gated RMSNorm per 128 elements chunk + SiLU(Z):
 	for h := 0; h < numVHeads; h++ {
@@ -163,10 +143,9 @@ func ForwardSSMToken(
 	}
 
 	// Gate with SiLU(gateZ)
+	nn.SiLUGGMLRange(gateZ, 0, bc.SSMInnerSize)
 	for i := 0; i < bc.SSMInnerSize; i++ {
-		zVal := gateZ[i]
-		siluZ := zVal / (1.0 + float32(math.Exp(float64(-zVal))))
-		ySSM[i] *= siluZ
+		ySSM[i] *= gateZ[i]
 	}
 
 	// 8. Output Projection: out = bw.SSMOut * ySSM -> [Dim = 5120]
@@ -176,7 +155,28 @@ func ForwardSSMToken(
 		}
 		ySSM = scratch.yGathered
 	}
-	load(scratch.batchYSSM, ySSM)
+	scratch.load(scratch.batchYSSM, ySSM)
 	calib(bc.Index, "o", ySSM)
 	bw.SSMOut.MatVec(scratch.batchYSSM, out)
+}
+
+// gdnRow is one row of the delta net's state for one token: decayed, corrected
+// toward v along k by beta, and read against q, which is what it returns.
+func gdnRow(row, k, q []float32, decay, beta, v float32) float32 {
+	k = k[:len(row)]
+	q = q[:len(row)]
+	var sumK float32
+	for i := range row {
+		h := row[i] * decay
+		row[i] = h
+		sumK += h * k[i]
+	}
+	d := (v - sumK) * beta
+	var sumQ float32
+	for i := range row {
+		h := row[i] + d*k[i]
+		row[i] = h
+		sumQ += h * q[i]
+	}
+	return sumQ
 }

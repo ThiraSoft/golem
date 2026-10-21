@@ -38,9 +38,7 @@ func ForwardFullAttnToken(
 	k := scratch.k[:kvDim]
 	v := scratch.v[:kvDim]
 
-	bw.Q.MatVec(scratch.batchX, qFull)
-	bw.K.MatVec(scratch.batchX, k)
-	bw.V.MatVec(scratch.batchX, v)
+	nn.MatVecs([]nn.Matrix{bw.Q, bw.K, bw.V}, scratch.batchX, [][]float32{qFull, k, v})
 
 	// Query norm, then RoPE, head by head inside the interleaving.
 	if rope != nil {
@@ -109,7 +107,7 @@ func ForwardFullAttnToken(
 		}
 	})
 
-	load(scratch.batchAttn, attnOut)
+	scratch.load(scratch.batchAttn, attnOut)
 	calib(bc.Index, "o", attnOut)
 	bw.O.MatVec(scratch.batchAttn, out)
 }

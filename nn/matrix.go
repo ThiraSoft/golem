@@ -106,6 +106,10 @@ func (m Matrix) MatVec(x *Batch, y []float32) {
 // arithmetic. So the row is the outer loop and the batch the inner one: the row
 // stays in the first-level cache while every column of the batch meets it.
 func (m Matrix) MatVecBatch(b *Batch, ys [][]float32) {
+	if m.ternaryInIntegers() {
+		m.matVecTernary(b, ys)
+		return
+	}
 	if m.WantsQ8K() {
 		b.QuantizeK()
 	}
@@ -120,6 +124,87 @@ func (m Matrix) MatVecBatch(b *Batch, ys [][]float32) {
 // worker that started it while another worker read it would hand out one that
 // is allocated and two that are not.
 func (m Matrix) WantsQ8K() bool { return m.Quant == Q6_K || m.Quant == Q3_K || m.Quant == Q2_K }
+
+// MatVecs computes ys[i] = ms[i] * x for matrices that all read x, which is a
+// batch of one: the attention's three projections, a feed forward's gate and
+// up. It is ms[i].MatVec(x, ys[i]) for each, and that is what it does unless
+// the matrices are ternary and read the activation through the same rotation.
+// Then the activation is prepared once and every row of every matrix is one
+// parallel section, which on the processor is what was left between the
+// products and the memory's speed: a section is filled and drained at every
+// call, and a token made a thousand of them.
+func MatVecs(ms []Matrix, x *Batch, ys [][]float32) {
+	if !sharedTernary(ms) || x.Size != 1 {
+		for i, m := range ms {
+			m.MatVec(x, ys[i])
+		}
+		return
+	}
+	first := ms[0]
+	cols := first.ternaryInput(x)
+	ends := make([]int, len(ms))
+	total := 0
+	for i, m := range ms {
+		total += m.Rows
+		ends[i] = total
+	}
+	InParallel(total, total*first.Cols, func(start, end int) {
+		lo := 0
+		for i, m := range ms {
+			hi := ends[i]
+			if s, e := max(start, lo), min(end, hi); s < e {
+				ternaryRows(m.Quant, m.Data, cols, m.Cols, [][]float32{ys[i]}, s-lo, e-lo)
+				for r := s - lo; r < e-lo && r < len(m.Bias); r++ {
+					ys[i][r] += m.Bias[r]
+				}
+			}
+			lo = hi
+		}
+	})
+}
+
+// sharedTernary says the matrices can share one prepared activation.
+func sharedTernary(ms []Matrix) bool {
+	if len(ms) == 0 {
+		return false
+	}
+	a := ms[0]
+	if !a.ternaryInIntegers() {
+		return false
+	}
+	for _, m := range ms[1:] {
+		if !m.ternaryInIntegers() || m.Quant != a.Quant || m.Cols != a.Cols ||
+			m.HadGroup != a.HadGroup || len(m.Pre) != len(a.Pre) ||
+			(len(m.Pre) > 0 && &m.Pre[0] != &a.Pre[0]) {
+			return false
+		}
+	}
+	return true
+}
+
+// ternaryInIntegers says the product goes through the integer kernels of
+// dot_ternary.go. They read a Q8_K activation, so the width has to be whole
+// superblocks; the fork falls back to Q8_0 when it is not, and this falls back
+// to the float product, which no Bonsai matrix has needed.
+func (m Matrix) ternaryInIntegers() bool {
+	return (m.Quant == PQ2_0 || m.Quant == PTQ1_0) && m.Cols%SuperBlock == 0
+}
+
+// matVecTernary is MatVecBatch for the ternary formats. The rotation is done
+// here, once, and not in rows: there it would be done again by every worker,
+// and the quantized form built from it is what every worker reads.
+// ternaryInput says how.
+func (m Matrix) matVecTernary(b *Batch, ys [][]float32) {
+	cols := m.ternaryInput(b)
+	InParallel(m.Rows, m.Rows*m.Cols*b.Size, func(start, end int) {
+		ternaryRows(m.Quant, m.Data, cols, m.Cols, ys, start, end)
+		for _, y := range ys {
+			for i := start; i < end && i < len(m.Bias); i++ {
+				y[i] += m.Bias[i]
+			}
+		}
+	})
+}
 
 // MatVecRows computes rows [start, end) of the product on the caller's thread,
 // for a caller that is already inside a parallel section and wants to finish
@@ -232,7 +317,7 @@ func (m Matrix) rows(b *Batch, ys [][]float32, start, end int) {
 // can do better by transforming it once itself, which is what qwen/block.go
 // does. This is for the callers that would rather not.
 func (m Matrix) prepare(b *Batch) *Batch {
-	out := &Batch{Size: b.Size, Width: b.Width, F: make([][]float32, b.Size)}
+	out := &Batch{Size: b.Size, Stride: b.Size, Width: b.Width, F: make([][]float32, b.Size)}
 	for c := 0; c < b.Size; c++ {
 		out.F[c] = make([]float32, b.Width)
 		copy(out.F[c], b.F[c])

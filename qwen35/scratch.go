@@ -36,6 +36,12 @@ type Scratch struct {
 	// FFN scratch
 	ffnUp   []float32
 	ffnDown []float32
+
+	// floatInputs says no matrix these batches feed reads their quantized
+	// forms: Bonsai's are ternary, which prepare their own, and bfloat16,
+	// which read floats. Quantizing for nobody was a hundred and thirty
+	// passes a token on one core.
+	floatInputs bool
 }
 
 func NewScratch(cfg *Config) *Scratch {
@@ -86,7 +92,7 @@ func NewScratch(cfg *Config) *Scratch {
 // that reads it.
 func (s *Scratch) SetInput(x []float32) {
 	copy(s.batchX.F[0], x)
-	quantize(s.batchX)
+	s.quantize(s.batchX)
 }
 
 // load points a batch at a vector the caller already filled and refreshes every
@@ -97,12 +103,15 @@ func (s *Scratch) SetInput(x []float32) {
 // the Q8_0 form and never looks at the floats, so a batch whose floats were
 // replaced without a requantization contributes whatever the previous token
 // left behind — or zeros, on the first one.
-func load(b *nn.Batch, v []float32) {
+func (s *Scratch) load(b *nn.Batch, v []float32) {
 	b.F[0] = v
-	quantize(b)
+	s.quantize(b)
 }
 
-func quantize(b *nn.Batch) {
+func (s *Scratch) quantize(b *nn.Batch) {
+	if s.floatInputs {
+		return
+	}
 	b.QuantizeColumnRange(0, 0, b.Width)
 	if b.QK != nil {
 		b.QuantizeK()

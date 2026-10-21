@@ -23,12 +23,26 @@ import (
 	"os"
 	"strconv"
 	"testing"
+
+	"github.com/ThiraSoft/golem/internal/heavy"
 )
 
 const bonsaiDir = "/mnt/data/LLMs_models/prism-ml/Ternary-Bonsai-2-27B-gguf/"
 const bonsaiRef = "/mnt/data/golem-testdata/bonsai/"
 
-func TestVulkanBonsaiMatchesLlamaCpp(t *testing.T) {
+func TestVulkanBonsaiMatchesLlamaCpp(t *testing.T) { bonsaiMatchesLlamaCpp(t, true) }
+
+// The same reference on the processor, through the integer ternary products of
+// nn/dot_ternary.go. Those read a Q8_K activation where the float product they
+// replaced read float32, so this is what says the quantization costs nothing a
+// reader of logits would see. Thirty-one positions of a 27B on the processor
+// take a while, so it is heavy.
+func TestBonsaiOnTheProcessorMatchesLlamaCpp(t *testing.T) {
+	heavy.Skip(t, "runs a 27B on the processor")
+	bonsaiMatchesLlamaCpp(t, false)
+}
+
+func bonsaiMatchesLlamaCpp(t *testing.T, vulkan bool) {
 	for _, q := range []string{"PQ2_0", "PTQ1_0"} {
 		t.Run(q, func(t *testing.T) {
 			path := bonsaiDir + "Ternary-Bonsai-2-27B-" + q + ".gguf"
@@ -47,8 +61,10 @@ func TestVulkanBonsaiMatchesLlamaCpp(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer m.Close()
-			if err := m.UseVulkan(); err != nil {
-				t.Fatalf("vulkan: %v", err)
+			if vulkan {
+				if err := m.UseVulkan(); err != nil {
+					t.Fatalf("vulkan: %v", err)
+				}
 			}
 
 			hs := m.ForwardBatch(tokens, 0)
@@ -77,7 +93,7 @@ func TestVulkanBonsaiMatchesLlamaCpp(t *testing.T) {
 			// on the processor alike. A missing rotation is worth nats, not
 			// hundredths of one.
 			if kl > 0.02 || agree < len(hs)-2 {
-				t.Errorf("mean KL %.5f, top-1 %d/%d: the card does not answer what the reference does", kl, agree, len(hs))
+				t.Errorf("mean KL %.5f, top-1 %d/%d: this does not answer what the reference does", kl, agree, len(hs))
 			}
 		})
 	}

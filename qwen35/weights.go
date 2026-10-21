@@ -212,3 +212,22 @@ func bindGolem(g *tensors.GGUF, m *nn.Matrix, name string) {
 		return
 	}
 }
+
+// floatInputs says every matrix of every block reads its activation as floats
+// or prepares it itself, so that a block's batches need no quantized form.
+func (w *Weights) floatInputs() bool {
+	for i := range w.Blocks {
+		b := &w.Blocks[i]
+		for _, m := range []nn.Matrix{b.Q, b.K, b.V, b.O, b.QKV, b.AttnGate, b.SSMAlpha, b.SSMBeta, b.SSMOut, b.Gate, b.Up, b.Down} {
+			if m.Data == nil {
+				continue
+			}
+			switch m.Quant {
+			case nn.PQ2_0, nn.PTQ1_0, nn.BF16, nn.F16, nn.F32:
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}

@@ -97,6 +97,7 @@ func New(g *tensors.GGUF, maxContext int) (*Model, error) {
 		x:       make([]float32, cfg.Dim),
 		hidden:  make([]float32, cfg.Dim),
 	}
+	m.scratch.floatInputs = w.floatInputs()
 	return m, nil
 }
 

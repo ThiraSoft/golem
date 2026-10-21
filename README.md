@@ -240,7 +240,7 @@ Against the reference each model was written from, same card, 2026-09-28:
 | Laya, 32 questions | **51 ms** | 56 ms (PyTorch) |
 | YuE2, a 195 s song, 7303 tokens forced, 2026-10-20 | **59.7 s** | 108.6 s (yue2.cpp) |
 
-On an i7-9700K with eight threads and Q4_0 weights, Gemma E2B draws 22.6 tokens a second and reads 204, the 26B A4B does 13.1 and 51, Qwen3 4B does 14.6 and 110: a tie with llama.cpp on generation, and between ×1.06 and ×1.33 reading a prompt.
+On an i7-9700K with eight threads and Q4_0 weights, Gemma E2B draws 22.6 tokens a second and reads 204, the 26B A4B does 13.1 and 51, Qwen3 4B does 14.6 and 110: a tie with llama.cpp on generation, and between ×1.06 and ×1.33 reading a prompt. On the same processor Bonsai 2 27B generates 4.2 tokens a second in PQ2_0 and 3.9 in PTQ1_0, where Prism's fork does 3.8 and 0.8 (2026-10-21).
 
 **Read these tables as a whole: golem reaches llama.cpp's level, and that is the claim.** It is one card and one driver. A kernel that wins on RDNA 4 need not win elsewhere, and the column worth reading is the gap between the two engines rather than the rate. The one model golem loses is Qwen3 0.6B, where the weights are small enough that arithmetic rather than memory sets the pace, and [`qwen/README.md`](qwen/README.md) says why. [ARCHITECTURE.md](ARCHITECTURE.md) has the kernel work, the per-op breakdown against llama.cpp, and the next bottleneck.
 

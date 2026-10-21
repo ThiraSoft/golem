@@ -160,60 +160,71 @@ func (b *Batch) QuantizeK() {
 	if b.Width%SuperBlock != 0 {
 		panic("nn: the Q8_K form needs a multiple of the superblock size")
 	}
+	b.allocK()
+	for c := 0; c < b.Size; c++ {
+		for block := 0; block < b.Width/SuperBlock; block++ {
+			b.quantizeKBlock(c, block)
+		}
+	}
+}
+
+// allocK makes room for the Q8_K form, once.
+func (b *Batch) allocK() {
 	if b.QK == nil {
 		b.QK = make([]int8, b.Stride*b.Width)
 		b.KScales = make([]float32, b.Stride*b.Width/SuperBlock)
 		b.BSums = make([]int16, b.Stride*b.Width/16)
 	}
-	for c := 0; c < b.Size; c++ {
-		q := b.QK[c*b.Width : (c+1)*b.Width]
-		scales := b.KScales[c*b.Width/SuperBlock : (c+1)*b.Width/SuperBlock]
-		sums := b.BSums[c*b.Width/16 : (c+1)*b.Width/16]
+}
 
-		for block := range scales {
-			values := b.F[c][block*SuperBlock : (block+1)*SuperBlock]
-			into := q[block*SuperBlock : (block+1)*SuperBlock]
+// quantizeKBlock refreshes one superblock of one column's Q8_K form, which
+// must already be allocated.
+func (b *Batch) quantizeKBlock(c, block int) {
+	q := b.QK[c*b.Width : (c+1)*b.Width]
+	scales := b.KScales[c*b.Width/SuperBlock : (c+1)*b.Width/SuperBlock]
+	sums := b.BSums[c*b.Width/16 : (c+1)*b.Width/16]
 
-			// ggml takes its scale from the signed extremum rather than the
-			// absolute one, and maps it to -127: quantize_row_q8_K_ref has
-			// used -127/max since IQ2_XXS wanted it, and x86 calls the
-			// reference. The -128 this used to have left every Q6_K product
-			// a step's worth of rounding away from ggml's — two tenths of a
-			// logit on the 12B assistant's head, from an input that matched
-			// to the bit.
-			var peak, extreme float32
-			for _, f := range values {
-				a := f
-				if a < 0 {
-					a = -a
-				}
-				if a > peak {
-					peak, extreme = a, f
-				}
-			}
-			if peak == 0 {
-				scales[block] = 0
-				clear(into)
-				clear(sums[block*(SuperBlock/16) : (block+1)*(SuperBlock/16)])
-				continue
-			}
-			inverse := -127 / extreme
-			for i, f := range values {
-				n := nearestInt(f * inverse)
-				if n > 127 {
-					n = 127
-				}
-				into[i] = int8(n)
-			}
-			scales[block] = 1 / inverse
-			for g := 0; g < SuperBlock/16; g++ {
-				var sum int32
-				for _, n := range into[g*16 : (g+1)*16] {
-					sum += int32(n)
-				}
-				sums[block*(SuperBlock/16)+g] = int16(sum)
-			}
+	values := b.F[c][block*SuperBlock : (block+1)*SuperBlock]
+	into := q[block*SuperBlock : (block+1)*SuperBlock]
+
+	// ggml takes its scale from the signed extremum rather than the
+	// absolute one, and maps it to -127: quantize_row_q8_K_ref has
+	// used -127/max since IQ2_XXS wanted it, and x86 calls the
+	// reference. The -128 this used to have left every Q6_K product
+	// a step's worth of rounding away from ggml's — two tenths of a
+	// logit on the 12B assistant's head, from an input that matched
+	// to the bit.
+	var peak, extreme float32
+	for _, f := range values {
+		a := f
+		if a < 0 {
+			a = -a
 		}
+		if a > peak {
+			peak, extreme = a, f
+		}
+	}
+	if peak == 0 {
+		scales[block] = 0
+		clear(into)
+		clear(sums[block*(SuperBlock/16) : (block+1)*(SuperBlock/16)])
+		return
+	}
+	inverse := -127 / extreme
+	for i, f := range values {
+		n := nearestInt(f * inverse)
+		if n > 127 {
+			n = 127
+		}
+		into[i] = int8(n)
+	}
+	scales[block] = 1 / inverse
+	for g := 0; g < SuperBlock/16; g++ {
+		var sum int32
+		for _, n := range into[g*16 : (g+1)*16] {
+			sum += int32(n)
+		}
+		sums[block*(SuperBlock/16)+g] = int16(sum)
 	}
 }
 

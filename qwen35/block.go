@@ -39,14 +39,13 @@ func Block(
 
 	gate := scratch.batchFFN.F[0][:bc.FFN]
 	up := scratch.ffnUp[:bc.FFN]
-	bw.Gate.MatVec(scratch.batchX, gate)
-	bw.Up.MatVec(scratch.batchX, up)
+	nn.MatVecs([]nn.Matrix{bw.Gate, bw.Up}, scratch.batchX, [][]float32{gate, up})
 
 	nn.SiLUGGMLRange(gate, 0, bc.FFN)
 	for i := 0; i < bc.FFN; i++ {
 		gate[i] *= up[i]
 	}
-	quantize(scratch.batchFFN)
+	scratch.quantize(scratch.batchFFN)
 	calib(bc.Index, "down", gate)
 
 	ffnOut := scratch.ffnDown[:dim]
