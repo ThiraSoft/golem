@@ -94,7 +94,7 @@ func TestRopeTableMatchesTheCPU(t *testing.T) {
 	// sum, and a sine of our own — shaders/rope_table.comp says why each was
 	// needed and what the built-ins cost instead.
 	if worst > 1e-6 {
-		t.Fatalf("the card's angles are out by %v", worst)
+		t.Fatalf("the card's angles are out by %v (%s)", worst, worstAt)
 	}
 	t.Logf("worst absolute error over %d columns: %v (%s)", columns, worst, worstAt)
 }

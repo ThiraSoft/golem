@@ -64,30 +64,56 @@ float cosQuarter(float x) {
     return fma(x2, fma(x2, fma(x2, fma(x2, 2.48015873e-5, -1.38888889e-3), 4.16666667e-2), -5.0e-1), 1.0);
 }
 
+// A float as two halves of twelve bits each, and the exact product of two
+// floats as a pair: Dekker's, out of multiplies and adds alone.
+//
+// This was a pair of fma calls once, fma(a, b, -a*b) for what the product
+// rounded away and fma(-q, quarterHi, hi) for the reduction. Mesa 26.2 stopped
+// keeping those fused: glslang puts NoContraction on a precise multiply or add
+// but never on a call to fma, and an fma without it is now free to come out as
+// a multiply and an add, which rounds exactly the part it was there to keep.
+// Every operation below carries the decoration, so none of it can be undone.
+void split(float a, out float hi, out float lo) {
+    precise float c = 4097.0 * a;
+    precise float h = c - (c - a);
+    hi = h;
+    lo = a - h;
+}
+
+void twoProduct(float a, float b, out float p, out float e) {
+    precise float pp = a * b;
+    float ah, al, bh, bl;
+    split(a, ah, al);
+    split(b, bh, bl);
+    precise float ee = ((ah * bh - pp) + ah * bl + al * bh) + al * bl;
+    p = pp;
+    e = ee;
+}
+
 void main() {
     uint c   = gl_WorkGroupID.x;
     float at = float(where_[c].x);
     for (uint j = gl_LocalInvocationID.x; j < p.halfDims; j += 64u) {
         // The angle as a pair: the rounded product, and everything the
         // rounding and the frequency's own second half left behind.
-        // precise, or the optimizer contracts the product and its own
-        // residual into each other and the second half of the frequency
-        // silently stops mattering.
-        precise float hi = at * inv[j];
-        precise float lo = fma(at, inv[j], -hi) + at * inv[p.halfDims + j];
+        float hi, res;
+        twoProduct(at, inv[j], hi, res);
+        precise float lo = res + at * inv[p.halfDims + j];
 
         // Into a quarter turn either side of zero, subtracting the quarters
         // from the pair rather than from the sum — which is the whole point of
         // carrying a pair, since a float32 cannot hold four thousand radians
         // to better than a quarter of a milliradian in the first place.
-        float q = floor(fma(hi, 0.636619772367581343, 0.5));
-        // The second subtraction is spelled out rather than given to fma:
-        // written as one, glslc folds it into the first and the low half of
-        // the quarter turn stops arriving. It is worth a hundred and thirteen
-        // microradians at the far end of the context, which is the whole gap
-        // this was written to close.
-        precise float x = fma(-q, quarterHi, hi);
-        x = x - (q * quarterLo) + lo;
+        float q = floor(hi * 0.636619772367581343 + 0.5);
+        // q quarter turns as a pair too. hi less their rounded product is
+        // exact, the two being within half a turn of each other, so what the
+        // product rounded away is the only part that needs carrying, and it
+        // is worth a hundred and thirteen microradians at the far end of the
+        // context, which is the whole gap this was written to close.
+        float turns, turnsLo;
+        twoProduct(q, quarterHi, turns, turnsLo);
+        precise float x = hi - turns;
+        x = x - turnsLo - (q * quarterLo) + lo;
 
         float sn = sinQuarter(x), cs = cosQuarter(x);
         uint n = uint(int(q) & 3);
