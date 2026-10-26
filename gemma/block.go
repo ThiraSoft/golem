@@ -37,6 +37,7 @@ func Block(
 		}
 	})
 
+	calib(bc.Index, "qkv", normed.F[:batch])
 	attn := s.attn[:batch]
 	Attention(cfg, bc, bw, ropes, at, s, normed, attn)
 	nn.InParallel(batch, batch*cfg.Dim*perPosition, func(first, last int) {
@@ -51,6 +52,7 @@ func Block(
 		}
 	})
 
+	calib(bc.Index, "gateup", normed.F[:batch])
 	if bc.MoE {
 		moeHalf(cfg, bc, bw, s, xs, normed, batch)
 	} else {
@@ -134,6 +136,7 @@ func denseHalf(cfg *Config, bc BlockConfig, bw *BlockWeights, s *Scratch, xs [][
 	})
 
 	ffn := s.ffn[:batch]
+	calib(bc.Index, "down", gate.F[:batch])
 	bw.Down.MatVecBatch(gate, ffn)
 
 	nn.InParallel(batch, batch*cfg.Dim*perPosition, func(first, last int) {
@@ -181,6 +184,7 @@ func moeHalf(cfg *Config, bc BlockConfig, bw *BlockWeights, s *Scratch, xs [][]f
 		}
 	})
 	shared := s.moeShared[:batch]
+	calib(bc.Index, "down", gate.F[:batch])
 	bw.Down.MatVecBatch(gate, shared)
 
 	// The expert branch, from the same residual under its own norm.

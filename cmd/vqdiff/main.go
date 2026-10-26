@@ -15,9 +15,11 @@ import (
 	"os"
 	"time"
 
+	"github.com/ThiraSoft/golem/gemma"
 	"github.com/ThiraSoft/golem/qwen"
 	"github.com/ThiraSoft/golem/qwen35"
 	"github.com/ThiraSoft/golem/tensors"
+	"github.com/ThiraSoft/golem/token/bpe"
 	"github.com/ThiraSoft/golem/token/bytebpe"
 )
 
@@ -41,6 +43,7 @@ func main() {
 	limit := flag.Int("limit", 4096, "how many corpus tokens to read")
 	steps := flag.Int("steps", 40, "greedy steps")
 	vulkan := flag.Bool("vulkan", false, "run the model on a Vulkan device")
+	prefix := flag.String("prefix", "", "text every corpus window opens with, special tokens parsed, and not scored: a chat turn, for an instruct model that reads raw text as noise")
 	stream := flag.Bool("stream", false, "carry the checkpoint past the card a window of blocks at a time, widened to floats. For one the resident stack cannot take: too large for the card, or a form no kernel here reads. The processor is the alternative and it reads every weight for every token. Not for a .golem: this streams the body and leaves the head on the processor, and a trellis head is 1.27 billion weights decoded per position — 4088 positions of Qwen3.8-27B did not finish in half an hour, where -vulkan does the whole corpus in under three minutes")
 	flag.Parse()
 
@@ -56,14 +59,14 @@ func main() {
 	m, err := open(*model, ctxSize, *vulkan)
 	must(err)
 	defer m.Close()
-	v, err := bytebpe.Load(m.File())
+	v, err := vocabulary(m)
 	must(err)
 	t0 := time.Now()
 
 	if *corpus != "" {
 		text, err := os.ReadFile(*corpus)
 		must(err)
-		ids := v.Encode(string(text), true, false)
+		ids := v.Encode(string(text), false, false)
 		if len(ids) > *limit {
 			ids = ids[:*limit]
 		}
@@ -83,10 +86,27 @@ func main() {
 		// path wants them all at once: it carries the model past the card a
 		// window of blocks at a time and every position has to meet a block
 		// while that block is resident.
-		var windows [][]int32
-		for start := 0; start+*ctx <= len(ids); start += *ctx {
-			windows = append(windows, ids[start:start+*ctx])
+		//
+		// Every window opens with the same head: the BOS, when the vocabulary
+		// wants one, then -prefix. The BOS on every window and not only the
+		// first, because Gemma reads a window that starts mid-sentence with
+		// none as noise, 338 against 33 on the E2B. The prefix because an
+		// instruct Gemma 4 12B reads raw text as noise too — llama.cpp
+		// continues "The three laws of thermodynamics are" with a column of
+		// underscores just as this does — and a perplexity of noise compares
+		// nothing; inside a model's turn the same text is prose. Only the
+		// text's own tokens are scored. Qwen wants neither and is cut as it
+		// always was.
+		var head []int32
+		if v.AddBOS() {
+			head = append(head, v.BOS())
 		}
+		if *prefix != "" {
+			head = append(head, v.Encode(*prefix, false, true)...)
+		}
+		windows := cutWindows(ids, head, *ctx)
+		skip := max(len(head)-1, 0)
+
 		// A checkpoint the resident stack cannot take, for either of the two
 		// reasons it cannot: too large for the card, or a form no kernel here
 		// reads. Both are answered the same way — the model goes past the card
@@ -124,8 +144,8 @@ func main() {
 				h = m.ForwardBatch(window, 0)
 			}
 			// The first token of a window has nothing before it, so it is not
-			// predicted and does not count.
-			for i := 0; i < len(window)-1; i++ {
+			// predicted and does not count; nor does the rest of the head.
+			for i := skip; i < len(window)-1; i++ {
 				m.Logits(h[i], logits)
 				if cf != nil {
 					must(binary.Write(cf, binary.LittleEndian, logits))
@@ -193,6 +213,22 @@ func main() {
 	}
 }
 
+// cutWindows makes windows of ctx positions out of a text, each the head and
+// then as much of the text as fills it, the text's tokens never repeated.
+func cutWindows(ids, head []int32, ctx int) [][]int32 {
+	step := ctx - len(head)
+	if step <= 0 {
+		return nil
+	}
+	var windows [][]int32
+	for start := 0; start+step <= len(ids); start += step {
+		w := make([]int32, 0, ctx)
+		w = append(append(w, head...), ids[start:start+step]...)
+		windows = append(windows, w)
+	}
+	return windows
+}
+
 func logSoftmaxAt(l []float32, id int32) float64 {
 	mx := float64(l[0])
 	for _, v := range l {
@@ -238,6 +274,37 @@ type qwen35Model struct{ *qwen35.Model }
 
 func (m qwen35Model) Vocab() int { return m.Cfg.Vocab }
 
+type gemmaModel struct{ *gemma.Model }
+
+func (m gemmaModel) Vocab() int { return m.Cfg.Vocab }
+
+// UseVulkan is what engine.UseVulkan does for Gemma, and in the same order: the
+// head first, because a head uploaded after the blocks is the one that does not
+// fit and lands in host memory without a word.
+func (m gemmaModel) UseVulkan() error {
+	if err := m.UseVulkanHead(); err != nil {
+		return err
+	}
+	return m.UseVulkanStack()
+}
+
+// vocab is the part of a tokenizer this tool reads. Gemma's is token/bpe and
+// Qwen's token/bytebpe; each reads the other's file without complaint and
+// encodes nonsense, so the choice follows the engine and not the file.
+type vocab interface {
+	Encode(text string, addBOS, parseSpecial bool) []int32
+	Decode(ids []int32, special bool) string
+	AddBOS() bool
+	BOS() int32
+}
+
+func vocabulary(m model) (vocab, error) {
+	if _, ok := m.(gemmaModel); ok {
+		return bpe.Load(m.File())
+	}
+	return bytebpe.Load(m.File())
+}
+
 // vulkanModel is a model that can put itself on a device. Both engines can;
 // naming it here keeps open's return type the narrow one above.
 type vulkanModel interface{ UseVulkan() error }
@@ -250,7 +317,7 @@ type streamedModel interface {
 }
 
 // open reads a checkpoint with whichever engine claims it. qwen refuses an
-// architecture it does not know, which is how the second gets its turn.
+// architecture it does not know, which is how the others get their turn.
 //
 // onDevice is not an optimisation here, it is what makes the measurement
 // possible. A perplexity over four thousand positions of a twenty-seven
@@ -264,8 +331,10 @@ func open(path string, ctx int, onDevice bool) (model, error) {
 		m = qwenModel{a}
 	} else if b, err2 := qwen35.Open(path, ctx); err2 == nil {
 		m = qwen35Model{b}
+	} else if c, err3 := gemma.Open(path, ctx); err3 == nil {
+		m = gemmaModel{c}
 	} else {
-		return nil, fmt.Errorf("neither engine reads it: %v; %v", err, err2)
+		return nil, fmt.Errorf("no engine reads it: %v; %v; %v", err, err2, err3)
 	}
 	if onDevice {
 		v, ok := m.(vulkanModel)

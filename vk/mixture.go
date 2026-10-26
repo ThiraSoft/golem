@@ -408,9 +408,11 @@ type Mixture struct {
 	dxq, dxs, dout *Buffer
 	// dxf is the shared branch's input as floats, which only a Golem branch
 	// reads, and which is nil until one is added.
-	dxf       *Buffer
-	doutParts *Buffer // the slices of a split down projection
-	daq, das  *Buffer
+	dxf *Buffer
+	// golemScratch is the two intermediates every Golem block shares.
+	golemScratch *GolemFFNScratch
+	doutParts    *Buffer // the slices of a split down projection
+	daq, das     *Buffer
 
 	blocks []*mixtureBlock
 }
@@ -1386,6 +1388,10 @@ func (m *Mixture) Close() {
 			b.golem.Close()
 			b.golem = nil
 		}
+	}
+	if m.golemScratch != nil {
+		m.golemScratch.Close()
+		m.golemScratch = nil
 	}
 	for _, b := range m.blocks {
 		b.close()

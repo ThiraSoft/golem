@@ -34,7 +34,11 @@ func (m *Mixture) AddBlockGolem(k *GolemKernels, gate, up, down []byte, preGateU
 			return err
 		}
 	}
-	f, err := NewGolemFFN(k, m.dim, m.dense, maxColumns, gate, up, down, preGateUp, preDown, m.dxf, m.dout)
+	// One pair of intermediates for every block: they run one after another.
+	if m.golemScratch == nil {
+		m.golemScratch = &GolemFFNScratch{}
+	}
+	f, err := NewGolemFFN(k, m.dim, m.dense, maxColumns, gate, up, down, preGateUp, preDown, m.dxf, m.dout, m.act, m.gelu, m.golemScratch)
 	if err != nil {
 		return err
 	}

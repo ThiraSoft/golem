@@ -45,10 +45,29 @@ import (
 // scores one activation at a time, and a batch reads the head once for all of
 // its columns already.
 func (m *Model) UseVulkanHead() error {
-	if m.head != nil {
+	if m.head != nil || m.golemHead != nil {
 		return nil
 	}
 	e := m.W.TokenEmbd
+	if e.Quant.Golem() {
+		// The table was scaled and rotated as a site when it was written,
+		// and output.pre is what the hidden state meets before the product.
+		// The embedding stays on the processor, which reads a row of it the
+		// same way: the card's lookup knows nothing of Gemma's scale.
+		if e.Pre == nil {
+			return fmt.Errorf("gemma: a %s head without output.pre — the checkpoint was written with the table left plain", e.Quant)
+		}
+		k, err := m.golemKernels(e.Quant)
+		if err != nil {
+			return err
+		}
+		h, err := vk.NewGolemHead(k, e.Data, e.Rows, e.Cols, e.Pre)
+		if err != nil {
+			return err
+		}
+		m.golemHead = h
+		return nil
+	}
 	if e.Quant != nn.Q6_K && !vk.QuantReadable(e.Quant) {
 		return fmt.Errorf("gemma: there is no Vulkan head kernel for a %s embedding", e.Quant)
 	}
@@ -222,8 +241,26 @@ func (m *Model) UseVulkanStack() error {
 		return err
 	}
 
+	// A .golem checkpoint reads through the Golem kernels: floats through a
+	// scale and a rotation rather than Q8_0, and one format for the whole
+	// model by construction. qwen/vulkan.go does the same.
+	var golem *vk.GolemKernels
+	if gq := m.W.Blocks[0].Q.Quant; gq.Golem() {
+		if golem, err = m.golemKernels(gq); err != nil {
+			stack.Close()
+			return err
+		}
+	}
+
 	for i := range cfg.Blocks {
 		bc, bw := cfg.Blocks[i], &m.W.Blocks[i]
+		if golem != nil {
+			if err := m.addGolemBlock(golem, attn, mix, stack, i, index[bc.RoPEBase]); err != nil {
+				stack.Close()
+				return err
+			}
+			continue
+		}
 		// Asked per matrix rather than per model. A Q4_K_M gives the same role
 		// different formats in different blocks — half of Gemma 4 12B's
 		// ffn_down and its attn_v are Q6_K where the rest is Q4_K — so a check
@@ -374,7 +411,84 @@ func (m *Model) device() (*vk.Device, error) {
 func (m *Model) VulkanEmbedding() bool { return m.stack != nil && m.stack.Embedding() }
 
 // VulkanHead says whether the head is on a device.
-func (m *Model) VulkanHead() bool { return m.head != nil }
+func (m *Model) VulkanHead() bool { return m.head != nil || m.golemHead != nil }
+
+// addGolemBlock is one block of a .golem checkpoint on the card: the same
+// attention and the same norms as any other, with its seven matrices read by
+// the Golem kernels through the vectors of their four sites. The matrices of
+// a site share its vector, so the query's is the key's and the value's, and
+// the gate's is the up's.
+func (m *Model) addGolemBlock(golem *vk.GolemKernels, attn *vk.Attention, mix *vk.Mixture, stack *vk.Stack, i, rotation int) error {
+	cfg := m.Cfg
+	bc, bw := cfg.Blocks[i], &m.W.Blocks[i]
+	if bc.MoE {
+		return fmt.Errorf("gemma: block %d is a mixture, and the card has no Golem experts", i)
+	}
+	mats := []*nn.Matrix{&bw.Q, &bw.O, &bw.Gate, &bw.Up, &bw.Down}
+	if bc.OwnsKV {
+		mats = append(mats, &bw.K)
+		if !bc.ValueIsKey {
+			mats = append(mats, &bw.V)
+		}
+	}
+	for _, mat := range mats {
+		if mat.Quant != bw.Q.Quant {
+			return fmt.Errorf("gemma: a %s checkpoint is one format throughout, and block %d has a %s", bw.Q.Quant, i, mat.Quant)
+		}
+		if mat.Pre == nil || mat.HadGroup != vk.GolemGroup {
+			return fmt.Errorf("gemma: block %d has a matrix with no site vector or a rotation of %d, where the card's is %d", i, mat.HadGroup, vk.GolemGroup)
+		}
+	}
+	var k, v []byte
+	if bc.OwnsKV {
+		k = bw.K.Data
+		if !bc.ValueIsKey {
+			v = bw.V.Data
+		}
+	}
+	if vk.Columns() > MaxPass {
+		return fmt.Errorf("gemma: a pass of %d columns is wider than the %d the window rings are sized for", vk.Columns(), MaxPass)
+	}
+	shape := vk.BlockShape{
+		Heads: bc.Heads, KVHeads: bc.KVHeads, HeadDim: bc.HeadDim,
+		RoPEDims: bc.RoPEDims, Capacity: ringCapacity(bc, m.SlotContext()), Rotation: rotation,
+		ValueIsKey: bc.ValueIsKey, OwnsKV: bc.OwnsKV, KVSource: bc.KVSource, NormValue: true,
+		Eps: cfg.Eps, Scale: 1, // Gemma 4's query norm holds the scores in range
+	}
+	if err := attn.AddBlockGolem(golem, shape, bw.Q.Data, k, v, bw.O.Data, bw.QNorm, bw.KNorm, bw.Q.Pre, bw.O.Pre); err != nil {
+		return err
+	}
+	if err := mix.AddBlockGolem(golem, bw.Gate.Data, bw.Up.Data, bw.Down.Data, bw.Gate.Pre, bw.Down.Pre); err != nil {
+		return err
+	}
+	return stack.AddBlock(vk.BlockNorms{
+		Attn: bw.AttnNorm, PostAttn: bw.PostAttnNorm, FFN: bw.FFNNorm,
+		PostFFW: bw.PostFFWNorm, OutScale: bw.OutScale, Layout: vk.LayoutDense,
+	})
+}
+
+// golemKernels are the Golem kernels of a format, built once. The body of a
+// .golem checkpoint is one format and its head may be another — four bits over
+// a three-bit body is golemquant's default — and kernels built for one read
+// the other's rows at the wrong length.
+func (m *Model) golemKernels(q nn.Quant) (*vk.GolemKernels, error) {
+	if k := m.golem[q]; k != nil {
+		return k, nil
+	}
+	d, err := m.device()
+	if err != nil {
+		return nil, err
+	}
+	k, err := vk.NewGolemKernels(d, q)
+	if err != nil {
+		return nil, err
+	}
+	if m.golem == nil {
+		m.golem = map[nn.Quant]*vk.GolemKernels{}
+	}
+	m.golem[q] = k
+	return k, nil
+}
 
 // closeVulkanHead releases the device. Close calls it; a caller that wants the
 // memory back sooner has no reason to.
@@ -387,6 +501,14 @@ func (m *Model) closeVulkanHead() {
 		m.head.Close()
 		m.head = nil
 	}
+	if m.golemHead != nil {
+		m.golemHead.Close()
+		m.golemHead = nil
+	}
+	for _, k := range m.golem {
+		k.Close()
+	}
+	m.golem = nil
 	if m.headDev != nil {
 		m.headDev.Close()
 		m.headDev = nil

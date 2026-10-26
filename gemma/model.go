@@ -41,6 +41,12 @@ type Model struct {
 	// gemma/vulkan.go says what that buys and what it leaves alone.
 	head      vk.Head
 	stack     *vk.Stack
+	// golemHead is the head of a .golem checkpoint, which has the transform
+	// of its site in front of the product and an API of its own; golem holds
+	// the kernels of each format, built once: a three-bit body usually comes
+	// with a four-bit head.
+	golemHead *vk.GolemHead
+	golem     map[nn.Quant]*vk.GolemKernels
 	rotations []rotation
 	headDev   *vk.Device
 
@@ -291,6 +297,7 @@ func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32,
 		copy(hidden[t], xs[t])
 		nn.RMSNormPlain(hidden[t], w.OutputNorm, cfg.Eps)
 	}
+	calib(-1, "head", hidden)
 	return hidden
 }
 
@@ -381,6 +388,14 @@ func (m *Model) Logits(hidden []float32, out []float32) {
 	if len(out) != m.Cfg.Vocab {
 		panic(fmt.Sprintf("gemma: logits need %d entries, given %d", m.Cfg.Vocab, len(out)))
 	}
+	if m.golemHead != nil {
+		if err := m.golemHead.Logits(hidden, out); err != nil {
+			panic(fmt.Sprintf("gemma: the Vulkan head failed: %v", err))
+		}
+		nn.Softcap(out, m.Cfg.LogitSoftcap)
+		m.suppress(out, nil)
+		return
+	}
 	v := m.scratch.Batch(m.Cfg.Dim, 1)
 	copy(v.F[0], hidden)
 	if m.head != nil {
@@ -457,7 +472,7 @@ func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
 			panic(fmt.Sprintf("gemma: logits need %d entries, given %d", m.Cfg.Vocab, len(o)))
 		}
 	}
-	if m.head != nil {
+	if m.head != nil || m.golemHead != nil {
 		for i := range hidden {
 			m.Logits(hidden[i], out[i])
 		}
