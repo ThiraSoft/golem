@@ -64,7 +64,11 @@ type pass struct {
 	tokens    []int32
 	positions []int
 	logits    []float32     // where to score the last token, or nil for a chunk
-	reply     chan struct{} // closed once the pass has run
+	// scores, when it is not nil, scores the last len(scores) tokens rather
+	// than the last alone: weighing an option of several tokens wants the
+	// distribution before each of them. A pass sets this or logits.
+	scores [][]float32
+	reply  chan struct{} // closed once the pass has run
 	// A conversation carrying a picture brings more than its tokens: the rows
 	// to use instead of the embedding table, and then whatever its engine
 	// needs beside them — Gemma's per-layer identifiers and how far forward
@@ -241,17 +245,19 @@ func (r *Runner) Forward(slot int, tokens []int32, positions []int, logits []flo
 // ForwardState is Forward that also keeps the hidden state the pass ended on,
 // which is what a conversation about to draft needs and no other has a use for.
 func (r *Runner) ForwardState(slot int, tokens []int32, positions []int, logits []float32, state *[]float32) {
-	p := &pass{slot: slot, tokens: tokens, positions: positions, logits: logits,
-		state: state, reply: make(chan struct{})}
-	r.passes <- p
-	<-p.reply
+	r.submit(&pass{slot: slot, tokens: tokens, positions: positions, logits: logits, state: state})
 }
 
 // ForwardEmbedded is the same, for a chunk that carries a picture.
 func (r *Runner) ForwardEmbedded(slot int, tokens []int32, embeds [][]float32, ple []int32,
 	positions, until []int, axes [][3]int, logits []float32) {
-	p := &pass{slot: slot, tokens: tokens, positions: positions, logits: logits,
-		embeds: embeds, ple: ple, until: until, axes: axes, reply: make(chan struct{})}
+	r.submit(&pass{slot: slot, tokens: tokens, positions: positions, logits: logits,
+		embeds: embeds, ple: ple, until: until, axes: axes})
+}
+
+// submit hands a pass to the loop and waits for it to have run.
+func (r *Runner) submit(p *pass) {
+	p.reply = make(chan struct{})
 	r.passes <- p
 	<-p.reply
 }
@@ -427,6 +433,10 @@ func (r *Runner) run(batch []*pass) {
 		if p.logits != nil {
 			last = append(last, states[end-1])
 			outs = append(outs, p.logits)
+		}
+		for i, out := range p.scores {
+			last = append(last, states[end-len(p.scores)+i])
+			outs = append(outs, out)
 		}
 	}
 	if len(last) == 1 {

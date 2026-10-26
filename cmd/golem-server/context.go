@@ -205,6 +205,20 @@ func (c *Context) PrefillPrompt(p engine.Prompt, logits []float32) (int, error) 
 // is minutes on a card, and the next request waits behind every one of them.
 // What was read stays held: a client that asks again goes on from there.
 func (c *Context) PrefillPromptState(ctx context.Context, p engine.Prompt, logits []float32, state *[]float32) (int, error) {
+	return c.prefill(ctx, p, logits, state, nil)
+}
+
+// PrefillScored is PrefillPrompt scoring the last len(outs) positions rather
+// than the last alone, each into its own row. Those positions are fed whatever
+// the cache holds, and in one pass.
+func (c *Context) PrefillScored(ctx context.Context, p engine.Prompt, outs [][]float32) (int, error) {
+	if len(outs) == 0 || len(outs) > p.Len() {
+		return 0, fmt.Errorf("serve: %d positions to score in a prompt of %d", len(outs), p.Len())
+	}
+	return c.prefill(ctx, p, nil, nil, outs)
+}
+
+func (c *Context) prefill(ctx context.Context, p engine.Prompt, logits []float32, state *[]float32, scored [][]float32) (int, error) {
 	ids := p.Tokens()
 	if len(ids) == 0 {
 		return 0, fmt.Errorf("serve: an empty prompt")
@@ -235,6 +249,8 @@ func (c *Context) PrefillPromptState(ctx context.Context, p engine.Prompt, logit
 		if from >= len(ids) {
 			from = len(ids) - 1
 		}
+		// The states of the positions scored were not kept either.
+		from = min(from, len(ids)-len(scored))
 		// A window block's ring may hold another conversation's keys where
 		// this one's window still looks.
 		from = c.intactFrom(from)
@@ -266,20 +282,27 @@ func (c *Context) PrefillPromptState(ctx context.Context, p engine.Prompt, logit
 		if len(saves) > 0 && saves[0] < to {
 			to = saves[0]
 		}
+		// And the positions scored all go in the last pass, the only one
+		// whose states are scored.
+		if last := len(ids) - len(scored); to < len(ids) && to > last {
+			to = last
+		}
 		// Only the chunk that ends the prompt is scored: the ones before it
 		// are read for their keys and values alone.
 		var out []float32
 		var keep *[]float32
+		var sc [][]float32
 		if to == len(ids) {
-			out, keep = logits, state
+			out, keep, sc = logits, state, scored
 		}
 		if p.Embeds() == nil {
-			c.runner.ForwardState(c.slot, ids[at:to], span(at, to-at), out, keep)
+			c.runner.submit(&pass{slot: c.slot, tokens: ids[at:to], positions: span(at, to-at),
+				logits: out, state: keep, scores: sc})
 		} else {
 			chunk := p.Slice(at, to)
 			ple, until, axes := chunk.Extras(at)
-			c.runner.ForwardEmbedded(c.slot, chunk.Tokens(), chunk.Embeds(), ple,
-				span(at, to-at), until, axes, out)
+			c.runner.submit(&pass{slot: c.slot, tokens: chunk.Tokens(), positions: span(at, to-at),
+				logits: out, scores: sc, embeds: chunk.Embeds(), ple: ple, until: until, axes: axes})
 			if keep != nil {
 				// A prompt carrying a picture goes through the vision path,
 				// which does not keep states. Such a conversation draws a
