@@ -27,10 +27,10 @@ type logprobCase struct {
 	} `json:"options"`
 }
 
-// The options are weighed as llama.cpp weighs them: E2B on the processor, the
-// card having no per-layer branch for it, and the 12B on the card, which is
-// where a server runs it. ref/systemone/README.md says how the fixtures are
-// recorded and what the gaps were.
+// The options are weighed as llama.cpp weighs them: E2B on the processor and
+// on the card, and the 12B on the card, which is where a server runs it.
+// ref/systemone/README.md says how the fixtures are recorded and what the gaps
+// were.
 func TestWeighMatchesLlamaCpp(t *testing.T) {
 	for _, run := range []struct {
 		name, env, fixture string
@@ -38,6 +38,7 @@ func TestWeighMatchesLlamaCpp(t *testing.T) {
 		nats, p            float64
 	}{
 		{"e2b/processor", "GOLEM_MODEL", "e2b", false, 0.3, 0.05},
+		{"e2b/card", "GOLEM_MODEL", "e2b", true, 0.3, 0.05},
 		{"12b/card", "GOLEM_MODEL_12B", "12b", true, 0.6, 0.05},
 	} {
 		t.Run(run.name, func(t *testing.T) {

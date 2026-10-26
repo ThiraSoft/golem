@@ -43,11 +43,17 @@ func screenshot(seed int) string {
 // three ways: from nothing, again with the same capture, and with a new
 // capture behind the same rules and history, which is the request a client
 // actually repeats.
-func TestSystemOneCost(t *testing.T) {
+func TestSystemOneCost(t *testing.T) { systemOneCost(t, "12b", "GOLEM_MODEL_12B", "GOLEM_MMPROJ_12B") }
+
+// TestSystemOneCostE2B is the same on E2B, which the card carries with its
+// per-layer branch.
+func TestSystemOneCostE2B(t *testing.T) { systemOneCost(t, "e2b", "GOLEM_MODEL", "GOLEM_MMPROJ") }
+
+func systemOneCost(t *testing.T, name, modelEnv, projEnv string) {
 	heavy.Skip(t, "a measurement, not a check")
-	path, proj := os.Getenv("GOLEM_MODEL_12B"), os.Getenv("GOLEM_MMPROJ_12B")
+	path, proj := os.Getenv(modelEnv), os.Getenv(projEnv)
 	if path == "" || proj == "" {
-		t.Skip("GOLEM_MODEL_12B and GOLEM_MMPROJ_12B are not both set")
+		t.Skipf("%s and %s are not both set", modelEnv, projEnv)
 	}
 	m, err := engine.Open(path, 8192)
 	if err != nil {
@@ -70,7 +76,7 @@ func TestSystemOneCost(t *testing.T) {
 	ctx := NewContext(r, m.Window, 8192, time.Now, 0)
 	ctx.SetRing(m.WindowRing())
 	s := NewServer(poolOf(NewGenerator(ctx, m.Vocab, m.Template, m.Vocabulary, 16)),
-		m.Vocab, "12b", m.Template, m.Sampling)
+		m.Vocab, name, m.Template, m.Sampling)
 	s.SetVision(v)
 
 	var rules, history strings.Builder
