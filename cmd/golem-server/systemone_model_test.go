@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ThiraSoft/golem/chat"
 )
 
 // An engine with a taste: whatever it has read, it would rather write some
@@ -167,6 +169,62 @@ func TestSystemOneRefusesAQuestionOfNoKind(t *testing.T) {
 	s, _ := newTasteServer(t, map[string]float32{"Yes": 1})
 	rec := ask(t, s, `{"state":"x","questions":{"q":{"type":"guess","instructions":"?"}}}`)
 	if rec.Code != 422 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+}
+
+// A template that closes every turn, as the real ones do.
+type closingTemplate struct{ wordTemplate }
+
+func (closingTemplate) Render(msgs []chat.Message, opt chat.Options) (string, error) {
+	var b strings.Builder
+	for _, m := range msgs {
+		b.WriteString(m.Role + " " + m.Content + " <turn|> ")
+	}
+	if opt.AddGenerationPrompt {
+		b.WriteString("assistant ")
+	}
+	return b.String(), nil
+}
+
+// An engine whose taste depends on the word it read last.
+type followEngine struct {
+	recordingEngine
+	vocab *wordVocab
+	after map[string]map[string]float32
+}
+
+func (e *followEngine) LogitsBatch(hidden [][]float32, out [][]float32) {
+	for i, o := range out {
+		clear(o)
+		likes, ok := e.after[e.vocab.Piece(int32(hidden[i][0]), false)]
+		if !ok {
+			likes = e.after[""]
+		}
+		for w, v := range likes {
+			o[e.vocab.id(w)] = v
+		}
+	}
+}
+
+func (e *followEngine) Logits(hidden []float32, out []float32) {
+	e.LogitsBatch([][]float32{hidden}, [][]float32{out})
+}
+
+// An option is weighed through the end of the answer: "heal" is the answer
+// that stops there, not every answer that starts with it.
+func TestSystemOneWeighsAnOptionWithItsEnd(t *testing.T) {
+	v := newWordVocab()
+	e := &followEngine{vocab: v, after: map[string]map[string]float32{
+		"":     {"heal": 20},
+		"heal": {"the": 20},
+		"the":  {"tank": 20},
+		"tank": {"<turn|>": 20},
+	}}
+	ctx := NewContext(running(t, e), 0, 4096, time.Now, 0)
+	s := NewServer(poolOf(NewGenerator(ctx, v, closingTemplate{}, 4096, 16)), v, "m", closingTemplate{}, greedy())
+	rec := ask(t, s, `{"state":"x","questions":{"g":{"type":"choice","instructions":"Which?","criteria":["heal","heal the tank"]}}}`)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"choice":"heal the tank"`) {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
 }
