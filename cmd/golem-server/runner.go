@@ -63,7 +63,7 @@ type pass struct {
 	slot      int
 	tokens    []int32
 	positions []int
-	logits    []float32     // where to score the last token, or nil for a chunk
+	logits    []float32 // where to score the last token, or nil for a chunk
 	// scores, when it is not nil, scores the last len(scores) tokens rather
 	// than the last alone: weighing an option of several tokens wants the
 	// distribution before each of them. A pass sets this or logits.
