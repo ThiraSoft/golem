@@ -266,6 +266,13 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 	if req.MaxTokens != nil && *req.MaxTokens > 0 {
 		gen = gen.WithMaxTokens(*req.MaxTokens)
 	}
+	if req.LogProbs != nil && *req.LogProbs {
+		top := 0
+		if req.TopLogProbs != nil {
+			top = *req.TopLogProbs
+		}
+		gen = gen.WithLogProbs(top)
+	}
 	if req.Stream {
 		s.stream(r.Context(), w, gen, id, built, params, req.Stop, req.StreamOptions.IncludeUsage)
 		return
@@ -291,6 +298,7 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 			Index: 0,
 			Message: &responseMessage{Role: "assistant", Content: answer.Text,
 				ReasoningContent: answer.Reasoning, ToolCalls: answer.ToolCalls},
+			LogProbs:     answer.LogProbs,
 			FinishReason: &reason,
 		}},
 		Usage: &usage{PromptTokens: answer.Prompt, CompletionTokens: answer.Generated,
@@ -307,8 +315,17 @@ func check(req *completionRequest) error {
 	if req.N != nil && *req.N != 1 {
 		return fmt.Errorf("n is %d: this server draws one answer", *req.N)
 	}
-	if req.LogProbs != nil && *req.LogProbs {
-		return fmt.Errorf("logprobs is not implemented")
+	asked := req.LogProbs != nil && *req.LogProbs
+	if asked && req.Stream {
+		return fmt.Errorf("logprobs is not implemented for a streamed answer")
+	}
+	if req.TopLogProbs != nil {
+		if !asked {
+			return fmt.Errorf("top_logprobs is only read with logprobs")
+		}
+		if *req.TopLogProbs < 0 || *req.TopLogProbs > 20 {
+			return fmt.Errorf("top_logprobs is %d: it is 0 to 20", *req.TopLogProbs)
+		}
 	}
 	// What constrains the answer is refused here rather than in the middle of
 	// one: a schema that does not compile is the client's mistake, and a

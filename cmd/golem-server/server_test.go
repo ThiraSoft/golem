@@ -195,7 +195,9 @@ func TestCompletionRefusesWhatItDoesNotImplement(t *testing.T) {
 	s := newTestServer(t, []string{"x", "<turn|>"})
 	for _, body := range []string{
 		`{"messages":[{"role":"user","content":"hi"}],"n":2}`,
-		`{"messages":[{"role":"user","content":"hi"}],"logprobs":true}`,
+		`{"messages":[{"role":"user","content":"hi"}],"logprobs":true,"stream":true}`,
+		`{"messages":[{"role":"user","content":"hi"}],"top_logprobs":2}`,
+		`{"messages":[{"role":"user","content":"hi"}],"logprobs":true,"top_logprobs":21}`,
 		`{"messages":[{"role":"user","content":"hi"}],"tool_choice":"required"}`,
 		`{"messages":[]}`,
 		`{"messages":[{"role":"tool","content":"x"}]}`,
@@ -355,5 +357,53 @@ func TestARequestTurnsThinkingOn(t *testing.T) {
 	w := post(t, s, `{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}`)
 	if w.Code != http.StatusOK || !asked {
 		t.Fatalf("enable_thinking true did not reach the template (%d: %s)", w.Code, w.Body)
+	}
+}
+
+// logprobs asks for each drawn token's log-probability under the model, and
+// top_logprobs for the most likely tokens at each step beside it.
+func TestCompletionWritesLogProbs(t *testing.T) {
+	s := newTestServer(t, []string{"Hello", "there", "<turn|>"})
+	w := post(t, s, `{"messages":[{"role":"user","content":"hi"}],"logprobs":true,"top_logprobs":2}`)
+	if w.Code != 200 {
+		t.Fatalf("%d: %s", w.Code, w.Body)
+	}
+	var out struct {
+		Choices []struct {
+			LogProbs struct {
+				Content []struct {
+					Token       string  `json:"token"`
+					LogProb     float64 `json:"logprob"`
+					Bytes       []int   `json:"bytes"`
+					TopLogProbs []struct {
+						Token   string  `json:"token"`
+						LogProb float64 `json:"logprob"`
+					} `json:"top_logprobs"`
+				} `json:"content"`
+			} `json:"logprobs"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	got := out.Choices[0].LogProbs.Content
+	if len(got) != 2 || got[0].Token != "Hello" || got[1].Token != "there" {
+		t.Fatalf("%s", w.Body)
+	}
+	for _, c := range got {
+		// The scripted engine puts all the mass on its word.
+		if c.LogProb < -1e-6 || len(c.TopLogProbs) != 2 || c.TopLogProbs[0].Token != c.Token ||
+			c.TopLogProbs[1].LogProb > -50 || len(c.Bytes) != len(c.Token) {
+			t.Fatalf("%s", w.Body)
+		}
+	}
+}
+
+// Without logprobs the answer carries none.
+func TestCompletionWritesNoLogProbsUnasked(t *testing.T) {
+	s := newTestServer(t, []string{"Hello", "<turn|>"})
+	w := post(t, s, `{"messages":[{"role":"user","content":"hi"}]}`)
+	if strings.Contains(w.Body.String(), "logprobs") {
+		t.Fatalf("%s", w.Body)
 	}
 }

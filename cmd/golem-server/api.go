@@ -43,6 +43,9 @@ type completionRequest struct {
 	Grammar        string          `json:"grammar"`
 	N              *int            `json:"n"`
 	LogProbs       *bool           `json:"logprobs"`
+	// TopLogProbs is how many of the likeliest tokens to write beside each
+	// one drawn, 0 to 20, and only with logprobs.
+	TopLogProbs *int `json:"top_logprobs"`
 	// What the template is given beyond the conversation, as llama-server
 	// reads it; enable_thinking is heard, off unless asked, and
 	// preserve_thinking.
@@ -241,7 +244,21 @@ type choice struct {
 	Index        int              `json:"index"`
 	Message      *responseMessage `json:"message,omitempty"`
 	Delta        *responseMessage `json:"delta,omitempty"`
+	LogProbs     *choiceLogProbs  `json:"logprobs,omitempty"`
 	FinishReason *string          `json:"finish_reason"`
+}
+
+// choiceLogProbs is OpenAI's: every token drawn, its log-probability under
+// the model before any penalty or grammar, and the likeliest beside it.
+type choiceLogProbs struct {
+	Content []tokenLogProb `json:"content"`
+}
+
+type tokenLogProb struct {
+	Token       string         `json:"token"`
+	LogProb     float64        `json:"logprob"`
+	Bytes       []int          `json:"bytes"`
+	TopLogProbs []tokenLogProb `json:"top_logprobs,omitempty"`
 }
 
 type usage struct {
