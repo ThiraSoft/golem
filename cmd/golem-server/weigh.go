@@ -17,6 +17,17 @@ package main
 // state its question's words end on scores the first token of every option.
 // An option of several costs a pass for its tokens past the first, less what
 // it shares with the option before it.
+//
+// That is on an engine that cannot write branches. One that can (Gemma)
+// writes every question's words and every option after the state at once,
+// each after the one before it in the cache, each turned as if it followed
+// what it continues and blind to the rest (Context.PrefillSegments), and cuts
+// all of it into passes as a prompt is cut. The questions then cost the
+// columns they fill, in the room the state's last pass leaves and in passes
+// of their own after it, and an option costs a column. Measured on the 12B at
+// two thousand seven hundred positions, a pass of one column is 13 ms, of
+// sixty-four 74 and of a hundred and twenty-eight 107: a pass of its own for
+// each option was most of the answer.
 
 import (
 	"context"
@@ -67,6 +78,10 @@ func (c *Context) Weigh(ctx context.Context, build func([]int32) (engine.Prompt,
 	rows := make([][]float32, longest)
 	for i := range rows {
 		rows[i] = make([]float32, vocab)
+	}
+
+	if c.runner.Branching() {
+		return c.weighBranches(ctx, build, state, qs, lead, vocab)
 	}
 
 	fed := 0
@@ -125,6 +140,80 @@ func (c *Context) Weigh(ctx context.Context, build func([]int32) (engine.Prompt,
 			}
 		}
 		out[qi] = lp
+	}
+	return out, fed, nil
+}
+
+// weighBranches is Weigh on an engine that writes branches: every question's
+// words continue the state, every option but its last token continues its
+// question's words, and all of it is written after the state in as few passes
+// as it fills (Context.PrefillSegments). Nothing reads the state after an
+// option's last token.
+//
+// The empty thought is found the way Weigh finds it, a question at a time:
+// the first question whose words end on it is read again with it, and so is
+// every question after that one, which starts with it without asking.
+func (c *Context) weighBranches(ctx context.Context, build func([]int32) (engine.Prompt, error),
+	state []int32, qs []weighing, lead []int32, vocab int) ([][]float64, int, error) {
+	p, err := build(state)
+	if err != nil {
+		return nil, 0, err
+	}
+	fed := 0
+	out := make([][]float64, len(qs))
+	leading := false
+	for first := 0; first < len(qs); {
+		var segs []segment
+		var rows [][]float32
+		words := make([]int, len(qs)) // the row of each question's last word
+		for qi := first; qi < len(qs); qi++ {
+			tail := qs[qi].tail
+			if leading {
+				tail = slices.Concat(tail, lead)
+			}
+			parent := len(segs)
+			words[qi] = len(rows)
+			segs = append(segs, segment{tokens: tail, parent: -1, scored: 1})
+			rows = append(rows, make([]float32, vocab))
+			for _, o := range qs[qi].options {
+				segs = append(segs, segment{tokens: o[:len(o)-1], parent: parent, scored: len(o) - 1})
+				for range len(o) - 1 {
+					rows = append(rows, make([]float32, vocab))
+				}
+			}
+		}
+		k, err := c.PrefillSegments(ctx, p, segs, rows)
+		fed += k
+		if err != nil {
+			return nil, fed, err
+		}
+
+		again := -1
+		for qi := first; qi < len(qs) && again < 0; qi++ {
+			w := rows[words[qi]]
+			if !leading && len(lead) > 0 && argmax(w) == lead[0] {
+				leading, again = true, qi
+				continue
+			}
+			// The words' last row scores every option's first token; an
+			// option's later tokens are scored off its own positions, which
+			// follow in order.
+			lp := make([]float64, len(qs[qi].options))
+			z := logSum(w)
+			at := words[qi] + 1
+			for i, o := range qs[qi].options {
+				lp[i] = float64(w[o[0]]) - z
+				for t := 1; t < len(o); t++ {
+					lp[i] += float64(rows[at][o[t]]) - logSum(rows[at])
+					at++
+				}
+			}
+			out[qi] = lp
+		}
+		if again < 0 {
+			break
+		}
+		first = again
 	}
 	return out, fed, nil
 }

@@ -64,6 +64,9 @@ func TestSystemOneCost(t *testing.T) {
 	r.OnDevice()
 	v, _ := m.Media()
 	r.SetVision(v)
+	if b, ok := m.Branches(); ok {
+		r.SetBranches(b)
+	}
 	ctx := NewContext(r, m.Window, 8192, time.Now, 0)
 	ctx.SetRing(m.WindowRing())
 	s := NewServer(poolOf(NewGenerator(ctx, m.Vocab, m.Template, m.Vocabulary, 16)),

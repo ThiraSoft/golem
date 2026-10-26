@@ -30,6 +30,9 @@ func liveDecider(t *testing.T) *Server {
 	r := running(t, m.Forward)
 	v, _ := m.Media()
 	r.SetVision(v)
+	if b, ok := m.Branches(); ok {
+		r.SetBranches(b)
+	}
 	ctx := NewContext(r, m.Window, 4096, time.Now, 0)
 	ctx.SetRing(m.WindowRing())
 	s := NewServer(poolOf(NewGenerator(ctx, m.Vocab, m.Template, m.Vocabulary, 16)),

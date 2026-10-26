@@ -205,7 +205,7 @@ func (c *Context) PrefillPrompt(p engine.Prompt, logits []float32) (int, error) 
 // is minutes on a card, and the next request waits behind every one of them.
 // What was read stays held: a client that asks again goes on from there.
 func (c *Context) PrefillPromptState(ctx context.Context, p engine.Prompt, logits []float32, state *[]float32) (int, error) {
-	return c.prefill(ctx, p, logits, state, nil)
+	return c.prefill(ctx, p, logits, state, nil, nil)
 }
 
 // PrefillScored is PrefillPrompt scoring the last len(outs) positions rather
@@ -215,13 +215,153 @@ func (c *Context) PrefillScored(ctx context.Context, p engine.Prompt, outs [][]f
 	if len(outs) == 0 || len(outs) > p.Len() {
 		return 0, fmt.Errorf("serve: %d positions to score in a prompt of %d", len(outs), p.Len())
 	}
-	return c.prefill(ctx, p, nil, nil, outs)
+	return c.prefill(ctx, p, nil, nil, outs, nil)
 }
 
-func (c *Context) prefill(ctx context.Context, p engine.Prompt, logits []float32, state *[]float32, scored [][]float32) (int, error) {
+// A segment is a run of tokens written after a prompt, continuing the prompt
+// itself or a segment before it: a question's words continue the state, and
+// each of its options continues its words. Every segment is written after the
+// one before it in the cache and turned as if it followed what it continues,
+// and it sees the prompt, what it continues and itself, and no other segment
+// (engine.Chunk). The last scored of its positions are scored.
+type segment struct {
+	tokens []int32
+	parent int // the segment it continues, or -1 for the prompt
+	scored int
+}
+
+// laid is segments laid out after a prompt, a position at a time, and which
+// of those positions are scored into which rows.
+type laid struct {
+	tokens            []int32
+	positions, shifts []int
+	holes             [][2][2]int
+	scoredAt          []int
+	outs              [][]float32
+}
+
+// lay places segments after a prompt of n positions. A segment sees the
+// prompt and the segments it continues, which leaves holes between them; a
+// column has room for two, which is a question's words and its options.
+func lay(n int, segs []segment, outs [][]float32) (*laid, error) {
+	l := &laid{}
+	start := make([]int, len(segs))  // where each is written
+	turned := make([]int, len(segs)) // where each would stand alone
+	rows := 0
+	for s, sg := range segs {
+		if sg.parent >= s || sg.parent < -1 {
+			return nil, fmt.Errorf("serve: segment %d continues %d, which is not before it", s, sg.parent)
+		}
+		if sg.scored > len(sg.tokens) {
+			return nil, fmt.Errorf("serve: segment %d of %d positions scores %d", s, len(sg.tokens), sg.scored)
+		}
+		start[s] = n + len(l.tokens)
+		turned[s] = n
+		if sg.parent >= 0 {
+			turned[s] = turned[sg.parent] + len(segs[sg.parent].tokens)
+		}
+		// What it sees past the prompt is its ancestors, each before the one
+		// it continues; the gaps between them are its holes.
+		var seen [][2]int
+		for p := sg.parent; p >= 0; p = segs[p].parent {
+			seen = append([][2]int{{start[p], start[p] + len(segs[p].tokens)}}, seen...)
+		}
+		seen = append(seen, [2]int{start[s], start[s]})
+		var holes [2][2]int
+		k, from := 0, n
+		for _, r := range seen {
+			if r[0] > from {
+				if k == len(holes) {
+					return nil, fmt.Errorf("serve: segment %d is too deep to lay out", s)
+				}
+				holes[k] = [2]int{from, r[0]}
+				k++
+			}
+			from = r[1]
+		}
+		for i, id := range sg.tokens {
+			if i >= len(sg.tokens)-sg.scored {
+				if rows == len(outs) {
+					return nil, fmt.Errorf("serve: more positions scored than the %d rows given", len(outs))
+				}
+				l.scoredAt = append(l.scoredAt, len(l.tokens))
+				l.outs = append(l.outs, outs[rows])
+				rows++
+			}
+			l.tokens = append(l.tokens, id)
+			l.positions = append(l.positions, start[s]+i)
+			l.shifts = append(l.shifts, start[s]-turned[s])
+			l.holes = append(l.holes, holes)
+		}
+	}
+	if rows != len(outs) {
+		return nil, fmt.Errorf("serve: %d positions scored and %d rows given", rows, len(outs))
+	}
+	return l, nil
+}
+
+// add puts the laid positions lo … hi-1 at the end of a pass, and their rows
+// among its scores. A pass carrying a picture gets them as text: their own
+// identifier, no row, and their own position for how far each looks.
+func (l *laid) add(pa *pass, lo, hi int) {
+	base := len(pa.tokens)
+	if pa.shifts == nil {
+		pa.shifts = make([]int, base)
+		pa.holes = make([][2][2]int, base)
+	}
+	pa.tokens = slices.Concat(pa.tokens, l.tokens[lo:hi])
+	pa.positions = slices.Concat(pa.positions, l.positions[lo:hi])
+	pa.shifts = append(pa.shifts, l.shifts[lo:hi]...)
+	pa.holes = append(pa.holes, l.holes[lo:hi]...)
+	if pa.embeds != nil {
+		pa.embeds = slices.Concat(pa.embeds, make([][]float32, hi-lo))
+		pa.ple = slices.Concat(pa.ple, l.tokens[lo:hi])
+		pa.until = slices.Concat(pa.until, l.positions[lo:hi])
+		if pa.axes != nil {
+			for _, q := range l.positions[lo:hi] {
+				pa.axes = append(pa.axes, [3]int{q, q, q})
+			}
+		}
+	}
+	for i, at := range l.scoredAt {
+		if at >= lo && at < hi {
+			pa.scores = append(pa.scores, l.outs[i])
+			pa.scoreAt = append(pa.scoreAt, base+at-lo)
+		}
+	}
+}
+
+// PrefillSegments brings the cache up to a prompt and writes the segments
+// after it, in as few passes as their positions fill: the room left in the
+// prompt's last pass, and whole passes after it. outs takes each segment's
+// scored positions, in order.
+//
+// The cache holds the prompt afterwards and nothing past it. The segments are
+// in it, beyond its end, for the next prompt to write over; the ring knows
+// what they took.
+func (c *Context) PrefillSegments(ctx context.Context, p engine.Prompt, segs []segment, outs [][]float32) (int, error) {
+	if !c.runner.Branching() {
+		return 0, fmt.Errorf("serve: this model cannot write branches")
+	}
+	l, err := lay(p.Len(), segs, outs)
+	if err != nil {
+		return 0, err
+	}
+	if p.Len()+len(l.tokens) > c.maxContext {
+		return 0, fmt.Errorf("serve: the conversation is %d positions and what is weighed after it %d, and the context is %d: start the server with a larger -context, or send less", p.Len(), len(l.tokens), c.maxContext)
+	}
+	return c.prefill(ctx, p, nil, nil, nil, l)
+}
+
+func (c *Context) prefill(ctx context.Context, p engine.Prompt, logits []float32, state *[]float32,
+	scored [][]float32, segs *laid) (int, error) {
 	ids := p.Tokens()
 	if len(ids) == 0 {
 		return 0, fmt.Errorf("serve: an empty prompt")
+	}
+	extra, rode := 0, 0 // the segments, and how many rode in the prompt's last pass
+	if segs != nil {
+		extra = len(segs.tokens)
 	}
 	if len(ids) > c.maxContext {
 		return 0, fmt.Errorf("serve: the conversation is %d positions and the context is %d: start the server with a larger -context, or send less", len(ids), c.maxContext)
@@ -296,13 +436,23 @@ func (c *Context) prefill(ctx context.Context, p engine.Prompt, logits []float32
 			out, keep, sc = logits, state, scored
 		}
 		if p.Embeds() == nil {
-			c.runner.submit(&pass{slot: c.slot, tokens: ids[at:to], positions: span(at, to-at),
-				logits: out, state: keep, scores: sc})
+			pa := &pass{slot: c.slot, tokens: ids[at:to], positions: span(at, to-at),
+				logits: out, state: keep, scores: sc}
+			if to == len(ids) && segs != nil {
+				rode = min(extra, c.runner.PassWidth()-(to-at))
+				segs.add(pa, 0, rode)
+			}
+			c.runner.submit(pa)
 		} else {
 			chunk := p.Slice(at, to)
 			ple, until, axes := chunk.Extras(at)
-			c.runner.submit(&pass{slot: c.slot, tokens: chunk.Tokens(), positions: span(at, to-at),
-				logits: out, scores: sc, embeds: chunk.Embeds(), ple: ple, until: until, axes: axes})
+			pa := &pass{slot: c.slot, tokens: chunk.Tokens(), positions: span(at, to-at),
+				logits: out, scores: sc, embeds: chunk.Embeds(), ple: ple, until: until, axes: axes}
+			if to == len(ids) && segs != nil {
+				rode = min(extra, c.runner.PassWidth()-(to-at))
+				segs.add(pa, 0, rode)
+			}
+			c.runner.submit(pa)
 			if keep != nil {
 				// A prompt carrying a picture goes through the vision path,
 				// which does not keep states. Such a conversation draws a
@@ -316,10 +466,28 @@ func (c *Context) prefill(ctx context.Context, p engine.Prompt, logits []float32
 		}
 		at = to
 	}
+	// What of the segments did not fit the prompt's last pass goes in passes
+	// of its own: every key it reads is in the cache by then.
+	for at := rode; at < extra; {
+		if err := ctx.Err(); err != nil {
+			break
+		}
+		to := min(at+c.runner.PassWidth(), extra)
+		pa := &pass{slot: c.slot}
+		segs.add(pa, at, to)
+		c.runner.submit(pa)
+		at = to
+	}
+	if segs != nil {
+		c.wrote(len(ids), extra)
+	}
 	c.held = append(c.held[:0], ids...)
 	c.media = embeds
 	c.last = c.now()
-	return len(ids) - from, nil
+	if err := ctx.Err(); err != nil {
+		return len(ids) - from + rode, err
+	}
+	return len(ids) - from + extra, nil
 }
 
 // resume brings a recurrent slot back to the latest of its checkpoints that

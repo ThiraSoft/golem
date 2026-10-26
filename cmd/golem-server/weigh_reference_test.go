@@ -64,6 +64,9 @@ func TestWeighMatchesLlamaCpp(t *testing.T) {
 				}
 			}
 			r := running(t, m.Forward)
+			if b, ok := m.Branches(); ok {
+				r.SetBranches(b)
+			}
 			if _, blocks := m.Vulkan(); blocks {
 				r.OnDevice()
 			}

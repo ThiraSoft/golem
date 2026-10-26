@@ -136,6 +136,10 @@ func main() {
 	if v, ok := m.Media(); ok {
 		runner.SetVision(v)
 	}
+	// Weigh writes a question's options side by side when the engine can.
+	if b, ok := m.Branches(); ok {
+		runner.SetBranches(b)
+	}
 	// A drafter, when the model has one where its caches are: the checkpoint's
 	// own prediction block (qwen35), or the assistant -assistant opened (gemma). It draws a second token out of the same
 	// reading of the weights, for a conversation drawing alone; two of them are
