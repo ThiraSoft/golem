@@ -44,6 +44,12 @@ type Media interface {
 // they travel together because a batch is one pass whatever its conversations
 // hold: Gemma fills PLE and Until, Qwen3.8 fills Axes, and each leaves the
 // other's nil.
+//
+// Shifts and Holes put tokens on branches, and are nil on a pass that has
+// none: a token is turned as if it stood Shifts[i] positions before where it
+// is written, and does not see the cache over either of Holes[i], each from
+// its first position up to its second.
+// Only an engine that says so through Model.Branches reads them.
 type Chunk struct {
 	Tokens    []int32
 	Embeds    [][]float32
@@ -53,6 +59,28 @@ type Chunk struct {
 	PLE   []int32
 	Until []int
 	Axes  [][3]int
+
+	Shifts []int
+	Holes  [][2][2]int
+}
+
+// Branches is an engine that can write several continuations of one prefix
+// side by side in one pass, each after the one before it in the cache, each
+// turned as if it followed the prefix and blind to the others: the options
+// of a question, weighed together rather than one after the other. Its
+// ForwardChunk reads a Chunk's Shifts and Holes, with or without pictures.
+type Branches interface {
+	ForwardChunk(c Chunk) [][]float32
+}
+
+// Branches says whether the engine can carry branches, and what carries them.
+// Gemma can; an engine whose cache is a state cannot be rewound at all, and
+// Qwen3 was never asked.
+func (m *Model) Branches() (Branches, bool) {
+	if inner, ok := m.Forward.(*gemma.Model); ok {
+		return gemmaMedia{inner}, true
+	}
+	return nil, false
 }
 
 // gemmaMedia is Gemma's adapter, and one of the two places that names an
@@ -83,7 +111,7 @@ func (v gemmaMedia) ForwardPrompt(p Prompt, startPos int) [][]float32 {
 }
 
 func (v gemmaMedia) ForwardChunk(c Chunk) [][]float32 {
-	return v.m.ForwardEmbeddedSlots(c.Tokens, c.Embeds, c.PLE, c.Slots, c.Positions, c.Until)
+	return v.m.ForwardBranchSlots(c.Tokens, c.Embeds, c.PLE, c.Slots, c.Positions, c.Until, c.Shifts, c.Holes)
 }
 
 // gemmaPrompt carries Gemma's own prompt behind the interface. Slice returns
@@ -143,6 +171,9 @@ func (v qwenMedia) ForwardPrompt(p Prompt, startPos int) [][]float32 {
 }
 
 func (v qwenMedia) ForwardChunk(c Chunk) [][]float32 {
+	if c.Shifts != nil {
+		panic("engine: Qwen3.8 carries no branches, and Model.Branches says so")
+	}
 	at := make([]qwen35.Place, len(c.Tokens))
 	for i := range at {
 		q := c.Positions[i]

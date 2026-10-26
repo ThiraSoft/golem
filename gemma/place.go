@@ -26,6 +26,33 @@ type Place struct {
 	Cache *Cache
 	Pos   int
 	Until int
+	// Shift and Holes put the token on a branch: one of several continuations
+	// of the same prefix, each written after the one before it in the cache.
+	// The token is turned, and its window measured, as if it stood Shift
+	// positions before Pos, which is where its branch would stand alone, and
+	// it does not see the cache over either hole, each from its first
+	// position up to its second: the branches it does not continue. An option
+	// of a question sees the state, its question's words and itself, which
+	// takes two. All are zero on the main line.
+	//
+	// It is what lets the questions about a state and all their options be
+	// weighed in as few passes as their positions fill
+	// (cmd/golem-server/weigh.go).
+	Shift int
+	Holes [2][2]int
+}
+
+// visible is the inclusive range of the cache this token's block may read,
+// hole and all. The window is the turned position's; the last position is the
+// written one.
+func (p Place) visible(b BlockConfig) (first, last int) {
+	first, last = p.Cache.Visible(b, p.Pos-p.Shift, p.Until-p.Shift)
+	return first, last + p.Shift
+}
+
+// blind says whether the token does not see position at of the cache.
+func (p Place) blind(at int) bool {
+	return (at >= p.Holes[0][0] && at < p.Holes[0][1]) || (at >= p.Holes[1][0] && at < p.Holes[1][1])
 }
 
 // Run is the places of a run of consecutive positions in one cache, which is

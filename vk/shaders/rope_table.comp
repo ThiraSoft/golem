@@ -29,7 +29,9 @@
 //
 // The position comes out of the attention's own where buffer, block zero:
 // every block of a column carries the same position, and only the visible
-// range differs between them.
+// range differs between them. A column on a branch is turned as if it stood
+// that many positions earlier, which is the first number of its entry past
+// the blocks' (attn_scores.comp's BRANCHES).
 
 layout(local_size_x = 64) in;
 
@@ -92,7 +94,7 @@ void twoProduct(float a, float b, out float p, out float e) {
 
 void main() {
     uint c   = gl_WorkGroupID.x;
-    float at = float(where_[c].x);
+    float at = float(where_[c].x - where_[128u * 512u + c].x);
     for (uint j = gl_LocalInvocationID.x; j < p.halfDims; j += 64u) {
         // The angle as a pair: the rounded product, and everything the
         // rounding and the frequency's own second half left behind.

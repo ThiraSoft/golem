@@ -363,9 +363,9 @@ func (m *Model) runStack(xs [][]float32, at []Place) {
 	// neither kernel has to check the other.
 	positions := make([]vk.Position, len(at))
 	for c, one := range at {
-		positions[c] = vk.Position{Slot: m.slotOf(one.Cache), Pos: one.Pos}
+		positions[c] = vk.Position{Slot: m.slotOf(one.Cache), Pos: one.Pos, Shift: one.Shift, Holes: one.Holes}
 		for _, bc := range cfg.Blocks {
-			first, last := one.Cache.Visible(bc, one.Pos, one.Until)
+			first, last := one.visible(bc)
 			positions[c].First = append(positions[c].First, first)
 			positions[c].Last = append(positions[c].Last, last)
 		}

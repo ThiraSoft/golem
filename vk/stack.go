@@ -678,6 +678,12 @@ type Position struct {
 	Pos   int
 	First []int // one per block
 	Last  []int
+	// Shift and Holes place the token on a branch (Attention.SetBranch): it is
+	// turned as if it stood Shift positions before Pos, and does not see
+	// either hole, each from its first position up to its second. All are
+	// zero on the main line.
+	Shift int
+	Holes [2][2]int
 }
 
 // Run carries the stream in Stream through every block, in one submission.
@@ -696,6 +702,9 @@ func (s *Stack) Run(at []Position, experts, used int) error {
 			return fmt.Errorf("vk: %d blocks want %d ranges, given %d", len(s.blocks), len(s.blocks), len(one.First))
 		}
 		slots[c] = one.Slot
+		if err := s.attn.SetBranch(c, one.Shift, one.Holes); err != nil {
+			return err
+		}
 		for i := range s.blocks {
 			if err := s.attn.SetWhere(i, c, one.Slot, one.Pos, one.First[i], one.Last[i]); err != nil {
 				return err

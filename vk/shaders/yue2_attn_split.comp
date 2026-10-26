@@ -41,6 +41,20 @@ layout(push_constant) uniform Push {
 
 const uint WHERE_COLUMNS = 512u;
 
+// BRANCHES is where the branches start in the same buffer, past every block's
+// columns: two entries a column, the same for every block. A column on a
+// branch (cmd/golem-server/weigh.go writes every question's words and options
+// after the state, each seeing the state, its own question and itself) is
+// written where it stands in the cache and does not see two stretches of it:
+// .y up to .z of the first entry and .x up to .y of the second, first and one
+// past the last. A column on no branch has both empty. The first entry's .x
+// is how far past its turn it stands, which only the angles read.
+const uint BRANCHES = 128u * WHERE_COLUMNS;
+
+bool hidden(uvec4 a, uvec4 b, uint pos) {
+    return (pos >= a.y && pos < a.z) || (pos >= b.x && pos < b.y);
+}
+
 // LPP lanes to a position and PPI positions to a tile, which multiply to the
 // workgroup. Eight and thirty-two, and both halves of that matter.
 //
@@ -93,6 +107,7 @@ void main() {
     uint base = p.col0;
 
     uvec4 mine = where_[p.block * WHERE_COLUMNS + base];
+    uvec4 hole = where_[BRANCHES + base], hole2 = where_[BRANCHES + WHERE_COLUMNS + base];
     slotBase = mine.w * p.capacity;
     // This workgroup's stretch of the visible range. A stretch past the end
     // leaves an empty row: a maximum of minus infinity and a sum of zero.
@@ -144,7 +159,8 @@ void main() {
         // Which positions this column's range admits. A sliding window moves
         // the first and its own position is the last.
         float inf = 1.0 / 0.0;
-        float s = (slotIn < got && pos >= mine.y && pos <= mine.z) ? d * p.scale : -inf;
+        float s = (slotIn < got && pos >= mine.y && pos <= mine.z && !hidden(hole, hole2, pos))
+                  ? d * p.scale : -inf;
         barrier();
         if (lane == 0u) ss[slotIn] = s;
         barrier();
