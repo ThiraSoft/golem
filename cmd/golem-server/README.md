@@ -520,11 +520,15 @@ curl -s localhost:8000/v1/systemone -d '{
 The state is read once for all the questions about it, and once for all the
 requests that start the same way: it is a conversation's prefix, and the slot
 that holds it is chosen and kept as a conversation's is, `-parallel` and all.
-Between questions the cache is rewound to where the state ends, and every
-option of a question is written at the same positions in turn, so a question
-costs no memory beyond its slot's. What that costs instead is a pass for each
-option but the first, of the option's tokens: the options of one question
-cannot share a pass, since they would write the same positions. So put what
+Every question's words and every option are then written after the state,
+each after the one before it in the cache, each turned as if it followed what
+it continues (the state, or its question's words) and blind to the rest. All
+of it goes through in as few passes as it fills: the room the state's last
+pass leaves, then passes of its own. It takes the cache past the state by as
+many positions as the questions and options hold, for the length of the
+request. A model that cannot write branches like that (Qwen3) has the cache
+rewound to where the state ends instead, and the options of a question
+written at the same positions in turn, a pass each. Either way, put what
 does not change in front of the state (persona, rules, history) and what
 does, the capture and the moment, at its end.
 
@@ -533,17 +537,31 @@ with its projector, a request of about 2630 positions (a system turn, rules, a
 history, a 1280×720 capture and a line) and two questions of six and five
 options:
 
-| | answered in | positions fed |
-|---|---:|---:|
-| from nothing | 2.15 s | 2793 |
-| again, the same capture | 558 ms | 163 |
-| again, a new capture behind the same text | 785 ms | 456 |
+| | answered in | positions fed | before 2026-10-26 |
+|---|---:|---:|---:|
+| from nothing | 1.86 s | 2795 | 2.15 s |
+| again, the same capture | 266 ms | 168 | 558 ms |
+| again, a new capture behind the same text | 510 ms | 458 | 785 ms |
 
-The last row is the one a client sending a capture every few seconds pays: the
-capture and what follows it read again (about 300 positions), each question's
-words, and nine passes for the options past the first of each question. Those
-are one to three tokens each and cost what drawing a token does at that depth,
-26 ms on this card at 2700 positions, which is about a third of the answer.
+The last row is the one a client sending a capture every few seconds pays.
+The capture and what follows it are read again (about 300 positions). Then
+come both questions' words and options (about 160): they fill the rest of
+that pass, and one pass of about forty after it. The capture is also looked
+at again, about 85 ms of the 510. The right-hand column is the same test
+before three changes:
+
+- Each option past the first of a question had a pass of its own, nine of
+  them. A pass of one column costs 13 ms at this depth, one of sixty-four
+  74 ms, one of a hundred and twenty-eight 107 ms. A pass a column was most
+  of the answer, and the passes are now filled instead.
+- A pass of one column at 2700 positions cost 26 ms, not 13. The attention of
+  a token walked the keys on one workgroup a head, sixteen workgroups on a
+  card with sixty-four compute units. It now takes the split attention
+  YuE2's tokens already used (`vk/yue2_ar.go`), thirty-two workgroups to a
+  head, and a chat drawing a token deep in a conversation gets the same.
+- The thirteen texts the questions are tokenized from are each the whole
+  state and more. They took 42 ms one after the other, and now go side by
+  side.
 
 Gemma 4's 12B, asked with thinking off, sometimes still opens a thought and
 closes it at once before answering. Weighed straight after the question, its
@@ -552,7 +570,7 @@ token after a question is the first of an empty thought, the empty thought is
 written and the options are weighed past it, for that question and the ones
 after it; a model that answers at once never pays for the check.
 
-How close to llama.cpp, `ref/systemone/README.md` says: an option's log-probability is within 0.22 nats of llama.cpp's on E2B on the processor and 0.46 on the 12B on the card, its probability within 0.023, and the pick is the same.
+How close to llama.cpp, `ref/systemone/README.md` says: an option's log-probability is within 0.22 nats of llama.cpp's on E2B on the processor and 0.39 on the 12B on the card, its probability within 0.023, and the pick is the same.
 
 A model whose cache is a recurrent state (Qwen3.8) cannot be rewound to weigh
 one option after another, and is refused with a 422 that says so. So is a

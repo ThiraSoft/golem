@@ -36,8 +36,9 @@ questions with the thought written, which is what the 12B is held to; the
 test weighs them without it, so that `Weigh` has to decide to write it.
 
 `TestWeighMatchesLlamaCpp` reads them back and weighs the same tokens through
-`Context.Weigh`, the four options of a question one after the other on the
-rewound cache, as the server does. `TestWeighFixtureTokensAreGolems` checks
+`Context.Weigh` as the server does: the question's words and its options
+written after the state in one pass, each option turned as if it followed the
+words and blind to the others. `TestWeighFixtureTokensAreGolems` checks
 that golem's tokenizer reads the prompts and the options into the tokens
 llama.cpp read.
 
@@ -46,14 +47,23 @@ Measured 2026-10-26, llama.cpp `8fe90e1fb`, i7-9700K and RX 9070 XT:
 | | worst gap in an option's log-probability | worst gap in its probability | same pick |
 |---|---:|---:|---|
 | E2B (QAT Q4_0), golem on the processor | 0.219 nats | 0.023 | 4 of 4 |
-| 12B (QAT Q4_0), golem on the card | 0.456 nats | 0.007 | 4 of 4 |
+| 12B (QAT Q4_0), golem on the card | 0.394 nats | 0.007 | 4 of 4 |
+
+The 12B's gap was 0.456 nats with the options weighed one after the other on
+the rewound cache, each through the attention of one column, and 0.489 with
+that attention split. In one pass an option is answered by the tiled
+attention and products, which sum the same products in other orders. None of
+the three is nearer to llama.cpp by design: the gap moves by a few
+hundredths with the order of the sums. On the processor the order does not
+change, and E2B's gap is the same to the last digit either way.
 
 E2B on the card is not compared: the card has no per-layer embedding branch,
 and refuses that checkpoint.
 
 The gap is the engine's, not the weighing's. Each option weighed alone from
 an empty cache gives the same numbers as the rewound cache to the fourth
-decimal, and the logits themselves are that far apart: `gemma/README.md`
+decimal, and the options in one pass give the rewound cache's bit for bit on
+the processor (`gemma`'s `TestBranchesAgreeWithOneAfterAnother`), and the logits themselves are that far apart: `gemma/README.md`
 puts the top 64 logits of E2B at 0.29 from llama.cpp and the 12B's at 0.86.
 An option's log-probability is a difference of logits, and its largest gaps
 are on unlikely options, where a few tenths of a nat move a probability of a
