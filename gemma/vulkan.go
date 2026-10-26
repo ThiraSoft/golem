@@ -352,6 +352,14 @@ func (m *Model) UseVulkanStack() error {
 	// The final norm too, so that what comes back off the card is the hidden
 	// state a caller can compare against llama.cpp's at the same point rather
 	// than one norm short of it.
+	// A token reads its keys through the split attention, many workgroups to
+	// a head rather than one (vk/yue2_ar.go). Two thousand positions deep,
+	// which is where a client weighing options against a long state draws its
+	// passes, one workgroup a head left most of the card idle.
+	if err := attn.UseSplitDecode(); err != nil {
+		stack.Close()
+		return err
+	}
 	if err := stack.SetOutputNorm(m.W.OutputNorm); err != nil {
 		stack.Close()
 		return err

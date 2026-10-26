@@ -88,6 +88,43 @@ func TestVulkan12BGreedyMatchesTheReference(t *testing.T) {
 	}
 }
 
+// TestVulkan12BDeepTokenMatchesWidePass is a token drawn past two thousand
+// positions, against the same position read as the last column of a wide
+// pass. The two take different attentions: the token's own, which a client
+// weighing options pays at every pass, and the tiled one a prompt is read
+// through. The prompt is longer than the sliding window, so a window block's
+// ring has turned over by then.
+//
+// They sum the same products in different orders and agree to a tolerance.
+// Measured, the token is two parts in a hundred of the peak from the wide
+// pass through attn_one.comp and three and a half through the split
+// attention, and at three hundred and at twelve hundred positions the two
+// are as far as each other from the processor's answer. A token that read the
+// wrong stretch of the cache, or the wrong slot of a ring, misses by far
+// more.
+func TestVulkan12BDeepTokenMatchesWidePass(t *testing.T) {
+	_, m := load12BStack(t)
+	const n = 2600
+	tokens := make([]int32, n)
+	for i := range tokens {
+		tokens[i] = int32(100 + i*37%5000)
+	}
+	width := m.stackColumns()
+	prefill := func(upTo int) {
+		m.Reset()
+		for at := 0; at < upTo; at += width {
+			m.ForwardBatch(tokens[at:min(at+width, upTo)], at)
+		}
+	}
+
+	prefill(n - 1)
+	token := append([]float32(nil), m.Forward(tokens[n-1], n-1)...)
+
+	prefill(n - 64)
+	wide := m.ForwardBatch(tokens[n-64:], n-64)
+	compareRelative(t, "the last position, a token against a wide pass", token, wide[len(wide)-1], 5e-2)
+}
+
 // The benchmarks: a whole token of the 12B, on the CPU and on the card.
 
 func open12BEngineBench(b *testing.B) *Model {
