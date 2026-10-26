@@ -119,7 +119,7 @@ func TestWeighSumsEachOptionsTokens(t *testing.T) {
 	c := NewContext(running(t, e), 0, 4096, time.Now, 0)
 	text := func(ids []int32) (engine.Prompt, error) { return engine.TextPrompt(ids), nil }
 	got, _, err := c.Weigh(context.Background(), text, []int32{1, 2},
-		[]weighing{{tail: []int32{3}, options: [][]int32{{5}, {6, 7}, {6, 8}}}}, 10)
+		[]weighing{{tail: []int32{3}, options: [][]int32{{5}, {6, 7}, {6, 8}}}}, nil, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestWeighReadsTheStateOnce(t *testing.T) {
 	_, _, err := c.Weigh(context.Background(), text, state, []weighing{
 		{tail: []int32{7}, options: [][]int32{{1}, {2}}},
 		{tail: []int32{8, 9}, options: [][]int32{{1}, {2, 3}}},
-	}, 8)
+	}, nil, 8)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,5 +160,46 @@ func TestWeighReadsTheStateOnce(t *testing.T) {
 		if wantPos := []int{6, 6, 7, 8}[i]; p != wantPos {
 			t.Fatalf("positions %v after the state", e.posOf[6:])
 		}
+	}
+}
+
+// A model that opens an empty thought before answering is weighed past it,
+// on that question and on the ones after it. The thought follows the words
+// already read, and only it is fed.
+func TestWeighGoesPastTheEmptyThought(t *testing.T) {
+	row := func(vals map[int]float32) []float32 {
+		r := make([]float32, 12)
+		for i := range r {
+			r[i] = -30
+		}
+		for k, v := range vals {
+			r[k] = v
+		}
+		return r
+	}
+	// After a question's words (3 or 4) the model opens a thought (9 10);
+	// past it (10) it answers 5 rather than 6.
+	e := &tableEngine{next: map[int32][]float32{
+		3:  row(map[int]float32{9: 5, 5: 1, 6: 0}),
+		4:  row(map[int]float32{9: 5, 5: 1, 6: 0}),
+		10: row(map[int]float32{5: 2, 6: 0}),
+	}}
+	c := NewContext(running(t, e), 0, 4096, time.Now, 0)
+	text := func(ids []int32) (engine.Prompt, error) { return engine.TextPrompt(ids), nil }
+	got, _, err := c.Weigh(context.Background(), text, []int32{1, 2}, []weighing{
+		{tail: []int32{3}, options: [][]int32{{5}, {6}}},
+		{tail: []int32{4}, options: [][]int32{{5}, {6}}},
+	}, []int32{9, 10}, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for q := range got {
+		if want := logSoftmaxAt(e.next[10], 5); math.Abs(got[q][0]-want) > 1e-9 {
+			t.Fatalf("question %d weighs 5 at %v, want %v past the thought", q, got[q][0], want)
+		}
+	}
+	want := []int32{1, 2, 3, 9, 10, 4, 9, 10}
+	if !slices.Equal(e.fed, want) {
+		t.Fatalf("fed %v, want %v", e.fed, want)
 	}
 }

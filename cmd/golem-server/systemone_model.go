@@ -152,7 +152,7 @@ func (s *Server) weighQuestions(w http.ResponseWriter, r *http.Request, system s
 	sl.ctx.runner.Enter()
 	defer sl.ctx.runner.Leave()
 
-	lps, fed, err := sl.ctx.Weigh(r.Context(), build, stateIDs, ws, sl.gen.Width())
+	lps, fed, err := sl.ctx.Weigh(r.Context(), build, stateIDs, ws, s.emptyThought(), sl.gen.Width())
 	if err != nil {
 		if r.Context().Err() != nil {
 			return nil, err
@@ -297,6 +297,18 @@ func (s *Server) turn(system string) (head, tail string, err error) {
 		return "", "", fmt.Errorf("the chat template did not write the turn's content where it could be found")
 	}
 	return head, tail, nil
+}
+
+// emptyThought is a thought opened and closed with nothing in it, as Gemma 4
+// writes one before an answer it was not asked to think about; nil for a
+// template with no reasoning markers. Weigh puts it before the options only
+// when the model reaches for it.
+func (s *Server) emptyThought() []int32 {
+	open, close := s.tpl.ReasoningMarkers()
+	if open == "" {
+		return nil
+	}
+	return s.vocab.Encode(open+"\n"+close, false, true)
 }
 
 // closing is the tokens that end the model's turn, which every option is

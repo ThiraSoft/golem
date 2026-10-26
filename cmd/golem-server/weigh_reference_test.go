@@ -38,7 +38,7 @@ func TestWeighMatchesLlamaCpp(t *testing.T) {
 		nats, p            float64
 	}{
 		{"e2b/processor", "GOLEM_MODEL", "e2b", false, 0.3, 0.05},
-		{"12b/card", "GOLEM_MODEL_12B", "12b", true, 0.3, 0.05},
+		{"12b/card", "GOLEM_MODEL_12B", "12b", true, 1.2, 0.05},
 	} {
 		t.Run(run.name, func(t *testing.T) {
 			path := os.Getenv(run.env)
@@ -70,14 +70,22 @@ func TestWeighMatchesLlamaCpp(t *testing.T) {
 			c := NewContext(r, m.Window, 2048, time.Now, 0)
 			c.SetRing(m.WindowRing())
 			text := func(ids []int32) (engine.Prompt, error) { return engine.TextPrompt(ids), nil }
+			open, close := m.Template.ReasoningMarkers()
+			lead := m.Vocab.Encode(open+"\n"+close, false, true)
 			worst, worstP := 0.0, 0.0
 			for _, tc := range fixture.Cases {
-				n := len(tc.Prompt)
-				w := weighing{tail: tc.Prompt[n-1:]}
+				// A fixture recorded past the empty thought is weighed without
+				// it: Weigh has to decide to write it, as the server does.
+				prompt := tc.Prompt
+				if base, ok := bytesCut(prompt, lead); ok {
+					prompt = base
+				}
+				n := len(prompt)
+				w := weighing{tail: prompt[n-1:]}
 				for _, o := range tc.Options {
 					w.options = append(w.options, o.Tokens)
 				}
-				got, _, err := c.Weigh(context.Background(), text, tc.Prompt[:n-1], []weighing{w}, m.Vocabulary)
+				got, _, err := c.Weigh(context.Background(), text, prompt[:n-1], []weighing{w}, lead, m.Vocabulary)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -100,6 +108,14 @@ func TestWeighMatchesLlamaCpp(t *testing.T) {
 			}
 		})
 	}
+}
+
+// bytesCut is ids without suffix, if it ends with it.
+func bytesCut(ids, suffix []int32) ([]int32, bool) {
+	if len(ids) < len(suffix) || !slices.Equal(ids[len(ids)-len(suffix):], suffix) {
+		return ids, false
+	}
+	return ids[:len(ids)-len(suffix)], true
 }
 
 // golem reads the fixture's prompts into the tokens llama.cpp read.

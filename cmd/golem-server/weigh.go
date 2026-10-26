@@ -39,8 +39,16 @@ type weighing struct {
 // their log-probabilities in the order they came, and how many positions were
 // fed. build turns a run of tokens that starts with the state into a prompt,
 // which is where a picture in the state goes back in.
+//
+// lead is what a model may write before its answer when it is not thinking:
+// Gemma 4's 12B opens and closes an empty thought, every time, and an option
+// weighed straight after the question is then an answer the model would not
+// give, whose probability is a few in a million. When the likeliest token
+// after a question's words is lead's first, lead is put after the words of
+// that question and of every one after it, and the options are weighed past
+// it. A model that answers at once never pays for it.
 func (c *Context) Weigh(ctx context.Context, build func([]int32) (engine.Prompt, error),
-	state []int32, qs []weighing, vocab int) ([][]float64, int, error) {
+	state []int32, qs []weighing, lead []int32, vocab int) ([][]float64, int, error) {
 	if c.recurrent {
 		return nil, 0, fmt.Errorf("serve: this model's cache is a recurrent state, which cannot be rewound to weigh one option after another")
 	}
@@ -63,7 +71,12 @@ func (c *Context) Weigh(ctx context.Context, build func([]int32) (engine.Prompt,
 
 	fed := 0
 	out := make([][]float64, len(qs))
+	leading := false
 	for qi, q := range qs {
+		if leading {
+			q.tail = slices.Concat(q.tail, lead)
+		}
+	again:
 		// Options that share a beginning go one after the other, so that the
 		// second is fed only from where it parts from the first.
 		order := make([]int, len(q.options))
@@ -96,6 +109,11 @@ func (c *Context) Weigh(ctx context.Context, build func([]int32) (engine.Prompt,
 			if err != nil {
 				return nil, fed, err
 			}
+			if n == 0 && !leading && len(lead) > 0 && argmax(scored[0]) == lead[0] {
+				leading = true
+				q.tail = slices.Concat(q.tail, lead)
+				goto again
+			}
 			if n == 0 {
 				z := logSum(scored[0])
 				for j, o := range q.options {
@@ -109,6 +127,16 @@ func (c *Context) Weigh(ctx context.Context, build func([]int32) (engine.Prompt,
 		out[qi] = lp
 	}
 	return out, fed, nil
+}
+
+func argmax(row []float32) int32 {
+	best := 0
+	for i, v := range row {
+		if v > row[best] {
+			best = i
+		}
+	}
+	return int32(best)
 }
 
 // logSum is the log of the sum of a row's exponentials, which a logit takes
