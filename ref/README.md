@@ -42,6 +42,7 @@ what node 1443 was; regenerate it whenever llama.cpp's graph changes, and
 | `dump_interpolate.cpp` | ggml's antialiased bilinear | an output directory |
 | `dump_vision.cpp` | the vision tower | a model, a projector, an output directory, a `.run` file |
 | `dump_audio.cpp` | the audio tower | a model, a projector, an output directory, a `.run` file |
+| `dump_logprobs.cpp` | the options `/v1/systemone` weighs | a model, an output directory, a `.tsv` of rendered questions |
 
 The per-model files are in [`gemma/`](gemma/) and [`qwen/`](qwen/), alongside
 the one recorder that is not shared — each architecture's own `dump_chats.py`,
@@ -111,6 +112,12 @@ mkdir -p testdata/nomic/{layers,layers_q8,tokenizer}
 build/ref/dump_layers "$GOLEM_MODEL_NOMIC"    testdata/nomic/layers    ref/nomic/short.run
 build/ref/dump_layers "$GOLEM_MODEL_NOMIC_Q8" testdata/nomic/layers_q8 ref/nomic/short.run
 build/ref/dump_tokens "$GOLEM_MODEL_NOMIC"    testdata/nomic/tokenizer ref/nomic/corpus.tsv
+
+# The options of closed questions, as golem-server's /v1/systemone weighs them
+# with the chat model; ref/systemone/README.md.
+mkdir -p testdata/systemone/{e2b,12b}
+build/ref/dump_logprobs "$GOLEM_MODEL"     testdata/systemone/e2b ref/systemone/cases.tsv
+build/ref/dump_logprobs "$GOLEM_MODEL_12B" testdata/systemone/12b ref/systemone/cases_thought.tsv
 
 # Laya, with GOLEM_MODEL_LAYA naming the checkpoint directory as Hugging Face
 # ships it. PyTorch runs the checkpoint's own rl_common.py; see laya/README.md.

@@ -23,7 +23,7 @@ The endpoints:
 | `POST /v1/audio/transcriptions` | audio transcription (WAV, MP3, FLAC), streamed or not, using Kyutai STT (requires `-stt`) |
 | `POST /v1/embeddings` | OpenAI's embeddings, float or base64 (requires `-embed`) |
 | `POST /api/embed`, `POST /api/embeddings` | ollama's two embedding endpoints, so a client pointed at ollama needs only the port changed (requires `-embed`) |
-| `POST /v1/systemone` | typed questions about a state, answered by Laya in Jev's shape, so a Jev or laya-serve client needs only its base URL changed (requires `-laya`) |
+| `POST /v1/systemone` | typed questions about a state in Jev's shape, so a Jev or laya-serve client needs only its base URL changed: answered by Laya with `-laya`, by the chat model otherwise |
 | `POST /synth` | song synthesis with YuE2, returning a job ID (requires `-yue2`) |
 | `GET /job` | poll job status or fetch multipart audio, replay JSON and latents (requires `-yue2`) |
 | `POST /job` | cancel a synthesis job (requires `-yue2`) |
@@ -357,10 +357,19 @@ A model that reasons answers without it unless the request asks,
 llama-server's way: `"chat_template_kwargs": {"enable_thinking": true}`. The
 reasoning then streams apart, as `reasoning_content`.
 
+## Log-probabilities
+
+`"logprobs": true` writes OpenAI's `choices[0].logprobs.content`: every token
+of the answer, its log-probability under the model before any penalty or
+grammar, and its bytes. `top_logprobs`, 0 to 20, adds that many of the
+likeliest tokens at each step. It is read on an answer that is not streamed,
+and refused on one that is.
+
 ## What it refuses
 
 With a 400 and OpenAI's error envelope, rather than answering something else:
-`n` above 1, `logprobs`, `tool_choice` beyond `auto` and `none`, a conversation
+`n` above 1, `logprobs` on a streamed answer, `top_logprobs` without
+`logprobs` or past 20, `tool_choice` beyond `auto` and `none`, a conversation
 with no message, a tool result answering no call, and a prompt longer than
 `-context`. In a schema: `pattern`, a numeric bound, and a `$ref` into another
 document — each by name, because a constraint silently dropped is worse than a
@@ -452,9 +461,15 @@ file is not in the page cache.
 
 ## Decisions
 
+`POST /v1/systemone` is the endpoint TypeSafe Jev and Laya's own `laya-serve`
+answer on, with the same request and the same answer: a state, typed
+questions about it (`choice`, `score`, `noul`), and every option of every
+question with its probability. Two models can answer it.
+
+### With Laya
+
 With `-laya <dir>` (or `GOLEM_LAYA`), a Laya checkpoint directory as Hugging
-Face ships it, it answers `POST /v1/systemone`, the endpoint TypeSafe Jev and
-Laya's own `laya-serve` answer on, with the same request and the same answer.
+Face ships it, Laya answers, whatever else the server carries.
 `laya/README.md` says what the model is and how close to PyTorch.
 
 ```bash
@@ -466,12 +481,89 @@ curl -s localhost:8000/v1/systemone -d '{
 }'
 ```
 
-Refusals are written as laya-serve writes them, `{"detail": "…"}`: 400 for a
-body that is not the request, 413 past a mebibyte or sixty-four questions, 422
-for a question Laya cannot read. Unknown fields are ignored, `model` among
-them: the server carries one checkpoint. Requests take turns on the model,
-and on an RX 9070 XT a request of three questions and 225 positions is
-answered in 14 ms over HTTP once the first has been.
+Requests take turns on the model, and on an RX 9070 XT a request of three
+questions and 225 positions is answered in 14 ms over HTTP once the first has
+been.
+
+### With the chat model
+
+Without `-laya`, the model `-model` opened answers, pictures included when it
+was given `-mmproj`. Nothing is drawn. Each question is written as a turn
+after the state, through the model's own template with thinking off, and each
+option is weighed: the sum of the log-probabilities of its tokens and of the
+end of the turn after them, each read off the state before it. The end of the
+turn is what keeps "heal" from being weighed as every answer that starts with
+it, "heal the tank" among them. The options' weights are put through a
+softmax, and the answer is Laya's shape: a choice's pick, its probabilities
+and their confidence, a score's expected level, a noul's probability of Yes
+against No. There is no act head, so `rl_agent` is left out.
+
+The request takes two things Laya has no use for. `system` is a system turn
+written before the state. `state` may be an array of chat completions' content
+parts, `text` and `image_url` (a `data:` URI or a path on the server), read in
+the order they come:
+
+```bash
+./golem-server -model gemma-4-12b-it-qat-q4_0.gguf -mmproj mmproj-gemma-4-12b-it-qat-q4_0.gguf \
+  -vulkan -context 8192 -addr 127.0.0.1:8000
+
+curl -s localhost:8000/v1/systemone -d '{
+  "system": "You are the combat brain of a party.",
+  "state": [{"type": "text", "text": "Rules: …"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,…"}},
+            {"type": "text", "text": "Now: the boss is at 12%."}],
+  "questions": {"order": {"type": "choice", "instructions": "Which order now?",
+                          "criteria": {"HOLD": "keep positions", "ATTACK": "all on the boss"}}}
+}'
+```
+
+The state is read once for all the questions about it, and once for all the
+requests that start the same way: it is a conversation's prefix, and the slot
+that holds it is chosen and kept as a conversation's is, `-parallel` and all.
+Between questions the cache is rewound to where the state ends, and every
+option of a question is written at the same positions in turn, so a question
+costs no memory beyond its slot's. What that costs instead is a pass for each
+option but the first, of the option's tokens: the options of one question
+cannot share a pass, since they would write the same positions. So put what
+does not change in front of the state (persona, rules, history) and what
+does, the capture and the moment, at its end.
+
+Measured with `TestSystemOneCost` on an RX 9070 XT, Gemma 4 12B (QAT Q4_0)
+with its projector, a request of about 2630 positions (a system turn, rules, a
+history, a 1280×720 capture and a line) and two questions of six and five
+options:
+
+| | answered in | positions fed |
+|---|---:|---:|
+| from nothing | 2.15 s | 2793 |
+| again, the same capture | 558 ms | 163 |
+| again, a new capture behind the same text | 785 ms | 456 |
+
+The last row is the one a client sending a capture every few seconds pays: the
+capture and what follows it read again (about 300 positions), each question's
+words, and nine passes for the options past the first of each question. Those
+are one to three tokens each and cost what drawing a token does at that depth,
+26 ms on this card at 2700 positions, which is about a third of the answer.
+
+Gemma 4's 12B, asked with thinking off, sometimes still opens a thought and
+closes it at once before answering. Weighed straight after the question, its
+options then share less than a thousandth of the mass. So when the likeliest
+token after a question is the first of an empty thought, the empty thought is
+written and the options are weighed past it, for that question and the ones
+after it; a model that answers at once never pays for the check.
+
+How close to llama.cpp, `ref/systemone/README.md` says: an option's log-probability is within 0.22 nats of llama.cpp's on E2B on the processor and 0.46 on the 12B on the card, its probability within 0.023, and the pick is the same.
+
+A model whose cache is a recurrent state (Qwen3.8) cannot be rewound to weigh
+one option after another, and is refused with a 422 that says so. So is a
+picture sent to a server without `-mmproj`.
+
+### Refusals
+
+Written as laya-serve writes them, `{"detail": "…"}`, whichever model
+answers: 400 for a body that is not the request, 413 past a mebibyte or
+sixty-four questions, 422 for a question the model cannot be asked. Unknown
+fields are ignored, `model` among them: the server carries one model.
 
 ## Songs
 
@@ -505,7 +597,7 @@ with `-model`, `-krea2`, or `-flux3` on the card.
 | `-yue2-context` | positions to keep in YuE2's KV cache; 24576 by default |
 | `-stt` | directory holding the Kyutai STT model, or `GOLEM_STT`; a server may carry it alone, and then answers `/v1/models` and `/v1/audio/transcriptions` and nothing else |
 | `-embed` | a nomic-embed-text-v2-moe GGUF, or `GOLEM_EMBED`, for the embedding endpoints; a server may carry it alone |
-| `-laya` | a Laya checkpoint directory, or `GOLEM_LAYA`, for `/v1/systemone`; a server may carry it alone |
+| `-laya` | a Laya checkpoint directory, or `GOLEM_LAYA`, to answer `/v1/systemone` instead of the chat model; a server may carry it alone |
 | `-mmproj` | the projector GGUF, which is what lets a model see and hear, or `GOLEM_MMPROJ` |
 | `-vulkan` | put the blocks and the logit head on a Vulkan device, the embedder's blocks with `-embed`, and Laya with `-laya`; it fails rather than falling back |
 | `-addr` | what to listen on; `127.0.0.1:8080` by default |

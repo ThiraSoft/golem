@@ -38,7 +38,7 @@ func TestWeighMatchesLlamaCpp(t *testing.T) {
 		nats, p            float64
 	}{
 		{"e2b/processor", "GOLEM_MODEL", "e2b", false, 0.3, 0.05},
-		{"12b/card", "GOLEM_MODEL_12B", "12b", true, 1.2, 0.05},
+		{"12b/card", "GOLEM_MODEL_12B", "12b", true, 0.6, 0.05},
 	} {
 		t.Run(run.name, func(t *testing.T) {
 			path := os.Getenv(run.env)
