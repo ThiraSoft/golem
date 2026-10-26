@@ -16,19 +16,37 @@ package vk
 //
 // The inputs themselves, a row of every block's slices for each column of a
 // pass, are written by the caller into PerLayerStage and copied onto the card
-// at the head of the pass.
+// at the head of the pass. After PerLayerInputs the caller writes only the
+// per-layer embedding's rows there, and the card adds the projection of the
+// stream to them: a bfloat16 product of 8960 rows that cost the processor 110
+// ms for a pass of 512 columns.
 
 import (
 	_ "embed"
 	"fmt"
+	"math"
 	"unsafe"
 
 	"github.com/ThiraSoft/golem/nn"
 )
 
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/ple_act.comp -o shaders/ple_act.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute shaders/ple_inputs.comp -o shaders/ple_inputs.spv
+//go:generate glslc -O -DROUND --target-env=vulkan1.1 -fshader-stage=compute shaders/ple_inputs.comp -o shaders/ple_round.spv
 //go:embed shaders/ple_act.spv
 var pleActSPIRV []byte
+
+//go:embed shaders/ple_inputs.spv
+var pleInputsSPIRV []byte
+
+//go:embed shaders/ple_round.spv
+var pleRoundSPIRV []byte
+
+// pleInputsPush is shaders/ple_inputs.comp's.
+type pleInputsPush struct {
+	width, row                uint32
+	eps, lookup, project, sum float32
+}
 
 // pleActPush is shaders/ple_act.comp's.
 type pleActPush struct {
@@ -43,6 +61,14 @@ type perLayer struct {
 	inputs        *Buffer // the same on the card
 	gate          *Buffer // the input gate's product, as floats
 	added         []*perLayerBlock
+
+	// The projection half of the inputs, when the card makes it: the stream
+	// rounded to bfloat16, the product, and the sum with the lookups.
+	dim                          int
+	push                         pleInputsPush
+	round, product, combine      *Pipeline
+	weights, gain, rounded, pj   *Buffer
+	roundSet, productSet, sumSet *Set
 }
 
 type perLayerBlock struct {
@@ -121,6 +147,64 @@ func (m *Mixture) AddPerLayer(q nn.Quant, gate, proj []byte) error {
 	return err
 }
 
+// perLayerInputs has the card make the projection half of the inputs out of
+// stream, which holds the pass's embeddings when the head of the pass reads
+// it: proj is per_layer_model_proj in bfloat16, a slice's width times the
+// blocks in rows and the stream's width in columns, and gain the norm every
+// slice of it goes through. The stage then holds the lookups alone.
+func (m *Mixture) perLayerInputs(stream *Buffer, proj []byte, gain []float32, eps float32) error {
+	p := m.perLayer
+	if p == nil {
+		return fmt.Errorf("vk: the per-layer inputs before PerLayer")
+	}
+	rows := p.width * p.blocks
+	if len(proj) != rows*m.dim*2 || len(gain) != p.width {
+		return fmt.Errorf("vk: a projection of %d bytes and a gain of %d for %d rows of %d", len(proj), len(gain), rows, m.dim)
+	}
+	p.dim = m.dim
+	p.push = pleInputsPush{width: uint32(p.width), row: uint32(rows), eps: eps,
+		lookup: float32(math.Sqrt(float64(p.width))), project: float32(1 / math.Sqrt(float64(m.dim))),
+		sum: float32(1 / math.Sqrt2)}
+	var err error
+	if p.round, err = m.d.NewPipeline(pleRoundSPIRV, 2, 4); err != nil {
+		return err
+	}
+	if p.combine, err = m.d.NewPipeline(pleInputsSPIRV, 3, uint32(unsafe.Sizeof(pleInputsPush{}))); err != nil {
+		return err
+	}
+	if p.product, err = m.d.NewPipeline(matvecBF16SPIRV, 3, uint32(unsafe.Sizeof(matvecKPush{}))); err != nil {
+		return err
+	}
+	for _, w := range []struct {
+		columns int
+		spirv   []byte
+	}{{2, matvecBF16_2SPIRV}, {4, matvecBF16_4SPIRV}, {8, matvecBF16_8SPIRV}, {16, matvecBF16_16SPIRV}} {
+		if err := p.product.Wide(w.columns, w.spirv); err != nil {
+			return err
+		}
+	}
+	if p.weights, err = m.d.Upload(proj); err != nil {
+		return err
+	}
+	if p.gain, err = m.d.Upload(asBytes(gain)); err != nil {
+		return err
+	}
+	if p.rounded, err = m.d.Local(m.dim*4*maxColumns, bufferUsageStorage); err != nil {
+		return err
+	}
+	if p.pj, err = m.d.Local(rows*4*maxColumns, bufferUsageStorage); err != nil {
+		return err
+	}
+	if p.roundSet, err = p.round.NewSet([]*Buffer{stream, p.rounded}); err != nil {
+		return err
+	}
+	if p.productSet, err = p.product.NewSet([]*Buffer{p.weights, p.rounded, p.pj}); err != nil {
+		return err
+	}
+	p.sumSet, err = p.combine.NewSet([]*Buffer{p.pj, p.gain, p.inputs})
+	return err
+}
+
 // PerLayerStage is where the caller writes a pass's per-layer inputs: for each
 // column, every block's slice one after the other. Nil without a branch.
 func (m *Mixture) PerLayerStage() []float32 {
@@ -131,10 +215,34 @@ func (m *Mixture) PerLayerStage() []float32 {
 }
 
 // recordPerLayerInputs copies a pass's inputs onto the card, once for every
-// block of it.
+// block of it, and makes their projection half there when it is the card's
+// to make. The stream has to hold the pass's embeddings by then.
 func (m *Mixture) recordPerLayerInputs(r *Recorder, columns int) {
 	p := m.perLayer
-	r.CopyFrom(p.inputs, 0, p.stage, 0, columns*p.width*p.blocks*4)
+	rows := p.width * p.blocks
+	r.CopyFrom(p.inputs, 0, p.stage, 0, columns*rows*4)
+	if p.product == nil {
+		return
+	}
+	n := uint32(columns * p.dim)
+	r.Dispatch(p.roundSet, (n+255)/256, unsafe.Pointer(&n))
+	r.Barrier()
+	// The widest binary that fits, as many times as the pass needs: a product
+	// of 8960 rows is half a megabyte of bfloat16 a column group, and the card
+	// reads it from its cache after the first.
+	groups := uint32((rows + 15) / 16)
+	for c := 0; c < columns; {
+		w := max(1, p.product.widestUpTo(columns-c))
+		push := matvecKPush{Dim: uint32(rows), FFN: uint32(p.dim), Col: uint32(c)}
+		if w == 1 {
+			r.Dispatch(p.productSet, groups, unsafe.Pointer(&push))
+		} else {
+			r.DispatchWide(p.productSet, w, groups, unsafe.Pointer(&push))
+		}
+		c += w
+	}
+	r.Barrier()
+	r.DispatchColumns(p.sumSet, uint32(p.blocks), uint32(columns), unsafe.Pointer(&p.push))
 }
 
 // recordPerLayer runs one block's branch from the stream's Q8_0 form, which
@@ -180,15 +288,17 @@ func (p *perLayer) close() {
 		}
 	}
 	p.added = nil
-	if p.actSet != nil {
-		p.actSet.Close()
+	for _, s := range []*Set{p.actSet, p.roundSet, p.productSet, p.sumSet} {
+		if s != nil {
+			s.Close()
+		}
 	}
-	for _, x := range []*Buffer{p.stage, p.inputs, p.gate} {
+	for _, x := range []*Buffer{p.stage, p.inputs, p.gate, p.weights, p.gain, p.rounded, p.pj} {
 		if x != nil {
 			x.Close()
 		}
 	}
-	for _, x := range []*Pipeline{p.act} {
+	for _, x := range []*Pipeline{p.act, p.round, p.product, p.combine} {
 		if x != nil {
 			x.Close()
 		}

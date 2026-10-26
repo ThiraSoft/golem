@@ -376,6 +376,16 @@ func (m *Model) UseVulkanStack() error {
 			return err
 		}
 	}
+	// The projection half of the per-layer inputs, when its weights are in the
+	// form the card's product reads: a bfloat16 product of 8960 rows that cost
+	// the processor 110 ms a pass of 512 columns and 2 ms a token.
+	if cfg.PLEDim > 0 && m.W.PLEProj.Quant == nn.BF16 {
+		if err := stack.PerLayerInputs(m.W.PLEProj.Data, m.W.PLEProjNorm); err != nil {
+			stack.Close()
+			return err
+		}
+		m.pleOnCard = true
+	}
 	// The final norm too, so that what comes back off the card is the hidden
 	// state a caller can compare against llama.cpp's at the same point rather
 	// than one norm short of it.

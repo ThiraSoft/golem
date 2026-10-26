@@ -630,6 +630,15 @@ func (s *Stack) AddBlock(n BlockNorms) error {
 	return nil
 }
 
+// PerLayerInputs has the card make the projection half of the per-layer
+// inputs from the stream at the head of every pass (Mixture.perLayerInputs),
+// so that PerLayerStage takes the per-layer embedding's rows alone: proj is
+// per_layer_model_proj in bfloat16 and gain per_layer_proj_norm.
+func (s *Stack) PerLayerInputs(proj []byte, gain []float32) error {
+	s.forget()
+	return s.mix.perLayerInputs(s.xs, proj, gain, s.eps)
+}
+
 // PerLayerStage is where a pass's per-layer inputs are written, for each
 // column every block's slice in turn; nil when the mixture has no per-layer
 // branch (Mixture.PerLayer).

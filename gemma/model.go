@@ -41,6 +41,9 @@ type Model struct {
 	// gemma/vulkan.go says what that buys and what it leaves alone.
 	head  vk.Head
 	stack *vk.Stack
+	// pleOnCard says the card makes the projection half of the per-layer
+	// inputs, and is handed only the per-layer embedding's rows.
+	pleOnCard bool
 	// golemHead is the head of a .golem checkpoint, which has the transform
 	// of its site in front of the product and an API of its own; golem holds
 	// the kernels of each format, built once: a three-bit body usually comes
@@ -259,7 +262,18 @@ func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32,
 		}
 	})
 	perLayer := m.ple[:batch]
-	PerLayerInputs(cfg, w, m.scratch, embedded, ple, perLayer)
+	if m.pleOnCard {
+		// The rows the per-layer embedding gives these identifiers, which is
+		// all the card wants from this side: it projects the stream itself.
+		stage, width := m.stack.PerLayerStage(), len(cfg.Blocks)*cfg.PLEDim
+		nn.InParallel(batch, batch*width*perPosition, func(first, last int) {
+			for t := first; t < last; t++ {
+				w.PLEEmbd.Row(int(ple[t]), stage[t*width:(t+1)*width])
+			}
+		})
+	} else {
+		PerLayerInputs(cfg, w, m.scratch, embedded, ple, perLayer)
+	}
 
 	xs := m.xs[:batch]
 	for t := range tokens {
@@ -268,7 +282,7 @@ func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32,
 	if m.stack != nil {
 		// The per-layer inputs are built here, out of the embedding, and the
 		// card reads them from its stage.
-		if stage := m.stack.PerLayerStage(); stage != nil {
+		if stage := m.stack.PerLayerStage(); stage != nil && !m.pleOnCard {
 			width := len(cfg.Blocks) * cfg.PLEDim
 			for t := range tokens {
 				copy(stage[t*width:(t+1)*width], perLayer[t])
