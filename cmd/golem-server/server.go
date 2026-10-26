@@ -48,6 +48,7 @@ type Server struct {
 	// pay for on a server nobody asks a schema of.
 	tokensOnce sync.Once
 	tokens     *grammar.Tokens
+	markerState
 }
 
 func NewServer(pool *Pool, v Vocabulary, name string, tpl chat.Template, defaults sample.Params) *Server {
@@ -141,7 +142,8 @@ func (s *Server) Handler() http.Handler {
 	if s.imager != nil {
 		mux.HandleFunc("POST /v1/images/generations", s.generations)
 	}
-	if s.decider != nil {
+	// Laya when there is one; the chat model otherwise.
+	if s.decider != nil || s.pool != nil {
 		mux.HandleFunc("POST /v1/systemone", s.systemone)
 	}
 	if s.yue2 != nil {

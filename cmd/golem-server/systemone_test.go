@@ -107,11 +107,23 @@ func TestSystemOneRefusesAsLayaServeDoes(t *testing.T) {
 	}
 }
 
-func TestSystemOneIsNotServedWithoutLaya(t *testing.T) {
+func TestSystemOneIsNotServedWithoutLayaOrAModel(t *testing.T) {
 	s := NewServer(nil, nil, "x", nil, sample.Params{})
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/systemone", strings.NewReader(`{}`)))
 	if rec.Code != 404 {
 		t.Fatalf("status %d without a decider", rec.Code)
+	}
+}
+
+// With -laya and -model both, Laya answers, as it did before the chat model
+// could.
+func TestSystemOneGoesToLayaWhenThereIsOne(t *testing.T) {
+	s, e := newTasteServer(t, map[string]float32{"Yes": 1})
+	f := &fakeDecider{}
+	s.SetDecider(f)
+	rec := ask(t, s, `{"state":"x","questions":{"q":{"type":"noul","instructions":"Fine."}}}`)
+	if rec.Code != 200 || len(f.got) != 1 || len(e.fed) != 0 {
+		t.Fatalf("status %d, Laya asked %d, the model fed %d: %s", rec.Code, len(f.got), len(e.fed), rec.Body)
 	}
 }

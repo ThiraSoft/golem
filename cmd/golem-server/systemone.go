@@ -1,6 +1,7 @@
 package main
 
-// POST /v1/systemone: typed questions about a state, answered by Laya.
+// POST /v1/systemone: typed questions about a state, answered by Laya, or by
+// the chat model when the server carries no Laya (systemone_model.go).
 //
 // It is TypeSafe Jev's endpoint, and the one laya-serve answers on, with the
 // same request and the same answer: {"state": …, "questions": {…}} in, every
@@ -40,6 +41,8 @@ func (s *Server) systemone(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		State     json.RawMessage `json:"state"`
 		Questions json.RawMessage `json:"questions"`
+		// System is read by the chat model alone; Laya has no turn for it.
+		System string `json:"system"`
 	}
 	body := http.MaxBytesReader(w, r.Body, maxDecisionBody)
 	if err := json.NewDecoder(body).Decode(&req); err != nil {
@@ -70,6 +73,10 @@ func (s *Server) systemone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.decider == nil {
+		s.systemoneByModel(w, r, req.System, req.State, questions)
+		return
+	}
 	res, err := s.decider.Decide(r.Context(), req.State, questions)
 	if err != nil {
 		var bad *laya.RequestError
