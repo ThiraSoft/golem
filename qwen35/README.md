@@ -156,6 +156,18 @@ Every waypoint is held to llama.cpp's: worst gap 1.1e-4 at the patches and
 6.4e-3 after all twenty-seven blocks. It sees and does not hear, because the
 projector carries no audio encoder.
 
+The tower goes to the card with the model. A 640×426 picture takes 33.6
+seconds on an i7-9700K and **1.03 on an RX 9070 XT**, and every waypoint of the
+card's tower is held to llama.cpp's the way the processor's is: worst gap
+9.9e-3 over the twenty-seven blocks, against the same 0.02 bar. Reading the
+prompt and drawing the answer then run wherever the model does.
+
+The projector is 884 MiB in fp16 and shares the card with the model, so it is
+resident when there is room and streamed one block at a time when there is
+not. That is 1.03 seconds an image against 1.41, rather than a fall back to the
+processor's thirty-three. `GOLEM_VISION_STREAM=1` forces the second path, which
+is how it gets tested on a machine that has room for the first.
+
 ```bash
 ./golem-cli -model Qwen3.8-27B-Q4_0.gguf -mmproj mmproj-F16.gguf \
     -image photo.png -p "Describe this image in one sentence."

@@ -47,6 +47,7 @@ Measured 2026-10-26, llama.cpp `8fe90e1fb`, i7-9700K and RX 9070 XT:
 | | worst gap in an option's log-probability | worst gap in its probability | same pick |
 |---|---:|---:|---|
 | E2B (QAT Q4_0), golem on the processor | 0.219 nats | 0.023 | 4 of 4 |
+| E2B (QAT Q4_0), golem on the card | 0.217 nats | 0.030 | 4 of 4 |
 | 12B (QAT Q4_0), golem on the card | 0.394 nats | 0.007 | 4 of 4 |
 
 The 12B's gap was 0.456 nats with the options weighed one after the other on
@@ -56,9 +57,6 @@ attention and products, which sum the same products in other orders. None of
 the three is nearer to llama.cpp by design: the gap moves by a few
 hundredths with the order of the sums. On the processor the order does not
 change, and E2B's gap is the same to the last digit either way.
-
-E2B on the card is not compared: the card has no per-layer embedding branch,
-and refuses that checkpoint.
 
 The gap is the engine's, not the weighing's. Each option weighed alone from
 an empty cache gives the same numbers as the rewound cache to the fourth

@@ -570,7 +570,24 @@ token after a question is the first of an empty thought, the empty thought is
 written and the options are weighed past it, for that question and the ones
 after it; a model that answers at once never pays for the check.
 
-How close to llama.cpp, `ref/systemone/README.md` says: an option's log-probability is within 0.22 nats of llama.cpp's on E2B on the processor and 0.39 on the 12B on the card, its probability within 0.023, and the pick is the same.
+The same request on E2B (QAT Q4_0) with its projector, on the same card
+(`TestSystemOneCostE2B`):
+
+| | answered in | positions fed |
+|---|---:|---:|
+| from nothing | 3.49 s | 2787 |
+| again, the same capture | 177 ms | 160 |
+| again, a new capture behind the same text | 3.00 s | 450 |
+
+E2B's text side runs on the card, and its passes cost less than the 12B's: a
+pass of 450 columns takes 137 ms. Its picture does not. The 12B's projector
+is an embedder whose blocks are the language model's own, so a capture is
+read on the card like the rest of the prompt. E2B's is a tower of sixteen
+blocks in bfloat16, and that tower runs on the processor: 2.8 s for a
+1280×720 capture. So on E2B the same capture is cheaper than on the 12B, and
+a new one is not.
+
+How close to llama.cpp, `ref/systemone/README.md` says: an option's log-probability is within 0.22 nats of llama.cpp's on E2B, on the processor or on the card, and 0.39 on the 12B on the card, its probability within 0.03, and the pick is the same.
 
 A model whose cache is a recurrent state (Qwen3.8) cannot be rewound to weigh
 one option after another, and is refused with a 422 that says so. So is a
