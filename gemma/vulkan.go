@@ -150,9 +150,6 @@ func (m *Model) UseVulkanStack() error {
 		return nil
 	}
 	cfg := m.Cfg
-	if cfg.PLEDim > 0 {
-		return fmt.Errorf("gemma: the Vulkan stack has no per-layer embedding branch, and this checkpoint carries one")
-	}
 	d, err := m.device()
 	if err != nil {
 		return err
@@ -192,12 +189,12 @@ func (m *Model) UseVulkanStack() error {
 	}
 	// A dense checkpoint is a mixture with no experts: the shared branch of a
 	// mixture block and an ordinary feed forward are the same three matrices
-	// under the same norm, which is what gemma/block.go says in prose.
-	dense := cfg.Blocks[0].FFN
-	for i, bc := range cfg.Blocks {
-		if bc.FFN != dense {
-			return fmt.Errorf("gemma: the feed-forward width is one buffer on the card, and block %d is %d wide against block 0's %d", i, bc.FFN, dense)
-		}
+	// under the same norm, which is what gemma/block.go says in prose. The
+	// mixture is made for the widest block, and a narrower one says so: E2B is
+	// 6144 wide in its first fifteen blocks and 12288 in the rest.
+	dense := 0
+	for _, bc := range cfg.Blocks {
+		dense = max(dense, bc.FFN)
 	}
 	mix, err := vk.NewMixture(d, cfg.Dim, cfg.ExpertFFN, dense, cfg.Experts, cfg.ExpertsUsed, vk.GELU)
 	if err == nil {
@@ -211,6 +208,15 @@ func (m *Model) UseVulkanStack() error {
 			}
 		}
 		mix.Expect(mixed)
+	}
+	if err == nil && cfg.PLEDim > 0 {
+		// The per-layer branch. Its inputs are built here, out of the
+		// embedding, and written to the card a pass at a time; the rest of it
+		// is three kernels and a second end to every block.
+		err = mix.PerLayer(cfg.PLEDim, len(cfg.Blocks))
+		if err != nil {
+			mix.Close()
+		}
 	}
 	if err != nil {
 		attn.Close()
@@ -321,7 +327,13 @@ func (m *Model) UseVulkanStack() error {
 			Eps: cfg.Eps, Scale: 1, // Gemma 4's query norm holds the scores in range
 			Formats: vk.BlockFormats{Q: bw.Q.Quant, K: bw.K.Quant, V: bw.V.Quant, O: bw.O.Quant},
 		}
-		if err := attn.AddBlock(shape, bw.Q.Data, k, v, bw.O.Data, bw.QNorm, bw.KNorm); err != nil {
+		// A block that reads another's cache computes no keys and has no norm
+		// for them; the kernel's binding still wants one.
+		knorm := bw.KNorm
+		if len(knorm) == 0 {
+			knorm = make([]float32, bc.HeadDim)
+		}
+		if err := attn.AddBlock(shape, bw.Q.Data, k, v, bw.O.Data, bw.QNorm, knorm); err != nil {
 			stack.Close()
 			return err
 		}
@@ -337,12 +349,27 @@ func (m *Model) UseVulkanStack() error {
 			norms.RouterScale, norms.DownScale, norms.Router = bw.RouterScale, bw.DownScale, routerRows(bw.Router)
 		}
 		formats := vk.MixtureFormats{GateUp: bw.Gate.Quant, Down: bw.Down.Quant}
+		if bc.FFN != dense {
+			formats.Dense = bc.FFN
+		}
 		if bc.MoE {
 			formats.GateUpExps, formats.DownExps = bw.GateUpExps.Quant, bw.DownExps.Quant
 		}
 		if err := mix.AddBlock(formats, gateUpExps, downExps, bw.Gate.Data, bw.Up.Data, bw.Down.Data); err != nil {
 			stack.Close()
 			return err
+		}
+		if cfg.PLEDim > 0 {
+			if bw.InpGate.Quant != bw.Proj.Quant {
+				stack.Close()
+				return fmt.Errorf("gemma: block %d's per-layer gate is %s and its projection %s, and one kernel reads both",
+					i, bw.InpGate.Quant, bw.Proj.Quant)
+			}
+			if err := mix.AddPerLayer(bw.InpGate.Quant, bw.InpGate.Data, bw.Proj.Data); err != nil {
+				stack.Close()
+				return err
+			}
+			norms.PerLayer = bw.PLENorm
 		}
 		if err := stack.AddBlock(norms); err != nil {
 			stack.Close()

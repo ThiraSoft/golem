@@ -414,6 +414,10 @@ type Mixture struct {
 	doutParts    *Buffer // the slices of a split down projection
 	daq, das     *Buffer
 
+	// perLayer is Gemma 4's per-layer branch, nil for a model that has none.
+	// vk/perlayer.go is all of it.
+	perLayer *perLayer
+
 	blocks []*mixtureBlock
 }
 
@@ -1414,6 +1418,8 @@ func (m *Mixture) Close() {
 		b.close()
 	}
 	m.blocks = nil
+	m.perLayer.close()
+	m.perLayer = nil
 	for _, b := range []**Buffer{
 		&m.gateOut, &m.das, &m.daq, &m.doutParts, &m.dout, &m.dxs, &m.dxq,
 		&m.as, &m.aq, &m.out, &m.cw, &m.ids, &m.xs, &m.xq,

@@ -1,0 +1,97 @@
+#version 450
+#extension GL_KHR_shader_subgroup_clustered : require
+
+// The middle of Gemma 4's per-layer branch: the GELU of the input gate's
+// product, times the block's own slice of the per-layer inputs, in Q8_0 for
+// the projection that follows.
+//
+// It is shaders/moe_act.comp with its second operand somewhere else. There the
+// up half sits beside the gate half in the product's own buffer; here it is
+// the per-layer inputs, one row a column holding every block's slice, and a
+// block reads its own. gemma/block.go is the other copy: nn.GELUTable, the
+// product, then the column quantized.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer Y  { float y[];    };  // the gate's product, ffn a column
+layout(std430, binding = 1) readonly  buffer GT { float gelu[]; };  // ggml's table, 65536 entries
+layout(std430, binding = 2) readonly  buffer PL { float ple[];  };  // the per-layer inputs, stride a column
+layout(std430, binding = 3) writeonly buffer AQ { uint  aq[];   };  // the product, Q8_0
+layout(std430, binding = 4) writeonly buffer AS { float as_[];  };  // its scales, then its corrections
+
+layout(push_constant) uniform Push {
+    uint ffn;     // the branch's width, which is a block's slice of the inputs
+    uint block;   // which slice
+    uint stride;  // a column of the inputs: every block's slice
+} p;
+
+// floatToHalf is nn/half.go, bit for bit; moe_act.comp says why.
+uint floatToHalf(float f) {
+    uint bits     = floatBitsToUint(f);
+    uint sign     = (bits >> 16) & 0x8000u;
+    int  exponent = int((bits >> 23) & 0xFFu) - 127 + 15;
+    uint mantissa = bits & 0x7FFFFFu;
+
+    if ((bits & 0x7FFFFFFFu) == 0u) return sign;
+    if (exponent >= 0x1F) {
+        if ((bits & 0x7F800000u) == 0x7F800000u && mantissa != 0u) return sign | 0x7E00u;
+        return sign | 0x7C00u;
+    }
+    if (exponent <= 0) {
+        if (exponent < -10) return sign;
+        mantissa |= 0x800000u;
+        uint shift = uint(14 - exponent);
+        uint value = mantissa >> shift;
+        uint rest  = mantissa & ((1u << shift) - 1u);
+        uint mid   = 1u << (shift - 1u);
+        if (rest > mid || (rest == mid && (value & 1u) == 1u)) value++;
+        return sign | value;
+    }
+    uint value = (uint(exponent) << 10) | (mantissa >> 13);
+    uint rest  = mantissa & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (value & 1u) == 1u)) value++;
+    return sign | value;
+}
+
+float halfToFloat(uint h) { return unpackHalf2x16(h).x; }
+
+int nearestInt(float f) {
+    return (floatBitsToInt(f + 12582912.0) & 0x007fffff) - 0x00400000;
+}
+
+void main() {
+    uint t   = gl_LocalInvocationID.x;
+    uint j   = gl_WorkGroupID.x * 256u + t;
+    uint col = gl_WorkGroupID.y;
+    if (j >= p.ffn) return;
+
+    float g = y[col * p.ffn + j];
+    float a;
+    if (g <= -10.0) {
+        a = 0.0;
+    } else if (g >= 10.0) {
+        a = g;
+    } else {
+        a = gelu[floatToHalf(g)];
+    }
+    float value = a * ple[col * p.stride + p.block * p.ffn + j];
+
+    float peak = subgroupClusteredMax(abs(value), 32u);
+    float scale = 0.0;
+    int   q = 0;
+    if (peak > 0.0) {
+        scale = halfToFloat(floatToHalf(peak / 127.0));
+        precise float scaled = value * (127.0 / peak);
+        q = clamp(nearestInt(scaled), -128, 127);
+    }
+    int total = subgroupClusteredAdd(q, 32u);
+    uint word = subgroupClusteredOr(uint(q & 0xFF) << ((t & 3u) * 8u), 4u);
+
+    if ((j & 3u) == 0u) aq[(col * p.ffn + j) >> 2] = word;
+    if ((j & 31u) == 0u) {
+        uint blocks = p.ffn >> 5;
+        uint blk    = j >> 5;
+        as_[col * 2u * blocks + blk]          = scale;
+        as_[col * 2u * blocks + blocks + blk] = 8.0 * scale * float(total);
+    }
+}

@@ -78,6 +78,7 @@ const (
 	normVScale             // and by a second one, which only the router wants
 	normFloat              // write the normed vector as floats
 	normQuant              // write its Q8_0 form
+	normRaw                // and leave it unnormed
 )
 
 // normPush is shaders/norm.comp's block.
@@ -192,6 +193,7 @@ type Stack struct {
 	resid  *Buffer // between the two halves of a block
 	normed *Buffer // the attention's output under its post-norm
 	none   *Buffer // bound where a shader's optional input is unused
+	pe     *Buffer // a block's end before its per-layer branch, nil without one
 
 	// traces keeps each block's output, which the recording would otherwise
 	// overwrite on its way to the next. It is a copy of eleven kilobytes a
@@ -243,6 +245,13 @@ type stackBlock struct {
 	setRouterWP *Set // the logits and the pick in one dispatch, for one column
 	setPick     *Set
 	setCombine  *Set
+
+	// The per-layer branch, on a block that has one: its gain, the stream's
+	// Q8_0 form, and the end that adds the branch on (vk/perlayer.go). The
+	// block's own end then writes s.pe rather than the stream.
+	pleGain       *Buffer
+	setPleNorm    *Set
+	setPleCombine *Set
 }
 
 // NewStack builds the kernels and the buffers a token passes through. The
@@ -474,6 +483,10 @@ type BlockNorms struct {
 	DownScale   []float32 // one scalar per expert
 	Router      []float32 // the router matrix, float32, experts by dim
 	OutScale    float32
+	// PerLayer is the gain of a per-layer branch's norm, on a block that has
+	// one (Mixture.PerLayer), and nil on one that has not. The block's scale
+	// then comes after the branch rather than before it.
+	PerLayer []float32
 
 	// Layout is which of the three shapes above the block's end has. Anything
 	// the shape does not use is unread: a LayoutDense block reads neither the
@@ -557,11 +570,41 @@ func (s *Stack) AddBlock(n BlockNorms) error {
 		shY, shQ, shS = s.mix.SharedFloatInput(), s.none, s.none
 	}
 
+	// A block with a per-layer branch ends twice: its own end into s.pe, and
+	// the branch's end from there into the stream.
+	end := s.xs
+	if n.PerLayer != nil {
+		if s.mix.perLayer == nil || len(s.mix.perLayer.added) <= len(s.blocks) {
+			return fail(fmt.Errorf("vk: block %d has a per-layer norm and the mixture no branch for it", len(s.blocks)))
+		}
+		if s.mix.Golem() {
+			return fail(fmt.Errorf("vk: a per-layer branch beside a Golem feed forward"))
+		}
+		if len(n.PerLayer) != s.dim {
+			return fail(fmt.Errorf("vk: a per-layer gain should be %d wide, given %d", s.dim, len(n.PerLayer)))
+		}
+		if s.pe == nil {
+			if s.pe, err = s.d.Local(s.dim*4*maxColumns, bufferUsageStorage); err != nil {
+				return fail(err)
+			}
+		}
+		if b.pleGain, err = s.d.Upload(asBytes(n.PerLayer)); err != nil {
+			return fail(err)
+		}
+		end = s.pe
+	}
+
 	// a, b, gain, vscale, sum, y, yq, ys
 	specs := []setSpec{
 		{&b.setAttnNorm, s.norm, []*Buffer{s.xs, s.none, b.gains[0], s.none, s.none, attnY, attnQ, attnS}},
 		{&b.setResid, s.norm, []*Buffer{s.xs, fromAttn, b.gains[2], s.none, s.resid, shY, shQ, shS}},
-		{&b.setCombine, s.combine, []*Buffer{shOut, expOut, s.resid, b.gains[4], b.gains[5], b.gains[6], s.xs}},
+		{&b.setCombine, s.combine, []*Buffer{shOut, expOut, s.resid, b.gains[4], b.gains[5], b.gains[6], end}},
+	}
+	if n.PerLayer != nil {
+		specs = append(specs,
+			setSpec{&b.setPleNorm, s.norm, []*Buffer{s.pe, s.none, s.none, s.none, s.none, s.none, shQ, shS}},
+			setSpec{&b.setPleCombine, s.combine, []*Buffer{shOut, expOut, s.pe, b.pleGain, b.pleGain, b.pleGain, s.xs}},
+		)
 	}
 	if n.Layout != LayoutPreNorm {
 		specs = append(specs, setSpec{&b.setPostAttn, s.norm,
@@ -586,6 +629,11 @@ func (s *Stack) AddBlock(n BlockNorms) error {
 	s.blocks = append(s.blocks, b)
 	return nil
 }
+
+// PerLayerStage is where a pass's per-layer inputs are written, for each
+// column every block's slice in turn; nil when the mixture has no per-layer
+// branch (Mixture.PerLayer).
+func (s *Stack) PerLayerStage() []float32 { return s.mix.PerLayerStage() }
 
 // Experts is how many logits the router produces, which Ready needs before it
 // can size their buffer.
@@ -808,6 +856,9 @@ func (s *Stack) record(r *Recorder, experts, used, columns int, runs []span, see
 	// this, so one dispatch a geometry at the head of the pass serves the
 	// whole of it.
 	s.attn.RecordRotations(r, columns)
+	if s.mix.perLayer != nil {
+		s.mix.recordPerLayerInputs(r, columns)
+	}
 	r.Barrier()
 	tl.Stamp(r, "rotations")
 	for i, b := range s.blocks {
@@ -860,7 +911,23 @@ func (s *Stack) record(r *Recorder, experts, used, columns int, runs []span, see
 		}
 		s.mix.Record(r, i, columns, sharedUp, sharedDown)
 		r.Barrier()
-		r.DispatchColumns(b.setCombine, 1, cols, unsafe.Pointer(&combine))
+		if b.pleGain != nil {
+			// The block's scale waits for the branch: gemma/block.go applies
+			// it to the stream the branch has been added to.
+			inner := combine
+			inner.outScale = 1
+			r.DispatchColumns(b.setCombine, 1, cols, unsafe.Pointer(&inner))
+			r.Barrier()
+			raw := normPush{n: uint32(s.dim), flags: normRaw | normQuant, eps: s.eps, scalar: 1}
+			r.DispatchColumns(b.setPleNorm, 1, cols, unsafe.Pointer(&raw))
+			r.Barrier()
+			s.mix.recordPerLayer(r, i, columns)
+			r.Barrier()
+			outer := combinePush{n: uint32(s.dim), eps: s.eps, outScale: b.outScale, layout: uint32(LayoutDense)}
+			r.DispatchColumns(b.setPleCombine, 1, cols, unsafe.Pointer(&outer))
+		} else {
+			r.DispatchColumns(b.setCombine, 1, cols, unsafe.Pointer(&combine))
+		}
 		r.Barrier()
 		tl.Stamp(r, "combine")
 		if s.trace {
@@ -928,7 +995,7 @@ func (s *Stack) Close() {
 		b.close()
 	}
 	s.blocks = nil
-	for _, b := range []**Buffer{&s.traces, &s.routerCount, &s.routerOut, &s.routerIn, &s.none, &s.normed, &s.resid, &s.stage, &s.xs} {
+	for _, b := range []**Buffer{&s.pe, &s.traces, &s.routerCount, &s.routerOut, &s.routerIn, &s.none, &s.normed, &s.resid, &s.stage, &s.xs} {
 		if *b != nil {
 			(*b).Close()
 			*b = nil
@@ -951,7 +1018,11 @@ func (s *Stack) Close() {
 }
 
 func (b *stackBlock) close() {
-	for _, set := range []**Set{&b.setCombine, &b.setPick, &b.setRouterW, &b.setRouterIn, &b.setExpert, &b.setResid, &b.setPostAttn, &b.setAttnNorm} {
+	if b.pleGain != nil {
+		b.pleGain.Close()
+		b.pleGain = nil
+	}
+	for _, set := range []**Set{&b.setPleNorm, &b.setPleCombine, &b.setCombine, &b.setPick, &b.setRouterW, &b.setRouterIn, &b.setExpert, &b.setResid, &b.setPostAttn, &b.setAttnNorm} {
 		if *set != nil {
 			(*set).Close()
 			*set = nil

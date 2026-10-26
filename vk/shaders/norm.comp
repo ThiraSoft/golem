@@ -91,6 +91,8 @@ const uint GAIN   = 4u;
 const uint VSCALE = 8u;
 const uint FLOAT  = 16u;  // write the normed vector as floats
 const uint QUANT  = 32u;  // write its Q8_0 form
+const uint RAW    = 64u;  // leave it unnormed: only the Q8_0 form of the
+                          // stream itself, which Gemma 4's per-layer branch reads
 
 // MAXN is the widest vector this binary norms, and it is the staging array's
 // size. A model whose hidden state is wider needs the binary built with a
@@ -163,7 +165,7 @@ void main() {
     barrier();
     float whole = 0.0;
     for (uint i = 0u; i < gl_NumSubgroups; i++) whole += partial[i];
-    float scale = 1.0 / sqrt(whole / float(p.n) + p.eps);
+    float scale = ((p.flags & RAW) != 0u) ? 1.0 : 1.0 / sqrt(whole / float(p.n) + p.eps);
 
     for (uint i = t; i < p.n; i += 1024u) {
         float x = v[i] * scale;

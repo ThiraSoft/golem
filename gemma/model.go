@@ -39,8 +39,8 @@ type Model struct {
 
 	// The logit head on a Vulkan device, when UseVulkanHead put it there.
 	// gemma/vulkan.go says what that buys and what it leaves alone.
-	head      vk.Head
-	stack     *vk.Stack
+	head  vk.Head
+	stack *vk.Stack
 	// golemHead is the head of a .golem checkpoint, which has the transform
 	// of its site in front of the product and an API of its own; golem holds
 	// the kernels of each format, built once: a three-bit body usually comes
@@ -266,6 +266,14 @@ func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32,
 		copy(xs[t], embedded.F[t])
 	}
 	if m.stack != nil {
+		// The per-layer inputs are built here, out of the embedding, and the
+		// card reads them from its stage.
+		if stage := m.stack.PerLayerStage(); stage != nil {
+			width := len(cfg.Blocks) * cfg.PLEDim
+			for t := range tokens {
+				copy(stage[t*width:(t+1)*width], perLayer[t])
+			}
+		}
 		m.runStack(xs, at)
 		// The card normed it: the last thing the recording does is the
 		// model's final norm, in place in the stream.
