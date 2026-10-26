@@ -88,3 +88,14 @@ target_link_directories(dump_audio PRIVATE ${LLAMA_DIR}/build/bin)
 target_link_libraries(dump_audio PRIVATE mtmd llama ggml ggml-base ggml-cpu)
 set_target_properties(dump_audio PROPERTIES
     BUILD_RPATH ${LLAMA_DIR}/build/bin)
+
+# The log-probabilities of a closed question's options, which /v1/systemone
+# weighs; the same linkage as dump_layers.
+add_executable(dump_logprobs dump_logprobs.cpp)
+target_include_directories(dump_logprobs PRIVATE
+    ${LLAMA_DIR}/include
+    ${LLAMA_DIR}/ggml/include)
+target_link_directories(dump_logprobs PRIVATE ${LLAMA_DIR}/build/bin)
+target_link_libraries(dump_logprobs PRIVATE llama ggml ggml-base ggml-cpu)
+set_target_properties(dump_logprobs PROPERTIES
+    BUILD_RPATH ${LLAMA_DIR}/build/bin)

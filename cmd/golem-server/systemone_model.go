@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,6 +85,10 @@ func (s *Server) weighQuestions(w http.ResponseWriter, r *http.Request, system s
 	if err != nil {
 		return nil, err
 	}
+	closing, err := s.closing()
+	if err != nil {
+		return nil, err
+	}
 	qs := make([]asked, len(questions))
 	for i, q := range questions {
 		p, err := laya.Prepare(q.Question)
@@ -127,7 +132,7 @@ func (s *Server) weighQuestions(w http.ResponseWriter, r *http.Request, system s
 			if commonPrefix(ids, whole[i]) != len(whole[i]) || len(ids) == len(whole[i]) {
 				return nil, requestError{fmt.Errorf("question %q: the option %q does not follow the question as tokens of its own", questions[i].ID, o)}
 			}
-			ws[i].options = append(ws[i].options, ids[len(whole[i]):])
+			ws[i].options = append(ws[i].options, slices.Concat(ids[len(whole[i]):], closing))
 		}
 	}
 	for i := range ws {
@@ -292,6 +297,30 @@ func (s *Server) turn(system string) (head, tail string, err error) {
 		return "", "", fmt.Errorf("the chat template did not write the turn's content where it could be found")
 	}
 	return head, tail, nil
+}
+
+// closing is the tokens that end the model's turn, which every option is
+// weighed with: without them "heal" would be weighed as every answer that
+// starts with it, "heal the tank" among them. It is read off the template, as
+// the end of an answer, through the first token that ends a generation, and
+// is empty for a template that writes none.
+func (s *Server) closing() ([]int32, error) {
+	text, err := s.tpl.Render([]chat.Message{{Role: "user", Content: sentinel},
+		{Role: "assistant", Content: sentinel + "A"}}, chat.Options{})
+	if err != nil {
+		return nil, err
+	}
+	_, after, ok := strings.Cut(text, sentinel+"A")
+	if !ok {
+		return nil, fmt.Errorf("the chat template did not write the answer where it could be found")
+	}
+	ids := s.vocab.Encode(after, false, true)
+	for i, id := range ids {
+		if s.vocab.IsEOG(id) {
+			return ids[:i+1], nil
+		}
+	}
+	return nil, nil
 }
 
 // pictureMarker is what the template writes for one picture, which the

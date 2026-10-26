@@ -22,7 +22,9 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"runtime"
 	"slices"
+	"sync"
 
 	"github.com/ThiraSoft/golem/engine"
 )
@@ -112,14 +114,34 @@ func (c *Context) Weigh(ctx context.Context, build func([]int32) (engine.Prompt,
 // logSum is the log of the sum of a row's exponentials, which a logit takes
 // away to become a log-probability. It is summed in float64: a row is a
 // quarter of a million entries, and a float32 sum loses the small ones.
+//
+// A quarter of a million exponentials is 3.4 ms on one core of an i7-9700K,
+// and a question asks for a few rows, so the row is cut between the cores.
+// Not on nn's workers: they belong to the runner, which may be using them.
 func logSum(row []float32) float64 {
 	m := math.Inf(-1)
 	for _, v := range row {
 		m = math.Max(m, float64(v))
 	}
+	parts := runtime.NumCPU()
+	if len(row) < 1<<14 {
+		parts = 1
+	}
+	sums := make([]float64, parts)
+	var wg sync.WaitGroup
+	for k := range parts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for _, v := range row[k*len(row)/parts : (k+1)*len(row)/parts] {
+				sums[k] += math.Exp(float64(v) - m)
+			}
+		}()
+	}
+	wg.Wait()
 	var sum float64
-	for _, v := range row {
-		sum += math.Exp(float64(v) - m)
+	for _, s := range sums {
+		sum += s
 	}
 	return m + math.Log(sum)
 }
