@@ -120,15 +120,38 @@ func (s *Server) weighQuestions(w http.ResponseWriter, r *http.Request, system s
 	// The state is what every question starts with. Its tokens are whatever
 	// all of them agree on, so that a merge across where the state ends is
 	// never taken for a different state.
-	stateIDs := s.vocab.Encode(head+body, false, true)
+	//
+	// Every one of these texts is the whole state and more, and there are as
+	// many of them as options: 42 ms one after the other for two questions of
+	// six and five options on a state of about 2600 positions. Encode is safe
+	// to call from several goroutines, so they go side by side.
+	texts := []string{head + body}
+	for _, q := range qs {
+		prompt := head + body + "\n\n" + q.text + tail
+		texts = append(texts, prompt)
+		for _, o := range q.options {
+			texts = append(texts, prompt+o)
+		}
+	}
+	encoded := make([][]int32, len(texts))
+	var wg sync.WaitGroup
+	for i, text := range texts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			encoded[i] = s.vocab.Encode(text, false, true)
+		}()
+	}
+	wg.Wait()
+	stateIDs, encoded := encoded[0], encoded[1:]
 	ws := make([]weighing, len(qs))
 	whole := make([][]int32, len(qs))
 	for i, q := range qs {
-		prompt := head + body + "\n\n" + q.text + tail
-		whole[i] = s.vocab.Encode(prompt, false, true)
+		whole[i], encoded = encoded[0], encoded[1:]
 		stateIDs = stateIDs[:commonPrefix(stateIDs, whole[i])]
 		for _, o := range q.options {
-			ids := s.vocab.Encode(prompt+o, false, true)
+			var ids []int32
+			ids, encoded = encoded[0], encoded[1:]
 			if commonPrefix(ids, whole[i]) != len(whole[i]) || len(ids) == len(whole[i]) {
 				return nil, requestError{fmt.Errorf("question %q: the option %q does not follow the question as tokens of its own", questions[i].ID, o)}
 			}
