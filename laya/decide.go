@@ -56,6 +56,9 @@ type Answer struct {
 	Confidence float64
 	// Act is the act head's probability that the answer should be acted on.
 	Act float64
+	// NoAct says no act head stood behind the answer, and the field is left
+	// out rather than written as a number nobody computed.
+	NoAct bool
 }
 
 type Probability struct {
@@ -68,6 +71,8 @@ type Probability struct {
 type Result struct {
 	Answers     []Answer
 	InputTokens int
+	// Model is the name the answer goes out under; "laya" when empty.
+	Model string
 }
 
 // Decide answers every question about one state in one pass. The state is
@@ -155,7 +160,27 @@ func (m *Model) answer(id string, q *question, o output) Answer {
 		z[i] = v / t
 	}
 	p := softmax(z)
-	a := Answer{ID: id, Type: kindNames[q.kind], Act: float64(o.act[0])}
+	wide := make([]float64, len(p))
+	for i, v := range p {
+		wide[i] = float64(v)
+	}
+	a := answered(id, q, wide)
+	a.Act = float64(o.act[0])
+	return a
+}
+
+// Answered reads a distribution over a question's options as its kind says:
+// the options in the order Prepare gave them, a noul's false then true. It is
+// how another model's probabilities come back in the shape Laya's do, with no
+// act head behind them.
+func Answered(id string, q *Prepared, p []float64) Answer {
+	a := answered(id, q.q, p)
+	a.NoAct = true
+	return a
+}
+
+func answered(id string, q *question, p []float64) Answer {
+	a := Answer{ID: id, Type: kindNames[q.kind]}
 	best := 0
 	for i := range p {
 		if p[i] > p[best] {
@@ -165,14 +190,14 @@ func (m *Model) answer(id string, q *question, o output) Answer {
 	switch q.kind {
 	case Choice, Score:
 		for i, v := range p {
-			a.Probabilities = append(a.Probabilities, Probability{q.labels[i], float64(v)})
+			a.Probabilities = append(a.Probabilities, Probability{q.labels[i], v})
 		}
 		a.Confidence = confidence(p)
 		if q.kind == Choice {
 			a.Label = q.labels[best]
 		} else {
 			for i, v := range p {
-				a.Score += float64(i) * float64(v)
+				a.Score += float64(i) * v
 			}
 			for _, opt := range q.options {
 				_, level, _ := bytes.Cut([]byte(opt), []byte(": "))
@@ -180,7 +205,7 @@ func (m *Model) answer(id string, q *question, o output) Answer {
 			}
 		}
 	case Noul:
-		a.Noul = float64(p[1])
+		a.Noul = p[1]
 	}
 	return a
 }
@@ -203,13 +228,13 @@ func (m *Model) temperature(kind, k int) float32 {
 	return m.Cfg.Temperature[kind]
 }
 
-func confidence(p []float32) float64 {
+func confidence(p []float64) float64 {
 	if len(p) < 2 {
 		return 1
 	}
 	var ent float64
 	for _, v := range p {
-		ent -= float64(v) * math.Log(math.Min(math.Max(float64(v), 1e-12), 1))
+		ent -= v * math.Log(math.Min(math.Max(v, 1e-12), 1))
 	}
 	return 1 - ent/math.Log(float64(len(p)))
 }
@@ -274,7 +299,9 @@ func (a Answer) MarshalJSON() ([]byte, error) {
 	case "noul":
 		field("noul", round4(a.Noul))
 	}
-	field("rl_agent", map[string]json.Number{"act_probability": round4(a.Act)})
+	if !a.NoAct {
+		field("rl_agent", map[string]json.Number{"act_probability": round4(a.Act)})
+	}
 	b.WriteByte('}')
 	return b.Bytes(), nil
 }
@@ -283,7 +310,14 @@ func (a Answer) MarshalJSON() ([]byte, error) {
 // identifiers, in order, and the usage.
 func (r *Result) MarshalJSON() ([]byte, error) {
 	var b bytes.Buffer
-	b.WriteString(`{"model":"laya","answers":{`)
+	model := r.Model
+	if model == "" {
+		model = "laya"
+	}
+	name, _ := json.Marshal(model)
+	b.WriteString(`{"model":`)
+	b.Write(name)
+	b.WriteString(`,"answers":{`)
 	for i, a := range r.Answers {
 		if i > 0 {
 			b.WriteByte(',')

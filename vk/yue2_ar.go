@@ -266,6 +266,11 @@ func (a *Attention) UseSplitDecode() error {
 		if ck == nil {
 			ck, cv = b.shape.Cache[0], b.shape.Cache[1]
 		}
+		if ck == nil {
+			// A block that reads an earlier block's cache, as E2B's second
+			// half does.
+			ck, cv = a.blocks[b.shape.KVSource].caches()
+		}
 		set, err := s.split.NewSet([]*Buffer{a.qh, ck, cv, s.part, a.where})
 		if err != nil {
 			return fail(err)

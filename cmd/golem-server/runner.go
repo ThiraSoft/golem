@@ -63,8 +63,17 @@ type pass struct {
 	slot      int
 	tokens    []int32
 	positions []int
-	logits    []float32     // where to score the last token, or nil for a chunk
-	reply     chan struct{} // closed once the pass has run
+	logits    []float32 // where to score the last token, or nil for a chunk
+	// scores, when it is not nil, scores the last len(scores) tokens rather
+	// than the last alone: weighing an option of several tokens wants the
+	// distribution before each of them. A pass sets this or logits.
+	scores [][]float32
+	// scoreAt, when it is not nil, says which tokens of the pass scores
+	// scores rather than the last of them: a pass of segments
+	// (Context.PrefillSegments) scores the end of a question's words and
+	// every position of its options, and not the words before.
+	scoreAt []int
+	reply   chan struct{} // closed once the pass has run
 	// A conversation carrying a picture brings more than its tokens: the rows
 	// to use instead of the embedding table, and then whatever its engine
 	// needs beside them — Gemma's per-layer identifiers and how far forward
@@ -74,6 +83,11 @@ type pass struct {
 	ple    []int32
 	until  []int
 	axes   [][3]int
+	// shifts and holes put some of the tokens on branches (engine.Chunk), one
+	// of each a token; nil for a pass that has none, which is every pass but
+	// the one that weighs a question's options.
+	shifts []int
+	holes  [][2][2]int
 	// state, when it is not nil, receives a copy of the hidden state the pass
 	// ended on. Only a conversation about to draft asks for it: that state is
 	// the prediction block's second input, and nothing else in the server has
@@ -103,8 +117,11 @@ type Runner struct {
 	// vision is set when the model was given a projector, and is what carries
 	// a batch that holds one. A batch that holds none never touches it.
 	vision engine.Media
-	passes chan *pass
-	asides chan *aside
+	// branches is set when the engine can carry branches, and carries a batch
+	// of text that holds some.
+	branches engine.Branches
+	passes   chan *pass
+	asides   chan *aside
 
 	// waiting is how many conversations are in flight, which says whether a
 	// pass in hand is all there is or the first of several.
@@ -153,6 +170,13 @@ const gatherShare = 8
 
 // SetVision says which encoder carries the batches that hold a picture.
 func (r *Runner) SetVision(v engine.Media) { r.vision = v }
+
+// SetBranches says what carries a batch whose tokens are on branches, which
+// is what lets Weigh put a question's options in one pass.
+func (r *Runner) SetBranches(b engine.Branches) { r.branches = b }
+
+// Branching says whether a pass may carry branches.
+func (r *Runner) Branching() bool { return r.branches != nil }
 
 func NewRunner(e Engine) *Runner {
 	return &Runner{
@@ -241,17 +265,19 @@ func (r *Runner) Forward(slot int, tokens []int32, positions []int, logits []flo
 // ForwardState is Forward that also keeps the hidden state the pass ended on,
 // which is what a conversation about to draft needs and no other has a use for.
 func (r *Runner) ForwardState(slot int, tokens []int32, positions []int, logits []float32, state *[]float32) {
-	p := &pass{slot: slot, tokens: tokens, positions: positions, logits: logits,
-		state: state, reply: make(chan struct{})}
-	r.passes <- p
-	<-p.reply
+	r.submit(&pass{slot: slot, tokens: tokens, positions: positions, logits: logits, state: state})
 }
 
 // ForwardEmbedded is the same, for a chunk that carries a picture.
 func (r *Runner) ForwardEmbedded(slot int, tokens []int32, embeds [][]float32, ple []int32,
 	positions, until []int, axes [][3]int, logits []float32) {
-	p := &pass{slot: slot, tokens: tokens, positions: positions, logits: logits,
-		embeds: embeds, ple: ple, until: until, axes: axes, reply: make(chan struct{})}
+	r.submit(&pass{slot: slot, tokens: tokens, positions: positions, logits: logits,
+		embeds: embeds, ple: ple, until: until, axes: axes})
+}
+
+// submit hands a pass to the loop and waits for it to have run.
+func (r *Runner) submit(p *pass) {
+	p.reply = make(chan struct{})
 	r.passes <- p
 	<-p.reply
 }
@@ -367,12 +393,26 @@ func (r *Runner) run(batch []*pass) {
 	var embeds [][]float32
 	var ple []int32
 	var axes [][3]int
-	pictures := false
+	var shifts []int
+	var holes [][2][2]int
+	pictures, branched := false, false
+	for _, p := range batch {
+		branched = branched || p.shifts != nil
+	}
 	for _, p := range batch {
 		tokens = append(tokens, p.tokens...)
 		at = append(at, p.positions...)
 		for range p.tokens {
 			slots = append(slots, p.slot)
+		}
+		if branched {
+			if p.shifts != nil {
+				shifts = append(shifts, p.shifts...)
+				holes = append(holes, p.holes...)
+			} else {
+				shifts = append(shifts, make([]int, len(p.tokens))...)
+				holes = append(holes, make([][2][2]int, len(p.tokens))...)
+			}
 		}
 		if p.embeds != nil {
 			pictures = true
@@ -403,12 +443,20 @@ func (r *Runner) run(batch []*pass) {
 	}
 	start := time.Now()
 	var states [][]float32
-	if pictures {
+	switch {
+	case pictures:
 		states = r.vision.ForwardChunk(engine.Chunk{
 			Tokens: tokens, Embeds: embeds, Slots: slots, Positions: at,
-			PLE: ple, Until: until, Axes: axes,
+			PLE: ple, Until: until, Axes: axes, Shifts: shifts, Holes: holes,
 		})
-	} else {
+	case branched:
+		// The three parallel slices a picture fills are filled for text too:
+		// each token its own identifier and its own position.
+		states = r.branches.ForwardChunk(engine.Chunk{
+			Tokens: tokens, Slots: slots, Positions: at,
+			PLE: tokens, Until: at, Shifts: shifts, Holes: holes,
+		})
+	default:
 		states = r.engine.ForwardSlots(tokens, slots, at)
 	}
 
@@ -427,6 +475,14 @@ func (r *Runner) run(batch []*pass) {
 		if p.logits != nil {
 			last = append(last, states[end-1])
 			outs = append(outs, p.logits)
+		}
+		for i, out := range p.scores {
+			at := end - len(p.scores) + i
+			if p.scoreAt != nil {
+				at = end - len(p.tokens) + p.scoreAt[i]
+			}
+			last = append(last, states[at])
+			outs = append(outs, out)
 		}
 	}
 	if len(last) == 1 {

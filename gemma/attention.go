@@ -15,6 +15,7 @@ package gemma
 
 import (
 	"github.com/ThiraSoft/golem/nn"
+	"math"
 )
 
 // Attention writes cfg.Dim floats per position into out: the attention output
@@ -103,8 +104,7 @@ func Attention(
 		for u := start; u < end; u++ {
 			t, h := u/bc.Heads, u%bc.Heads
 			lc := at[t].Cache.Layers[bc.Index]
-			pos := at[t].Pos
-			first, last := at[t].Cache.Visible(bc, pos, at[t].Until)
+			first, last := at[t].visible(bc)
 			if bc.Behind {
 				last--
 			}
@@ -116,6 +116,10 @@ func Attention(
 			// No 1/sqrt(head_dim): Gemma 4 scales by one, and the query norm is
 			// what keeps the scores in range.
 			for p := first; p <= last; p++ {
+				if at[t].blind(p) {
+					scores[p-first] = float32(math.Inf(-1))
+					continue
+				}
 				scores[p-first] = nn.DotF32Half(query, lc.Key(p, kv))
 			}
 			nn.SoftmaxInPlace(scores)
@@ -133,6 +137,7 @@ func Attention(
 		}
 	})
 
+	calib(bc.Index, "o", set.F[:len(out)])
 	bw.O.MatVecBatch(set, out)
 }
 

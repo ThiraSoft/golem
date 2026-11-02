@@ -99,6 +99,20 @@ layout(push_constant) uniform Push {
 // WHERE_COLUMNS is vk/attention.go's maxColumns, and the two have to agree.
 const uint WHERE_COLUMNS = 512u;
 
+// BRANCHES is where the branches start in the same buffer, past every block's
+// columns: two entries a column, the same for every block. A column on a
+// branch (cmd/golem-server/weigh.go writes every question's words and options
+// after the state, each seeing the state, its own question and itself) is
+// written where it stands in the cache and does not see two stretches of it:
+// .y up to .z of the first entry and .x up to .y of the second, first and one
+// past the last. A column on no branch has both empty. The first entry's .x
+// is how far past its turn it stands, which only the angles read.
+const uint BRANCHES = 128u * WHERE_COLUMNS;
+
+bool hidden(uvec4 a, uvec4 b, uint pos) {
+    return (pos >= a.y && pos < a.z) || (pos >= b.x && pos < b.y);
+}
+
 // BR columns to a workgroup against BC positions at a time, both thirty-two,
 // answered by a sixteen by sixteen grid of threads — so a thread carries a two
 // by two block of scores rather than one. That is register tiling and it is
@@ -256,6 +270,8 @@ void main() {
     // work.
     uint r0 = t >> 3, cl = t & 7u;
     uvec4 mine = where_[p.block * WHERE_COLUMNS + base + min(r0, rows - 1u)];
+    uvec4 hole = where_[BRANCHES + base + min(r0, rows - 1u)];
+    uvec4 hole2 = where_[BRANCHES + WHERE_COLUMNS + base + min(r0, rows - 1u)];
     bool live = r0 < rows;
     uint qst = hd + 8u;   // a query row and its slack, in halves
 #else
@@ -265,6 +281,10 @@ void main() {
     uint r0 = sr, r1 = sr + 16u;
     uvec4 mine0 = where_[p.block * WHERE_COLUMNS + base + min(r0, rows - 1u)];
     uvec4 mine1 = where_[p.block * WHERE_COLUMNS + base + min(r1, rows - 1u)];
+    uvec4 hole0 = where_[BRANCHES + base + min(r0, rows - 1u)];
+    uvec4 hole1 = where_[BRANCHES + base + min(r1, rows - 1u)];
+    uvec4 hole0b = where_[BRANCHES + WHERE_COLUMNS + base + min(r0, rows - 1u)];
+    uvec4 hole1b = where_[BRANCHES + WHERE_COLUMNS + base + min(r1, rows - 1u)];
     bool live0 = r0 < rows, live1 = r1 < rows;
 #endif
 
@@ -356,7 +376,7 @@ void main() {
         [[unroll]] for (uint i = 0u; i < 4u; i++) {
             uint c   = cl + (i << 3);
             uint pos = lo + start + c;
-            float v  = (live && c < got && pos >= mine.y && pos <= mine.z)
+            float v  = (live && c < got && pos >= mine.y && pos <= mine.z && !hidden(hole, hole2, pos))
                         ? pr[r0 * BC + c] * p.scale : -1.0 / 0.0;
             sv[i] = v;
             peak  = max(peak, v);
@@ -409,10 +429,12 @@ void main() {
         // Which of the four the row's own range admits.
         uint pos0 = lo + start + sc, pos1 = pos0 + 16u;
         float inf = 1.0 / 0.0;
-        float s00 = (live0 && sc        < got && pos0 >= mine0.y && pos0 <= mine0.z) ? d00 * p.scale : -inf;
-        float s01 = (live0 && sc + 16u  < got && pos1 >= mine0.y && pos1 <= mine0.z) ? d01 * p.scale : -inf;
-        float s10 = (live1 && sc        < got && pos0 >= mine1.y && pos0 <= mine1.z) ? d10 * p.scale : -inf;
-        float s11 = (live1 && sc + 16u  < got && pos1 >= mine1.y && pos1 <= mine1.z) ? d11 * p.scale : -inf;
+        bool out00 = hidden(hole0, hole0b, pos0), out01 = hidden(hole0, hole0b, pos1);
+        bool out10 = hidden(hole1, hole1b, pos0), out11 = hidden(hole1, hole1b, pos1);
+        float s00 = (live0 && sc        < got && pos0 >= mine0.y && pos0 <= mine0.z && !out00) ? d00 * p.scale : -inf;
+        float s01 = (live0 && sc + 16u  < got && pos1 >= mine0.y && pos1 <= mine0.z && !out01) ? d01 * p.scale : -inf;
+        float s10 = (live1 && sc        < got && pos0 >= mine1.y && pos0 <= mine1.z && !out10) ? d10 * p.scale : -inf;
+        float s11 = (live1 && sc + 16u  < got && pos1 >= mine1.y && pos1 <= mine1.z && !out11) ? d11 * p.scale : -inf;
 
         // The online softmax, one clustered fold per row. The two rows a
         // thread carries fold over the same sixteen lanes, one after the other.

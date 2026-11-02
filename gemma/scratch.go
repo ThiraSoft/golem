@@ -202,7 +202,7 @@ func (s *Scratch) RoPE(bc BlockConfig, at []Place, freqs []float32) []*nn.RoPETa
 		s.ropes[bc.RoPEBase] = t
 	}
 	for i, p := range at {
-		t[i].Prepare(bc.RoPEDims, p.Pos, bc.RoPEBase, freqs)
+		t[i].Prepare(bc.RoPEDims, p.Pos-p.Shift, bc.RoPEBase, freqs)
 	}
 	return t
 }

@@ -143,6 +143,10 @@ func newPrepareGolem(d *Device, shared *Pipeline, pre []float32, group int, spir
 // prepareGolemGroup is the rotation width the shader was built for.
 const prepareGolemGroup = 128
 
+// GolemGroup is the rotation width the card's Golem kernels undo, for an engine
+// that has to check its checkpoint was written with the same one.
+const GolemGroup = prepareGolemGroup
+
 // Run transforms the first `columns` activations of the bound buffer in place.
 func (p *PrepareGolem) Run(columns int) error {
 	push := prepareGolemPush{n: uint32(p.n), columns: uint32(columns)}

@@ -31,6 +31,7 @@ var swigluGolemSPIRV []byte
 type swigluGolemPush struct {
 	ffn     uint32
 	columns uint32
+	act     uint32
 }
 
 // GolemFFN is one block's feed forward.
@@ -46,6 +47,11 @@ type GolemFFN struct {
 
 	stacked *Buffer // gate and up, 2*ffn a column
 	act     *Buffer // the gated intermediate, ffn a column, prepared in place
+	// owned says stacked and act are this block's own. A model's blocks run
+	// one after another and can share them, and at a pass of 512 columns
+	// they are a tenth of a gigabyte a block — 4.4 GiB over Gemma 4 12B's
+	// forty-eight, which was more than its three-bit weights saved.
+	owned bool
 
 	prepIn  *PrepareGolem
 	prepAct *PrepareGolem
@@ -53,33 +59,39 @@ type GolemFFN struct {
 	gateUp *GolemMatrix
 	down   *GolemMatrix
 
-	swiglu *Pipeline
-	setAct *Set
+	swiglu     *Pipeline
+	setAct     *Set
+	activation Activation
 }
 
 // NewGolemFFN uploads one block's three matrices and binds them. gate, up and
 // down are the file's own bytes; preGateUp and preDown are the two vectors the
 // checkpoint carries for this block's two sites. in and out belong to the
 // caller and are the stream this feed forward reads and writes; columns is the
-// widest pass it will be asked for.
+// widest pass it will be asked for. act is the gate's activation, and gelu
+// ggml's table, which a SiLU never reads but the kernel binds all the same.
+// scratch, when not nil, is the pair of intermediates this block uses in place
+// of its own — see GolemFFNScratch.
 func NewGolemFFN(k *GolemKernels, dim, ffn, columns int, gate, up, down []byte,
-	preGateUp, preDown []float32, in, out *Buffer) (*GolemFFN, error) {
+	preGateUp, preDown []float32, in, out *Buffer, act Activation, gelu *Buffer, scratch *GolemFFNScratch) (*GolemFFN, error) {
 	if len(preGateUp) != dim || len(preDown) != ffn {
 		return nil, fmt.Errorf("vk: the feed forward's vectors are %d and %d wide, want %d and %d",
 			len(preGateUp), len(preDown), dim, ffn)
 	}
-	f := &GolemFFN{d: k.d, k: k, dim: dim, ffn: ffn, columns: columns, in: in, out: out}
+	f := &GolemFFN{d: k.d, k: k, dim: dim, ffn: ffn, columns: columns, in: in, out: out, activation: act}
 	fail := func(err error) (*GolemFFN, error) {
 		f.Close()
 		return nil, err
 	}
-	var err error
-	if f.stacked, err = k.d.Local(2*ffn*columns*4, bufferUsageStorage); err != nil {
+	if scratch == nil {
+		f.owned = true
+		scratch = &GolemFFNScratch{}
+	}
+	err := scratch.fit(k.d, ffn, columns)
+	if err != nil {
 		return fail(err)
 	}
-	if f.act, err = k.d.Local(ffn*columns*4, bufferUsageStorage); err != nil {
-		return fail(err)
-	}
+	f.stacked, f.act = scratch.stacked, scratch.act
 	if f.prepIn, err = NewPrepareGolem(k.d, in, preGateUp, prepareGolemGroup); err != nil {
 		return fail(err)
 	}
@@ -97,10 +109,10 @@ func NewGolemFFN(k *GolemKernels, dim, ffn, columns int, gate, up, down []byte,
 		return fail(err)
 	}
 
-	if f.swiglu, err = k.d.NewPipeline(swigluGolemSPIRV, 2, uint32(unsafe.Sizeof(swigluGolemPush{}))); err != nil {
+	if f.swiglu, err = k.d.NewPipeline(swigluGolemSPIRV, 3, uint32(unsafe.Sizeof(swigluGolemPush{}))); err != nil {
 		return fail(err)
 	}
-	if f.setAct, err = f.swiglu.NewSet([]*Buffer{f.stacked, f.act}); err != nil {
+	if f.setAct, err = f.swiglu.NewSet([]*Buffer{f.stacked, f.act, gelu}); err != nil {
 		return fail(err)
 	}
 	return f, nil
@@ -125,7 +137,7 @@ func (f *GolemFFN) Record(r *Recorder, columns int) error {
 	}
 	r.Barrier()
 
-	act := swigluGolemPush{ffn: uint32(f.ffn), columns: uint32(columns)}
+	act := swigluGolemPush{ffn: uint32(f.ffn), columns: uint32(columns), act: uint32(f.activation)}
 	r.Dispatch(f.setAct, uint32((f.ffn*columns+255)/256), unsafe.Pointer(&act))
 	r.Barrier()
 
@@ -138,6 +150,47 @@ func (f *GolemFFN) Record(r *Recorder, columns int) error {
 		r.Dispatch(f.down.Set(width), f.down.Groups(width), unsafe.Pointer(&p))
 	}
 	return nil
+}
+
+// GolemFFNScratch is the two intermediates of a Golem feed forward, which the
+// blocks of one model can share: they run one after another, and nothing a
+// block leaves in them is read by the next.
+type GolemFFNScratch struct {
+	stacked, act *Buffer
+	ffn, columns int
+}
+
+// fit allocates the pair the first time and checks the width after: a shared
+// pair sized for one block's feed forward is too short for a wider one.
+func (s *GolemFFNScratch) fit(d *Device, ffn, columns int) error {
+	if s.stacked != nil {
+		if ffn > s.ffn || columns > s.columns {
+			return fmt.Errorf("vk: a shared feed-forward scratch of %d by %d is asked for %d by %d", s.ffn, s.columns, ffn, columns)
+		}
+		return nil
+	}
+	var err error
+	if s.stacked, err = d.Local(2*ffn*columns*4, bufferUsageStorage); err != nil {
+		return err
+	}
+	if s.act, err = d.Local(ffn*columns*4, bufferUsageStorage); err != nil {
+		s.stacked.Close()
+		s.stacked = nil
+		return err
+	}
+	s.ffn, s.columns = ffn, columns
+	return nil
+}
+
+// Close releases the pair. The feed forwards that share it must be closed
+// first, or at least never run again.
+func (s *GolemFFNScratch) Close() {
+	for _, b := range []*Buffer{s.stacked, s.act} {
+		if b != nil {
+			b.Close()
+		}
+	}
+	s.stacked, s.act = nil, nil
 }
 
 // golemPassWidth is the widest pass that divides a run of columns. A pass reads
@@ -172,6 +225,9 @@ func (f *GolemFFN) Close() {
 		if p != nil {
 			p.Close()
 		}
+	}
+	if !f.owned {
+		f.stacked, f.act = nil, nil
 	}
 	for _, b := range []*Buffer{f.stacked, f.act} {
 		if b != nil {

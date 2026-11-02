@@ -22,11 +22,13 @@ import (
 	"time"
 
 	"github.com/ThiraSoft/golem/compress"
+	"github.com/ThiraSoft/golem/gemma"
 	"github.com/ThiraSoft/golem/internal/version"
 	"github.com/ThiraSoft/golem/nn"
 	"github.com/ThiraSoft/golem/qwen"
 	"github.com/ThiraSoft/golem/qwen35"
 	"github.com/ThiraSoft/golem/tensors"
+	"github.com/ThiraSoft/golem/token/bpe"
 	"github.com/ThiraSoft/golem/token/bytebpe"
 	"github.com/ThiraSoft/golem/vk"
 )
@@ -58,6 +60,7 @@ func main() {
 	salFile := flag.String("salience", "", "read the sites from this file, or write them to it after measuring; the salience does not depend on -alpha, -clamp or the codec, and measuring it again for each of them is most of a sweep's wall clock")
 	calibWindow := flag.Int("calib-window", 0, "how many blocks of a float checkpoint are resident on the card at once while it is calibrated. Zero sizes the window from the block's own weight, which is all this has to go on: nothing here asks the driver what is free")
 	measure := flag.Bool("measure-only", false, "stop once the sites are written, converting nothing. The two halves of a conversion do not want the same device — the card cannot run a BF16 checkpoint at all, and only the card can encode one in reasonable time — so a model too large to calibrate on the card is done in two commands: this one with -vulkan=false to measure the checkpoint exactly, then the conversion with -salience, which reads the file and never runs the model")
+	flag.StringVar(&calibPrefix, "calib-prefix", "", "text every calibration context opens with, special tokens parsed: a chat turn, for an instruct model that reads raw text as noise")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -762,10 +765,11 @@ func checkVectors(out []tensors.OutStream, rotatedBy map[string]string) error {
 // cache is forgotten between windows: each is its own context, which is what
 // makes one long text into many independent samples.
 func runCalib(path, text string, ntok, ctx int, hook func(int, string, [][]float32)) int {
-	// Whichever engine claims the checkpoint. The salience is worth twenty
-	// points of perplexity on Qwen3-0.6B — 39.80 against 60.01 with the
-	// columns left alone — so a conversion that cannot calibrate is not a
-	// conversion worth doing, and it says so rather than quietly writing one.
+	// Whichever engine claims the checkpoint: Qwen3, the hybrid or Gemma 4.
+	// The salience is worth twenty points of perplexity on Qwen3-0.6B — 39.80
+	// against 60.01 with the columns left alone — so a conversion that cannot
+	// calibrate is not a conversion worth doing, and it says so rather than
+	// quietly writing one.
 	var run func(func(int, string, [][]float32)) (int, error)
 	if m, err := qwen.Open(path, ctx); err == nil {
 		run = func(h func(int, string, [][]float32)) (int, error) {
@@ -781,7 +785,20 @@ func runCalib(path, text string, ntok, ctx int, hook func(int, string, [][]float
 			defer func() { qwen35.Calib = nil }()
 			return sweep(m2.File(), text, ntok, ctx, m2.Reset, m2.ForwardBatch)
 		}
+	} else if m3, err3 := gemma.Open(path, ctx); err3 == nil {
+		run = func(h func(int, string, [][]float32)) (int, error) {
+			defer m3.Close()
+			gemma.Calib = h
+			defer func() { gemma.Calib = nil }()
+			// Gemma's vocabulary is token/bpe, not Qwen's byte-level one.
+			v, err := bpe.Load(m3.File())
+			if err != nil {
+				return 0, err
+			}
+			return windows(cut(v.Encode(text, false, false), calibHead(v.BOS(), v.AddBOS(), v.Encode), ntok, ctx), m3.Reset, m3.ForwardBatch), nil
+		}
 	} else {
+		err2 = fmt.Errorf("%v; %v", err2, err3)
 		fmt.Printf("no calibration: %v; %v\n  every matrix will be rotated with signs alone, and none scaled —\n  which is worth twenty points of perplexity, so do not ship this\n", err, err2)
 		return 0
 	}
@@ -798,17 +815,62 @@ func sweep(g *tensors.GGUF, text string, ntok, ctx int,
 	if err != nil {
 		return 0, err
 	}
-	ids := v.Encode(text, true, false)
+	return windows(cut(v.Encode(text, false, false), calibHead(v.BOS(), v.AddBOS(), v.Encode), ntok, ctx), reset, forward), nil
+}
+
+// windows is sweep once the text is cut, for an engine whose vocabulary is not
+// the byte-level one.
+func windows(runs [][]int32, reset func(), forward func([]int32, int) [][]float32) int {
+	n := 0
+	for _, run := range runs {
+		reset()
+		forward(run, 0)
+		n += len(run)
+	}
+	return n
+}
+
+// cut makes independent contexts of ctx positions out of the first ntok tokens
+// of a text encoded without a BOS, each the head and then as much of the text
+// as fills it.
+//
+// The head is the BOS, for a vocabulary that wants one, and -calib-prefix.
+// The BOS on every context and not only the first: Gemma reads a window that
+// starts mid-sentence with no BOS as noise — a perplexity of 338 against 33 on
+// the E2B — and a calibration would measure that noise. The prefix for the same
+// reason one step further: an instruct Gemma 4 12B reads raw text as noise
+// even with its BOS, and a model's turn is where its activations are the ones
+// it will meet.
+func cut(ids, head []int32, ntok, ctx int) [][]int32 {
 	if len(ids) > ntok {
 		ids = ids[:ntok]
 	}
-	n := 0
-	for start := 0; start+ctx <= len(ids); start += ctx {
-		reset()
-		forward(ids[start:start+ctx], 0)
-		n += ctx
+	step := ctx - len(head)
+	if step <= 0 {
+		return nil
 	}
-	return n, nil
+	var runs [][]int32
+	for start := 0; start+step <= len(ids); start += step {
+		run := make([]int32, 0, ctx)
+		runs = append(runs, append(append(run, head...), ids[start:start+step]...))
+	}
+	return runs
+}
+
+// calibPrefix is -calib-prefix: text every calibration context opens with,
+// special tokens parsed.
+var calibPrefix string
+
+// calibHead is what every calibration context opens with.
+func calibHead(bos int32, addBOS bool, encode func(string, bool, bool) []int32) []int32 {
+	var head []int32
+	if addBOS {
+		head = append(head, bos)
+	}
+	if calibPrefix != "" {
+		head = append(head, encode(calibPrefix, false, true)...)
+	}
+	return head
 }
 
 // calibrate keeps, for each site, the per-column power of the activations that

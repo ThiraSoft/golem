@@ -5,7 +5,8 @@
 // The gate and the up projection read the same activation through the same
 // vector, so they are one matrix of twice the rows and one dispatch, and their
 // answers arrive stacked: for a column, the gate's outputs then the up's. This
-// takes the two apart, puts a SiLU on the first and multiplies.
+// takes the two apart, puts the activation on the first and multiplies: a
+// SiLU for Qwen, ggml's tabulated GELU for Gemma.
 //
 // It works on floats because everything on this path does. The Q8_0 form the
 // rest of the engine carries between its stages exists so a Q4_0 kernel can
@@ -16,11 +17,50 @@ layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer G { float g[]; }; // 2*ffn a column
 layout(std430, binding = 1) writeonly buffer A { float a[]; }; // ffn a column
+layout(std430, binding = 2) readonly buffer GT { float gelu[]; }; // ggml's table, 65536 entries
 
 layout(push_constant) uniform Push {
     uint ffn;
     uint columns;
+    uint act; // 0: ggml's tabulated GELU; 1: SiLU
 } p;
+
+// floatToHalf is nn/half.go, bit for bit, as shaders/moe_act.comp has it: the
+// table is indexed by those sixteen bits, and a bucket away is a divergence.
+uint floatToHalf(float f) {
+    uint bits     = floatBitsToUint(f);
+    uint sign     = (bits >> 16) & 0x8000u;
+    int  exponent = int((bits >> 23) & 0xFFu) - 127 + 15;
+    uint mantissa = bits & 0x7FFFFFu;
+
+    if ((bits & 0x7FFFFFFFu) == 0u) return sign;
+    if (exponent >= 0x1F) {
+        if ((bits & 0x7F800000u) == 0x7F800000u && mantissa != 0u) return sign | 0x7E00u;
+        return sign | 0x7C00u;
+    }
+    if (exponent <= 0) {
+        if (exponent < -10) return sign;
+        mantissa |= 0x800000u;
+        uint shift = uint(14 - exponent);
+        uint value = mantissa >> shift;
+        uint rest  = mantissa & ((1u << shift) - 1u);
+        uint mid   = 1u << (shift - 1u);
+        if (rest > mid || (rest == mid && (value & 1u) == 1u)) value++;
+        return sign | value;
+    }
+    uint value = (uint(exponent) << 10) | (mantissa >> 13);
+    uint rest  = mantissa & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (value & 1u) == 1u)) value++;
+    return sign | value;
+}
+
+// geluTable is nn.GELUTable: zero far below, the value itself far above, and
+// the table between.
+float geluTable(float x) {
+    if (x <= -10.0) return 0.0;
+    if (x >= 10.0) return x;
+    return gelu[floatToHalf(x)];
+}
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
@@ -31,7 +71,9 @@ void main() {
     uint base = col * 2u * p.ffn;
     float gate = g[base + j];
     float up = g[base + p.ffn + j];
-    // SiLU, which is what Qwen's feed forward gates with. Gemma's tabulated
-    // GELU is a different kernel and a different model.
-    a[i] = (gate / (1.0 + exp(-gate))) * up;
+    if (p.act == 0u) {
+        a[i] = geluTable(gate) * up;
+    } else {
+        a[i] = (gate / (1.0 + exp(-gate))) * up;
+    }
 }

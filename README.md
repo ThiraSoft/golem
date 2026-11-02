@@ -1,7 +1,6 @@
 <div align="center">
-  <img src="assets/logo.svg" alt="golem" width="420">
+  <img src="assets/brand/banner.svg" alt="golem: local AI in one static Go binary" width="760">
 
-**Local AI in one static Go binary.**  
 _LLMs, vision, speech, images and decisions. No Python, no cgo. CPU, or GPU with `-vulkan`._
 
 [![test](https://github.com/ThiraSoft/golem/actions/workflows/test.yml/badge.svg)](https://github.com/ThiraSoft/golem/actions/workflows/test.yml)

@@ -408,9 +408,15 @@ type Mixture struct {
 	dxq, dxs, dout *Buffer
 	// dxf is the shared branch's input as floats, which only a Golem branch
 	// reads, and which is nil until one is added.
-	dxf       *Buffer
-	doutParts *Buffer // the slices of a split down projection
-	daq, das  *Buffer
+	dxf *Buffer
+	// golemScratch is the two intermediates every Golem block shares.
+	golemScratch *GolemFFNScratch
+	doutParts    *Buffer // the slices of a split down projection
+	daq, das     *Buffer
+
+	// perLayer is Gemma 4's per-layer branch, nil for a model that has none.
+	// vk/perlayer.go is all of it.
+	perLayer *perLayer
 
 	blocks []*mixtureBlock
 }
@@ -420,6 +426,9 @@ type mixtureBlock struct {
 	// golem is the shared branch when it is in that format, and nil when it is
 	// Q4_0. vk/mixture_golem.go is all of it.
 	golem *GolemFFN
+	// dense is this block's shared branch width, which is the mixture's own
+	// unless MixtureFormats.Dense said otherwise.
+	dense int
 
 	gateUp, down           *Buffer
 	denseGateUp, denseDown *Buffer
@@ -901,9 +910,22 @@ type MixtureFormats struct {
 	Down       nn.Quant
 	GateUpExps nn.Quant
 	DownExps   nn.Quant
+	// Dense is the block's feed-forward width when it is narrower than the
+	// one the mixture was made for, and zero when it is that one. Gemma 4's
+	// E2B is 6144 wide in its first fifteen blocks and 12288 in the rest; the
+	// buffers between the products are sized for the widest, and each block
+	// reads as much of them as it is wide.
+	Dense int
 }
 
 func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, down []byte) error {
+	dense := m.dense
+	if f.Dense != 0 {
+		dense = f.Dense
+	}
+	if dense > m.dense || dense%nn.QuantBlock != 0 {
+		return fmt.Errorf("vk: a shared branch %d wide in a mixture made for %d", dense, m.dense)
+	}
 	switch f.GateUp {
 	case nn.Q4_0, nn.Q2_K, nn.Q3_K, nn.Q4_K, nn.Q8_0:
 	default:
@@ -915,9 +937,9 @@ func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, dow
 		rows, cols int
 		quant      nn.Quant
 	}{
-		{"the shared gate", gate, m.dense, m.dim, f.GateUp},
-		{"the shared up", up, m.dense, m.dim, f.GateUp},
-		{"the shared down", down, m.dim, m.dense, f.Down},
+		{"the shared gate", gate, dense, m.dim, f.GateUp},
+		{"the shared up", up, dense, m.dim, f.GateUp},
+		{"the shared down", down, m.dim, dense, f.Down},
 	}
 	if m.experts > 0 {
 		if f.GateUpExps != f.DownExps {
@@ -959,7 +981,7 @@ func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, dow
 		return fmt.Errorf("vk: this mixture was opened without experts, and the block brings %d bytes of them", len(gateUpExps)+len(downExps))
 	}
 
-	b := &mixtureBlock{}
+	b := &mixtureBlock{dense: dense}
 	fail := func(err error) error {
 		b.close()
 		return err
@@ -1035,14 +1057,14 @@ func (m *Mixture) AddBlock(f MixtureFormats, gateUpExps, downExps, gate, up, dow
 	// matrix of twice the rows packs to the same bytes as the two apart.
 	joined := make([]byte, 0, len(gate)+len(up))
 	joined = append(append(joined, gate...), up...)
-	gateUpLayout, err := quantLayout(f.GateUp, joined, 2*m.dense, m.dim)
+	gateUpLayout, err := quantLayout(f.GateUp, joined, 2*dense, m.dim)
 	if err != nil {
 		return fail(fmt.Errorf("vk: the shared gate and up: %w", err))
 	}
 	if b.denseGateUp, err = m.d.Upload(gateUpLayout); err != nil {
 		return fail(err)
 	}
-	downLayout, derr := quantLayout(f.Down, down, m.dim, m.dense)
+	downLayout, derr := quantLayout(f.Down, down, m.dim, dense)
 	if derr != nil {
 		return fail(fmt.Errorf("vk: the shared down: %w", derr))
 	}
@@ -1164,8 +1186,9 @@ func (m *Mixture) RecordSharedUp(r *Recorder, block, columns int) bool {
 		// between them: there are no experts to put there.
 		return false
 	}
-	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act), split: 1}
-	r.Dispatch(m.blocks[block].setDenseUp, uint32(m.dense/nn.QuantBlock), unsafe.Pointer(&shared))
+	dense := m.blocks[block].dense
+	shared := moePush{dim: uint32(m.dim), ffn: uint32(dense), used: 1, act: uint32(m.act), split: 1}
+	r.Dispatch(m.blocks[block].setDenseUp, uint32(dense/nn.QuantBlock), unsafe.Pointer(&shared))
 	return true
 }
 
@@ -1173,7 +1196,7 @@ func (m *Mixture) RecordSharedDown(r *Recorder, block, columns int) bool {
 	if m.blocks[block].golem != nil || passWidth(columns) != 1 {
 		return false
 	}
-	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act), split: 1}
+	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.blocks[block].dense), used: 1, act: uint32(m.act), split: 1}
 	r.Dispatch(m.blocks[block].setDenseDn, m.productGroups(1, m.dim), unsafe.Pointer(&shared))
 	return true
 }
@@ -1196,10 +1219,10 @@ func (m *Mixture) Record(r *Recorder, block, columns int, sharedUp, sharedDown b
 	}
 	experts := moePush{dim: uint32(m.dim), ffn: uint32(m.ffn), used: expertsUsed, act: uint32(m.act),
 		cap: uint32(maxColumns), split: 1}
-	shared := moePush{dim: uint32(m.dim), ffn: uint32(m.dense), used: 1, act: uint32(m.act), split: 1}
 	b := m.blocks[block]
+	shared := moePush{dim: uint32(m.dim), ffn: uint32(b.dense), used: 1, act: uint32(m.act), split: 1}
 	width := passWidth(columns)
-	up, down := uint32(m.dense/nn.QuantBlock), m.productGroups(width, m.dim)
+	up, down := uint32(b.dense/nn.QuantBlock), m.productGroups(width, m.dim)
 	// Nothing in either branch waits on the other, so they go in without a
 	// barrier between them and the card runs them together.
 	// A token reads the expert stack a column at a time — eight matrices for
@@ -1282,11 +1305,11 @@ func (m *Mixture) Record(r *Recorder, block, columns int, sharedUp, sharedDown b
 		// the fused kernel carries eight columns because that is what a wave
 		// holds, so a pass of two hundred and fifty-six ran it thirty-two
 		// times and read the gate and up matrices thirty-two times with it.
-		product := moePush{dim: uint32(2 * m.dense), ffn: uint32(m.dim), used: 1, split: 1}
-		r.DispatchWide(b.setDenseProd, width, m.productGroups(width, 2*m.dense), unsafe.Pointer(&product))
+		product := moePush{dim: uint32(2 * b.dense), ffn: uint32(m.dim), used: 1, split: 1}
+		r.DispatchWide(b.setDenseProd, width, m.productGroups(width, 2*b.dense), unsafe.Pointer(&product))
 		r.Barrier()
-		gelu := moePush{dim: uint32(2 * m.dense), ffn: uint32(m.dense), used: 1, act: uint32(m.act)}
-		r.DispatchColumns(m.actSet, uint32((m.dense+255)/256), uint32(width), unsafe.Pointer(&gelu))
+		gelu := moePush{dim: uint32(2 * b.dense), ffn: uint32(b.dense), used: 1, act: uint32(m.act)}
+		r.DispatchColumns(m.actSet, uint32((b.dense+255)/256), uint32(width), unsafe.Pointer(&gelu))
 	case width > 1:
 		gate := gateColumns
 		if width < gate {
@@ -1387,10 +1410,16 @@ func (m *Mixture) Close() {
 			b.golem = nil
 		}
 	}
+	if m.golemScratch != nil {
+		m.golemScratch.Close()
+		m.golemScratch = nil
+	}
 	for _, b := range m.blocks {
 		b.close()
 	}
 	m.blocks = nil
+	m.perLayer.close()
+	m.perLayer = nil
 	for _, b := range []**Buffer{
 		&m.gateOut, &m.das, &m.daq, &m.doutParts, &m.dout, &m.dxs, &m.dxq,
 		&m.as, &m.aq, &m.out, &m.cw, &m.ids, &m.xs, &m.xq,

@@ -64,19 +64,14 @@ base of 100, and the token range of 40 … 280. They are what llama.cpp
 hardcodes for this projector, and a file that disagreed with them would run
 under llama.cpp with those values anyway.
 
-### The tower on the card
+### The tower stays on the processor
 
-The tower goes to the card with the model. A 640×426 picture takes 33.6 seconds
-on an i7-9700K and **1.03 on an RX 9070 XT**, and every waypoint of the card's
-tower is held to llama.cpp's the way the processor's is: worst gap 9.9e-3 over
-the twenty-seven blocks, against the same 0.02 bar. Reading the prompt and
-drawing the answer then run wherever the model does.
-
-The projector is 884 MiB in fp16 and shares the card with the model, so it is
-resident when there is room and streamed one block at a time when there is not.
-That is 1.03 seconds an image against 1.41, rather than a fall back to the
-processor's thirty-three. `GOLEM_VISION_STREAM=1` forces the second path, which
-is how it gets tested on a machine that has room for the first.
+E2B's tower runs on the processor even when the model is on a card: sixteen
+blocks in bfloat16, 0.78 s for a 640×426 picture and 2.8 s for a 1280×720
+capture, which is then most of what reading a screenshot costs. The tower that
+goes to the card with its model is Qwen3.8's (`vk.VisionPipeline`), and
+[`qwen35/README.md`](../qwen35/README.md) has its numbers. The 12B has no tower
+to move: its embedder is one product, and its blocks are the language model's.
 
 ### Two projectors, and only one of them is a tower
 
@@ -216,6 +211,55 @@ residual stream on the way out of each.
 
 None of it is written into the code. Every number is read from the file, which
 is why the 12B runs from the same lines.
+
+## E2B on the card
+
+`UseVulkanStack` takes E2B as it takes the 12B, and draws a token in 5.0 ms
+where the processor takes 45: **200 tokens a second** on an RX 9070 XT, with
+thirty-two positions behind it and with four thousand alike
+(`BenchmarkE2BTokenVulkan`, the blocks and the head on the card). Four
+thousand positions do not show, because only seven of the thirty-five blocks
+see everything and twenty of them read a cache another block wrote.
+
+Three things had to reach the card for that.
+
+**The per-layer branch.** After its feed forward, every block puts the stream,
+unnormed, through an input gate of 256 rows, multiplies the GELU of that by
+its own slice of the token's per-layer inputs, projects it back to 1536 and
+adds it on under a norm of its own. `vk/perlayer.go` is the three kernels in
+between, on the mixture because it already holds the product pipelines,
+ggml's GELU table and buffers the shared branch is done with by then. The
+block's own end writes into a second buffer instead of the stream, and the
+branch's end, which is `combine.comp`'s dense layout under another gain, takes
+it from there into the stream. The block's scale moves to that second end,
+because `gemma/block.go` applies it after the branch. `norm.comp` got a flag
+to quantize the stream to Q8_0 without norming it, which is what the gate
+reads.
+
+**Two feed-forward widths.** E2B is 6144 wide in its first fifteen blocks and
+12288 in the other twenty. The mixture is made for the widest, and
+`MixtureFormats.Dense` tells it a block is narrower: the buffers are shared,
+and each block reads as much of them as it is wide.
+
+**The per-layer inputs.** A token's row of 35 slices is a lookup in the
+per-layer embedding plus a projection of the token's embedding, normed, the
+two summed and scaled. The lookup stays on the processor, which writes it into
+`PerLayerStage`; the projection is a bfloat16 product of 8960 rows that cost
+the processor 110 ms for a pass of 512 columns and 2 ms a token, and the card
+makes it at the head of every pass (`ple_inputs.comp`, rounded to bfloat16
+first by the same shader built with `ROUND`). That took a token from 7.7 ms to
+5.0.
+
+The blocks that own no keys keep their query norm and get a key norm of zeros,
+because the attention kernel still binds one, and the split attention a deep
+token reads through follows `KVSource` to the cache it borrows.
+
+`vulkane2b_test.go` holds the card to the same fixtures the processor is held
+to: every waypoint block by block a token at a time, the prompt in one pass
+against the last norm, the greedy tokens against the reference's, and six
+hundred positions past the window of 512. `cmd/golem-server` weighs
+`/v1/systemone`'s options on it within 0.217 nats of llama.cpp
+(`TestWeighMatchesLlamaCpp`, `e2b/card`).
 
 ## The 12B, and what it does not have
 

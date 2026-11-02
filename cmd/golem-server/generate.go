@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,9 @@ type Generator struct {
 	logits    []float32
 	maxTokens int
 	calls     *int // how many calls this server has handed out, for identifiers
+	// top is how many of the likeliest tokens to keep beside each one drawn,
+	// and -1 when the log-probabilities were not asked for.
+	top int
 }
 
 // Answer is one answer and what it cost.
@@ -42,12 +46,15 @@ type Answer struct {
 	Prefill   time.Duration // reading the prompt
 	Decode    time.Duration // drawing the answer
 	Reason    string        // "stop", "length" or "tool_calls"
+	// LogProbs is every token of the answer and what the model gave it, when
+	// they were asked for.
+	LogProbs *choiceLogProbs
 }
 
 func NewGenerator(ctx *Context, v Vocabulary, tpl chat.Template, vocabSize, maxTokens int) *Generator {
 	calls := 0
 	return &Generator{ctx: ctx, vocab: v, tpl: tpl, logits: make([]float32, vocabSize),
-		maxTokens: maxTokens, calls: &calls}
+		maxTokens: maxTokens, calls: &calls, top: -1}
 }
 
 // Width is how many identifiers this generator scores, which is the width of
@@ -62,6 +69,52 @@ func (g *Generator) WithMaxTokens(n int) *Generator {
 	out.maxTokens = n
 	out.logits = make([]float32, len(g.logits))
 	return &out
+}
+
+// WithLogProbs is the same generator writing down each drawn token's
+// log-probability, and the top likeliest beside it.
+func (g *Generator) WithLogProbs(top int) *Generator {
+	out := *g
+	out.top = top
+	out.logits = make([]float32, len(g.logits))
+	return &out
+}
+
+// logProb is what a row of logits says of the token drawn from it, and of the
+// top likeliest.
+func (g *Generator) logProb(row []float32, id int32) tokenLogProb {
+	z := logSum(row)
+	entry := func(id int32) tokenLogProb {
+		piece := g.vocab.Piece(id, false)
+		bytes := make([]int, len(piece))
+		for i := range len(piece) {
+			bytes[i] = int(piece[i])
+		}
+		return tokenLogProb{Token: piece, LogProb: float64(row[id]) - z, Bytes: bytes}
+	}
+	out := entry(id)
+	if g.top > 0 {
+		// The top few of a quarter of a million, kept sorted as the row is
+		// read once.
+		best := make([]int32, 0, g.top+1)
+		for i, v := range row {
+			if len(best) == g.top && v <= row[best[len(best)-1]] {
+				continue
+			}
+			at := len(best)
+			for at > 0 && row[best[at-1]] < v {
+				at--
+			}
+			best = slices.Insert(best, at, int32(i))
+			if len(best) > g.top {
+				best = best[:g.top]
+			}
+		}
+		for _, b := range best {
+			out.TopLogProbs = append(out.TopLogProbs, entry(b))
+		}
+	}
+	return out
 }
 
 // endsInThought says whether the prompt's last words open a thought, blank
@@ -110,6 +163,20 @@ func (g *Generator) GeneratePrompt(ctx context.Context, prompt engine.Prompt, p 
 	// first draw (tools/server/server-context.cpp:254-260).
 	sampler.Seed(prompt.Tokens())
 
+	// Every draw goes through pick, a drafted one included, and a draw is
+	// taken in the order it was drawn: the log-probabilities wait in drawn
+	// until take writes them down.
+	pick := sampler.Pick
+	var drawnProbs []tokenLogProb
+	if g.top >= 0 {
+		answer.LogProbs = &choiceLogProbs{Content: []tokenLogProb{}}
+		pick = func(row []float32) int32 {
+			id := sampler.Pick(row)
+			drawnProbs = append(drawnProbs, g.logProb(row, id))
+			return id
+		}
+	}
+
 	var drawn strings.Builder // everything drawn, calls and reasoning included
 	open, close := g.tpl.ReasoningMarkers()
 	sorted := sorter{open: open, close: close, call: g.tpl.CallOpen(), emit: emit}
@@ -126,6 +193,12 @@ func (g *Generator) GeneratePrompt(ctx context.Context, prompt engine.Prompt, p 
 	var cut *string
 	take := func(id int32) error {
 		answer.Generated++
+		if len(drawnProbs) > 0 {
+			if !g.vocab.IsEOG(id) {
+				answer.LogProbs.Content = append(answer.LogProbs.Content, drawnProbs[0])
+			}
+			drawnProbs = drawnProbs[1:]
+		}
 		if g.vocab.IsEOG(id) {
 			stopped = true
 			return nil
@@ -150,7 +223,7 @@ func (g *Generator) GeneratePrompt(ctx context.Context, prompt engine.Prompt, p 
 		}
 		id := pending
 		if id < 0 {
-			id = sampler.Pick(g.logits)
+			id = pick(g.logits)
 		}
 		pending = -1
 		if err := take(id); err != nil {
@@ -165,7 +238,7 @@ func (g *Generator) GeneratePrompt(ctx context.Context, prompt engine.Prompt, p 
 		// a pass — a pass carrying two of them is the better bargain, and
 		// Runner.CanDraft is what weighs the two.
 		if span := g.ctx.DraftSpan(); g.ctx.CanDraft(state) && answer.Generated+span-1 < g.maxTokens && g.ctx.Room(span) {
-			next, err := g.ctx.Draft(id, &state, sampler.Pick)
+			next, err := g.ctx.Draft(id, &state, pick)
 			if err != nil {
 				return answer, err
 			}

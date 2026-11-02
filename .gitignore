@@ -28,6 +28,7 @@
 /testdata/qwen/layers/
 /testdata/qwen/long/
 /testdata/qwen/layers_q4/
+/testdata/systemone/
 /testdata/layer0/
 /testdata/pipeline/
 /testdata/pipeline_en/

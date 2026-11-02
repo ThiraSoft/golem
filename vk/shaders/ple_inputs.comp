@@ -1,0 +1,81 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// Gemma 4's per-layer inputs, from the two halves the card has by then.
+//
+// gemma/ple.go is the other copy and the one held to llama.cpp. A token's row
+// of every block's slices is the sum of two things: the per-layer embedding's
+// own row, looked up on the host and written over this buffer, and the
+// projection of the token's embedding, which the bfloat16 product left in PJ.
+// The lookup is scaled by the square root of a slice's width; the projection
+// by one over the square root of the stream's, then normed slice by slice
+// under one gain; the two are added and scaled by one over the square root of
+// two.
+//
+// ROUND, the same source under another name, is the step before the product:
+// ggml multiplies a bfloat16 matrix by an activation rounded to bfloat16, and
+// so does nn's kernel on the processor, so the stream is rounded the same way
+// into a buffer of its own.
+
+layout(local_size_x = 256) in;
+
+#ifdef ROUND
+layout(std430, binding = 0) readonly  buffer X  { float x[];  };
+layout(std430, binding = 1) writeonly buffer XR { float xr[]; };
+
+layout(push_constant) uniform Push {
+    uint n;   // the floats to round
+} p;
+
+// nn.RoundBF16, bit for bit: to nearest, ties to even, a NaN kept quiet.
+float roundBF16(float v) {
+    uint bits = floatBitsToUint(v);
+    if ((bits & 0x7FFFFFFFu) > 0x7F800000u) return uintBitsToFloat(((bits >> 16) | 64u) << 16);
+    return uintBitsToFloat((bits + 0x7FFFu + ((bits >> 16) & 1u)) & 0xFFFF0000u);
+}
+
+void main() {
+    uint i = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    if (i < p.n) xr[i] = roundBF16(x[i]);
+}
+#else
+layout(std430, binding = 0) readonly  buffer PJ { float pj[];   };  // the projection, a row a column
+layout(std430, binding = 1) readonly  buffer G  { float gain[]; };  // per_layer_proj_norm
+layout(std430, binding = 2)           buffer IN { float ins[];  };  // the lookups in, the inputs out
+
+layout(push_constant) uniform Push {
+    uint  width;       // a slice: one block's share of a row
+    uint  row;         // every block's slices
+    float eps;
+    float lookup;      // the lookup's scale
+    float project;     // the projection's, before its norm
+    float sum;         // what their sum is scaled by
+} p;
+
+shared float partial[32];
+
+void main() {
+    uint t     = gl_LocalInvocationID.x;
+    uint block = gl_WorkGroupID.x;
+    uint col   = gl_WorkGroupID.y;
+    uint base  = col * p.row + block * p.width;
+
+    float s = 0.0;
+    for (uint i = t; i < p.width; i += 256u) {
+        float v = pj[base + i] * p.project;
+        s += v * v;
+    }
+    float folded = subgroupAdd(s);
+    if (subgroupElect()) partial[gl_SubgroupID] = folded;
+    barrier();
+    float whole = 0.0;
+    for (uint i = 0u; i < gl_NumSubgroups; i++) whole += partial[i];
+    float scale = 1.0 / sqrt(whole / float(p.width) + p.eps);
+
+    for (uint i = t; i < p.width; i += 256u) {
+        float v = pj[base + i] * p.project * scale * gain[i];
+        ins[base + i] = (ins[base + i] * p.lookup + v) * p.sum;
+    }
+}
+#endif

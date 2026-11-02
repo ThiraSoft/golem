@@ -18,7 +18,13 @@ import (
 // a way a single kernel's test would not have caught — the wrong vector on the
 // wrong site, the halves of the stacked product swapped, a barrier missing
 // between a write and the read of it.
-func TestGolemFFNMatchesCPU(t *testing.T) {
+func TestGolemFFNMatchesCPU(t *testing.T) { golemFFNMatchesCPU(t, SiLU) }
+
+// Gemma's gate: ggml's GELU, looked up in its table by the fp16 bits of the
+// value, which is what the processor does too.
+func TestGolemFFNGELUMatchesCPU(t *testing.T) { golemFFNMatchesCPU(t, GELU) }
+
+func golemFFNMatchesCPU(t *testing.T, act Activation) {
 	d := open(t)
 	defer d.Close()
 
@@ -53,7 +59,13 @@ func TestGolemFFNMatchesCPU(t *testing.T) {
 	}
 	defer out.Close()
 
-	f, err := NewGolemFFN(k, dim, ffn, columns, gateD, upD, downD, preGateUp, preDown, in, out)
+	gelu, err := d.Upload(asBytes(nn.GELUTableData()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gelu.Close()
+
+	f, err := NewGolemFFN(k, dim, ffn, columns, gateD, upD, downD, preGateUp, preDown, in, out, act, gelu, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,8 +104,15 @@ func TestGolemFFNMatchesCPU(t *testing.T) {
 		gateM.MatVec(b, g)
 		upM.MatVec(b, u)
 		a := make([]float32, ffn)
-		for i := range a {
-			a[i] = float32(float64(g[i])/(1+math.Exp(-float64(g[i])))) * u[i]
+		if act == GELU {
+			nn.GELUTable(g)
+			for i := range a {
+				a[i] = g[i] * u[i]
+			}
+		} else {
+			for i := range a {
+				a[i] = float32(float64(g[i])/(1+math.Exp(-float64(g[i])))) * u[i]
+			}
 		}
 		nn.PrepareGolem(a, preDown, 128)
 		ab := nn.NewBatch(ffn, 1)

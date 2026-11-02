@@ -339,7 +339,7 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, slotContext, s
 		{&a.scoreRows, 4, true},                                      // nothing: the scores never leave the workgroup, and the binding stays for the layout
 		{&a.aq, maxHeads * maxColumns, true},                         // the mixed values, Q8_0
 		{&a.as, 2 * maxHeads / nn.QuantBlock * 4 * maxColumns, true},
-		{&a.where, maxBlocks * maxColumns * 16, false}, // per block and column: position, first, last
+		{&a.where, (maxBlocks + 2) * maxColumns * 16, false}, // per block and column: position, first, last; then two entries a column for a branch
 	} {
 		var b *Buffer
 		if spec.local {
@@ -353,6 +353,10 @@ func NewAttention(d *Device, dim, maxHeads, maxKV, maxQueryHeads, slotContext, s
 		}
 		*spec.into = b
 	}
+	// Every column on the main line until a pass says otherwise: host memory
+	// is not handed over cleared, and a caller that never branches never
+	// writes the branches.
+	clear(a.where.Bytes())
 	if a.splitOut > 1 {
 		if a.reduceSet, err = a.reduce.NewSet([]*Buffer{a.outParts, a.out}); err != nil {
 			a.Close()
@@ -668,6 +672,34 @@ func (a *Attention) SetWhere(block, column, slot, pos, first, last int) error {
 	entries := unsafe.Slice((*uint32)(unsafe.Pointer(&a.where.Bytes()[0])), maxBlocks*maxColumns*4)
 	at := entries[(block*maxColumns+column)*4:]
 	at[0], at[1], at[2], at[3] = uint32(pos), uint32(first), uint32(last), uint32(slot)
+	return nil
+}
+
+// SetBranch writes where one column of a pass stands on a branch: shift
+// positions past where it is turned, and blind to the cache over two holes,
+// each from its first position up to its second. A branch is one of several
+// continuations written after the same prefix, each after the one before in
+// the cache and each seeing the prefix, what it continues and itself alone:
+// an option sees the state and its own question's words, which takes two
+// holes. A column on no branch is SetBranch(c, 0, [2][2]int{}), and every
+// column of every pass is written one way or the other: the entries outlive
+// the pass that wrote them.
+//
+// It is two entries a column for every block, past the blocks' own: the holes
+// are in positions of the cache, which every block shares, and a window is
+// the caller's to work out from where the column is turned.
+func (a *Attention) SetBranch(column, shift int, holes [2][2]int) error {
+	if column < 0 || column >= maxColumns {
+		return fmt.Errorf("vk: column %d of the %d one pass carries", column, maxColumns)
+	}
+	if shift < 0 || holes[0][0] > holes[0][1] || holes[1][0] > holes[1][1] {
+		return fmt.Errorf("vk: a branch shifted by %d with holes %v", shift, holes)
+	}
+	entries := unsafe.Slice((*uint32)(unsafe.Pointer(&a.where.Bytes()[0])), (maxBlocks+2)*maxColumns*4)
+	at := entries[(maxBlocks*maxColumns+column)*4:]
+	at[0], at[1], at[2], at[3] = uint32(shift), uint32(holes[0][0]), uint32(holes[0][1]), 0
+	at = entries[((maxBlocks+1)*maxColumns+column)*4:]
+	at[0], at[1], at[2], at[3] = uint32(holes[1][0]), uint32(holes[1][1]), 0, 0
 	return nil
 }
 

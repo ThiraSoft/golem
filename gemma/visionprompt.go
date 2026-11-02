@@ -244,9 +244,19 @@ func (p *Prompt) Boundary(from, want int) int {
 // token goes, until how far forward it may look.
 func (m *Model) ForwardEmbeddedSlots(tokens []int32, embeds [][]float32, ple []int32,
 	slots, positions, until []int) [][]float32 {
+	return m.ForwardBranchSlots(tokens, embeds, ple, slots, positions, until, nil, nil)
+}
+
+// ForwardBranchSlots is the same with some tokens on branches (Place's Shift
+// and Holes), given one of each a token; nil for a pass that has none.
+func (m *Model) ForwardBranchSlots(tokens []int32, embeds [][]float32, ple []int32,
+	slots, positions, until, shifts []int, holes [][2][2]int) [][]float32 {
 	at := make([]Place, len(tokens))
 	for i := range tokens {
 		at[i] = Place{Cache: m.Slot(slots[i]), Pos: positions[i], Until: until[i]}
+		if shifts != nil {
+			at[i].Shift, at[i].Holes = shifts[i], holes[i]
+		}
 	}
 	return m.ForwardEmbedded(tokens, embeds, ple, at)
 }

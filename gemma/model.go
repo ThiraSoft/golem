@@ -39,8 +39,17 @@ type Model struct {
 
 	// The logit head on a Vulkan device, when UseVulkanHead put it there.
 	// gemma/vulkan.go says what that buys and what it leaves alone.
-	head      vk.Head
-	stack     *vk.Stack
+	head  vk.Head
+	stack *vk.Stack
+	// pleOnCard says the card makes the projection half of the per-layer
+	// inputs, and is handed only the per-layer embedding's rows.
+	pleOnCard bool
+	// golemHead is the head of a .golem checkpoint, which has the transform
+	// of its site in front of the product and an API of its own; golem holds
+	// the kernels of each format, built once: a three-bit body usually comes
+	// with a four-bit head.
+	golemHead *vk.GolemHead
+	golem     map[nn.Quant]*vk.GolemKernels
 	rotations []rotation
 	headDev   *vk.Device
 
@@ -253,13 +262,32 @@ func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32,
 		}
 	})
 	perLayer := m.ple[:batch]
-	PerLayerInputs(cfg, w, m.scratch, embedded, ple, perLayer)
+	if m.pleOnCard {
+		// The rows the per-layer embedding gives these identifiers, which is
+		// all the card wants from this side: it projects the stream itself.
+		stage, width := m.stack.PerLayerStage(), len(cfg.Blocks)*cfg.PLEDim
+		nn.InParallel(batch, batch*width*perPosition, func(first, last int) {
+			for t := first; t < last; t++ {
+				w.PLEEmbd.Row(int(ple[t]), stage[t*width:(t+1)*width])
+			}
+		})
+	} else {
+		PerLayerInputs(cfg, w, m.scratch, embedded, ple, perLayer)
+	}
 
 	xs := m.xs[:batch]
 	for t := range tokens {
 		copy(xs[t], embedded.F[t])
 	}
 	if m.stack != nil {
+		// The per-layer inputs are built here, out of the embedding, and the
+		// card reads them from its stage.
+		if stage := m.stack.PerLayerStage(); stage != nil && !m.pleOnCard {
+			width := len(cfg.Blocks) * cfg.PLEDim
+			for t := range tokens {
+				copy(stage[t*width:(t+1)*width], perLayer[t])
+			}
+		}
 		m.runStack(xs, at)
 		// The card normed it: the last thing the recording does is the
 		// model's final norm, in place in the stream.
@@ -291,6 +319,7 @@ func (m *Model) ForwardEmbedded(tokens []int32, embeds [][]float32, ple []int32,
 		copy(hidden[t], xs[t])
 		nn.RMSNormPlain(hidden[t], w.OutputNorm, cfg.Eps)
 	}
+	calib(-1, "head", hidden)
 	return hidden
 }
 
@@ -356,9 +385,9 @@ func (m *Model) runStack(xs [][]float32, at []Place) {
 	// neither kernel has to check the other.
 	positions := make([]vk.Position, len(at))
 	for c, one := range at {
-		positions[c] = vk.Position{Slot: m.slotOf(one.Cache), Pos: one.Pos}
+		positions[c] = vk.Position{Slot: m.slotOf(one.Cache), Pos: one.Pos, Shift: one.Shift, Holes: one.Holes}
 		for _, bc := range cfg.Blocks {
-			first, last := one.Cache.Visible(bc, one.Pos, one.Until)
+			first, last := one.visible(bc)
 			positions[c].First = append(positions[c].First, first)
 			positions[c].Last = append(positions[c].Last, last)
 		}
@@ -380,6 +409,14 @@ func (m *Model) runStack(xs [][]float32, at []Place) {
 func (m *Model) Logits(hidden []float32, out []float32) {
 	if len(out) != m.Cfg.Vocab {
 		panic(fmt.Sprintf("gemma: logits need %d entries, given %d", m.Cfg.Vocab, len(out)))
+	}
+	if m.golemHead != nil {
+		if err := m.golemHead.Logits(hidden, out); err != nil {
+			panic(fmt.Sprintf("gemma: the Vulkan head failed: %v", err))
+		}
+		nn.Softcap(out, m.Cfg.LogitSoftcap)
+		m.suppress(out, nil)
+		return
 	}
 	v := m.scratch.Batch(m.Cfg.Dim, 1)
 	copy(v.F[0], hidden)
@@ -457,7 +494,7 @@ func (m *Model) LogitsBatch(hidden [][]float32, out [][]float32) {
 			panic(fmt.Sprintf("gemma: logits need %d entries, given %d", m.Cfg.Vocab, len(o)))
 		}
 	}
-	if m.head != nil {
+	if m.head != nil || m.golemHead != nil {
 		for i := range hidden {
 			m.Logits(hidden[i], out[i])
 		}

@@ -37,6 +37,30 @@ type question struct {
 	options      []string // the rendered texts, in label order
 }
 
+// Prepared is a question made ready, for a model other than Laya to ask: its
+// kind, its instructions as one string, the identifiers its answer names the
+// options by, and the options as Laya reads them ("label: description",
+// "level 2: high", "true: …").
+type Prepared struct {
+	Kind         string
+	Instructions string
+	Labels       []string
+	Options      []string
+
+	q *question
+}
+
+// Prepare reads one question as Decide would, and refuses what Decide would
+// refuse.
+func Prepare(q Question) (*Prepared, error) {
+	p, err := prepare(q)
+	if err != nil {
+		return nil, err
+	}
+	return &Prepared{Kind: kindNames[p.kind], Instructions: p.instructions,
+		Labels: p.labels, Options: p.options, q: p}, nil
+}
+
 func prepare(q Question) (*question, error) {
 	p := &question{kind: -1}
 	for k, name := range kindNames {

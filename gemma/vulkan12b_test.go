@@ -88,6 +88,91 @@ func TestVulkan12BGreedyMatchesTheReference(t *testing.T) {
 	}
 }
 
+// TestVulkan12BDeepTokenMatchesWidePass is a token drawn past two thousand
+// positions, against the same position read as the last column of a wide
+// pass. The two take different attentions: the token's own, which a client
+// weighing options pays at every pass, and the tiled one a prompt is read
+// through. The prompt is longer than the sliding window, so a window block's
+// ring has turned over by then.
+//
+// They sum the same products in different orders and agree to a tolerance.
+// Measured, the token is two parts in a hundred of the peak from the wide
+// pass through attn_one.comp and three and a half through the split
+// attention, and at three hundred and at twelve hundred positions the two
+// are as far as each other from the processor's answer. A token that read the
+// wrong stretch of the cache, or the wrong slot of a ring, misses by far
+// more.
+func TestVulkan12BDeepTokenMatchesWidePass(t *testing.T) {
+	_, m := load12BStack(t)
+	const n = 2600
+	tokens := make([]int32, n)
+	for i := range tokens {
+		tokens[i] = int32(100 + i*37%5000)
+	}
+	width := m.stackColumns()
+	prefill := func(upTo int) {
+		m.Reset()
+		for at := 0; at < upTo; at += width {
+			m.ForwardBatch(tokens[at:min(at+width, upTo)], at)
+		}
+	}
+
+	prefill(n - 1)
+	token := append([]float32(nil), m.Forward(tokens[n-1], n-1)...)
+
+	prefill(n - 64)
+	wide := m.ForwardBatch(tokens[n-64:], n-64)
+	compareRelative(t, "the last position, a token against a wide pass", token, wide[len(wide)-1], 5e-2)
+}
+
+// TestVulkan12BBranchesAgreeWithOneAfterAnother is
+// TestBranchesAgreeWithOneAfterAnother on the card, past the window. The pass
+// of five columns takes the tiled attention and the runs of two and three the
+// token's, so they agree to a tolerance and not to the bit; a branch that saw
+// the one before it, or was turned where it is written, misses by far more.
+func TestVulkan12BBranchesAgreeWithOneAfterAnother(t *testing.T) {
+	_, m := load12BStack(t)
+	prefix := make([]int32, 1500)
+	for i := range prefix {
+		prefix[i] = int32(100 + i*37%5000)
+	}
+	a, b := []int32{2000, 2001}, []int32{3000, 3001, 3002}
+	n := len(prefix)
+	width := m.stackColumns()
+	prefill := func() {
+		m.Reset()
+		for at := 0; at < n; at += width {
+			m.ForwardBatch(prefix[at:min(at+width, n)], at)
+		}
+	}
+
+	prefill()
+	var want [][]float32
+	for _, h := range m.ForwardBatch(a, n) {
+		want = append(want, append([]float32(nil), h...))
+	}
+	for _, h := range m.ForwardBatch(b, n) {
+		want = append(want, append([]float32(nil), h...))
+	}
+
+	prefill()
+	got := m.ForwardMixed(append(append([]int32{}, a...), b...), branches(m.Slot(0), n, len(a), len(b)))
+	for i := range want {
+		compareRelative(t, "position "+itoa(i)+" of the pass", got[i], want[i], 5e-2)
+	}
+}
+
+// TestVulkan12BTwoHolesAgreeWithOneAfterAnother is
+// TestTwoHolesAgreeWithOneAfterAnother on the card, to the tolerance the
+// branches are held to.
+func TestVulkan12BTwoHolesAgreeWithOneAfterAnother(t *testing.T) {
+	_, m := load12BStack(t)
+	twoHoles(t, m, func(got, want []float32) bool {
+		compareRelative(t, "the last option", got, want, 5e-2)
+		return true
+	})
+}
+
 // The benchmarks: a whole token of the 12B, on the CPU and on the card.
 
 func open12BEngineBench(b *testing.B) *Model {
